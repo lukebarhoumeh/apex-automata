@@ -12,7 +12,7 @@ const Index = () => {
   const [botState, setBotState] = useState<"paper" | "live" | "paused">("paper");
 
   return (
-    <div className="min-h-screen bg-background dark">
+    <div className="min-h-screen bg-background">
       <div className="terminal-grid fixed inset-0 pointer-events-none" />
       
       <DashboardHeader botState={botState} onStateChange={setBotState} />
