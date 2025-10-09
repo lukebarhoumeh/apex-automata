@@ -1,12 +1,44 @@
-// Update this page (the content is just a fallback if you fail to update the page)
+import { useState } from "react";
+import { DashboardHeader } from "@/components/dashboard/DashboardHeader";
+import { MetricsGrid } from "@/components/dashboard/MetricsGrid";
+import { ChartSection } from "@/components/dashboard/ChartSection";
+import { PositionsPanel } from "@/components/dashboard/PositionsPanel";
+import { RiskControls } from "@/components/dashboard/RiskControls";
+import { SignalsPanel } from "@/components/dashboard/SignalsPanel";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const Index = () => {
+  const [botState, setBotState] = useState<"paper" | "live" | "paused">("paper");
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background">
-      <div className="text-center">
-        <h1 className="mb-4 text-4xl font-bold">Welcome to Your Blank App</h1>
-        <p className="text-xl text-muted-foreground">Start building your amazing project here!</p>
-      </div>
+    <div className="min-h-screen bg-background">
+      <DashboardHeader botState={botState} onStateChange={setBotState} />
+      
+      <main className="container mx-auto p-6 space-y-6">
+        <MetricsGrid />
+        
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div className="lg:col-span-2 space-y-6">
+            <ChartSection />
+            <PositionsPanel />
+          </div>
+          
+          <div className="space-y-6">
+            <Tabs defaultValue="risk" className="w-full">
+              <TabsList className="grid w-full grid-cols-2">
+                <TabsTrigger value="risk">Risk</TabsTrigger>
+                <TabsTrigger value="signals">Signals</TabsTrigger>
+              </TabsList>
+              <TabsContent value="risk" className="mt-4">
+                <RiskControls />
+              </TabsContent>
+              <TabsContent value="signals" className="mt-4">
+                <SignalsPanel />
+              </TabsContent>
+            </Tabs>
+          </div>
+        </div>
+      </main>
     </div>
   );
 };
