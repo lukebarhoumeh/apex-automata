@@ -3,20 +3,21 @@ import { supabase } from "@/integrations/supabase/client";
 
 export interface Position {
   id: string;
+  user_id: string;
   symbol: string;
-  side: "long" | "short";
-  entry_price: number;
-  current_price: number;
-  size: number;
-  pnl: number;
-  pnl_r: number;
-  meta_prob: number | null;
   strategy: string;
-  stop_loss: number;
-  take_profit: number;
-  risk_progress: number;
-  time_opened: string;
-  status: "open" | "closed";
+  side: "long" | "short";
+  qty_open: number;
+  entry_price: number;
+  stop_price_at_entry: number;
+  take_profit_price: number | null;
+  opened_at: string;
+  closed_at: string | null;
+  exit_price: number | null;
+  exit_reason: string | null;
+  realized_pnl_usd: number | null;
+  realized_r: number | null;
+  created_at: string;
 }
 
 export const usePositions = () => {
@@ -26,11 +27,11 @@ export const usePositions = () => {
       const { data, error } = await supabase
         .from("positions")
         .select("*")
-        .eq("status", "open")
-        .order("time_opened", { ascending: false });
+        .is("closed_at", null)
+        .order("opened_at", { ascending: false });
 
       if (error) throw error;
-      return data as Position[];
+      return data;
     },
     refetchInterval: 5000, // Refresh every 5 seconds
   });

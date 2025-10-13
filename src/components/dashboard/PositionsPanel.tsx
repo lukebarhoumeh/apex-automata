@@ -6,20 +6,22 @@ import { TrendingUp, TrendingDown, X, Target } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 
 interface Position {
-  id?: string;
+  id: string;
+  user_id: string;
   symbol: string;
-  side: "long" | "short";
-  entry_price: number;
-  current_price: number;
-  size: number;
-  pnl: number;
-  pnl_r: number;
-  meta_prob: number | null;
   strategy: string;
-  time_opened: string;
-  stop_loss: number;
-  take_profit: number;
-  risk_progress: number;
+  side: "long" | "short";
+  qty_open: number;
+  entry_price: number;
+  stop_price_at_entry: number;
+  take_profit_price: number | null;
+  opened_at: string;
+  closed_at: string | null;
+  exit_price: number | null;
+  exit_reason: string | null;
+  realized_pnl_usd: number | null;
+  realized_r: number | null;
+  created_at: string;
 }
 
 interface PositionsPanelProps {
@@ -64,10 +66,10 @@ export const PositionsPanel = ({ positions = [] }: PositionsPanelProps) => {
                 <TableRow className="bg-muted/30 hover:bg-muted/30">
                   <TableHead className="font-semibold">Symbol</TableHead>
                   <TableHead className="font-semibold">Side</TableHead>
-                  <TableHead className="font-semibold">Entry → Current</TableHead>
+                  <TableHead className="font-semibold">Entry Price</TableHead>
+                  <TableHead className="font-semibold">Qty</TableHead>
                   <TableHead className="font-semibold">P&L</TableHead>
                   <TableHead className="font-semibold">Progress</TableHead>
-                  <TableHead className="font-semibold">Meta</TableHead>
                   <TableHead className="font-semibold">Strategy</TableHead>
                   <TableHead className="font-semibold">Time</TableHead>
                   <TableHead className="text-right font-semibold">Actions</TableHead>
@@ -75,15 +77,18 @@ export const PositionsPanel = ({ positions = [] }: PositionsPanelProps) => {
               </TableHeader>
               <TableBody>
                 {displayPositions.map((pos, idx) => {
-                  const timeFormatted = new Date(pos.time_opened).toLocaleTimeString('en-US', { 
+                  const timeFormatted = new Date(pos.opened_at).toLocaleTimeString('en-US', { 
                     hour: '2-digit', 
                     minute: '2-digit',
                     hour12: false 
                   });
                   
+                  const pnl = pos.realized_pnl_usd || 0;
+                  const rValue = pos.realized_r || 0;
+                  
                   return (
                   <TableRow 
-                    key={pos.id || idx} 
+                    key={pos.id} 
                     className="cursor-pointer hover:bg-muted/30 transition-all duration-200 border-border/50 animate-slide-up hover:scale-[1.01]"
                     style={{ animationDelay: `${idx * 50}ms` }}
                   >
@@ -105,22 +110,22 @@ export const PositionsPanel = ({ positions = [] }: PositionsPanelProps) => {
                     </Badge>
                   </TableCell>
                     <TableCell>
-                      <div className="space-y-0.5">
-                        <div className="font-mono text-xs text-muted-foreground">
-                          ${pos.entry_price.toLocaleString()}
-                        </div>
-                        <div className="font-mono text-sm font-semibold">
-                          ${pos.current_price.toLocaleString()}
-                        </div>
+                      <div className="font-mono text-sm font-semibold">
+                        ${pos.entry_price.toLocaleString()}
                       </div>
                     </TableCell>
                     <TableCell>
-                      <div className={pos.pnl >= 0 ? "text-success" : "text-destructive"}>
-                        <div className={`font-bold ${pos.pnl >= 0 ? 'profit-glow' : 'loss-glow'}`}>
-                          {pos.pnl >= 0 ? "+" : ""}${pos.pnl.toFixed(2)}
+                      <div className="font-mono text-sm">
+                        {pos.qty_open}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <div className={pnl >= 0 ? "text-success" : "text-destructive"}>
+                        <div className={`font-bold ${pnl >= 0 ? 'profit-glow' : 'loss-glow'}`}>
+                          {pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}
                         </div>
                         <div className="text-xs font-medium">
-                          {pos.pnl_r >= 0 ? "+" : ""}{pos.pnl_r.toFixed(2)}R
+                          {rValue >= 0 ? "+" : ""}{rValue.toFixed(2)}R
                         </div>
                       </div>
                     </TableCell>
@@ -128,29 +133,15 @@ export const PositionsPanel = ({ positions = [] }: PositionsPanelProps) => {
                       <div className="space-y-1.5 min-w-[100px]">
                         <div className="flex items-center justify-between text-xs">
                           <span className="text-muted-foreground">SL → TP</span>
-                          <span className="font-medium">{pos.risk_progress}%</span>
+                          <span className="font-medium">0%</span>
                         </div>
-                        <Progress value={pos.risk_progress} className="h-1.5" />
+                        <Progress value={0} className="h-1.5" />
                         <div className="flex items-center justify-between text-xs font-mono">
-                          <span className="text-destructive">${pos.stop_loss}</span>
+                          <span className="text-destructive">${pos.stop_price_at_entry}</span>
                           <Target className="h-3 w-3 text-muted-foreground" />
-                          <span className="text-success">${pos.take_profit}</span>
+                          <span className="text-success">${pos.take_profit_price || '-'}</span>
                         </div>
                       </div>
-                    </TableCell>
-                    <TableCell>
-                      <Badge 
-                        variant="outline" 
-                        className={`font-mono text-xs ${
-                          (pos.meta_prob || 0) >= 0.7 
-                            ? 'bg-success/10 border-success/40 text-success' 
-                            : (pos.meta_prob || 0) >= 0.6
-                            ? 'bg-warning/10 border-warning/40 text-warning'
-                            : 'bg-muted'
-                        }`}
-                      >
-                        {pos.meta_prob ? ((pos.meta_prob || 0) * 100).toFixed(0) : '-'}%
-                      </Badge>
                     </TableCell>
                     <TableCell>
                       <Badge variant="outline" className="text-xs bg-card/50">
