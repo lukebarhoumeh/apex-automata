@@ -104,12 +104,38 @@ const MetricCard = ({
   );
 };
 
-export const MetricsGrid = () => {
+interface MetricsGridProps {
+  metrics?: {
+    total_equity: number;
+    daily_pnl: number;
+    daily_pnl_r: number;
+    risk_heat: number;
+    spread_percentile: number;
+    open_positions_count: number;
+    wins_today: number;
+    losses_today: number;
+  };
+}
+
+export const MetricsGrid = ({ metrics }: MetricsGridProps) => {
+  // Use provided metrics or defaults
+  const equity = metrics?.total_equity || 52450;
+  const dailyPnl = metrics?.daily_pnl || 945.20;
+  const dailyPnlR = metrics?.daily_pnl_r || 1.8;
+  const riskHeat = metrics?.risk_heat || 2.1;
+  const spreadPercentile = metrics?.spread_percentile || 42;
+  const openPositions = metrics?.open_positions_count || 2;
+  const wins = metrics?.wins_today || 6;
+  const losses = metrics?.losses_today || 2;
+
+  const dailyPnlVariant = dailyPnl >= 0 ? "success" : "destructive";
+  const dailyPnlTrend = dailyPnl >= 0 ? "up" : "down";
+
   return (
     <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 animate-slide-up">
       <MetricCard
         title="Total Equity"
-        value="$52,450"
+        value={`$${equity.toLocaleString()}`}
         change="+2.3%"
         trend="up"
         subtitle="All-time high"
@@ -119,31 +145,31 @@ export const MetricsGrid = () => {
       />
       <MetricCard
         title="Daily P&L"
-        value="+1.8R"
-        change="$945.20"
-        trend="up"
-        subtitle="6 wins, 2 losses"
+        value={`${dailyPnlR >= 0 ? "+" : ""}${dailyPnlR.toFixed(1)}R`}
+        change={`${dailyPnl >= 0 ? "+" : ""}$${Math.abs(dailyPnl).toFixed(2)}`}
+        trend={dailyPnlTrend}
+        subtitle={`${wins} wins, ${losses} losses`}
         icon={<TrendingUp className="h-4 w-4" />}
-        variant="success"
+        variant={dailyPnlVariant}
       />
       <MetricCard
         title="Risk Heat"
-        value="2.1%"
+        value={`${riskHeat.toFixed(1)}%`}
         subtitle="of 3% max limit"
         icon={<Activity className="h-4 w-4" />}
-        variant="default"
+        variant={riskHeat > 2.5 ? "warning" : "default"}
       />
       <MetricCard
         title="Spread Percentile"
-        value="42%"
-        subtitle="Normal conditions"
+        value={`${spreadPercentile}%`}
+        subtitle={spreadPercentile > 80 ? "High volatility" : "Normal conditions"}
         icon={<Percent className="h-4 w-4" />}
-        variant="default"
+        variant={spreadPercentile > 90 ? "warning" : "default"}
       />
       <MetricCard
         title="Open Positions"
-        value="2"
-        subtitle="BTC, ETH active"
+        value={openPositions.toString()}
+        subtitle={openPositions > 0 ? "Active trades" : "No positions"}
         icon={<Zap className="h-4 w-4" />}
         variant="default"
       />

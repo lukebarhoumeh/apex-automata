@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { DashboardHeader } from "@/components/dashboard/DashboardHeader";
-import { MetricsGrid } from "@/components/dashboard/MetricsGrid";
+import { MetricsGridConnected } from "@/components/dashboard/MetricsGridConnected";
 import { ChartSection } from "@/components/dashboard/ChartSection";
-import { PositionsPanel } from "@/components/dashboard/PositionsPanel";
+import { PositionsPanelConnected } from "@/components/dashboard/PositionsPanelConnected";
 import { RiskControls } from "@/components/dashboard/RiskControls";
 import { SignalsPanel } from "@/components/dashboard/SignalsPanel";
 import { MarketConditions } from "@/components/dashboard/MarketConditions";
@@ -18,14 +18,14 @@ const Index = () => {
       <DashboardHeader botState={botState} onStateChange={setBotState} />
       
       <main className="container mx-auto p-4 lg:p-6 space-y-4 lg:space-y-6 relative z-10">
-        <MetricsGrid />
+        <MetricsGridConnected />
         
         <MarketConditions />
         
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 lg:gap-6">
           <div className="xl:col-span-2 space-y-4 lg:space-y-6">
             <ChartSection />
-            <PositionsPanel />
+            <PositionsPanelConnected />
           </div>
           
           <div className="space-y-4 lg:space-y-6">

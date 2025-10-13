@@ -72,6 +72,15 @@ All colors MUST be HSL.
     --glow-primary: 189 94% 50%;
     --glow-success: 142 71% 45%;
     --glow-destructive: 0 85% 55%;
+    --glow-warning: 38 92% 50%;
+    
+    --gradient-primary: linear-gradient(135deg, hsl(189 94% 40%), hsl(189 94% 60%));
+    --gradient-success: linear-gradient(135deg, hsl(142 71% 35%), hsl(142 71% 55%));
+    --gradient-premium: linear-gradient(135deg, hsl(189 94% 50%), hsl(263 70% 50%));
+    
+    --shadow-glow-sm: 0 0 10px -2px hsl(var(--glow-primary) / 0.2);
+    --shadow-glow-md: 0 0 20px -5px hsl(var(--glow-primary) / 0.3);
+    --shadow-glow-lg: 0 0 40px -10px hsl(var(--glow-primary) / 0.4);
   }
 }
 
@@ -86,15 +95,21 @@ All colors MUST be HSL.
   }
   
   .card-glow {
-    box-shadow: 0 0 20px -5px hsl(var(--glow-primary) / 0.1);
+    box-shadow: var(--shadow-glow-md);
+    transition: box-shadow 0.3s ease;
+  }
+  
+  .card-glow:hover {
+    box-shadow: var(--shadow-glow-lg);
   }
   
   .profit-glow {
-    text-shadow: 0 0 20px hsl(var(--glow-success) / 0.3);
+    text-shadow: 0 0 20px hsl(var(--glow-success) / 0.4);
+    animation: profit-pulse 2s ease-in-out infinite;
   }
   
   .loss-glow {
-    text-shadow: 0 0 20px hsl(var(--glow-destructive) / 0.3);
+    text-shadow: 0 0 20px hsl(var(--glow-destructive) / 0.4);
   }
   
   .terminal-grid {
@@ -103,5 +118,49 @@ All colors MUST be HSL.
       linear-gradient(to bottom, hsl(var(--border)) 1px, transparent 1px);
     background-size: 40px 40px;
     opacity: 0.1;
+  }
+  
+  .gradient-border {
+    position: relative;
+    background: hsl(var(--card));
+    background-clip: padding-box;
+    border: 2px solid transparent;
+  }
+  
+  .gradient-border::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    margin: -2px;
+    border-radius: inherit;
+    background: var(--gradient-primary);
+  }
+  
+  @keyframes profit-pulse {
+    0%, 100% {
+      text-shadow: 0 0 20px hsl(var(--glow-success) / 0.4);
+    }
+    50% {
+      text-shadow: 0 0 30px hsl(var(--glow-success) / 0.6);
+    }
+  }
+  
+  @keyframes data-stream {
+    0% {
+      opacity: 0;
+      transform: translateY(-10px);
+    }
+    50% {
+      opacity: 1;
+    }
+    100% {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+  }
+  
+  .data-stream {
+    animation: data-stream 2s ease-in-out infinite;
   }
 }
