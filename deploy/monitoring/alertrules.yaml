@@ -1,0 +1,87 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: atlas-alerts
+  namespace: atlas-bot
+  labels:
+    release: monitoring  # Must match Prometheus operator release name
+spec:
+  groups:
+    - name: trading-engine
+      interval: 30s
+      rules:
+        - alert: TradingEngineDown
+          expr: atlas_engine_running == 0
+          for: 2m
+          labels:
+            severity: critical
+            component: trading-engine
+          annotations:
+            summary: "Trading engine is not running"
+            description: "AtlasBot trading engine has been stopped for more than 2 minutes."
+        
+        - alert: KillSwitchTriggered
+          expr: atlas_kill_switch_active == 1
+          for: 1m
+          labels:
+            severity: warning
+            component: risk-management
+          annotations:
+            summary: "Kill switch has been triggered"
+            description: "Trading kill switch is active. All new orders blocked."
+        
+        - alert: HighOrderRejectionRate
+          expr: |
+            rate(atlas_orders_rejected_total[5m]) / 
+            rate(atlas_orders_created_total[5m]) > 0.1
+          for: 3m
+          labels:
+            severity: warning
+            component: order-execution
+          annotations:
+            summary: "High order rejection rate detected"
+            description: "More than 10% of orders are being rejected."
+        
+        - alert: APIHighErrorRate
+          expr: |
+            rate(http_requests_total{job="atlas-api",status=~"5.."}[5m]) / 
+            rate(http_requests_total{job="atlas-api"}[5m]) > 0.05
+          for: 2m
+          labels:
+            severity: warning
+            component: api
+          annotations:
+            summary: "API error rate is high"
+            description: "More than 5% of API requests are failing."
+        
+        - alert: PodCrashLooping
+          expr: rate(kube_pod_container_status_restarts_total{namespace="atlas-bot"}[15m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+            component: infrastructure
+          annotations:
+            summary: "Pod is crash looping"
+            description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} is restarting."
+        
+        - alert: HighMemoryUsage
+          expr: |
+            container_memory_usage_bytes{namespace="atlas-bot",container="api"} / 
+            container_spec_memory_limit_bytes{namespace="atlas-bot",container="api"} > 0.9
+          for: 5m
+          labels:
+            severity: warning
+            component: infrastructure
+          annotations:
+            summary: "High memory usage detected"
+            description: "API container is using more than 90% of allocated memory."
+        
+        - alert: DatabaseConnectionFailed
+          expr: atlas_db_connection_status == 0
+          for: 2m
+          labels:
+            severity: critical
+            component: database
+          annotations:
+            summary: "Database connection failed"
+            description: "Unable to connect to Supabase database."

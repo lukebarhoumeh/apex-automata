@@ -8,6 +8,7 @@ import { SignalProcessor } from '../strategies/signal-processor';
 import { createClient } from '@supabase/supabase-js';
 import path from 'path';
 import { loadEnv } from '../core/env';
+import client from 'prom-client';
 
 const app = express();
 const server = createServer(app);
@@ -16,6 +17,34 @@ const wss = new WebSocketServer({ server });
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Prometheus metrics
+client.collectDefaultMetrics({ prefix: 'atlas_' });
+
+const engineRunningGauge = new client.Gauge({
+  name: 'atlas_engine_running',
+  help: '1 if trading engine is running, 0 otherwise'
+});
+
+const killSwitchActiveGauge = new client.Gauge({
+  name: 'atlas_kill_switch_active',
+  help: '1 if kill switch is active, 0 otherwise'
+});
+
+const ordersCreatedCounter = new client.Counter({
+  name: 'atlas_orders_created_total',
+  help: 'Total number of orders created'
+});
+
+const ordersFilledCounter = new client.Counter({
+  name: 'atlas_orders_filled_total',
+  help: 'Total number of orders filled'
+});
+
+const dbConnectionGauge = new client.Gauge({
+  name: 'atlas_db_connection_status',
+  help: '1 if connected to database, 0 otherwise'
+});
 
 // Load environment
 const atlasRoot = path.resolve(process.cwd(), '../..');
@@ -73,6 +102,21 @@ wss.on('connection', (ws) => {
 
 // API Routes
 
+// Prometheus metrics endpoint
+app.get('/metrics', async (req, res) => {
+  try {
+    res.set('Content-Type', client.register.contentType);
+    res.end(await client.register.metrics());
+  } catch (error) {
+    res.status(500).end(error);
+  }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // Get trading engine status
 app.get('/api/status', (req, res) => {
   res.json({
@@ -115,6 +159,9 @@ app.post('/api/engine/start', async (req, res) => {
 
     // Create trading engine
     tradingEngine = new TradingEngine(engineConfig, logger);
+    
+    // Update metrics
+    engineRunningGauge.set(1);
 
     // Set up event listeners to update frontend
     tradingEngine.on('market:ticker', (ticker) => {
@@ -125,11 +172,13 @@ app.post('/api/engine/start', async (req, res) => {
     });
 
     tradingEngine.on('order:created', async (order) => {
+      ordersCreatedCounter.inc();
       broadcast({ type: 'order:created', data: order });
       await syncOrderToSupabase(order);
     });
 
     tradingEngine.on('order:filled', async (order, fill) => {
+      ordersFilledCounter.inc();
       broadcast({ type: 'order:filled', data: { order, fill } });
       await syncFillToSupabase(fill);
     });
@@ -140,6 +189,9 @@ app.post('/api/engine/start', async (req, res) => {
     });
 
     tradingEngine.on('risk:alert', async (alert) => {
+      if (alert?.type === 'kill_switch') {
+        killSwitchActiveGauge.set(1);
+      }
       broadcast({ type: 'risk:alert', data: alert });
       await createSupabaseAlert(alert);
     });
@@ -232,6 +284,9 @@ app.post('/api/engine/stop', async (req, res) => {
     await tradingEngine.stop();
     tradingEngine = null;
     signalProcessor = null;
+    
+    // Update metrics
+    engineRunningGauge.set(0);
 
     res.json({ success: true, message: 'Trading engine stopped' });
 
@@ -248,7 +303,11 @@ app.post('/api/engine/kill', async (req, res) => {
       await tradingEngine.emergencyStop('User activated kill switch');
       tradingEngine = null;
       signalProcessor = null;
+      engineRunningGauge.set(0);
     }
+    
+    // Update metrics
+    killSwitchActiveGauge.set(1);
 
     // Update risk events in Supabase
     await supabase
@@ -391,6 +450,23 @@ async function createSupabaseAlert(alert: any) {
   }
 }
 
+// Check database connection on startup
+(async () => {
+  try {
+    const { error } = await supabase.from('symbols').select('count').limit(1);
+    if (error) {
+      logger.error('Database connection failed:', error);
+      dbConnectionGauge.set(0);
+    } else {
+      logger.info('Database connection successful');
+      dbConnectionGauge.set(1);
+    }
+  } catch (error) {
+    logger.error('Database connection check failed:', error);
+    dbConnectionGauge.set(0);
+  }
+})();
+
 // Start server
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
@@ -400,11 +476,15 @@ server.listen(PORT, () => {
     ================================
     HTTP API: http://localhost:${PORT}
     WebSocket: ws://localhost:${PORT}
+    Metrics: http://localhost:${PORT}/metrics
+    Health: http://localhost:${PORT}/health
     
     Endpoints:
     - GET  /api/status
     - POST /api/engine/start
     - POST /api/engine/stop
     - POST /api/engine/kill
+    - GET  /metrics (Prometheus)
+    - GET  /health
   `);
 });

@@ -1,0 +1,40 @@
+# Multi-stage build for Atlas API
+FROM node:20-bullseye AS build
+
+WORKDIR /app
+
+# Copy workspace config
+COPY atlas/package.json atlas/pnpm-lock.yaml atlas/pnpm-workspace.yaml ./atlas/
+
+# Copy core-node app
+COPY atlas/apps/core-node ./atlas/apps/core-node
+
+# Install dependencies and build
+RUN corepack enable && \
+    npm i -g pnpm && \
+    cd atlas && \
+    pnpm install --frozen-lockfile && \
+    cd apps/core-node && \
+    pnpm build
+
+# Production image
+FROM node:20-alpine
+
+ENV NODE_ENV=production
+
+WORKDIR /app
+
+# Copy built artifacts
+COPY --from=build /app/atlas/apps/core-node/dist ./dist
+COPY --from=build /app/atlas/apps/core-node/package.json ./
+COPY --from=build /app/atlas/apps/core-node/node_modules ./node_modules
+
+# Expose API port
+EXPOSE 3001
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:3001/api/status', (r) => { process.exit(r.statusCode === 200 ? 0 : 1); }).on('error', () => process.exit(1));"
+
+# Run the server
+CMD ["node", "dist/api/server.js"]

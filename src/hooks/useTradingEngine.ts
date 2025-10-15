@@ -11,6 +11,7 @@ export interface TradingEngineState {
   lastOrder: any;
   lastPosition: any;
   lastAlert: any;
+  backendAvailable: boolean;
 }
 
 export const useTradingEngine = () => {
@@ -24,30 +25,50 @@ export const useTradingEngine = () => {
     lastOrder: null,
     lastPosition: null,
     lastAlert: null,
+    backendAvailable: false,
   });
+
+  // Check backend availability on mount
+  useEffect(() => {
+    const checkBackend = async () => {
+      try {
+        await tradingApi.getStatus();
+        setState(prev => ({ ...prev, backendAvailable: true }));
+      } catch (error) {
+        setState(prev => ({ ...prev, backendAvailable: false }));
+        console.log('Backend not available - UI will use Supabase data only');
+      }
+    };
+    
+    checkBackend();
+  }, []);
 
   useEffect(() => {
     const unsubscribers: (() => void)[] = [];
 
-    // Connection status
+    // Connection status - only show toasts if backend was available
     unsubscribers.push(
       tradingApi.on('connected', () => {
-        setState(prev => ({ ...prev, isConnected: true }));
-        toast({
-          title: "Connected to Trading Engine",
-          description: "Real-time data stream established",
-        });
+        setState(prev => ({ ...prev, isConnected: true, backendAvailable: true }));
+        if (state.backendAvailable) {
+          toast({
+            title: "Connected to Trading Engine",
+            description: "Real-time data stream established",
+          });
+        }
       })
     );
 
     unsubscribers.push(
       tradingApi.on('disconnected', () => {
         setState(prev => ({ ...prev, isConnected: false }));
-        toast({
-          title: "Disconnected from Trading Engine",
-          description: "Attempting to reconnect...",
-          variant: "destructive",
-        });
+        if (state.backendAvailable) {
+          toast({
+            title: "Disconnected from Trading Engine",
+            description: "Attempting to reconnect...",
+            variant: "destructive",
+          });
+        }
       })
     );
 

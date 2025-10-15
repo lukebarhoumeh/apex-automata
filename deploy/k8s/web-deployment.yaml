@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atlas-web
+  namespace: atlas-bot
+  labels:
+    app: atlas-web
+    component: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: atlas-web
+  template:
+    metadata:
+      labels:
+        app: atlas-web
+        component: frontend
+    spec:
+      containers:
+        - name: web
+          image: ghcr.io/YOUR_ORG/atlas-web:latest  # Update with your image
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            successThreshold: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            successThreshold: 1
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101  # nginx user
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+      restartPolicy: Always

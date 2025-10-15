@@ -1,0 +1,17 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: atlas-api
+  namespace: atlas-bot
+  labels:
+    app: atlas-api
+    release: monitoring  # Must match Prometheus operator release name
+spec:
+  selector:
+    matchLabels:
+      app: atlas-api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s

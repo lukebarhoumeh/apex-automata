@@ -1,0 +1,179 @@
+{
+  "dashboard": {
+    "title": "AtlasBot Trading Overview",
+    "tags": ["trading", "atlas"],
+    "timezone": "browser",
+    "schemaVersion": 16,
+    "version": 1,
+    "refresh": "10s",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Daily P&L (USD)",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+        "targets": [
+          {
+            "datasource": "Supabase",
+            "rawSql": "SELECT date as time, daily_pnl as value FROM account_metrics WHERE $__timeFilter(date) ORDER BY date",
+            "format": "time_series"
+          }
+        ],
+        "yaxes": [
+          {"format": "currencyUSD", "label": "P&L"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Daily P&L (R)",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+        "targets": [
+          {
+            "datasource": "Supabase",
+            "rawSql": "SELECT day as time, daily_r as value FROM v_daily_r WHERE $__timeFilter(day) ORDER BY day",
+            "format": "time_series"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "R"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Open Positions",
+        "type": "table",
+        "gridPos": {"x": 0, "y": 8, "w": 24, "h": 8},
+        "targets": [
+          {
+            "datasource": "Supabase",
+            "rawSql": "SELECT symbol, strategy, side, qty_open, entry_price, stop_price_at_entry, take_profit_price, opened_at FROM v_open_positions ORDER BY opened_at DESC",
+            "format": "table"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Recent Orders",
+        "type": "table",
+        "gridPos": {"x": 0, "y": 16, "w": 24, "h": 8},
+        "targets": [
+          {
+            "datasource": "Supabase",
+            "rawSql": "SELECT created_at, symbol, side, type, status, price, quantity, filled_qty FROM v_recent_activity ORDER BY created_at DESC LIMIT 50",
+            "format": "table"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Risk Heat",
+        "type": "gauge",
+        "gridPos": {"x": 0, "y": 24, "w": 6, "h": 6},
+        "targets": [
+          {
+            "datasource": "Supabase",
+            "rawSql": "SELECT risk_heat as value FROM account_metrics ORDER BY date DESC LIMIT 1",
+            "format": "table"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "min": 0,
+            "max": 100,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 50, "color": "yellow"},
+                {"value": 80, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "title": "Total Equity",
+        "type": "stat",
+        "gridPos": {"x": 6, "y": 24, "w": 6, "h": 6},
+        "targets": [
+          {
+            "datasource": "Supabase",
+            "rawSql": "SELECT total_equity as value FROM account_metrics ORDER BY date DESC LIMIT 1",
+            "format": "table"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "currencyUSD"
+          }
+        }
+      },
+      {
+        "id": 7,
+        "title": "Win Rate Today",
+        "type": "stat",
+        "gridPos": {"x": 12, "y": 24, "w": 6, "h": 6},
+        "targets": [
+          {
+            "datasource": "Supabase",
+            "rawSql": "SELECT CASE WHEN (wins_today + losses_today) > 0 THEN (wins_today::float / (wins_today + losses_today) * 100) ELSE 0 END as value FROM account_metrics ORDER BY date DESC LIMIT 1",
+            "format": "table"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent"
+          }
+        }
+      },
+      {
+        "id": 8,
+        "title": "Open Positions Count",
+        "type": "stat",
+        "gridPos": {"x": 18, "y": 24, "w": 6, "h": 6},
+        "targets": [
+          {
+            "datasource": "Supabase",
+            "rawSql": "SELECT COUNT(*) as value FROM positions WHERE closed_at IS NULL",
+            "format": "table"
+          }
+        ]
+      },
+      {
+        "id": 9,
+        "title": "Signal Funnel (Last 24h)",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 30, "w": 12, "h": 8},
+        "targets": [
+          {
+            "datasource": "Supabase",
+            "rawSql": "SELECT hour as time, rejected, allowed FROM v_signal_funnel WHERE hour > NOW() - INTERVAL '24 hours' ORDER BY hour",
+            "format": "time_series"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Count"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 10,
+        "title": "Active Risk Events",
+        "type": "table",
+        "gridPos": {"x": 12, "y": 30, "w": 12, "h": 8},
+        "targets": [
+          {
+            "datasource": "Supabase",
+            "rawSql": "SELECT event_type, details, triggered_at FROM risk_events WHERE active = true ORDER BY triggered_at DESC",
+            "format": "table"
+          }
+        ]
+      }
+    ]
+  }
+}

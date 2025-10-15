@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-ds-supabase
+  namespace: atlas-bot
+  labels:
+    grafana_datasource: "1"
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Supabase
+        type: postgres
+        url: gdrdaajvutmewgxbjurk.supabase.co:5432
+        user: postgres
+        secureJsonData:
+          password: ${SUPABASE_SERVICE_KEY}
+        jsonData:
+          database: postgres
+          sslmode: require
+          postgresVersion: 1500
+          timescaledb: false

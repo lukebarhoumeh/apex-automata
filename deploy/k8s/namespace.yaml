@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: atlas-bot
+  labels:
+    name: atlas-bot
+    app: trading-bot
