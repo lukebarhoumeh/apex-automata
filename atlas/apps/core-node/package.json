@@ -1,0 +1,46 @@
+{
+  "name": "core-node",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "dev": "tsx src/cli/index.ts -- --config ../../config/paper.local.yaml",
+    "start:paper": "node --enable-source-maps dist/cli/index.js -- --config ../../config/paper.local.yaml",
+    "start:live": "node --enable-source-maps dist/cli/index.js -- --config ../../config/live.local.yaml",
+    "build": "rimraf dist && tsc -p tsconfig.json",
+    "lint": "echo 'add ruff/eslint later'",
+    "backtest": "tsx src/cli/backtest.ts",
+    "paper-test": "tsx src/cli/paper-test.ts",
+    "api": "tsx src/api/server.ts",
+    "diagnose": "tsx src/cli/diagnose.ts",
+    "quick-check": "tsx src/cli/quick-check.ts"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "date-fns": "^4.1.0",
+    "dotenv": "^16.4.5",
+    "fast-glob": "^3.3.2",
+    "onnxruntime-node": "^1.20.0",
+    "ws": "^8.18.0",
+    "yaml": "^2.5.1",
+    "yargs": "^17.7.2",
+    "zod": "^3.23.8",
+    "@supabase/supabase-js": "^2.39.0",
+    "uuid": "^9.0.1",
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.6",
+    "@types/ws": "^8.5.10",
+    "@types/yargs": "^17.0.33",
+    "@types/uuid": "^9.0.7",
+    "@types/express": "^4.17.21",
+    "@types/cors": "^2.8.17",
+    "rimraf": "^6.0.1",
+    "tsx": "^4.19.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}

@@ -1,0 +1,17 @@
+node_modules/
+.pnpm-store/
+.DS_Store
+.env.local
+var/**/*.json
+var/**/*.jsonl
+var/**/*.csv
+var/**/*.onnx
+var/**/*.md
+var/logs/*
+var/bars/*
+var/state/*
+var/models/*
+!var/logs/.gitkeep
+!var/bars/.gitkeep
+!var/state/.gitkeep
+!var/models/.gitkeep

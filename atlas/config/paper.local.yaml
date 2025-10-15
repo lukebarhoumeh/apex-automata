@@ -1,0 +1,26 @@
+mode: paper
+exchange: coinbase-advanced
+symbols: [BTC-USD, ETH-USD]
+bars: { tf_primary: 5m }
+risk:
+  per_trade_risk_bp: 70
+  max_heat_bp: 300
+  daily_stop_R: -2.0
+signals:
+  breakout: { enabled: true, adx_min: 18, donchian_n: 20, atr_pctile_min: 0.6 }
+  vwap_mr:  { enabled: true, z_abs_min: 1.2, adx_max: 14 }
+meta:
+  enabled: false
+  threshold: 0.62
+  model_path: ./var/models/metalabel_latest.onnx
+execution:
+  prefer_post_only: true
+  partial_tp_R: 1.0
+  trail_atr_mult: 1.0
+  twap: { slice_secs: 10, max_duration_secs: 180 }
+killswitch:
+  spread_pctile_max: 0.98
+  atr_burst_mult: 3.0
+limits:
+  min_order_usd: 25
+  per_symbol_usd_cap: 250

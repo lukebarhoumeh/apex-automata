@@ -12,6 +12,9 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+import { tradingApi } from "@/services/tradingApi";
+import { useToast } from "@/components/ui/use-toast";
+import { useState, useEffect } from "react";
 
 interface DashboardHeaderProps {
   botState: "paper" | "live" | "paused";
@@ -19,6 +22,103 @@ interface DashboardHeaderProps {
 }
 
 export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProps) => {
+  const { toast } = useToast();
+  const [isEngineRunning, setIsEngineRunning] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+
+  useEffect(() => {
+    // Check initial engine status
+    checkEngineStatus();
+
+    // Listen for WebSocket status updates
+    const unsubscribe = tradingApi.on('status', (data: any) => {
+      setIsEngineRunning(data.engineRunning);
+      if (data.mode) {
+        onStateChange(data.engineRunning ? data.mode : 'paused');
+      }
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [onStateChange]);
+
+  const checkEngineStatus = async () => {
+    try {
+      const status = await tradingApi.getStatus();
+      setIsEngineRunning(status.engineRunning);
+      if (status.mode) {
+        onStateChange(status.engineRunning ? status.mode : 'paused');
+      }
+    } catch (error) {
+      console.error('Failed to check engine status:', error);
+    }
+  };
+
+  const handleStartEngine = async () => {
+    setIsLoading(true);
+    try {
+      await tradingApi.startEngine('paper');
+      toast({
+        title: "Trading Engine Started",
+        description: "Paper trading mode is now active",
+      });
+      onStateChange('paper');
+      setIsEngineRunning(true);
+    } catch (error) {
+      toast({
+        title: "Failed to Start Engine",
+        description: error instanceof Error ? error.message : 'Unknown error',
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleStopEngine = async () => {
+    setIsLoading(true);
+    try {
+      await tradingApi.stopEngine();
+      toast({
+        title: "Trading Engine Stopped",
+        description: "All trading activity has been paused",
+      });
+      onStateChange('paused');
+      setIsEngineRunning(false);
+    } catch (error) {
+      toast({
+        title: "Failed to Stop Engine",
+        description: error instanceof Error ? error.message : 'Unknown error',
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleKillSwitch = async () => {
+    setIsLoading(true);
+    try {
+      await tradingApi.activateKillSwitch();
+      toast({
+        title: "Kill Switch Activated",
+        description: "All positions closed and trading halted",
+        variant: "destructive",
+      });
+      onStateChange('paused');
+      setIsEngineRunning(false);
+    } catch (error) {
+      toast({
+        title: "Failed to Activate Kill Switch",
+        description: error instanceof Error ? error.message : 'Unknown error',
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const getBotStateColor = () => {
     switch (botState) {
       case "live":
@@ -68,21 +168,23 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
               <Settings className="h-4 w-4" />
             </Button>
 
-            {botState === "paused" ? (
+            {!isEngineRunning ? (
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => onStateChange("paper")}
+                onClick={handleStartEngine}
+                disabled={isLoading}
                 className="gap-2"
               >
                 <Play className="h-4 w-4" />
-                <span className="hidden sm:inline">Resume</span>
+                <span className="hidden sm:inline">Start</span>
               </Button>
             ) : (
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => onStateChange("paused")}
+                onClick={handleStopEngine}
+                disabled={isLoading}
                 className="gap-2"
               >
                 <Pause className="h-4 w-4" />
@@ -122,7 +224,11 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
                 </AlertDialogHeader>
                 <AlertDialogFooter>
                   <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction className="bg-destructive text-destructive-foreground hover:bg-destructive/90">
+                  <AlertDialogAction 
+                    onClick={handleKillSwitch}
+                    disabled={isLoading}
+                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                  >
                     Confirm Kill Switch
                   </AlertDialogAction>
                 </AlertDialogFooter>

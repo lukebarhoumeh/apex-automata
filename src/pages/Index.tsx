@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { DashboardHeader } from "@/components/dashboard/DashboardHeader";
 import { MetricsGridConnected } from "@/components/dashboard/MetricsGridConnected";
 import { ChartSection } from "@/components/dashboard/ChartSection";
@@ -7,9 +7,12 @@ import { RiskControls } from "@/components/dashboard/RiskControls";
 import { SignalsPanel } from "@/components/dashboard/SignalsPanel";
 import { MarketConditions } from "@/components/dashboard/MarketConditions";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useTradingEngine } from "@/hooks/useTradingEngine";
+import { Badge } from "@/components/ui/badge";
 
 const Index = () => {
   const [botState, setBotState] = useState<"paper" | "live" | "paused">("paper");
+  const tradingEngine = useTradingEngine();
 
   return (
     <div className="min-h-screen bg-background">
@@ -18,6 +21,13 @@ const Index = () => {
       <DashboardHeader botState={botState} onStateChange={setBotState} />
       
       <main className="container mx-auto p-4 lg:p-6 space-y-4 lg:space-y-6 relative z-10">
+        {/* Connection Status Badge */}
+        <div className="flex justify-end">
+          <Badge variant={tradingEngine.isConnected ? "default" : "destructive"}>
+            {tradingEngine.isConnected ? "Connected" : "Disconnected"}
+          </Badge>
+        </div>
+        
         <MetricsGridConnected />
         
         <MarketConditions />
