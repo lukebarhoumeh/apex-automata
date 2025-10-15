@@ -1,6 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Power, Pause, Play, AlertTriangle, Settings, Bell } from "lucide-react";
+import { Power, Pause, Play, AlertTriangle, Settings, Bell, User, LogOut } from "lucide-react";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -12,8 +12,17 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { tradingApi } from "@/services/tradingApi";
 import { useToast } from "@/components/ui/use-toast";
+import { useAuth } from "@/components/auth/AuthProvider";
 import { useState, useEffect } from "react";
 
 interface DashboardHeaderProps {
@@ -23,8 +32,17 @@ interface DashboardHeaderProps {
 
 export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProps) => {
   const { toast } = useToast();
+  const { user, signOut } = useAuth();
   const [isEngineRunning, setIsEngineRunning] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+
+  const handleSignOut = async () => {
+    try {
+      await signOut();
+    } catch (error) {
+      // Error handled in AuthProvider
+    }
+  };
 
   useEffect(() => {
     // Check initial engine status
@@ -152,21 +170,32 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
           </div>
 
           <div className="flex items-center gap-2">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="relative"
-            >
-              <Bell className="h-4 w-4" />
-              <span className="absolute top-1 right-1 h-2 w-2 rounded-full bg-destructive animate-pulse" />
-            </Button>
-            
-            <Button
-              variant="ghost"
-              size="icon"
-            >
-              <Settings className="h-4 w-4" />
-            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon">
+                  <User className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuLabel className="font-normal">
+                  <div className="flex flex-col space-y-1">
+                    <p className="text-sm font-medium leading-none">Account</p>
+                    <p className="text-xs leading-none text-muted-foreground">
+                      {user?.email}
+                    </p>
+                  </div>
+                </DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem>
+                  <Settings className="mr-2 h-4 w-4" />
+                  Settings
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={handleSignOut}>
+                  <LogOut className="mr-2 h-4 w-4" />
+                  Sign Out
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
 
             {!isEngineRunning ? (
               <Button
