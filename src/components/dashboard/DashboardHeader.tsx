@@ -13,9 +13,10 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { tradingApi } from "@/services/tradingApi";
+import { runtimeClient } from "@/services/runtimeClient";
+import { useRuntimeStatus } from "@/hooks/useRuntimeStatus";
 import { useToast } from "@/hooks/use-toast";
-import { useState, useEffect } from "react";
+import { useState } from "react";
 
 interface DashboardHeaderProps {
   botState: "paper" | "live" | "paused";
@@ -24,85 +25,37 @@ interface DashboardHeaderProps {
 
 export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProps) => {
   const { toast } = useToast();
-  const [isEngineRunning, setIsEngineRunning] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const { data: metrics } = useAccountMetrics();
-  
-  // Mock runtime status - will be replaced with real data from runtime API
-  const runtimeStatus = {
-    killSwitch: false,
-    killSwitchReasons: [] as string[],
-    dailyStopHit: false,
-    spreadPctile: 45,
-    regime: "trend" as "trend" | "chop",
-  };
+  const { data: runtimeStatus } = useRuntimeStatus();
 
   const formatCurrency = (val: number) => 
     new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0 }).format(val);
 
-  useEffect(() => {
-    // Check initial engine status
-    checkEngineStatus();
+  const isPaused = runtimeStatus?.paused ?? false;
+  const isLive = runtimeStatus?.mode === 'live';
+  const killSwitchActive = runtimeStatus?.killSwitch?.active ?? false;
+  const dailyStopHit = runtimeStatus?.dailyStopHit ?? false;
 
-    // Listen for WebSocket status updates
-    const unsubscribe = tradingApi.on('status', (data: any) => {
-      setIsEngineRunning(data.engineRunning);
-      if (data.mode) {
-        onStateChange(data.engineRunning ? data.mode : 'paused');
-      }
-    });
-
-    return () => {
-      unsubscribe();
-    };
-  }, [onStateChange]);
-
-  const checkEngineStatus = async () => {
-    try {
-      const status = await tradingApi.getStatus();
-      setIsEngineRunning(status.engineRunning);
-      if (status.mode) {
-        onStateChange(status.engineRunning ? status.mode : 'paused');
-      }
-    } catch (error) {
-      console.error('Failed to check engine status:', error);
-    }
-  };
-
-  const handleStartEngine = async () => {
+  const handlePauseResume = async () => {
     setIsLoading(true);
     try {
-      await tradingApi.startEngine('paper');
-      toast({
-        title: "Trading Engine Started",
-        description: "Paper trading mode is now active",
-      });
-      onStateChange('paper');
-      setIsEngineRunning(true);
+      if (isPaused) {
+        await runtimeClient.resume();
+        toast({
+          title: "Engine Resumed",
+          description: "Trading activity has resumed",
+        });
+      } else {
+        await runtimeClient.pause();
+        toast({
+          title: "Engine Paused",
+          description: "New entries are blocked. Existing positions remain open.",
+        });
+      }
     } catch (error) {
       toast({
-        title: "Failed to Start Engine",
-        description: error instanceof Error ? error.message : 'Unknown error',
-        variant: "destructive",
-      });
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const handleStopEngine = async () => {
-    setIsLoading(true);
-    try {
-      await tradingApi.stopEngine();
-      toast({
-        title: "Trading Engine Stopped",
-        description: "All trading activity has been paused",
-      });
-      onStateChange('paused');
-      setIsEngineRunning(false);
-    } catch (error) {
-      toast({
-        title: "Failed to Stop Engine",
+        title: "Control Failed",
         description: error instanceof Error ? error.message : 'Unknown error',
         variant: "destructive",
       });
@@ -114,14 +67,13 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   const handleKillSwitch = async () => {
     setIsLoading(true);
     try {
-      await tradingApi.activateKillSwitch();
+      await runtimeClient.closeAll("KILL_SWITCH_MANUAL", "CLOSE ALL");
       toast({
         title: "Kill Switch Activated",
-        description: "All positions closed and trading halted",
+        description: "All positions closed. Engine stopped.",
         variant: "destructive",
       });
       onStateChange('paused');
-      setIsEngineRunning(false);
     } catch (error) {
       toast({
         title: "Failed to Activate Kill Switch",
@@ -133,36 +85,25 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
     }
   };
 
-  const getBotStateColor = () => {
-    switch (botState) {
-      case "live":
-        return "bg-success text-success-foreground animate-pulse-glow";
-      case "paper":
-        return "bg-warning text-warning-foreground";
-      case "paused":
-        return "bg-muted text-muted-foreground";
-    }
-  };
-
   return (
     <header className="border-b border-border bg-card/50 backdrop-blur supports-[backdrop-filter]:bg-card/30 sticky top-0 z-50">
       <div className="container mx-auto px-4 lg:px-6 py-3">
         {/* Critical Status Badges - Always Visible */}
-        {(runtimeStatus.killSwitch || runtimeStatus.dailyStopHit || !isEngineRunning) && (
+        {(killSwitchActive || dailyStopHit || isPaused) && (
           <div className="flex flex-wrap items-center gap-2 mb-3 pb-3 border-b border-destructive/20">
-            {runtimeStatus.killSwitch && (
+            {killSwitchActive && (
               <Badge variant="destructive" className="animate-pulse">
                 <Ban className="h-3 w-3 mr-1" />
-                KILL-SWITCH: {runtimeStatus.killSwitchReasons.join(", ") || "Active"}
+                KILL-SWITCH: {runtimeStatus?.killSwitch?.reasons?.join(", ") || "Active"}
               </Badge>
             )}
-            {runtimeStatus.dailyStopHit && (
+            {dailyStopHit && (
               <Badge variant="outline" className="border-warning text-warning">
                 <AlertTriangle className="h-3 w-3 mr-1" />
                 DAILY STOP — New entries blocked
               </Badge>
             )}
-            {!isEngineRunning && !runtimeStatus.killSwitch && (
+            {isPaused && !killSwitchActive && (
               <Badge variant="secondary">
                 <Pause className="h-3 w-3 mr-1" />
                 PAUSED
@@ -178,44 +119,41 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
             <div className="flex items-center gap-3">
               <h1 className="text-xl font-bold tracking-tight font-mono">AtlasBot v2</h1>
               <Badge 
-                variant={botState === "live" ? "destructive" : "default"}
+                variant={isLive ? "destructive" : "default"}
                 className="font-mono"
               >
-                {botState.toUpperCase()}
+                {isLive ? "LIVE" : "PAPER"}
               </Badge>
             </div>
             
             {/* Right: Controls */}
             <div className="flex flex-wrap items-center gap-2">
-              {!isEngineRunning ? (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleStartEngine}
-                  disabled={isLoading}
-                  className="gap-2 font-mono"
-                >
-                  <Play className="h-4 w-4" />
-                  <span>Start</span>
-                </Button>
-              ) : (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleStopEngine}
-                  disabled={isLoading}
-                  className="gap-2 font-mono"
-                >
-                  <Pause className="h-4 w-4" />
-                  <span>Pause</span>
-                </Button>
-              )}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handlePauseResume}
+                disabled={isLoading || killSwitchActive}
+                className="gap-2 font-mono"
+              >
+                {isPaused ? (
+                  <>
+                    <Play className="h-4 w-4" />
+                    <span>Resume</span>
+                  </>
+                ) : (
+                  <>
+                    <Pause className="h-4 w-4" />
+                    <span>Pause</span>
+                  </>
+                )}
+              </Button>
 
               <AlertDialog>
                 <AlertDialogTrigger asChild>
                   <Button 
                     variant="destructive" 
                     size="sm"
+                    disabled={killSwitchActive}
                     className="gap-2 font-mono"
                   >
                     <Power className="h-4 w-4" />
@@ -292,9 +230,9 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
             <div className="space-y-1">
               <div className="text-xs text-muted-foreground font-mono">Spread %ile</div>
               <div className={`text-lg font-bold font-mono tabular-nums ${
-                runtimeStatus.spreadPctile > 95 ? 'text-destructive' : 'text-foreground'
+                (runtimeStatus?.spreadPctile ?? 0) > 95 ? 'text-destructive' : 'text-foreground'
               }`}>
-                {runtimeStatus.spreadPctile}%
+                {runtimeStatus?.spreadPctile ?? 0}%
               </div>
             </div>
 
@@ -302,9 +240,9 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
             <div className="space-y-1">
               <div className="text-xs text-muted-foreground font-mono">Regime</div>
               <div className={`text-lg font-bold font-mono tabular-nums ${
-                runtimeStatus.regime === 'trend' ? 'text-success' : 'text-muted-foreground'
+                runtimeStatus?.regime === 'trend' ? 'text-success' : 'text-muted-foreground'
               }`}>
-                {runtimeStatus.regime.toUpperCase()}
+                {(runtimeStatus?.regime ?? 'chop').toUpperCase()}
               </div>
             </div>
           </div>

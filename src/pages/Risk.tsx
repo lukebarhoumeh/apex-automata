@@ -40,10 +40,18 @@ const Risk = () => {
 
   const handleSave = async () => {
     try {
-      // TODO: Call runtime API to update risk config
+      const { runtimeClient } = await import("@/services/runtimeClient");
+      await runtimeClient.updateRiskConfig({
+        perTradeBp: perTradeRisk * 100,
+        heatBp: maxHeat * 100,
+        dailyStopR: dailyStopR,
+        spreadPctileMax: spreadThreshold,
+        atrBurstMult: atrBurstMult,
+      });
+      
       toast({
         title: "Risk Configuration Updated",
-        description: "New risk parameters have been applied",
+        description: "New risk parameters have been applied to the runtime",
       });
       setHasChanges(false);
     } catch (error) {

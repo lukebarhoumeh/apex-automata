@@ -55,10 +55,33 @@ const Signals = () => {
 
   const handleSave = async () => {
     try {
-      // TODO: Call runtime API to update signal config
+      const { runtimeClient } = await import("@/services/runtimeClient");
+      
+      const breakoutConfig = getConfig("breakout");
+      const vwapConfig = getConfig("vwap_mr");
+      const metaConfig = getConfig("meta");
+
+      await runtimeClient.updateSignalsConfig({
+        breakout: {
+          enabled: breakoutConfig?.enabled ?? true,
+          adxMin: (breakoutConfig?.params as any)?.adxMin,
+          donchianN: (breakoutConfig?.params as any)?.donchianN,
+          atrPctileMin: (breakoutConfig?.params as any)?.atrPctileMin,
+        },
+        vwap_mr: {
+          enabled: vwapConfig?.enabled ?? true,
+          zAbsMin: (vwapConfig?.params as any)?.zAbsMin,
+          adxMax: (vwapConfig?.params as any)?.adxMax,
+        },
+        meta: {
+          enabled: metaConfig?.enabled ?? true,
+          threshold: (metaConfig?.params as any)?.threshold || 0.65,
+        },
+      });
+
       toast({
         title: "Signal Configuration Updated",
-        description: "Strategy thresholds have been applied",
+        description: "Strategy thresholds have been applied to the runtime",
       });
       setHasChanges(false);
     } catch (error) {
