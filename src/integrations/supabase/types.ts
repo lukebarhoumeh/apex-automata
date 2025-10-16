@@ -902,6 +902,10 @@ export type Database = {
         }
         Returns: boolean
       }
+      upsert_account_metrics: {
+        Args: { p_user_id: string }
+        Returns: undefined
+      }
     }
     Enums: {
       alert_severity: "info" | "warning" | "critical"
@@ -925,7 +929,7 @@ export type Database = {
         | "stop"
         | "take_profit"
       position_side: "long" | "short"
-      strategy_name: "breakout" | "vwap_mr" | "obi_scalper"
+      strategy_name: "breakout" | "vwap_mr" | "obi_scalper" | "momentum"
       trade_exit_reason:
         | "take_profit"
         | "stop_loss"
@@ -1083,7 +1087,7 @@ export const Constants = {
         "take_profit",
       ],
       position_side: ["long", "short"],
-      strategy_name: ["breakout", "vwap_mr", "obi_scalper"],
+      strategy_name: ["breakout", "vwap_mr", "obi_scalper", "momentum"],
       trade_exit_reason: [
         "take_profit",
         "stop_loss",
