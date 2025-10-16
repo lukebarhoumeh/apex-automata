@@ -723,7 +723,7 @@ export type Database = {
           name: string
           params: Json
           updated_at: string
-          user_id: string
+          user_id: string | null
           win_rate: number | null
         }
         Insert: {
@@ -734,7 +734,7 @@ export type Database = {
           name: string
           params?: Json
           updated_at?: string
-          user_id: string
+          user_id?: string | null
           win_rate?: number | null
         }
         Update: {
@@ -745,7 +745,7 @@ export type Database = {
           name?: string
           params?: Json
           updated_at?: string
-          user_id?: string
+          user_id?: string | null
           win_rate?: number | null
         }
         Relationships: []

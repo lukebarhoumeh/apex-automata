@@ -22,9 +22,8 @@ const Index = () => {
   };
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="relative">
       <div className="terminal-grid fixed inset-0 pointer-events-none" />
-      
       <DashboardHeader botState={botState} onStateChange={setBotState} />
       
       <main className="container mx-auto p-4 lg:p-6 space-y-4 lg:space-y-6 relative z-10">
