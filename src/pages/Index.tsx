@@ -13,6 +13,8 @@ import { SystemHealthPanel } from "@/components/dashboard/SystemHealthPanel";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useTradingEngine } from "@/hooks/useTradingEngine";
 import { Badge } from "@/components/ui/badge";
+import { StaleDataWarning } from "@/components/dashboard/StaleDataWarning";
+import { ConnectionStatusBanner } from "@/components/dashboard/ConnectionStatusBanner";
 
 const Index = () => {
   const [botState, setBotState] = useState<"paper" | "live" | "paused">("paper");
@@ -28,6 +30,17 @@ const Index = () => {
       <DashboardHeader botState={botState} onStateChange={setBotState} />
       
       <main className="container mx-auto p-4 lg:p-6 space-y-4 lg:space-y-6 relative z-10">
+        {/* Connection & Status Banners */}
+        <ConnectionStatusBanner 
+          isConnected={tradingEngine.isConnected} 
+          isReconnecting={tradingEngine.isReconnecting}
+        />
+        
+        <StaleDataWarning 
+          lastUpdate={tradingEngine.lastUpdate}
+          onRefresh={() => window.location.reload()}
+        />
+        
         {/* Status Bar */}
         <div className="flex justify-end items-center">
           <Badge variant={tradingEngine.backendAvailable ? "default" : "secondary"}>

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { tradingApi } from '@/services/tradingApi';
 import { useToast } from '@/components/ui/use-toast';
 
@@ -12,6 +12,8 @@ export interface TradingEngineState {
   lastPosition: any;
   lastAlert: any;
   backendAvailable: boolean;
+  lastUpdate: Date | null;
+  isReconnecting: boolean;
 }
 
 export const useTradingEngine = () => {
@@ -26,7 +28,26 @@ export const useTradingEngine = () => {
     lastPosition: null,
     lastAlert: null,
     backendAvailable: false,
+    lastUpdate: null,
+    isReconnecting: false,
   });
+
+  const tickerDebounceRef = useRef<NodeJS.Timeout>();
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
+
+  // Debounced ticker update to avoid excessive re-renders
+  const updateTicker = useCallback((ticker: any) => {
+    if (tickerDebounceRef.current) {
+      clearTimeout(tickerDebounceRef.current);
+    }
+    tickerDebounceRef.current = setTimeout(() => {
+      setState(prev => ({ 
+        ...prev, 
+        lastTicker: ticker,
+        lastUpdate: new Date()
+      }));
+    }, 150);
+  }, []);
 
   // Check backend availability on mount
   useEffect(() => {
@@ -46,10 +67,19 @@ export const useTradingEngine = () => {
   useEffect(() => {
     const unsubscribers: (() => void)[] = [];
 
-    // Connection status - only show toasts if backend was available
+    // Connection status
     unsubscribers.push(
       tradingApi.on('connected', () => {
-        setState(prev => ({ ...prev, isConnected: true, backendAvailable: true }));
+        if (reconnectTimeoutRef.current) {
+          clearTimeout(reconnectTimeoutRef.current);
+        }
+        setState(prev => ({ 
+          ...prev, 
+          isConnected: true, 
+          backendAvailable: true,
+          isReconnecting: false,
+          lastUpdate: new Date()
+        }));
         if (state.backendAvailable) {
           toast({
             title: "Connected to Trading Engine",
@@ -61,7 +91,7 @@ export const useTradingEngine = () => {
 
     unsubscribers.push(
       tradingApi.on('disconnected', () => {
-        setState(prev => ({ ...prev, isConnected: false }));
+        setState(prev => ({ ...prev, isConnected: false, isReconnecting: true }));
         if (state.backendAvailable) {
           toast({
             title: "Disconnected from Trading Engine",
@@ -69,6 +99,11 @@ export const useTradingEngine = () => {
             variant: "destructive",
           });
         }
+        
+        // Set reconnecting flag with timeout
+        reconnectTimeoutRef.current = setTimeout(() => {
+          setState(prev => ({ ...prev, isReconnecting: false }));
+        }, 10000);
       })
     );
 
@@ -83,10 +118,10 @@ export const useTradingEngine = () => {
       })
     );
 
-    // Market data
+    // Market data - debounced
     unsubscribers.push(
       tradingApi.on('ticker', (ticker: any) => {
-        setState(prev => ({ ...prev, lastTicker: ticker }));
+        updateTicker(ticker);
       })
     );
 
@@ -144,8 +179,14 @@ export const useTradingEngine = () => {
     // Cleanup
     return () => {
       unsubscribers.forEach(unsub => unsub());
+      if (tickerDebounceRef.current) {
+        clearTimeout(tickerDebounceRef.current);
+      }
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
     };
-  }, [toast]);
+  }, [toast, updateTicker]);
 
   return state;
 };
