@@ -9,6 +9,7 @@ import { SignalsPanel } from "@/components/dashboard/SignalsPanel";
 import { MarketConditions } from "@/components/dashboard/MarketConditions";
 import { AlertsPanel } from "@/components/dashboard/AlertsPanel";
 import { StrategiesPanel } from "@/components/dashboard/StrategiesPanel";
+import { SystemHealthPanel } from "@/components/dashboard/SystemHealthPanel";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useTradingEngine } from "@/hooks/useTradingEngine";
 import { Badge } from "@/components/ui/badge";
@@ -46,6 +47,8 @@ const Index = () => {
           </div>
           
           <div className="space-y-4 lg:space-y-6">
+            <SystemHealthPanel />
+            
             <Tabs defaultValue="strategies" className="w-full">
               <TabsList className="grid w-full grid-cols-4 bg-card text-xs">
                 <TabsTrigger value="strategies">Strategies</TabsTrigger>
