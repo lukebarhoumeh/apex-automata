@@ -2,7 +2,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { TrendingUp, TrendingDown, X, Target } from "lucide-react";
+import { TrendingUp, TrendingDown, Target } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 
 interface Position {
@@ -26,9 +26,10 @@ interface Position {
 
 interface PositionsPanelProps {
   positions?: Position[];
+  onViewDetails?: (positionId: string) => void;
 }
 
-export const PositionsPanel = ({ positions = [] }: PositionsPanelProps) => {
+export const PositionsPanel = ({ positions = [], onViewDetails }: PositionsPanelProps) => {
   const displayPositions = positions.length > 0 ? positions : [];
   const isEmpty = displayPositions.length === 0;
   return (
@@ -155,9 +156,10 @@ export const PositionsPanel = ({ positions = [] }: PositionsPanelProps) => {
                       <Button 
                         variant="ghost" 
                         size="icon" 
-                        className="h-8 w-8 text-destructive hover:text-destructive hover:bg-destructive/10 transition-all hover:scale-110"
+                        className="h-8 w-8 hover:bg-muted transition-all hover:scale-110"
+                        onClick={() => onViewDetails?.(pos.id)}
                       >
-                        <X className="h-4 w-4" />
+                        <Target className="h-4 w-4" />
                       </Button>
                     </TableCell>
                   </TableRow>

@@ -3,6 +3,7 @@ import { DashboardHeader } from "@/components/dashboard/DashboardHeader";
 import { MetricsGridConnected } from "@/components/dashboard/MetricsGridConnected";
 import { ChartSection } from "@/components/dashboard/ChartSection";
 import { PositionsPanelConnected } from "@/components/dashboard/PositionsPanelConnected";
+import { OrdersBlotter } from "@/components/dashboard/OrdersBlotter";
 import { RiskControls } from "@/components/dashboard/RiskControls";
 import { SignalsPanel } from "@/components/dashboard/SignalsPanel";
 import { MarketConditions } from "@/components/dashboard/MarketConditions";
@@ -15,6 +16,10 @@ import { Badge } from "@/components/ui/badge";
 const Index = () => {
   const [botState, setBotState] = useState<"paper" | "live" | "paused">("paper");
   const tradingEngine = useTradingEngine();
+
+  const handleViewDetails = (id: string) => {
+    console.log("View details for:", id);
+  };
 
   return (
     <div className="min-h-screen bg-background">
@@ -37,6 +42,7 @@ const Index = () => {
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 lg:gap-6">
           <div className="xl:col-span-2 space-y-4 lg:space-y-6">
             <ChartSection />
+            <OrdersBlotter onViewDetails={handleViewDetails} />
             <PositionsPanelConnected />
           </div>
           
