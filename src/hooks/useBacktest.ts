@@ -55,7 +55,8 @@ export const useRunBacktest = () => {
 
     try {
       // Call runtime API to start backtest
-      const response = await fetch("http://localhost:3001/api/backtest/run", {
+      const apiUrl = import.meta.env.VITE_RUNTIME_API_URL || 'http://localhost:3001';
+      const response = await fetch(`${apiUrl}/api/backtest/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(config),

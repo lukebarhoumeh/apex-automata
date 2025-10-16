@@ -433,7 +433,10 @@ export class RiskEngine extends EventEmitter {
         });
 
       if (error) {
-        this.logger.error('Failed to persist risk metrics:', error);
+        // Silently ignore if table doesn't exist in development
+        if (error.code !== 'PGRST205') {
+          this.logger.error('Failed to persist risk metrics:', error);
+        }
       }
     } catch (error) {
       this.logger.error('Error persisting risk metrics:', error);

@@ -95,6 +95,8 @@ export class SignalProcessor extends EventEmitter {
       candles.shift();
     }
 
+    this.logger.debug(`Signal processor: ${symbol} has ${candles.length} candles`);
+
     // Update indicators
     this.updateIndicators(symbol);
 

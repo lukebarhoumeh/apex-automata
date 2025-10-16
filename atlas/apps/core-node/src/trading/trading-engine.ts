@@ -94,6 +94,9 @@ export class TradingEngine extends EventEmitter {
       // Connect to exchange
       await this.exchange!.connect();
 
+      // Wait a bit for WebSocket to fully establish
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
       // Subscribe to market data
       this.subscribeToMarketData();
 
@@ -150,11 +153,18 @@ export class TradingEngine extends EventEmitter {
   }
 
   private async initializeExchange(): Promise<void> {
-    // Get exchange credentials
-    let credentials = await this.secretManager.getExchangeCredentials(
-      this.config.exchange.name,
-      this.config.exchange.environment
-    );
+    let credentials;
+    
+    try {
+      // Get exchange credentials
+      credentials = await this.secretManager.getExchangeCredentials(
+        this.config.exchange.name,
+        this.config.exchange.environment
+      );
+    } catch (error) {
+      this.logger.warn('Failed to retrieve exchange credentials:', error);
+      credentials = null;
+    }
 
     // Allow paper mode without stored credentials (market-data only)
     if (!credentials && this.config.mode === 'paper') {
@@ -298,8 +308,8 @@ export class TradingEngine extends EventEmitter {
     // Subscribe to ticker for all products
     this.exchange!.subscribeTicker(this.config.products);
     
-    // Subscribe to level 2 order book
-    this.exchange!.subscribeOrderBook(this.config.products, 'level2');
+    // Note: level2 orderbook requires authentication in sandbox
+    // For paper trading, ticker data is sufficient
   }
 
   private handleTicker(ticker: Ticker): void {
@@ -458,6 +468,11 @@ export class TradingEngine extends EventEmitter {
   // Get current positions
   public getPositions(): Position[] {
     return this.positionTracker?.getPositions() || [];
+  }
+
+  // Get open positions
+  public getOpenPositions(): Position[] {
+    return this.positionTracker?.getOpenPositions() || [];
   }
 
   // Get risk metrics

@@ -94,8 +94,10 @@ export class CoinbaseExchange extends EventEmitter {
     // Connect WebSocket (public market data)
     this.wsClient.connect();
 
-    // Start order polling
-    this.startOrderPolling();
+    // Start order polling only if we have credentials
+    if (hasCredentials) {
+      this.startOrderPolling();
+    }
   }
 
   public disconnect(): void {

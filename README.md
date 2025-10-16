@@ -1,73 +1,197 @@
-# Welcome to your Lovable project
+# AtlasBot v2
 
-## Project info
+Professional algorithmic trading system with a React frontend, Node.js trading runtime, and Supabase persistence. Supports real-time paper trading with Coinbase market data, strategy configuration, risk controls, WebSocket updates, and deployment via Docker/Kubernetes.
 
-**URL**: https://lovable.dev/projects/971d867c-7d69-48f3-86e9-d4dfd83b161f
+---
 
-## How can I edit this code?
+## Contents
+- Overview
+- Architecture
+- Prerequisites
+- Environment Variables
+- Database Setup (Supabase)
+- Local Development
+- Starting the Trading Engine
+- Frontend Features
+- API & WebSocket
+- Deployment (Docker/K8s)
+- Troubleshooting
 
-There are several ways of editing your application.
+---
 
-**Use Lovable**
+## Overview
+- Frontend: React + Vite + shadcn-ui (this repo root)
+- Backend: Node.js runtime at `atlas/apps/core-node/`
+- Persistence: Supabase (Postgres, Realtime)
+- Exchange: Coinbase Advanced Trade (sandbox for paper mode)
+- Single-user MVP with fixed `USER_ID`
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/971d867c-7d69-48f3-86e9-d4dfd83b161f) and start prompting.
+Key features:
+- Live dashboard with equity/PnL, risk heat, spread percentile, open positions
+- Strategy configuration (Breakout+Volume, VWAP Mean Reversion, Meta gating)
+- Risk management (position sizing, daily stop, kill-switch)
+- Orders, fills, positions, alerts syncing to Supabase
+- Real-time WebSocket updates to the UI
 
-Changes made via Lovable will be committed automatically to this repo.
+---
 
-**Use your preferred IDE**
+## Architecture
+- `src/` – Frontend UI
+- `atlas/apps/core-node/` – Trading runtime (Express API + engine)
+- `supabase/` – SQL migrations/scripts
+- `deploy/` – Dockerfile and K8s manifests
 
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
+Runtime flow:
+1) Engine connects to Coinbase WS → ticker → candles → SignalProcessor
+2) RiskEngine gates entries; OrderManager simulates fills (paper)
+3) PositionTracker updates positions/PnL; data synced to Supabase
+4) UI consumes Supabase tables + runtime WebSocket events
 
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
+---
 
-Follow these steps:
+## Prerequisites
+- Node.js 20+
+- pnpm 9+ (recommended)
+- Supabase project (URL + keys)
 
-```sh
-# Step 1: Clone the repository using the project's Git URL.
-git clone <YOUR_GIT_URL>
+---
 
-# Step 2: Navigate to the project directory.
-cd <YOUR_PROJECT_NAME>
+## Environment Variables
+Create `.env` at repo root:
 
-# Step 3: Install the necessary dependencies.
-npm i
+```
+VITE_RUNTIME_API_URL=http://localhost:3001
+CONFIRM_LIVE=NO
 
-# Step 4: Start the development server with auto-reloading and an instant preview.
-npm run dev
+# Backend runtime (atlas/apps/core-node)
+SUPABASE_URL=YOUR_SUPABASE_URL
+SUPABASE_SERVICE_KEY=YOUR_SERVICE_ROLE_KEY
+SUPABASE_ANON_KEY=YOUR_ANON_KEY
+ENCRYPTION_KEY=32-byte-hex-or-strong-secret
 ```
 
-**Edit a file directly in GitHub**
+---
 
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
+## Database Setup (Supabase)
+Run the migration script in Supabase SQL Editor (copy/paste and run):
+- `supabase/migrations/20251016_fix_trading_tables.sql`
 
-**Use GitHub Codespaces**
+This will:
+- Reconcile `positions` (add `user_id` if missing)
+- Create `upsert_account_metrics(user_id uuid)` RPC
+- Add indexes and policies
 
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
+Optional, but available:
+- `supabase/migrations/20251016_risk_metrics.sql` – extended risk analytics table
 
-## What technologies are used for this project?
+---
 
-This project is built with:
+## Local Development
 
-- Vite
-- TypeScript
-- React
-- shadcn-ui
-- Tailwind CSS
+Install UI deps and run:
+```
+pnpm install
+pnpm dev
+```
 
-## How can I deploy this project?
+Install backend deps and run API:
+```
+cd atlas/apps/core-node
+pnpm install
+pnpm build
+pnpm api
+```
 
-Simply open [Lovable](https://lovable.dev/projects/971d867c-7d69-48f3-86e9-d4dfd83b161f) and click on Share -> Publish.
+Open the app at `http://localhost:5173` (default Vite dev port).
 
-## Can I connect a custom domain to my Lovable project?
+---
 
-Yes, you can!
+## Starting the Trading Engine
+With API running on `:3001`, start paper mode:
+```
+curl -X POST http://localhost:3001/api/engine/start \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"paper"}'
+```
 
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
+Notes:
+- Paper mode uses Coinbase sandbox ticker data (BTC-USD).
+- Signals start after ~50 candles (~50 minutes of live data).
+- Orders/fills/positions sync to Supabase.
 
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/features/custom-domain#custom-domain)
+Kill switch (immediate halt):
+```
+curl -X POST http://localhost:3001/api/engine/kill
+```
+
+Pause/Resume:
+```
+curl -X POST http://localhost:3001/api/control/pause
+curl -X POST http://localhost:3001/api/control/resume
+```
+
+Close all positions (with confirmation):
+```
+curl -X POST http://localhost:3001/api/control/close-all \
+  -H "Content-Type: application/json" \
+  -d '{"confirm":"CLOSE ALL"}'
+```
+
+---
+
+## Frontend Features
+- Dashboard KPIs: total equity, daily P&L, risk heat, spread percentile, open positions
+- Orders & Positions: live blotter + open positions
+- Signals: configure strategy thresholds and meta gating
+- Risk: per-trade risk, heat cap, daily stop, kill-switch
+- Journal & Alerts: persisted in Supabase with Realtime updates
+
+---
+
+## API & WebSocket
+REST:
+- `GET /api/health` – healthcheck
+- `GET /api/status` – runtime status (mode, paused, kill switch, latencies)
+- `POST /api/engine/start {mode: paper|live}`
+- `POST /api/engine/kill`
+- `POST /api/control/{pause|resume|close-all}`
+- `POST /api/config/{risk|signals}`
+
+WebSocket:
+- `ws://localhost:3001/events`
+- Messages: `StatusUpdate`, `TickerUpdate`, `Signal`, `OrderUpdate`, `Fill`, `PositionUpdate`, `RiskEvent`
+
+---
+
+## Deployment
+
+Docker (API):
+```
+docker build -f deploy/docker/Dockerfile.api -t atlas-api:latest .
+docker run -p 3001:3001 --env-file .env atlas-api:latest
+```
+
+Kubernetes:
+1) Update image in `deploy/k8s/api-deployment.yaml`
+2) Create namespace/secrets; apply manifests
+3) Use readiness/liveness probes on `/api/status`
+
+---
+
+## Troubleshooting
+- No signals yet → wait ~50 minutes for 1m candles to accumulate
+- 401 from Coinbase polling → running in paper mode without live creds (expected)
+- Supabase errors on metrics → ensure migration `20251016_fix_trading_tables.sql` ran
+- ETH-USD subscribe error in sandbox → BTC-USD only (by design)
+
+---
+
+## Security Notes
+- Single-user MVP with fixed `USER_ID`
+- `CONFIRM_LIVE=NO` by default; set to `YES` for live only after review
+- Store exchange credentials via encrypted backend workflow (do not insert raw into DB)
+
+---
+
+## License
+Proprietary – internal project.
