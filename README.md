@@ -86,7 +86,41 @@ Optional, but available:
 
 ---
 
-## Local Development
+## Quick Start (One Command)
+
+### Cross-platform (Recommended):
+```bash
+pnpm start
+# or
+npm run start
+```
+
+### Platform-specific:
+```bash
+# macOS/Linux
+./start.sh
+
+# Windows
+start.bat
+```
+
+This will automatically:
+- Install all dependencies
+- Build the backend
+- Start the API server
+- Start the trading engine
+- Launch the frontend
+- Open your browser
+
+To stop everything:
+```bash
+node stop.cjs
+# or press Ctrl+C in the terminal
+```
+
+## Manual Development Setup
+
+If you prefer to start services individually:
 
 Install UI deps and run:
 ```
