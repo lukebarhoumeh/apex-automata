@@ -3,6 +3,7 @@ import { Logger } from '../core/logger';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { OrderRequest } from '../exchanges/coinbase';
 import { Position, PositionTracker } from './position-tracker';
+import { GuardrailConfig } from '../config/loadGuardrails';
 
 export interface RiskEngineConfig {
   supabaseUrl: string;
@@ -26,6 +27,8 @@ export interface RiskEngineConfig {
   };
   riskPerTrade: number;            // Percentage of capital to risk per trade
   kellyFraction: number;           // Kelly criterion fraction (0.25 = quarter Kelly)
+  guardrails: GuardrailConfig;
+  accountEquity: number;
 }
 
 export interface RiskCheck {
@@ -37,6 +40,7 @@ export interface RiskCheck {
     dailyLoss: boolean;
     orderSize: boolean;
     openOrders: boolean;
+    openPositions: boolean;
     killSwitch: boolean;
   };
 }
@@ -70,9 +74,21 @@ export class RiskEngine extends EventEmitter {
   private metrics: RiskMetrics;
   private killSwitchActive = false;
   private dailyStartEquity = 0;
+  private weeklyStartEquity = 0;
+  private weeklyStartTimestamp = 0;
+  private equityHistory: Array<{ timestamp: number; equity: number }> = [];
   private orderHistory: Array<{ timestamp: Date; success: boolean }> = [];
   private latencyHistory: number[] = [];
   private metricsUpdateInterval: NodeJS.Timeout | null = null;
+  private guardrails: GuardrailConfig;
+  private accountEquity: number;
+  private dailyLossLimitUsd: number;
+  private weeklyLossLimitUsd: number;
+  private maxDrawdownUsd: number;
+  private maxPositionExposureUsd: number;
+  private minOrderNotionalUsd: number;
+  private rapidLossThresholdUsd: number;
+  private maxOpenPositionsLimit: number;
 
   constructor(
     config: RiskEngineConfig,
@@ -84,6 +100,22 @@ export class RiskEngine extends EventEmitter {
     this.logger = logger;
     this.positionTracker = positionTracker;
     this.supabase = createClient(config.supabaseUrl, config.supabaseKey);
+
+    this.guardrails = config.guardrails;
+    this.accountEquity = config.accountEquity;
+    const riskCfg = this.guardrails.risk;
+    const accountCfg = this.guardrails.account;
+    const circuitCfg = this.guardrails.circuit_breakers;
+
+    this.dailyLossLimitUsd = Math.abs(riskCfg.daily_loss_limit) * this.accountEquity;
+    this.weeklyLossLimitUsd = Math.abs(riskCfg.weekly_loss_limit) * this.accountEquity;
+    this.maxDrawdownUsd = Math.abs(riskCfg.max_drawdown_limit) * this.accountEquity;
+    this.maxPositionExposureUsd = this.accountEquity * riskCfg.max_position_exposure_pct;
+    this.maxOpenPositionsLimit = accountCfg.max_open_positions;
+    this.minOrderNotionalUsd = this.accountEquity * accountCfg.risk_per_trade * accountCfg.min_notional_buffer;
+    this.rapidLossThresholdUsd = Math.abs(circuitCfg.rapid_loss_trigger) * this.accountEquity;
+    this.weeklyStartEquity = this.accountEquity;
+    this.weeklyStartTimestamp = Date.now();
 
     this.metrics = this.initializeMetrics();
     this.startMetricsUpdate();
@@ -130,6 +162,9 @@ export class RiskEngine extends EventEmitter {
       this.dailyStartEquity = equity;
       await this.saveDailyStartEquity(equity);
     }
+
+    this.weeklyStartEquity = this.dailyStartEquity;
+    this.weeklyStartTimestamp = Date.now();
   }
 
   private async saveDailyStartEquity(equity: number): Promise<void> {
@@ -148,7 +183,7 @@ export class RiskEngine extends EventEmitter {
   private async calculateCurrentEquity(): Promise<number> {
     // Get account balances
     // This is simplified - in production, you'd get actual balances from exchange
-    const baseEquity = 50000; // Example starting equity
+    const baseEquity = this.accountEquity;
     const portfolioSummary = this.positionTracker.getPortfolioSummary();
     return baseEquity + portfolioSummary.totalPnL;
   }
@@ -163,6 +198,7 @@ export class RiskEngine extends EventEmitter {
         dailyLoss: true,
         orderSize: true,
         openOrders: true,
+        openPositions: true,
         killSwitch: true
       }
     };
@@ -185,6 +221,13 @@ export class RiskEngine extends EventEmitter {
       check.checks.orderSize = false;
     }
 
+    const openPositions = this.positionTracker.getOpenPositions();
+    if (openPositions.length >= this.maxOpenPositionsLimit) {
+      check.passed = false;
+      check.reason = `Open position limit reached (${openPositions.length}/${this.maxOpenPositionsLimit})`;
+      check.checks.openPositions = false;
+    }
+
     // Check maximum order size
     if (orderValue > this.config.limits.maxOrderSize) {
       check.passed = false;
@@ -197,7 +240,7 @@ export class RiskEngine extends EventEmitter {
     const currentPositionValue = position ? position.size * position.marketPrice : 0;
     const newPositionValue = currentPositionValue + (order.side === 'buy' ? orderValue : -orderValue);
 
-    if (Math.abs(newPositionValue) > this.config.limits.maxPositionSize) {
+    if (Math.abs(newPositionValue) > this.config.limits.maxPositionSize || Math.abs(newPositionValue) > this.maxPositionExposureUsd) {
       check.passed = false;
       check.reason = `Position size would exceed limit: $${Math.abs(newPositionValue).toFixed(2)} > $${this.config.limits.maxPositionSize}`;
       check.checks.positionSize = false;
@@ -207,7 +250,7 @@ export class RiskEngine extends EventEmitter {
     const currentExposure = this.calculateTotalExposure();
     const newExposure = currentExposure + orderValue;
 
-    if (newExposure > this.config.limits.maxTotalExposure) {
+    if (newExposure > this.config.limits.maxTotalExposure || newExposure > this.maxPositionExposureUsd) {
       check.passed = false;
       check.reason = `Total exposure would exceed limit: $${newExposure.toFixed(2)} > $${this.config.limits.maxTotalExposure}`;
       check.checks.totalExposure = false;
@@ -248,11 +291,76 @@ export class RiskEngine extends EventEmitter {
     }
   }
 
+  public computeOrderSize(productId: string, entryPrice: number, stopPrice: number): number {
+    const stopDistance = Math.abs(entryPrice - stopPrice);
+    if (!Number.isFinite(stopDistance) || stopDistance === 0) {
+      return 0;
+    }
+
+    const riskUsd = this.accountEquity * this.guardrails.account.risk_per_trade;
+    let size = riskUsd / stopDistance;
+    if (!Number.isFinite(size) || size <= 0) {
+      return 0;
+    }
+
+    // Cap by max exposure
+    const maxSizeByExposure = this.maxPositionExposureUsd / entryPrice;
+    if (Number.isFinite(maxSizeByExposure)) {
+      size = Math.min(size, maxSizeByExposure);
+    }
+
+    const notional = size * entryPrice;
+    if (notional < this.minOrderNotionalUsd) {
+      return 0;
+    }
+
+    // Round to 6 decimals for crypto lot sizes
+    return parseFloat(size.toFixed(6));
+  }
+
   private calculateTotalExposure(): number {
     const positions = this.positionTracker.getOpenPositions();
     return positions.reduce((total, position) => {
       return total + Math.abs(position.size * position.marketPrice);
     }, 0);
+  }
+
+  private enforceLossGuardrails(currentEquity: number): void {
+    const now = Date.now();
+    const dailyLoss = this.dailyStartEquity - currentEquity;
+    if (!this.killSwitchActive && dailyLoss >= this.dailyLossLimitUsd) {
+      this.triggerKillSwitch(`Daily loss guardrail tripped: -$${dailyLoss.toFixed(2)}`);
+      return;
+    }
+
+    const oneWeekMs = 7 * 24 * 60 * 60 * 1000;
+    if (now - this.weeklyStartTimestamp > oneWeekMs) {
+      this.weeklyStartEquity = currentEquity;
+      this.weeklyStartTimestamp = now;
+    }
+
+    const weeklyLoss = this.weeklyStartEquity - currentEquity;
+    if (!this.killSwitchActive && weeklyLoss >= this.weeklyLossLimitUsd) {
+      this.triggerKillSwitch(`Weekly loss guardrail tripped: -$${weeklyLoss.toFixed(2)}`);
+      return;
+    }
+
+    const absoluteDrawdown = this.accountEquity - currentEquity;
+    if (!this.killSwitchActive && absoluteDrawdown >= this.maxDrawdownUsd) {
+      this.triggerKillSwitch(`Max drawdown exceeded: -$${absoluteDrawdown.toFixed(2)}`);
+      return;
+    }
+
+    const rapidWindowMs = 10 * 60 * 1000;
+    this.equityHistory.push({ timestamp: now, equity: currentEquity });
+    this.equityHistory = this.equityHistory.filter(point => now - point.timestamp <= rapidWindowMs);
+    if (this.rapidLossThresholdUsd > 0 && this.equityHistory.length > 0) {
+      const maxEquityWindow = Math.max(...this.equityHistory.map(point => point.equity));
+      const drop = maxEquityWindow - currentEquity;
+      if (!this.killSwitchActive && drop >= this.rapidLossThresholdUsd) {
+        this.triggerKillSwitch(`Rapid loss guardrail tripped: -$${drop.toFixed(2)} in <10m`);
+      }
+    }
   }
 
   // Update risk metrics
@@ -266,7 +374,9 @@ export class RiskEngine extends EventEmitter {
     // Update daily P&L
     const currentEquity = await this.calculateCurrentEquity();
     this.metrics.dailyPnL = currentEquity - this.dailyStartEquity;
-    this.metrics.dailyLossPercentage = (this.metrics.dailyPnL / this.dailyStartEquity) * 100;
+    this.metrics.dailyLossPercentage = this.dailyStartEquity !== 0
+      ? (this.metrics.dailyPnL / this.dailyStartEquity) * 100
+      : 0;
 
     // Calculate max drawdown
     let maxEquity = this.dailyStartEquity;
@@ -294,6 +404,9 @@ export class RiskEngine extends EventEmitter {
     }
 
     this.metrics.lastUpdated = new Date();
+
+    this.enforceLossGuardrails(currentEquity);
+    this.metrics.killSwitchActive = this.killSwitchActive;
 
     // Check kill switches
     this.checkKillSwitches();

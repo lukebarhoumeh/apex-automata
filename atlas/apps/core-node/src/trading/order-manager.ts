@@ -2,7 +2,6 @@ import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 import { Logger } from '../core/logger';
 import { CoinbaseExchange, CoinbaseOrder, OrderRequest, Fill } from '../exchanges/coinbase';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 export interface OrderManagerConfig {
   supabaseUrl: string;
@@ -24,8 +23,9 @@ export interface ManagedOrder {
   clientOrderId: string;
   exchangeOrderId?: string;
   product: string;
+  productId?: string;
   side: 'buy' | 'sell';
-  type: 'limit' | 'market' | 'twap';
+  type: 'limit' | 'market' | 'stop' | 'twap';
   size: number;
   price?: number;
   status: string; // Aligns with OrderStatus from Coinbase types
@@ -37,12 +37,13 @@ export interface ManagedOrder {
   parentOrderId?: string; // For TWAP child orders
   metadata?: Record<string, any>;
   fills: Fill[];
+  strategy?: string;
 }
 
 export interface TWAPOrder extends ManagedOrder {
   type: 'twap';
-  totalSize: string;
-  remainingSize: string;
+  totalSize: number;
+  remainingSize: number;
   slices: TWAPSlice[];
   startTime: Date;
   endTime: Date;
@@ -71,7 +72,6 @@ export class OrderManager extends EventEmitter {
   private config: OrderManagerConfig;
   private logger: Logger;
   private exchange: CoinbaseExchange;
-  private supabase: SupabaseClient;
   private orders: Map<string, ManagedOrder> = new Map();
   private twapOrders: Map<string, TWAPOrder> = new Map();
   private twapTimers: Map<string, NodeJS.Timeout[]> = new Map();
@@ -85,7 +85,6 @@ export class OrderManager extends EventEmitter {
     this.config = config;
     this.logger = logger;
     this.exchange = exchange;
-    this.supabase = createClient(config.supabaseUrl, config.supabaseKey);
 
     this.setupExchangeHandlers();
   }
@@ -103,9 +102,9 @@ export class OrderManager extends EventEmitter {
 
     // Update order status
     managedOrder.status = this.mapExchangeStatus(order.status);
-    managedOrder.filledSize = order.filled_size;
-    managedOrder.executedValue = order.executed_value;
-    managedOrder.fees = order.fill_fees;
+    managedOrder.filledSize = order.filled_size ? parseFloat(order.filled_size) : managedOrder.filledSize;
+    managedOrder.executedValue = order.executed_value ? parseFloat(order.executed_value) : managedOrder.executedValue;
+    managedOrder.fee = order.fill_fees ? parseFloat(order.fill_fees) : managedOrder.fee;
     managedOrder.updatedAt = new Date();
 
     await this.persistOrder(managedOrder);
@@ -118,10 +117,14 @@ export class OrderManager extends EventEmitter {
       return;
     }
 
-    managedOrder.filledSize = fill.size;
-    managedOrder.executedValue = fill.usd_volume;
-    managedOrder.fees = fill.fee;
-    managedOrder.updatedAt = new Date();
+    managedOrder.filledSize = parseFloat(fill.size);
+    const executedValue = fill.usd_volume
+      ? parseFloat(fill.usd_volume)
+      : parseFloat(fill.price) * parseFloat(fill.size);
+    managedOrder.executedValue = executedValue;
+    managedOrder.fee = parseFloat(fill.fee);
+    managedOrder.updatedAt = new Date(fill.created_at);
+    managedOrder.fills = [...managedOrder.fills, fill];
 
     await this.persistOrder(managedOrder);
     this.emit('order:filled', managedOrder, fill);
@@ -151,20 +154,25 @@ export class OrderManager extends EventEmitter {
   // Create a standard order
   public async createOrder(request: Omit<OrderRequest, 'client_oid'>): Promise<ManagedOrder> {
     const clientOrderId = uuidv4();
+    const parsedSize = request.size ? parseFloat(request.size) : 0;
+    const parsedPrice = request.price ? parseFloat(request.price) : undefined;
     const managedOrder: ManagedOrder = {
       id: clientOrderId,
       clientOrderId,
+      product: request.product_id,
       productId: request.product_id,
       side: request.side,
       type: request.type,
-      size: request.size || '0',
-      price: request.price,
+      size: Number.isFinite(parsedSize) ? parsedSize : 0,
+      price: parsedPrice,
       status: 'pending',
-      filledSize: '0',
-      executedValue: '0',
-      fees: '0',
+      filledSize: 0,
+      executedValue: 0,
+      fee: 0,
       createdAt: new Date(),
-      updatedAt: new Date()
+      updatedAt: new Date(),
+      metadata: {},
+      fills: []
     };
 
     this.orders.set(clientOrderId, managedOrder);
@@ -202,6 +210,8 @@ export class OrderManager extends EventEmitter {
     const parentId = uuidv4();
     const startTime = new Date();
     const endTime = new Date(startTime.getTime() + request.duration);
+    const totalSize = request.totalSize ? parseFloat(request.totalSize) : 0;
+    const price = request.price ? parseFloat(request.price) : undefined;
     
     // Calculate slices
     const numSlices = request.numSlices || Math.ceil(request.duration / this.config.twapConfig.sliceDuration);
@@ -210,22 +220,25 @@ export class OrderManager extends EventEmitter {
     const twapOrder: TWAPOrder = {
       id: parentId,
       clientOrderId: parentId,
+      product: request.product_id,
       productId: request.product_id,
       side: request.side,
       type: 'twap',
-      size: request.totalSize,
-      price: request.price,
+      size: Number.isFinite(totalSize) ? totalSize : 0,
+      price,
       status: 'pending',
-      filledSize: '0',
-      executedValue: '0',
-      fees: '0',
-      totalSize: request.totalSize,
-      remainingSize: request.totalSize,
+      filledSize: 0,
+      executedValue: 0,
+      fee: 0,
+      totalSize: Number.isFinite(totalSize) ? totalSize : 0,
+      remainingSize: Number.isFinite(totalSize) ? totalSize : 0,
       slices,
       startTime,
       endTime,
       createdAt: new Date(),
-      updatedAt: new Date()
+      updatedAt: new Date(),
+      metadata: {},
+      fills: []
     };
 
     this.twapOrders.set(parentId, twapOrder);
@@ -288,7 +301,9 @@ export class OrderManager extends EventEmitter {
     // Add any remaining size to the last slice due to rounding
     if (remainingSize > 0 && slices.length > 0) {
       const lastSlice = slices[slices.length - 1];
-      lastSlice.size = (parseFloat(lastSlice.size) + remainingSize).toString();
+      if (lastSlice) {
+        lastSlice.size = (parseFloat(lastSlice.size) + remainingSize).toString();
+      }
     }
 
     return slices;
@@ -361,17 +376,17 @@ export class OrderManager extends EventEmitter {
       if (slice.orderId) {
         const sliceOrder = this.orders.get(slice.orderId);
         if (sliceOrder) {
-          totalFilled += parseFloat(sliceOrder.filledSize);
+          totalFilled += sliceOrder.filledSize;
         }
       }
     }
 
-    twapOrder.filledSize = totalFilled.toString();
-    twapOrder.remainingSize = (parseFloat(twapOrder.totalSize) - totalFilled).toString();
+    twapOrder.filledSize = totalFilled;
+    twapOrder.remainingSize = Math.max(twapOrder.totalSize - totalFilled, 0);
 
     // Check if complete
     const allSlicesExecuted = twapOrder.slices.every(s => s.status !== 'pending');
-    if (allSlicesExecuted || totalFilled >= parseFloat(twapOrder.totalSize)) {
+    if (allSlicesExecuted || totalFilled >= twapOrder.totalSize) {
       twapOrder.status = 'filled';
       this.emit('twap:complete', twapOrder);
       
@@ -472,34 +487,8 @@ export class OrderManager extends EventEmitter {
 
   // Persist order to database
   private async persistOrder(order: ManagedOrder | TWAPOrder): Promise<void> {
-    try {
-      const { error } = await this.supabase
-        .from('orders')
-        .upsert({
-          id: order.id,
-          client_order_id: order.clientOrderId,
-          exchange_order_id: order.exchangeOrderId,
-          product_id: order.product,
-          side: order.side,
-          type: order.type,
-          size: order.size.toString(),
-          price: order.price?.toString(),
-          status: order.status,
-          filled_size: order.filledSize.toString(),
-          executed_value: order.executedValue.toString(),
-          fees: order.fee.toString(),
-          parent_order_id: order.parentOrderId,
-          metadata: order.metadata || {},
-          created_at: order.createdAt.toISOString(),
-          updated_at: order.updatedAt.toISOString()
-        });
-
-      if (error) {
-        this.logger.error('Failed to persist order:', error);
-      }
-    } catch (error) {
-      this.logger.error('Error persisting order:', error);
-    }
+    // Persistence is handled upstream in the API layer when events emit.
+    return;
   }
 
   // Get all active orders

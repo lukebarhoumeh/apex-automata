@@ -5,6 +5,7 @@ import { TrendingUp, Activity, Maximize2, Settings } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useTradingEngine } from "@/hooks/useTradingEngine";
 import { useState, useEffect } from "react";
+import { LivePriceChart } from "./LivePriceChart";
 
 interface ChartSectionProps {
   symbol?: string;
@@ -76,56 +77,9 @@ export const ChartSection = ({ symbol = "BTC-USD" }: ChartSectionProps) => {
       </CardHeader>
       <CardContent>
         <div className="relative">
-          {/* Chart Placeholder with Grid */}
+          {/* Live Price Chart */}
           <div className="h-[450px] w-full bg-gradient-to-b from-muted/20 to-muted/5 rounded-lg border border-border/50 relative overflow-hidden">
-            {/* Grid Background */}
-            <div className="absolute inset-0 opacity-20">
-              <div className="h-full w-full" 
-                style={{
-                  backgroundImage: `
-                    linear-gradient(to right, hsl(var(--border)) 1px, transparent 1px),
-                    linear-gradient(to bottom, hsl(var(--border)) 1px, transparent 1px)
-                  `,
-                  backgroundSize: '60px 60px'
-                }}
-              />
-            </div>
-            
-            {/* Mock Price Line */}
-            <div className="absolute top-1/2 left-0 right-0 h-0.5 bg-gradient-to-r from-transparent via-primary/40 to-transparent" />
-            
-            {/* Content */}
-            <div className="relative h-full flex flex-col items-center justify-center p-8 text-center space-y-4">
-              <div className="p-4 rounded-full bg-primary/10 border border-primary/20">
-                <TrendingUp className="h-12 w-12 text-primary" />
-              </div>
-              <div className="space-y-2 max-w-md">
-                <p className="text-sm text-muted-foreground">
-                  Real-time candlestick chart with technical indicators
-                </p>
-                <div className="flex flex-wrap justify-center gap-2 text-xs text-muted-foreground">
-                  <Badge variant="outline" className="bg-card/50">VWAP</Badge>
-                  <Badge variant="outline" className="bg-card/50">ATR Bands</Badge>
-                  <Badge variant="outline" className="bg-card/50">Donchian</Badge>
-                  <Badge variant="outline" className="bg-card/50">Entry/Exit Signals</Badge>
-                </div>
-              </div>
-              
-              {/* Mock Signal Markers */}
-              <div className="absolute top-1/3 left-1/4 group">
-                <div className="h-3 w-3 rounded-full bg-success animate-pulse-glow" />
-                <div className="absolute top-full left-1/2 -translate-x-1/2 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <Badge className="text-xs bg-success/90">BUY +0.8R</Badge>
-                </div>
-              </div>
-              
-              <div className="absolute top-1/2 right-1/3 group">
-                <div className="h-3 w-3 rounded-full bg-primary animate-pulse-glow" />
-                <div className="absolute top-full left-1/2 -translate-x-1/2 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <Badge className="text-xs bg-primary/90">EXIT +1.2R</Badge>
-                </div>
-              </div>
-            </div>
+            <LivePriceChart symbol={symbol} height={450} />
           </div>
           
           {/* Legend */}

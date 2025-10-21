@@ -38,6 +38,7 @@ export const useJournalEntries = (filters?: {
       let query = supabase
         .from("journal_entries")
         .select("*")
+        .eq("user_id", "b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f") // Fixed USER_ID
         .order("created_at", { ascending: false });
 
       if (filters?.search) {
@@ -72,8 +73,8 @@ export const useCreateJournalEntry = () => {
       // Validate input
       const validated = journalEntrySchema.parse(input);
 
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) throw new Error("Not authenticated");
+      // Use fixed USER_ID for single-user MVP
+      const user = { id: 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f' };
 
       const { data, error } = await supabase
         .from("journal_entries")

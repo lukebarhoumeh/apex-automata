@@ -131,7 +131,7 @@ export class BacktestRunner {
       ));
 
       try {
-        const response = await this.exchange.rest.getCandles(product, {
+        const response = await this.exchange.getCandles(product, {
           start: currentStart.toISOString(),
           end: currentEnd.toISOString(),
           granularity
@@ -140,12 +140,12 @@ export class BacktestRunner {
         // Convert response to OHLCV format
         for (const candle of response) {
           candles.unshift({
-            time: candle[0] * 1000, // Convert to milliseconds
-            low: candle[1],
-            high: candle[2],
-            open: candle[3],
-            close: candle[4],
-            volume: candle[5]
+            time: candle.time * 1000, // Convert to milliseconds
+            low: candle.low,
+            high: candle.high,
+            open: candle.open,
+            close: candle.close,
+            volume: candle.volume
           });
         }
 
@@ -349,6 +349,10 @@ ${trades.slice(-10).map(t =>
 
       const key = keys[index];
       const range = ranges[key];
+      if (!range) {
+        generate(index + 1, current);
+        return;
+      }
       
       for (let value = range.min; value <= range.max; value += range.step) {
         current[key] = value;
@@ -370,6 +374,9 @@ ${trades.slice(-10).map(t =>
       let obj: any = config;
       
       for (let i = 0; i < keys.length - 1; i++) {
+        if (obj[keys[i]] === undefined) {
+          obj[keys[i]] = {};
+        }
         obj = obj[keys[i]];
       }
       

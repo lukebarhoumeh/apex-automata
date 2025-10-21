@@ -7,6 +7,7 @@ import { PositionTracker, PositionTrackerConfig, Position } from './position-tra
 import { RiskEngine, RiskEngineConfig, RiskMetrics } from './risk-engine';
 import { SecretManager, SecretConfig } from '../config/secrets';
 import { PaperTradingSimulator, PaperTradingConfig } from './paper-trading-simulator';
+import { GuardrailConfig } from '../config/loadGuardrails';
 
 export interface TradingEngineConfig {
   mode: 'paper' | 'live';
@@ -23,6 +24,7 @@ export interface TradingEngineConfig {
   security: {
     encryptionKey: string;
   };
+  guardrails: GuardrailConfig;
 }
 
 export interface TradingEngineEvents {
@@ -49,11 +51,15 @@ export class TradingEngine extends EventEmitter {
   private paperSimulator: PaperTradingSimulator | null = null;
   private isRunning = false;
   private marketPrices: Map<string, number> = new Map();
+  private guardrails: GuardrailConfig;
+  private lastMarketDataTimestamp = 0;
+  private dataGapMonitor: NodeJS.Timeout | null = null;
 
   constructor(config: TradingEngineConfig, logger: Logger) {
     super();
     this.config = config;
     this.logger = logger;
+    this.guardrails = config.guardrails;
 
     // Initialize secret manager
     this.secretManager = new SecretManager(
@@ -64,6 +70,14 @@ export class TradingEngine extends EventEmitter {
       },
       logger
     );
+  }
+
+  public getConfig(): TradingEngineConfig {
+    return this.config;
+  }
+
+  public get engineRunning(): boolean {
+    return this.isRunning;
   }
 
   public async start(): Promise<void> {
@@ -99,6 +113,8 @@ export class TradingEngine extends EventEmitter {
 
       // Subscribe to market data
       this.subscribeToMarketData();
+      this.lastMarketDataTimestamp = Date.now();
+      this.startDataGapMonitor();
 
       this.isRunning = true;
       this.emit('engine:started');
@@ -140,6 +156,11 @@ export class TradingEngine extends EventEmitter {
 
       if (this.riskEngine) {
         this.riskEngine.stop();
+      }
+
+      if (this.dataGapMonitor) {
+        clearInterval(this.dataGapMonitor);
+        this.dataGapMonitor = null;
       }
 
       this.isRunning = false;
@@ -232,28 +253,38 @@ export class TradingEngine extends EventEmitter {
   }
 
   private initializeRiskEngine(): void {
+    const guardrails = this.config.guardrails;
+    const accountEquity = guardrails.account.equity_usd;
+    const maxPositionSizeUsd = accountEquity * guardrails.risk.max_position_exposure_pct;
+    const maxTotalExposureUsd = accountEquity * guardrails.account.max_account_leverage;
+    const maxDailyLossUsd = Math.abs(guardrails.risk.daily_loss_limit) * accountEquity;
+    const maxDrawdownPercent = Math.abs(guardrails.risk.max_drawdown_limit) * 100;
+    const minOrderUsd = accountEquity * guardrails.account.risk_per_trade * guardrails.account.min_notional_buffer;
+
     const config: RiskEngineConfig = {
       supabaseUrl: this.config.supabase.url,
       supabaseKey: this.config.supabase.serviceKey,
       limits: {
-        maxPositionSize: 10000,      // $10k per position
-        maxTotalExposure: 30000,     // $30k total
-        maxDailyLoss: 1000,          // $1k daily loss
-        maxDrawdown: 10,             // 10% drawdown
-        maxOrderSize: 5000,          // $5k per order
-        minOrderSize: 10,            // $10 minimum
-        maxOpenOrders: 10,           // 10 concurrent orders
-        maxLeverage: 1               // No leverage
+        maxPositionSize: maxPositionSizeUsd,
+        maxTotalExposure: maxTotalExposureUsd,
+        maxDailyLoss: maxDailyLossUsd,
+        maxDrawdown: maxDrawdownPercent,
+        maxOrderSize: maxPositionSizeUsd,
+        minOrderSize: minOrderUsd,
+        maxOpenOrders: guardrails.account.max_open_positions,
+        maxLeverage: guardrails.account.max_account_leverage
       },
       killSwitches: {
         enabled: true,
-        dailyLossLimit: 1500,        // $1.5k
+        dailyLossLimit: maxDailyLossUsd,
         consecutiveLossLimit: 5,     // 5 losses in a row
         errorRateLimit: 20,          // 20% error rate
-        latencyLimit: 1000           // 1 second
+        latencyLimit: guardrails.circuit_breakers.data_gap_sec * 1000
       },
-      riskPerTrade: 1,               // 1% risk per trade
-      kellyFraction: 0.25            // Quarter Kelly
+      riskPerTrade: guardrails.account.risk_per_trade * 100,
+      kellyFraction: 0.25,
+      guardrails,
+      accountEquity
     };
 
     this.riskEngine = new RiskEngine(config, this.logger, this.positionTracker!);
@@ -262,7 +293,7 @@ export class TradingEngine extends EventEmitter {
   private initializePaperSimulator(): void {
     const config: PaperTradingConfig = {
       initialBalances: new Map([
-        ['USD', 10000],  // Start with $10k
+        ['USD', this.guardrails.account.equity_usd],
         ['BTC', 0],
         ['ETH', 0]
       ]),
@@ -302,6 +333,7 @@ export class TradingEngine extends EventEmitter {
       this.logger.error(`Kill switch triggered: ${reason}`);
       await this.stop();
     });
+    this.riskEngine!.on('risk:metrics:update', (metrics) => this.emit('risk:metrics', metrics));
   }
 
   private subscribeToMarketData(): void {
@@ -312,7 +344,31 @@ export class TradingEngine extends EventEmitter {
     // For paper trading, ticker data is sufficient
   }
 
+  private startDataGapMonitor(): void {
+    if (this.dataGapMonitor) {
+      clearInterval(this.dataGapMonitor);
+    }
+    const gapMs = this.guardrails.circuit_breakers.data_gap_sec * 1000;
+    if (gapMs <= 0) {
+      return;
+    }
+    this.dataGapMonitor = setInterval(() => {
+      if (!this.isRunning) {
+        return;
+      }
+      if (this.lastMarketDataTimestamp === 0) {
+        return;
+      }
+      const elapsed = Date.now() - this.lastMarketDataTimestamp;
+      if (elapsed > gapMs) {
+        this.logger.error(`Market data gap detected (${elapsed}ms) - triggering kill switch`);
+        this.riskEngine?.activateKillSwitch('Market data gap detected');
+      }
+    }, gapMs);
+  }
+
   private handleTicker(ticker: Ticker): void {
+    this.lastMarketDataTimestamp = Date.now();
     // Update market price
     const price = parseFloat(ticker.price);
     this.marketPrices.set(ticker.product_id, price);
@@ -368,14 +424,16 @@ export class TradingEngine extends EventEmitter {
           const paperOrder = await this.paperSimulator.placeOrder(request);
           
           // Create managed order from paper order
+          const parsedSize = request.size ? parseFloat(request.size) : 0;
           const managedOrder: ManagedOrder = {
             id: paperOrder.id,
-            clientOrderId: request.client_oid || paperOrder.id,
+            clientOrderId: paperOrder.id,
             exchangeOrderId: paperOrder.id,
             product: request.product_id,
+            productId: request.product_id,
             side: request.side,
             type: request.type,
-            size: parseFloat(request.size),
+            size: Number.isFinite(parsedSize) ? parsedSize : 0,
             price: request.price ? parseFloat(request.price) : undefined,
             status: paperOrder.status,
             filledSize: parseFloat(paperOrder.filled_size),
@@ -494,5 +552,12 @@ export class TradingEngine extends EventEmitter {
     }
 
     await this.stop();
+  }
+
+  public computeOrderSize(productId: string, entryPrice: number, stopPrice: number): number {
+    if (!this.riskEngine) {
+      return 0;
+    }
+    return this.riskEngine.computeOrderSize(productId, entryPrice, stopPrice);
   }
 }

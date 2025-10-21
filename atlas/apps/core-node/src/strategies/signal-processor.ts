@@ -347,7 +347,7 @@ export class SignalProcessor extends EventEmitter {
     const ema12 = indicators.ema12;
     const ema26 = indicators.ema26;
 
-    if (!rsi || !macdHistogram || !ema12 || !ema26) {
+    if (!rsi || rsi.length < 2 || !macdHistogram || macdHistogram.length < 2 || !ema12 || ema12.length === 0 || !ema26 || ema26.length === 0) {
       return;
     }
 

@@ -2,7 +2,8 @@ import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
 import { OHLCV, TechnicalIndicators } from '../indicators/technical';
 import { SignalProcessor, Signal } from '../strategies/signal-processor';
-import { OrderSide, OrderType, TimeInForce } from '../exchanges/coinbase/types';
+
+type OrderSide = 'BUY' | 'SELL';
 
 export interface BacktestConfig {
   startDate: Date;
@@ -198,21 +199,37 @@ export class BacktestEngine extends EventEmitter {
   }
 
   private async processTimeSteps(): Promise<void> {
+    const processor = this.signalProcessor;
+    if (!processor) {
+      throw new Error('Signal processor not initialized');
+    }
+
     // Find minimum candle count across all products
     let minCandles = Infinity;
     for (const data of this.historicalData.values()) {
       minCandles = Math.min(minCandles, data.length);
     }
 
+    const firstSeries = this.historicalData.values().next().value as OHLCV[] | undefined;
+    if (!firstSeries || !Number.isFinite(minCandles) || minCandles === Infinity) {
+      this.logger.warn('No historical data available for backtest');
+      return;
+    }
+
     // Process each timestamp
     for (let i = 50; i < minCandles; i++) { // Start at 50 for indicator warmup
-      const timestamp = new Date(this.historicalData.values().next().value[i].time);
+      const baseCandle = firstSeries[i];
+      if (!baseCandle) {
+        continue;
+      }
+      const timestamp = new Date(baseCandle.time);
 
       // Feed data to signal processor for each product
       for (const [product, data] of this.historicalData.entries()) {
-        // Get candle data up to current time
-        const candles = data.slice(0, i + 1);
-        const latestCandle = candles[candles.length - 1];
+        const latestCandle = data[i];
+        if (!latestCandle) {
+          continue;
+        }
 
         // Update positions with current price
         this.updatePositions(product, latestCandle.close, timestamp);
@@ -221,7 +238,7 @@ export class BacktestEngine extends EventEmitter {
         this.checkExitConditions(product, latestCandle, timestamp);
 
         // Add candle to signal processor
-        this.signalProcessor.addCandle(product, latestCandle);
+        processor.addCandle(product, latestCandle);
       }
 
       // Record equity curve
@@ -325,7 +342,9 @@ export class BacktestEngine extends EventEmitter {
     }
 
     // Return capital
-    this.capital += position.size * exitPrice - position.trades[0].exitFee!;
+    const firstTrade = position.trades[0];
+    const exitFee = firstTrade?.exitFee ?? 0;
+    this.capital += position.size * exitPrice - exitFee;
 
     // Remove position
     this.positions.delete(product);
@@ -334,7 +353,7 @@ export class BacktestEngine extends EventEmitter {
       product,
       exitPrice,
       reason,
-      pnl: position.trades[0].pnl
+      pnl: firstTrade?.pnl ?? 0
     });
   }
 
@@ -350,7 +369,8 @@ export class BacktestEngine extends EventEmitter {
     }
 
     // Update daily returns
-    const dateKey = timestamp.toISOString().split('T')[0];
+    const [dateKeyRaw] = timestamp.toISOString().split('T');
+    const dateKey = dateKeyRaw ?? timestamp.toISOString().slice(0, 10);
     const currentEquity = this.calculateCurrentEquity();
     const previousEquity = this.equityCurve.length > 0 
       ? this.equityCurve[this.equityCurve.length - 1].equity 
@@ -430,6 +450,9 @@ export class BacktestEngine extends EventEmitter {
       const data = this.historicalData.get(product);
       if (data && data.length > 0) {
         const lastCandle = data[data.length - 1];
+        if (!lastCandle) {
+          continue;
+        }
         this.closePosition(product, lastCandle.close, new Date(lastCandle.time), reason);
       }
     }

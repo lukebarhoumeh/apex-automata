@@ -81,7 +81,7 @@ fi
 
 # Check and free ports
 check_port 3001
-check_port 5173
+check_port 8080
 
 # Start backend API
 echo -e "${GREEN}🚀 Starting backend API...${NC}"
@@ -108,7 +108,7 @@ pnpm dev > logs/frontend.log 2>&1 &
 FRONTEND_PID=$!
 
 # Wait for frontend
-wait_for_service "http://localhost:5173" "Frontend"
+wait_for_service "http://localhost:8080" "Frontend"
 
 # Print success message
 echo -e "${GREEN}"
@@ -116,7 +116,7 @@ echo "════════════════════════�
 echo "  🎉 AtlasBot v2 is running!"
 echo "═══════════════════════════════════════════════════════════════"
 echo -e "${NC}"
-echo "  📊 Frontend:   http://localhost:5173"
+echo "  📊 Frontend:   http://localhost:8080"
 echo "  🔧 Backend:    http://localhost:3001"
 echo "  📝 API Health: http://localhost:3001/health"
 echo "  📈 Status:     http://localhost:3001/api/status"
@@ -144,7 +144,7 @@ cleanup() {
     
     # Kill any remaining processes on ports
     lsof -ti:3001 | xargs kill -9 2>/dev/null || true
-    lsof -ti:5173 | xargs kill -9 2>/dev/null || true
+    lsof -ti:8080 | xargs kill -9 2>/dev/null || true
     
     echo -e "${GREEN}✅ AtlasBot stopped${NC}"
     exit 0

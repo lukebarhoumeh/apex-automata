@@ -10,6 +10,8 @@ import path from 'path';
 import { loadEnv } from '../core/env';
 import client from 'prom-client';
 import { OHLCV } from '../indicators/technical';
+import { loadGuardrails } from '../config/loadGuardrails';
+import { OrderRequest } from '../exchanges/coinbase';
 
 const app = express();
 const server = createServer(app);
@@ -47,6 +49,16 @@ const dbConnectionGauge = new client.Gauge({
   help: '1 if connected to database, 0 otherwise'
 });
 
+const exposureGauge = new client.Gauge({
+  name: 'atlas_exposure_usd',
+  help: 'Current portfolio exposure in USD'
+});
+
+const dailyPnlGauge = new client.Gauge({
+  name: 'atlas_daily_pnl_usd',
+  help: 'Daily profit and loss in USD'
+});
+
 // Runtime status state (UI contract)
 type Regime = 'trend' | 'chop';
 const runtimeState = {
@@ -61,6 +73,12 @@ const runtimeState = {
   restLatencyMs: 0,
   spreadPctile: 0,
   regime: 'chop' as Regime,
+  risk: {
+    exposureUsd: 0,
+    dailyPnLUsd: 0,
+    maxDrawdownPct: 0,
+    killSwitchActive: false
+  }
 };
 
 // In-memory configs (will be persisted/hot-reloaded later)
@@ -70,12 +88,14 @@ let signalsConfig: any = null;
 // Load environment
 const atlasRoot = path.resolve(process.cwd(), '../..');
 const env = loadEnv(atlasRoot);
+const guardrails = loadGuardrails(atlasRoot);
 
 // Logger
 const logger = createLogger(path.join(atlasRoot, 'var/logs/api-server.jsonl'));
 
 // Fixed USER_ID for single-user mode
 const USER_ID = 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f';
+const INITIAL_BALANCE = 50000; // Starting balance for paper trading
 logger.info('Using fixed USER_ID for single-user mode:', USER_ID);
 
 // Supabase client
@@ -167,7 +187,7 @@ function processTickerForCandles(ticker: { product_id: string; price: string; la
 
 // Periodic update for account metrics (every 5 minutes)
 setInterval(async () => {
-  if (tradingEngine?.isRunning) {
+if (tradingEngine?.engineRunning) {
     await updateAccountMetrics();
   }
 }, 5 * 60 * 1000);
@@ -178,7 +198,7 @@ setInterval(() => {
   
   // TODO: Calculate actual latency and spread from exchange data
   // For now, using mock values
-  if (tradingEngine?.isRunning) {
+if (tradingEngine?.engineRunning) {
     runtimeState.wsLatencyMs = Math.round(50 + Math.random() * 20);
     runtimeState.restLatencyMs = Math.round(100 + Math.random() * 50);
     runtimeState.spreadPctile = Math.round(Math.random() * 100);
@@ -189,7 +209,7 @@ setInterval(() => {
   broadcast({
     type: 'StatusUpdate',
     payload: {
-      mode: (tradingEngine?.config?.mode || 'paper'),
+      mode: (tradingEngine?.getConfig().mode || 'paper'),
       paused: runtimeState.paused,
       dailyStopHit: runtimeState.dailyStopHit,
       killSwitch: runtimeState.killSwitch,
@@ -219,7 +239,7 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({
     type: 'StatusUpdate',
     payload: {
-      mode: (tradingEngine?.config?.mode || 'paper'),
+      mode: (tradingEngine?.getConfig().mode || 'paper'),
       paused: runtimeState.paused,
       dailyStopHit: runtimeState.dailyStopHit,
       killSwitch: runtimeState.killSwitch,
@@ -256,14 +276,15 @@ app.get('/api/health', (req, res) => {
 // Get trading engine status (UI contract)
 app.get('/api/status', (req, res) => {
   res.json({
-    mode: (tradingEngine?.config?.mode || 'paper'),
+    mode: (tradingEngine?.getConfig().mode || 'paper'),
     paused: runtimeState.paused,
     dailyStopHit: runtimeState.dailyStopHit,
     killSwitch: runtimeState.killSwitch,
     wsLatencyMs: runtimeState.wsLatencyMs,
-    restLatencyMs: runtimeState.restLatencyMs,
-    spreadPctile: runtimeState.spreadPctile,
-    regime: runtimeState.regime,
+   restLatencyMs: runtimeState.restLatencyMs,
+   spreadPctile: runtimeState.spreadPctile,
+   regime: runtimeState.regime,
+    risk: runtimeState.risk
   });
 });
 
@@ -285,7 +306,7 @@ app.post('/api/engine/start', async (req, res) => {
         name: 'coinbase',
         environment: mode === 'live' ? 'production' : 'sandbox'
       },
-      products: ['BTC-USD'], // ETH-USD not available in sandbox
+      products: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
       supabase: {
         url: env.SUPABASE_URL || '',
         serviceKey: env.SUPABASE_SERVICE_KEY || '',
@@ -293,7 +314,8 @@ app.post('/api/engine/start', async (req, res) => {
       },
       security: {
         encryptionKey: env.ENCRYPTION_KEY || ''
-      }
+      },
+      guardrails
     };
 
     // Create trading engine
@@ -348,16 +370,30 @@ app.post('/api/engine/start', async (req, res) => {
       await createSupabaseAlert(alert);
     });
 
+    tradingEngine.on('risk:metrics', (metrics: any) => {
+      runtimeState.risk = {
+        exposureUsd: metrics.currentExposure ?? 0,
+        dailyPnLUsd: metrics.dailyPnL ?? 0,
+        maxDrawdownPct: metrics.maxDrawdown ?? 0,
+        killSwitchActive: Boolean(metrics.killSwitchActive)
+      };
+      exposureGauge.set(runtimeState.risk.exposureUsd);
+      dailyPnlGauge.set(runtimeState.risk.dailyPnLUsd);
+      killSwitchActiveGauge.set(runtimeState.risk.killSwitchActive ? 1 : 0);
+      broadcast({ type: 'RiskMetrics', payload: metrics });
+    });
+
     // Initialize signal processor
+    const strategyGuard = guardrails.strategy;
     const signalConfig = {
       supabaseUrl: env.SUPABASE_URL || '',
       supabaseKey: env.SUPABASE_SERVICE_KEY || '',
       strategies: {
         breakout: {
           enabled: true,
-          period: 20,
-          atrPeriod: 14,
-          atrMultiplier: 2,
+          period: strategyGuard.donchian_len,
+          atrPeriod: strategyGuard.atr_len_15m,
+          atrMultiplier: strategyGuard.stop_init_atr,
           volumeThreshold: 1.5
         },
         vwapMeanReversion: {
@@ -367,7 +403,7 @@ app.post('/api/engine/start', async (req, res) => {
           minVolume: 1000
         },
         momentum: {
-          enabled: false,
+          enabled: strategyGuard.mode.includes('momentum'),
           rsiPeriod: 14,
           rsiOverbought: 70,
           rsiOversold: 30,
@@ -398,14 +434,102 @@ app.post('/api/engine/start', async (req, res) => {
           logger.warn('Signal suppressed due to runtime state (paused/dailyStop/killSwitch)');
           return;
         }
-        const orderRequest = {
+
+        const signalTime = signal.timestamp instanceof Date ? signal.timestamp : new Date(signal.timestamp ?? Date.now());
+        const entryPrice = signal.price;
+        const fallbackStop = signal.direction === 'buy'
+          ? entryPrice * 0.985
+          : entryPrice * 1.015;
+        const stopPrice = signal.stopLoss ?? fallbackStop;
+
+        // Time filter guardrail
+        if (guardrails.filters.time_filter_enabled) {
+          const hour = signalTime.getUTCHours();
+          const hours = guardrails.filters.allowed_hours_utc;
+          let withinWindow = true;
+          if (hours.length === 2) {
+            const [start, end] = hours;
+            if (start <= end) {
+              withinWindow = hour >= start && hour <= end;
+            } else {
+              withinWindow = hour >= start || hour <= end;
+            }
+          } else {
+            withinWindow = hours.includes(hour);
+          }
+          if (!withinWindow) {
+            logger.info('Signal filtered by trading hours guardrail', { hour, allowed: hours });
+            return;
+          }
+        }
+
+        // ATR volatility filter
+        const atrMin = guardrails.filters.atr_volatility_min;
+        const atrMax = guardrails.filters.atr_volatility_max;
+        const atrValue = (signal.metadata?.indicators as Record<string, number> | undefined)?.atr;
+        if (typeof atrValue === 'number' && atrValue > 0) {
+          const atrPct = atrValue / entryPrice;
+          if (atrPct < atrMin || atrPct > atrMax) {
+            logger.info('Signal filtered by ATR guardrail', { atrPct, atrMin, atrMax, symbol: signal.symbol });
+            return;
+          }
+        }
+
+        if (guardrails.filters.funding_bias_enabled) {
+          logger.debug('Funding bias guardrail enabled (spot mode stub) - no action taken');
+        }
+
+        const computedSize = tradingEngine!.computeOrderSize(signal.symbol, entryPrice, stopPrice);
+        if (!Number.isFinite(computedSize) || computedSize <= 0) {
+          logger.warn('Guardrail sizing returned zero size, skipping signal', {
+            signalId: signal.id,
+            symbol: signal.symbol,
+            entryPrice,
+            stopPrice
+          });
+          return;
+        }
+
+        const orderTypeSetting = guardrails.execution.order_type;
+        let orderType: 'limit' | 'market' = 'limit';
+        let postOnly = orderTypeSetting === 'post_only';
+        let limitPrice = entryPrice;
+
+        if (orderTypeSetting === 'market') {
+          orderType = 'market';
+          postOnly = false;
+        } else if (orderTypeSetting === 'marketable_limit') {
+          const priceOffsetBps = guardrails.execution.price_offset_ticks;
+          const priceDelta = entryPrice * (priceOffsetBps / 10000);
+          limitPrice = signal.direction === 'buy' ? entryPrice + priceDelta : entryPrice - priceDelta;
+          if (limitPrice <= 0) {
+            limitPrice = entryPrice;
+          }
+        }
+
+        const baseOrder = {
           product_id: signal.symbol,
           side: signal.direction,
-          type: 'limit' as const,
-          size: '0.001', // Small size for paper trading
-          price: signal.price.toFixed(2),
-          post_only: true
+          type: orderType,
+          size: computedSize.toFixed(6)
         };
+
+        const orderRequest = orderType === 'limit'
+          ? { ...baseOrder, price: limitPrice.toFixed(2), post_only: postOnly }
+          : baseOrder;
+        const limitPriceStr = orderType === 'limit' ? (orderRequest as { price: string }).price : undefined;
+
+        logger.info('Sizing order from signal', {
+          signalId: signal.id,
+          symbol: signal.symbol,
+          direction: signal.direction,
+          entryPrice,
+          stopPrice,
+          size: computedSize,
+          orderType,
+          notionalUsd: (computedSize * entryPrice),
+          limitPrice: limitPriceStr
+        });
 
         const order = await tradingEngine!.createOrder(orderRequest);
         if (order) {
@@ -490,14 +614,14 @@ app.post('/api/engine/kill', async (req, res) => {
 // Control: pause
 app.post('/api/control/pause', (req, res) => {
   runtimeState.paused = true;
-  broadcast({ type: 'StatusUpdate', payload: { ...runtimeState, mode: (tradingEngine?.config?.mode || 'paper') } });
+  broadcast({ type: 'StatusUpdate', payload: { ...runtimeState, mode: (tradingEngine?.getConfig().mode || 'paper') } });
   res.json({ ok: true });
 });
 
 // Control: resume
 app.post('/api/control/resume', (req, res) => {
   runtimeState.paused = false;
-  broadcast({ type: 'StatusUpdate', payload: { ...runtimeState, mode: (tradingEngine?.config?.mode || 'paper') } });
+  broadcast({ type: 'StatusUpdate', payload: { ...runtimeState, mode: (tradingEngine?.getConfig().mode || 'paper') } });
   res.json({ ok: true });
 });
 
@@ -519,10 +643,11 @@ app.post('/api/control/close-all', async (req, res) => {
     let submitted = 0;
     
     for (const position of positions) {
-      const closeOrder = {
+      const side: 'buy' | 'sell' = position.side === 'long' ? 'sell' : 'buy';
+      const closeOrder: Omit<OrderRequest, 'client_oid'> = {
         product_id: position.symbol,
-        side: position.side > 0 ? 'sell' : 'buy',
-        type: 'market' as const,
+        side,
+        type: 'market',
         size: Math.abs(position.size).toString()
       };
       
@@ -557,7 +682,7 @@ app.post('/api/config/signals', (req, res) => {
 // Backtest endpoint
 app.post('/api/backtest/run', async (req, res) => {
   try {
-    const { startDate, endDate, symbols, strategies, initialCapital } = req.body;
+    const { startDate, endDate, symbols, strategies, initialCapital, risk = {} } = req.body;
     
     // Validate inputs
     if (!startDate || !endDate || !symbols || !strategies || !initialCapital) {
@@ -572,26 +697,86 @@ app.post('/api/backtest/run', async (req, res) => {
     const { BacktestEngine } = await import('../backtesting/backtest-engine');
     
     // Create backtest config
+    const normalizedSymbols: string[] = Array.isArray(symbols) ? symbols : [symbols];
+    const strategyConfig = {
+      breakout: {
+        enabled: strategies?.breakout?.enabled ?? true,
+        parameters: strategies?.breakout?.parameters ?? {}
+      },
+      vwapMeanReversion: {
+        enabled: strategies?.vwapMeanReversion?.enabled ?? false,
+        parameters: strategies?.vwapMeanReversion?.parameters ?? {}
+      },
+      momentum: {
+        enabled: strategies?.momentum?.enabled ?? false,
+        parameters: strategies?.momentum?.parameters ?? {}
+      }
+    };
+
+    const riskConfigBacktest = {
+      maxPositionSize: risk.maxPositionSize ?? 10000,
+      maxTotalExposure: risk.maxTotalExposure ?? 50000,
+      stopLossPercent: risk.stopLossPercent ?? 0.02,
+      takeProfitPercent: risk.takeProfitPercent ?? 0.04
+    };
+
     const backtestConfig = {
       startDate: new Date(startDate),
       endDate: new Date(endDate),
-      symbols,
-      strategies,
-      initialCapital,
+      initialCapital: Number(initialCapital),
       commission: 0.001, // 0.1% commission
       slippage: 0.0005, // 0.05% slippage
-      riskPerTrade: 0.01, // 1% risk per trade
-      maxPositions: 5
+      products: normalizedSymbols,
+      signals: strategyConfig,
+      risk: riskConfigBacktest
     };
 
     // Create backtest engine
     const backtestEngine = new BacktestEngine(backtestConfig, logger);
 
-    // Mock data provider - in production, this would fetch from database or external API
+    // Mock data provider - generates synthetic price data for backtesting
     const dataProvider = async (product: string, start: Date, end: Date) => {
-      // For now, return empty array - implement actual historical data fetching
-      logger.warn(`Historical data provider not implemented for ${product}`);
-      return [];
+      logger.info(`Generating mock historical data for ${product} from ${start} to ${end}`);
+      
+      // Generate synthetic OHLCV data
+      const bars = [];
+      const basePrice = product === 'BTC-USD' ? 60000 : product === 'ETH-USD' ? 3000 : 100;
+      let currentPrice = basePrice;
+      
+      // Generate 5-minute bars
+      const current = new Date(start);
+      const endTime = new Date(end);
+      
+      while (current <= endTime) {
+        // Random walk with mean reversion
+        const volatility = 0.001; // 0.1% per 5 minutes
+        const drift = (basePrice - currentPrice) / basePrice * 0.001; // Mean reversion
+        const change = (Math.random() - 0.5 + drift) * volatility;
+        
+        currentPrice = currentPrice * (1 + change);
+        
+        // Generate OHLCV
+        const open = currentPrice;
+        const close = currentPrice * (1 + (Math.random() - 0.5) * volatility);
+        const high = Math.max(open, close) * (1 + Math.random() * volatility * 0.5);
+        const low = Math.min(open, close) * (1 - Math.random() * volatility * 0.5);
+        const volume = 100 + Math.random() * 900; // Random volume 100-1000
+        
+        bars.push({
+          timestamp: current.toISOString(),
+          open,
+          high,
+          low,
+          close,
+          volume
+        });
+        
+        currentPrice = close;
+        current.setMinutes(current.getMinutes() + 5); // 5-minute intervals
+      }
+      
+      logger.info(`Generated ${bars.length} bars for ${product}`);
+      return bars;
     };
 
     // Load historical data
@@ -610,9 +795,9 @@ app.post('/api/backtest/run', async (req, res) => {
       config: {
         startDate,
         endDate,
-        symbols,
-        strategies,
-        initialCapital
+        symbols: normalizedSymbols,
+        strategies: strategyConfig,
+        initialCapital: Number(initialCapital)
       },
       results: {
         totalReturn: metrics.netProfit || 0,
@@ -621,9 +806,9 @@ app.post('/api/backtest/run', async (req, res) => {
         winRate: metrics.winRate || 0,
         profitFactor: metrics.profitFactor || 0,
         totalTrades: trades.length,
-        avgWinR: metrics.averageWinR || 0,
-        avgLossR: metrics.averageLossR || 0,
-        expectancyR: metrics.expectancy || 0,
+        avgWin: metrics.averageWin || 0,
+        avgLoss: metrics.averageLoss || 0,
+        expectancyPerTrade: trades.length > 0 ? (metrics.netProfit || 0) / trades.length : 0,
         equityCurve: equityCurve.map((point: any) => ({
           date: point.date,
           equity: point.equity
@@ -634,11 +819,29 @@ app.post('/api/backtest/run', async (req, res) => {
     res.json(response);
   } catch (error) {
     logger.error('Backtest failed:', error);
-    res.status(500).json({ error: 'Backtest failed', details: error instanceof Error ? error.message : 'Unknown error' });
+    
+    // Provide more detailed error response
+    const errorDetails = error instanceof Error ? {
+      message: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    } : { message: 'Unknown error' };
+    
+    res.status(500).json({ 
+      error: 'Backtest failed', 
+      details: errorDetails.message,
+      hint: 'Check that your date range is valid and not too large (max 30 days recommended)'
+    });
   }
 });
 
 // Helper functions to sync with Supabase
+
+async function notifyAlertChannels(alert: { severity: string; title: string; message: string }) {
+  for (const channel of guardrails.ui.alert_channels) {
+    // Placeholder: integrate real transports (telegram/email/etc.)
+    logger.info(`[Alert:${channel}] ${alert.title}`, { severity: alert.severity, message: alert.message });
+  }
+}
 
 async function updateSupabasePrice(symbol: string, price: number) {
   // Update a price cache table or use for position calculations
@@ -662,7 +865,115 @@ async function updateAccountMetrics() {
   }
 }
 
+// Initialize account metrics with starting balance
+async function initializeAccountMetrics() {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    
+    // Check if metrics exist for today
+    const { data: existing, error: checkError } = await supabase
+      .from('account_metrics')
+      .select('id')
+      .eq('user_id', USER_ID)
+      .eq('date', today)
+      .maybeSingle();
+    
+    if (checkError && checkError.code !== 'PGRST205') {
+      logger.error('Failed to check account metrics:', checkError);
+      return;
+    }
+    
+    // If no metrics exist for today, create them
+    if (!existing) {
+      const { error: insertError } = await supabase
+        .from('account_metrics')
+        .insert({
+          user_id: USER_ID,
+          date: today,
+          total_equity: INITIAL_BALANCE,
+          daily_pnl: 0,
+          daily_pnl_r: 0,
+          risk_heat: 0,
+          spread_percentile: 0,
+          open_positions_count: 0,
+          wins_today: 0,
+          losses_today: 0
+        });
+      
+      if (insertError && insertError.code !== 'PGRST205') {
+        logger.error('Failed to initialize account metrics:', insertError);
+      } else {
+        logger.info('Initialized account metrics for today with starting balance:', INITIAL_BALANCE);
+      }
+    }
+  } catch (error) {
+    logger.error('Error initializing account metrics:', error);
+  }
+}
+
 async function syncOrderToSupabase(order: any) {
+  const mapOrderStatus = (status?: string) => {
+    switch ((status || '').toLowerCase()) {
+      case 'open':
+      case 'active':
+        return 'working';
+      case 'partially_filled':
+        return 'partially_filled';
+      case 'filled':
+      case 'done':
+        return 'filled';
+      case 'cancelled':
+      case 'canceled':
+        return 'canceled';
+      case 'expired':
+        return 'expired';
+      case 'failed':
+      case 'rejected':
+        return 'rejected';
+      case 'placing':
+      case 'pending':
+      default:
+        return 'new';
+    }
+  };
+
+  const mapOrderType = (type?: string) => {
+    switch ((type || '').toLowerCase()) {
+      case 'market':
+        return 'market';
+      case 'stop':
+        return 'stop';
+      case 'twap_child':
+      case 'twap-slice':
+        return 'twap_child';
+      case 'twap':
+      case 'twap_parent':
+        return 'twap_parent';
+      case 'post_only':
+        return 'post_only';
+      case 'ioc':
+        return 'ioc';
+      case 'limit':
+      default:
+        return 'limit';
+    }
+  };
+
+  const normalizeStrategy = (strategy?: string) => {
+    const candidate = (strategy || '').toLowerCase();
+    const validStrategies = ['breakout', 'vwap_mr', 'obi_scalper'];
+    if (validStrategies.includes(candidate)) {
+      return candidate;
+    }
+    if (candidate === 'vwapmeanreversion') {
+      return 'vwap_mr';
+    }
+    return 'breakout';
+  };
+
+  const sizeValue = Number(order.size ?? order.quantity ?? 0);
+  const normalizedQuantity = Number.isFinite(sizeValue) ? sizeValue : 0;
+
   try {
     const { error } = await supabase
       .from('orders')
@@ -670,13 +981,13 @@ async function syncOrderToSupabase(order: any) {
         id: order.id,
         user_id: USER_ID,
         external_order_id: order.exchangeOrderId,
-        symbol: order.product || order.symbol,
-        side: order.side, // Supabase expects order_side enum
-        type: order.type, // Supabase expects order_type enum
-        status: order.status, // Supabase expects order_status enum
+        symbol: order.productId || order.product || order.symbol,
+        side: ((order.side || 'buy').toLowerCase() === 'sell' ? 'sell' : 'buy') as 'buy' | 'sell',
+        type: mapOrderType(order.type) as any,
+        status: mapOrderStatus(order.status) as any,
         price: order.price ? parseFloat(order.price) : null,
-        quantity: parseFloat(order.size || order.quantity),
-        strategy: order.strategy || 'breakout', // Default strategy
+        quantity: normalizedQuantity,
+        strategy: normalizeStrategy(order.strategy) as any,
         meta_prob: order.metaProb || null,
         created_at: order.createdAt ? order.createdAt.toISOString() : new Date().toISOString(),
         updated_at: order.updatedAt ? order.updatedAt.toISOString() : new Date().toISOString()
@@ -789,6 +1100,11 @@ async function createSupabaseAlert(alert: any) {
     if (error) {
       logger.error('Failed to create alert in Supabase:', error);
     }
+    await notifyAlertChannels({
+      severity: alert.severity || 'warning',
+      title: alert.title || alert.type || 'Risk Alert',
+      message: alert.message || JSON.stringify(alert),
+    });
   } catch (error) {
     logger.error('Error creating alert:', error);
   }
@@ -810,6 +1126,11 @@ async function createSupabaseAlert(alert: any) {
     dbConnectionGauge.set(0);
   }
 })();
+
+// Initialize account metrics on startup
+initializeAccountMetrics().catch(err => {
+  logger.error('Failed to initialize account metrics on startup:', err);
+});
 
 // Start server
 const PORT = process.env.PORT || 3001;

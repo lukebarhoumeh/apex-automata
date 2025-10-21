@@ -2,9 +2,14 @@ import path from 'node:path';
 import { createLogger } from '../core/logger';
 import { TradingEngine, TradingEngineConfig } from '../trading/trading-engine';
 import { SignalProcessor } from '../strategies/signal-processor';
+import { loadEnv } from '../core/env';
+import { loadGuardrails } from '../config/loadGuardrails';
 
 async function main() {
-  const logger = createLogger(path.resolve(process.cwd(), '../../var/logs/paper_test.jsonl'));
+  const atlasRoot = path.resolve(process.cwd(), '../..');
+  const logger = createLogger(path.join(atlasRoot, 'var/logs/paper_test.jsonl'));
+  const env = loadEnv(atlasRoot);
+  const guardrails = loadGuardrails(atlasRoot);
 
   logger.info('Starting paper trading test');
 
@@ -17,13 +22,14 @@ async function main() {
     },
     products: ['BTC-USD', 'ETH-USD'],
     supabase: {
-      url: process.env.SUPABASE_URL || '',
-      serviceKey: process.env.SUPABASE_SERVICE_KEY || '',
-      anonKey: process.env.SUPABASE_ANON_KEY || ''
+      url: env.SUPABASE_URL || '',
+      serviceKey: env.SUPABASE_SERVICE_KEY || '',
+      anonKey: env.SUPABASE_ANON_KEY || ''
     },
     security: {
-      encryptionKey: process.env.ENCRYPTION_KEY || 'test-encryption-key-32-chars-long'
-    }
+      encryptionKey: env.ENCRYPTION_KEY || 'test-encryption-key-32-chars-long'
+    },
+    guardrails
   };
 
   // Create trading engine
@@ -121,12 +127,12 @@ async function main() {
     // Log positions
     positions.forEach(pos => {
       logger.info('Position', {
-        product: pos.product,
+        symbol: pos.symbol,
         side: pos.side,
         size: pos.size,
-        avgPrice: pos.avgPrice,
-        unrealizedPnl: pos.unrealizedPnl,
-        realizedPnl: pos.realizedPnl
+        averagePrice: pos.averagePrice,
+        unrealizedPnL: pos.unrealizedPnL,
+        realizedPnL: pos.realizedPnL
       });
     });
   }, 30000); // Every 30 seconds

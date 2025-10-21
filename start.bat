@@ -38,10 +38,10 @@ if %errorlevel% equ 0 (
     timeout /t 2 /nobreak >nul
 )
 
-netstat -an | findstr :5173 >nul
+netstat -an | findstr :8080 >nul
 if %errorlevel% equ 0 (
-    echo Port 5173 is in use. Attempting to free it...
-    for /f "tokens=5" %%a in ('netstat -aon ^| findstr :5173 ^| findstr LISTENING') do (
+    echo Port 8080 is in use. Attempting to free it...
+    for /f "tokens=5" %%a in ('netstat -aon ^| findstr :8080 ^| findstr LISTENING') do (
         taskkill /F /PID %%a >nul 2>nul
     )
     timeout /t 2 /nobreak >nul
@@ -98,7 +98,7 @@ REM Wait for frontend
 echo Waiting for frontend to start...
 :wait_frontend
 timeout /t 2 /nobreak >nul
-curl -s http://localhost:5173 >nul 2>nul
+curl -s http://localhost:8080 >nul 2>nul
 if %errorlevel% neq 0 goto wait_frontend
 
 REM Success message
@@ -108,7 +108,7 @@ echo ===============================================================
 echo   AtlasBot v2 is running!
 echo ===============================================================
 echo.
-echo   Frontend:   http://localhost:5173
+echo   Frontend:   http://localhost:8080
 echo   Backend:    http://localhost:3001
 echo   API Health: http://localhost:3001/health
 echo   Status:     http://localhost:3001/api/status
@@ -131,7 +131,7 @@ taskkill /F /FI "WindowTitle eq AtlasBot Frontend*" >nul 2>nul
 for /f "tokens=5" %%a in ('netstat -aon ^| findstr :3001 ^| findstr LISTENING') do (
     taskkill /F /PID %%a >nul 2>nul
 )
-for /f "tokens=5" %%a in ('netstat -aon ^| findstr :5173 ^| findstr LISTENING') do (
+for /f "tokens=5" %%a in ('netstat -aon ^| findstr :8080 ^| findstr LISTENING') do (
     taskkill /F /PID %%a >nul 2>nul
 )
 echo AtlasBot stopped.

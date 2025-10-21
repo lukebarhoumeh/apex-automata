@@ -1,7 +1,7 @@
 // Trading API Service - connects frontend to Atlas backend
 
-const API_URL = 'http://localhost:3001';
-const WS_URL = 'ws://localhost:3001';
+const API_URL = import.meta.env.VITE_RUNTIME_API_URL || 'http://localhost:3001';
+const WS_URL = API_URL.replace('http://', 'ws://').replace('https://', 'wss://');
 
 export interface TradingEngineStatus {
   engineRunning: boolean;
@@ -72,8 +72,9 @@ class TradingApiService {
   }
 
   private handleMessage(message: any) {
-    const { type, data } = message;
-    this.emit(type, data);
+    const { type, data, payload } = message;
+    // Backend sends payload, not data
+    this.emit(type, payload || data);
   }
 
   private emit(event: string, data: any) {

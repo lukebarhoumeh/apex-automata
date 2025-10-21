@@ -1,0 +1,79 @@
+account:
+  equity_usd: 10000
+  risk_per_trade: 0.01
+  max_open_positions: 2
+  max_account_leverage: 3.0
+  min_notional_buffer: 1.1
+
+risk:
+  daily_loss_limit: -0.008
+  weekly_loss_limit: -0.025
+  max_drawdown_limit: -0.1
+  max_position_exposure_pct: 0.5
+  funding_cost_tolerance_bps: 20
+  slippage_estimate_bps: 3
+
+strategy:
+  mode: momentum_futures
+  donchian_len: 20
+  ema_len_1h: 100
+  atr_len_15m: 20
+  atr_entry_band:
+    - 0.005
+    - 0.025
+  stop_init_atr: 1.5
+  stop_trail_atr: 1.0
+  time_stop_bars: 96
+  allow_short: true
+  trade_cooldown_min: 15
+
+execution:
+  order_type: marketable_limit
+  price_offset_ticks: 2
+  max_slippage_bps: 5
+  order_timeout_sec: 5
+  retry_backoff_ms:
+    - 100
+    - 500
+    - 1000
+    - 5000
+    - 30000
+
+circuit_breakers:
+  rapid_loss_trigger: -0.003
+  fill_rate_collapse: 0.1
+  adverse_selection_spike: 0.6
+  correlation_spike: 0.8
+  vol_spike_atr: 0.03
+  data_gap_sec: 2
+
+filters:
+  atr_volatility_min: 0.005
+  atr_volatility_max: 0.025
+  funding_bias_enabled: true
+  time_filter_enabled: true
+  allowed_hours_utc:
+    - 0
+    - 23
+
+compliance:
+  tax_method: FIFO
+  export_frequency_days: 7
+  log_level: INFO
+  audit_trail_enabled: true
+  flatten_on_shutdown: true
+
+ui:
+  heartbeat_sec: 15
+  show_pnl_per_symbol: true
+  show_risk_status: true
+  kill_switch_button: true
+  alert_channels:
+    - telegram
+    - email
+
+go_live_criteria:
+  paper_parity_max_diff_bps: 20
+  min_profitable_days: 3
+  max_error_count_per_day: 0
+  manual_approval_required: true

@@ -1,10 +1,10 @@
 import { DollarSign, TrendingUp, Activity, AlertCircle, Percent, Zap } from "lucide-react";
 import { MetricsGrid } from "./MetricsGrid";
-import { useAccountMetrics } from "@/hooks/useAccountMetrics";
+import { useCalculatedMetrics } from "@/hooks/useCalculatedMetrics";
 import { SkeletonCard } from "@/components/ui/skeleton-card";
 
 export const MetricsGridConnected = () => {
-  const { data: metrics, isLoading } = useAccountMetrics();
+  const { data: metrics, isLoading } = useCalculatedMetrics();
 
   if (isLoading) {
     return (

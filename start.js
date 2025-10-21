@@ -226,7 +226,7 @@ function cleanup() {
   // Kill processes on ports
   Promise.all([
     killPort(3001),
-    killPort(8080),
+    killPort(5173),
   ]).then(() => {
     log.success('AtlasBot stopped');
     process.exit(0);
@@ -260,7 +260,7 @@ async function start() {
     // Free ports
     log.info('Checking ports...');
     await killPort(3001);
-    await killPort(8080);
+    await killPort(5173);
     
     // Start backend
     log.info('Starting backend API...');
@@ -278,13 +278,13 @@ async function start() {
     frontendProcess = startProcess(pnpmCmd, ['dev'], __dirname, 'frontend.log');
     
     // Wait for frontend
-    await waitForService('http://localhost:8080', 'Frontend');
+    await waitForService('http://localhost:5173', 'Frontend');
     
     // Success!
     console.log('\n' + colors.green + '═'.repeat(60) + colors.reset);
     console.log(colors.green + '  🎉 AtlasBot v2 is running!' + colors.reset);
     console.log(colors.green + '═'.repeat(60) + colors.reset);
-    console.log('\n  📊 Frontend:   http://localhost:8080');
+    console.log('\n  📊 Frontend:   http://localhost:5173');
     console.log('  🔧 Backend:    http://localhost:3001');
     console.log('  📝 API Health: http://localhost:3001/health');
     console.log('  📈 Status:     http://localhost:3001/api/status');

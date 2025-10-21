@@ -7,6 +7,7 @@ import { loadEnv } from '@/core/env';
 import { createLogger } from '@/core/logger';
 import { TradingEngine, TradingEngineConfig } from '@/trading/trading-engine';
 import { SignalProcessor } from '@/strategies/signal-processor';
+import { loadGuardrails } from '@/config/loadGuardrails';
 
 async function main() {
   const argv = await yargs(hideBin(process.argv))
@@ -33,6 +34,7 @@ async function main() {
 
   const env = loadEnv(atlasRoot);
   const cfg = loadConfig(configPath);
+  const guardrails = loadGuardrails(atlasRoot);
 
   const logger = createLogger(path.join(atlasRoot, 'var/logs/atlas_app.jsonl'));
 
@@ -58,7 +60,8 @@ async function main() {
     },
     security: {
       encryptionKey: env.ENCRYPTION_KEY || ''
-    }
+    },
+    guardrails
   };
 
   // Create and start trading engine

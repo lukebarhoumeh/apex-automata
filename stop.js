@@ -13,7 +13,7 @@ const isWindows = os.platform() === 'win32';
 console.log('🛑 Stopping AtlasBot v2...\n');
 
 // Kill processes on ports
-const ports = [3001, 8080];
+const ports = [3001, 5173];
 
 if (isWindows) {
   // Windows

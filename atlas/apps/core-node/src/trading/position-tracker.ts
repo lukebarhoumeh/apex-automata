@@ -312,63 +312,13 @@ export class PositionTracker extends EventEmitter {
 
   // Persist position to database
   private async persistPosition(position: Position): Promise<void> {
-    try {
-      const { error } = await this.supabase
-        .from('positions')
-        .upsert({
-          id: position.id,
-          symbol: position.symbol,
-          side: position.side,
-          size: position.size,
-          average_price: position.averagePrice,
-          market_price: position.marketPrice,
-          unrealized_pnl: position.unrealizedPnL,
-          realized_pnl: position.realizedPnL,
-          total_pnl: position.totalPnL,
-          open_time: position.openTime.toISOString(),
-          last_update_time: position.lastUpdateTime.toISOString(),
-          max_size: position.maxSize,
-          max_drawdown: position.maxDrawdown,
-          trade_count: position.trades.length,
-          metadata: position.metadata || {},
-          updated_at: new Date().toISOString()
-        });
-
-      if (error) {
-        this.logger.error('Failed to persist position:', error);
-      }
-
-      // Also persist trades
-      for (const trade of position.trades) {
-        await this.persistTrade(position.id, trade);
-      }
-    } catch (error) {
-      this.logger.error('Error persisting position:', error);
-    }
+    // Persistence is handled by the API layer when positions are broadcast.
+    return;
   }
 
   private async persistTrade(positionId: string, trade: Trade): Promise<void> {
-    try {
-      const { error } = await this.supabase
-        .from('trades')
-        .upsert({
-          id: trade.id,
-          position_id: positionId,
-          order_id: trade.orderId,
-          side: trade.side,
-          size: trade.size,
-          price: trade.price,
-          fee: trade.fee,
-          realized_pnl: trade.realizedPnL || 0,
-          timestamp: trade.timestamp.toISOString()
-        });
-
-      if (error) {
-        this.logger.error('Failed to persist trade:', error);
-      }
-    } catch (error) {
-      this.logger.error('Error persisting trade:', error);
-    }
+    // Persistence is handled by the API layer when fills are processed.
+    return;
   }
 
   // Get current positions

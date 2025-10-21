@@ -2,10 +2,12 @@ import path from 'node:path';
 import { createLogger } from '../core/logger';
 import { loadEnv } from '../core/env';
 import { TradingEngine, TradingEngineConfig } from '../trading/trading-engine';
+import { loadGuardrails } from '../config/loadGuardrails';
 
 async function main() {
   const atlasRoot = path.resolve(process.cwd(), '../../');
   const env = loadEnv(path.resolve(atlasRoot));
+  const guardrails = loadGuardrails(atlasRoot);
   const logger = createLogger(path.join(atlasRoot, 'var/logs/diagnose.jsonl'));
 
   logger.info('Starting diagnostics');
@@ -28,7 +30,8 @@ async function main() {
       serviceKey: env.SUPABASE_SERVICE_KEY || '',
       anonKey: env.SUPABASE_ANON_KEY || ''
     },
-    security: { encryptionKey: env.ENCRYPTION_KEY || '00000000000000000000000000000000' }
+    security: { encryptionKey: env.ENCRYPTION_KEY || '00000000000000000000000000000000' },
+    guardrails
   };
 
   const engine = new TradingEngine(engineConfig, logger);
@@ -59,5 +62,4 @@ main().catch((err) => {
   console.error(JSON.stringify({ ok: false, error: String(err) }));
   process.exit(1);
 });
-
 

@@ -1,4 +1,4 @@
-import axios, { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
+import axios, { AxiosInstance, AxiosResponse, InternalAxiosRequestConfig } from 'axios';
 import crypto from 'crypto';
 import { Logger } from '../../core/logger';
 import {
@@ -56,7 +56,7 @@ export class CoinbaseRestClient {
     );
   }
 
-  private addAuthHeaders(config: AxiosRequestConfig): AxiosRequestConfig {
+  private addAuthHeaders(config: InternalAxiosRequestConfig): InternalAxiosRequestConfig {
     const timestamp = Date.now() / 1000;
     const method = config.method?.toUpperCase() || 'GET';
     const path = config.url || '';
@@ -75,13 +75,22 @@ export class CoinbaseRestClient {
     const signature = hmac.update(what).digest('base64');
 
     // Add headers
-    config.headers = {
-      ...config.headers,
-      'CB-ACCESS-KEY': this.credentials.key,
-      'CB-ACCESS-SIGN': signature,
-      'CB-ACCESS-TIMESTAMP': timestamp.toString(),
-      'CB-ACCESS-PASSPHRASE': this.credentials.passphrase || ''
-    };
+    const headers = config.headers;
+    if (headers && typeof (headers as any).set === 'function') {
+      const axiosHeaders = headers as any;
+      axiosHeaders.set('CB-ACCESS-KEY', this.credentials.key);
+      axiosHeaders.set('CB-ACCESS-SIGN', signature);
+      axiosHeaders.set('CB-ACCESS-TIMESTAMP', timestamp.toString());
+      axiosHeaders.set('CB-ACCESS-PASSPHRASE', this.credentials.passphrase || '');
+    } else {
+      config.headers = {
+        ...(headers ?? {}),
+        'CB-ACCESS-KEY': this.credentials.key,
+        'CB-ACCESS-SIGN': signature,
+        'CB-ACCESS-TIMESTAMP': timestamp.toString(),
+        'CB-ACCESS-PASSPHRASE': this.credentials.passphrase || ''
+      } as any;
+    }
 
     return config;
   }

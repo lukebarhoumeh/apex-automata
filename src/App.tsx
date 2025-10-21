@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/AppSidebar";
+import { AuthProvider } from "@/contexts/AuthContext";
 import Index from "./pages/Index";
 import Orders from "./pages/Orders";
 import Signals from "./pages/Signals";
@@ -15,7 +16,8 @@ import NotFound from "./pages/NotFound";
 const App = () => {
   return (
     <BrowserRouter>
-      <SidebarProvider>
+      <AuthProvider>
+        <SidebarProvider>
         <div className="flex min-h-screen w-full">
           <AppSidebar />
           <div className="flex-1 flex flex-col">
@@ -42,6 +44,7 @@ const App = () => {
           </div>
         </div>
       </SidebarProvider>
+      </AuthProvider>
     </BrowserRouter>
   );
 };

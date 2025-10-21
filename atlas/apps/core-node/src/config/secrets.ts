@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
+import type { CipherGCM, DecipherGCM } from 'crypto';
 import { Logger } from '../core/logger';
 
 export interface SecretConfig {
@@ -37,7 +38,7 @@ export class SecretManager {
   // Encrypt sensitive data
   private encrypt(text: string): { encrypted: string; iv: string; tag: string } {
     const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv(this.algorithm, this.encryptionKey, iv);
+    const cipher = crypto.createCipheriv(this.algorithm, this.encryptionKey, iv) as CipherGCM;
     
     let encrypted = cipher.update(text, 'utf8', 'hex');
     encrypted += cipher.final('hex');
@@ -57,7 +58,7 @@ export class SecretManager {
       this.algorithm,
       this.encryptionKey,
       Buffer.from(iv, 'hex')
-    );
+    ) as DecipherGCM;
     
     decipher.setAuthTag(Buffer.from(tag, 'hex'));
     

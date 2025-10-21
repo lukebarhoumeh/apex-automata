@@ -60,13 +60,27 @@ Runtime flow:
 Create `.env` at repo root:
 
 ```
+# Frontend Environment Variables
 VITE_RUNTIME_API_URL=http://localhost:3001
+
+# Backend Environment Variables
+SUPABASE_URL=https://gdrdaajvutmewgxbjurk.supabase.co
+SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdkcmRhYWp2dXRtZXdneGJqdXJrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjAzNjAzOTcsImV4cCI6MjA3NTkzNjM5N30.SdShP29qp-N5gPtpKC3rA7eqMtsKhn-3QIyPMup6Q5I
+
+# IMPORTANT: Add your Supabase Service Role Key here
+# You can find it in your Supabase dashboard under Settings > API
+SUPABASE_SERVICE_KEY=your_service_role_key_here
+
+# Trading Configuration
 CONFIRM_LIVE=NO
 
-# Backend runtime (atlas/apps/core-node)
-SUPABASE_URL=YOUR_SUPABASE_URL
-SUPABASE_SERVICE_KEY=YOUR_SERVICE_ROLE_KEY
-SUPABASE_ANON_KEY=YOUR_ANON_KEY
+# Fixed USER_ID for single-user MVP
+USER_ID=b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f
+
+# Optional: Coinbase API credentials (for live trading)
+# COINBASE_API_KEY=
+# COINBASE_API_SECRET=
+# COINBASE_API_PASSPHRASE=
 ENCRYPTION_KEY=32-byte-hex-or-strong-secret
 ```
 
@@ -136,7 +150,7 @@ pnpm build
 pnpm api
 ```
 
-Open the app at `http://localhost:5173` (default Vite dev port).
+Open the app at `http://localhost:8080` (configured Vite port).
 
 ---
 

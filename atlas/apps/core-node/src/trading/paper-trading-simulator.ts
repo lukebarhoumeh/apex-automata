@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
-import { OrderRequest, OrderResponse, OrderStatus, Fill, Ticker } from '../exchanges/coinbase/types';
+import { OrderRequest, Fill, Ticker } from '../exchanges/coinbase/types';
 import { v4 as uuidv4 } from 'uuid';
 
 export interface PaperTradingConfig {
@@ -16,15 +16,32 @@ interface SimulatedOrder {
   clientOrderId: string;
   productId: string;
   side: 'buy' | 'sell';
-  type: 'limit' | 'market';
+  type: 'limit' | 'market' | 'stop';
   size: number;
   price?: number;
-  status: OrderStatus;
+  status: SimulatedOrderStatus;
   filledSize: number;
   executedValue: number;
   createdAt: Date;
   updatedAt: Date;
   fills: Fill[];
+}
+
+type SimulatedOrderStatus = 'pending' | 'open' | 'done' | 'cancelled' | 'rejected';
+
+interface PaperOrderResponse {
+  id: string;
+  product_id: string;
+  side: 'buy' | 'sell';
+  type: 'limit' | 'market' | 'stop';
+  size: string;
+  price?: string;
+  status: SimulatedOrderStatus;
+  filled_size: string;
+  executed_value: string;
+  created_at: string;
+  fill_fees: string;
+  settled: boolean;
 }
 
 export class PaperTradingSimulator extends EventEmitter {
@@ -78,7 +95,7 @@ export class PaperTradingSimulator extends EventEmitter {
   /**
    * Place an order
    */
-  public async placeOrder(request: OrderRequest): Promise<OrderResponse> {
+  public async placeOrder(request: OrderRequest): Promise<PaperOrderResponse> {
     // Simulate network latency
     await new Promise(resolve => setTimeout(resolve, this.config.latencyMs));
 
@@ -92,14 +109,20 @@ export class PaperTradingSimulator extends EventEmitter {
     }
 
     // Create simulated order
+    const rawSize = request.size ? parseFloat(request.size) : 0;
+    if (!Number.isFinite(rawSize) || rawSize <= 0) {
+      throw new Error('Invalid order size');
+    }
+    const parsedPrice = request.price !== undefined ? parseFloat(request.price) : undefined;
+
     const order: SimulatedOrder = {
       id: orderId,
       clientOrderId: request.client_oid || uuidv4(),
       productId: request.product_id,
       side: request.side,
       type: request.type,
-      size: parseFloat(request.size),
-      price: request.price ? parseFloat(request.price) : undefined,
+      size: rawSize,
+      price: parsedPrice,
       status: request.type === 'market' ? 'pending' : 'open',
       filledSize: 0,
       executedValue: 0,
@@ -122,13 +145,13 @@ export class PaperTradingSimulator extends EventEmitter {
     }
 
     // Return order response
-    const response: OrderResponse = {
+    const response: PaperOrderResponse = {
       id: order.id,
       product_id: order.productId,
       side: order.side,
       type: order.type,
       size: order.size.toString(),
-      price: order.price?.toString(),
+      price: order.price !== undefined ? order.price.toString() : undefined,
       status: order.status,
       filled_size: order.filledSize.toString(),
       executed_value: order.executedValue.toString(),
@@ -143,7 +166,7 @@ export class PaperTradingSimulator extends EventEmitter {
       side: order.side,
       type: order.type,
       size: order.size,
-      price: order.price,
+      price: order.price ?? null,
       status: order.status
     });
 
@@ -180,7 +203,7 @@ export class PaperTradingSimulator extends EventEmitter {
   /**
    * Get all orders
    */
-  public getOrders(productId?: string, status?: OrderStatus[]): SimulatedOrder[] {
+  public getOrders(productId?: string, status?: SimulatedOrderStatus[]): SimulatedOrder[] {
     let orders = Array.from(this.orders.values());
     
     if (productId) {
@@ -199,8 +222,13 @@ export class PaperTradingSimulator extends EventEmitter {
    */
   private validateOrder(request: OrderRequest): { valid: boolean; reason?: string } {
     const [baseCurrency, quoteCurrency] = request.product_id.split('-');
-    const size = parseFloat(request.size);
-    const price = request.price ? parseFloat(request.price) : this.marketPrices.get(request.product_id) || 0;
+    const size = request.size ? parseFloat(request.size) : 0;
+    if (!Number.isFinite(size) || size <= 0) {
+      return { valid: false, reason: 'Order size must be greater than zero' };
+    }
+    const price = request.price !== undefined
+      ? parseFloat(request.price)
+      : this.marketPrices.get(request.product_id) || 0;
 
     if (request.side === 'buy') {
       // Check quote currency balance
@@ -245,8 +273,9 @@ export class PaperTradingSimulator extends EventEmitter {
       : marketPrice * (1 - this.config.slippage);
 
     // Create fill
+    const fillId = ++this.fillSequence;
     const fill: Fill = {
-      trade_id: `fill_${++this.fillSequence}`,
+      trade_id: fillId,
       product_id: order.productId,
       order_id: order.id,
       user_id: 'paper_trader',
@@ -257,7 +286,8 @@ export class PaperTradingSimulator extends EventEmitter {
       fee: (order.size * executionPrice * this.config.takerFee).toString(),
       side: order.side,
       settled: true,
-      created_at: new Date().toISOString()
+      created_at: new Date().toISOString(),
+      usd_volume: (order.size * executionPrice).toString()
     };
 
     // Update order
@@ -273,7 +303,7 @@ export class PaperTradingSimulator extends EventEmitter {
     // Emit fill event
     this.emit('fill', fill);
 
-    this.logger.info('Paper market order executed', {
+    this.logger.info('PAPER: Simulated market fill', {
       orderId: order.id,
       price: executionPrice,
       size: order.size,
@@ -289,30 +319,33 @@ export class PaperTradingSimulator extends EventEmitter {
       return;
     }
 
-    const canFill = (order.side === 'buy' && marketPrice <= order.price) ||
-                   (order.side === 'sell' && marketPrice >= order.price);
+    const limitPrice = order.price ?? marketPrice;
+    const canFill = (order.side === 'buy' && marketPrice <= limitPrice) ||
+                   (order.side === 'sell' && marketPrice >= limitPrice);
 
     if (canFill) {
       // Create fill at limit price (maker)
+      const fillId = ++this.fillSequence;
       const fill: Fill = {
-        trade_id: `fill_${++this.fillSequence}`,
+        trade_id: fillId,
         product_id: order.productId,
         order_id: order.id,
         user_id: 'paper_trader',
         profile_id: 'default',
         liquidity: 'M', // Maker
-        price: order.price.toString(),
+        price: limitPrice.toString(),
         size: order.size.toString(),
-        fee: (order.size * order.price * this.config.makerFee).toString(),
+        fee: (order.size * limitPrice * this.config.makerFee).toString(),
         side: order.side,
         settled: true,
-        created_at: new Date().toISOString()
+        created_at: new Date().toISOString(),
+        usd_volume: (order.size * limitPrice).toString()
       };
 
       // Update order
       order.fills.push(fill);
       order.filledSize = order.size;
-      order.executedValue = order.size * order.price;
+      order.executedValue = order.size * limitPrice;
       order.status = 'done';
       order.updatedAt = new Date();
 
@@ -322,9 +355,9 @@ export class PaperTradingSimulator extends EventEmitter {
       // Emit fill event
       this.emit('fill', fill);
 
-      this.logger.info('Paper limit order filled', {
+      this.logger.info('PAPER: Simulated limit fill', {
         orderId: order.id,
-        price: order.price,
+        price: limitPrice,
         size: order.size,
         side: order.side
       });
@@ -336,7 +369,7 @@ export class PaperTradingSimulator extends EventEmitter {
    */
   private checkLimitOrders(productId: string, marketPrice: number): void {
     for (const order of this.orders.values()) {
-      if (order.productId === productId && order.type === 'limit' && order.status === 'open') {
+      if (order.productId === productId && order.status === 'open' && order.type !== 'market') {
         this.checkLimitOrderFill(order, marketPrice);
       }
     }
@@ -347,6 +380,10 @@ export class PaperTradingSimulator extends EventEmitter {
    */
   private updateBalances(order: SimulatedOrder, fill: Fill): void {
     const [baseCurrency, quoteCurrency] = order.productId.split('-');
+    if (!baseCurrency || !quoteCurrency) {
+      this.logger.warn('Unable to update balances: invalid product id', { productId: order.productId });
+      return;
+    }
     const fillSize = parseFloat(fill.size);
     const fillPrice = parseFloat(fill.price);
     const fee = parseFloat(fill.fee);

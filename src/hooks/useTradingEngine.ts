@@ -55,6 +55,7 @@ export const useTradingEngine = () => {
       try {
         await tradingApi.getStatus();
         setState(prev => ({ ...prev, backendAvailable: true }));
+        console.log('Backend API available');
       } catch (error) {
         setState(prev => ({ ...prev, backendAvailable: false }));
         console.log('Backend not available - UI will use Supabase data only');
@@ -107,27 +108,30 @@ export const useTradingEngine = () => {
       })
     );
 
-    // Engine status
+    // Engine status - backend sends StatusUpdate
     unsubscribers.push(
-      tradingApi.on('status', (data: any) => {
+      tradingApi.on('StatusUpdate', (status: any) => {
+        console.log('Received StatusUpdate:', status);
         setState(prev => ({
           ...prev,
-          engineRunning: data.engineRunning,
-          mode: data.mode || null,
+          engineRunning: status.mode !== null && !status.paused,
+          mode: status.mode || null,
         }));
       })
     );
 
-    // Market data - debounced
+    // Market data - backend sends TickerUpdate
     unsubscribers.push(
-      tradingApi.on('ticker', (ticker: any) => {
+      tradingApi.on('TickerUpdate', (ticker: any) => {
+        console.log('Received TickerUpdate:', ticker);
         updateTicker(ticker);
       })
     );
 
-    // Trading signals
+    // Trading signals - backend sends Signal
     unsubscribers.push(
-      tradingApi.on('signal', (signal: any) => {
+      tradingApi.on('Signal', (signal: any) => {
+        console.log('Received Signal:', signal);
         setState(prev => ({ ...prev, lastSignal: signal }));
         toast({
           title: `${signal.strategy} Signal`,
@@ -136,9 +140,10 @@ export const useTradingEngine = () => {
       })
     );
 
-    // Orders
+    // Orders - backend sends OrderUpdate
     unsubscribers.push(
-      tradingApi.on('order:created', (order: any) => {
+      tradingApi.on('OrderUpdate', (order: any) => {
+        console.log('Received OrderUpdate:', order);
         setState(prev => ({ ...prev, lastOrder: order }));
         toast({
           title: "Order Placed",
@@ -147,30 +152,34 @@ export const useTradingEngine = () => {
       })
     );
 
+    // Fills - backend sends Fill
     unsubscribers.push(
-      tradingApi.on('order:filled', ({ order, fill }: any) => {
+      tradingApi.on('Fill', (fill: any) => {
+        console.log('Received Fill:', fill);
         toast({
           title: "Order Filled",
-          description: `${order.side} ${fill.size} ${order.product} @ ${fill.price}`,
+          description: `Filled ${fill.quantity} @ ${fill.price}`,
           variant: "default",
         });
       })
     );
 
-    // Positions
+    // Positions - backend sends PositionUpdate
     unsubscribers.push(
-      tradingApi.on('position:update', (position: any) => {
+      tradingApi.on('PositionUpdate', (position: any) => {
+        console.log('Received PositionUpdate:', position);
         setState(prev => ({ ...prev, lastPosition: position }));
       })
     );
 
-    // Risk alerts
+    // Risk alerts - backend sends RiskEvent
     unsubscribers.push(
-      tradingApi.on('risk:alert', (alert: any) => {
+      tradingApi.on('RiskEvent', (alert: any) => {
+        console.log('Received RiskEvent:', alert);
         setState(prev => ({ ...prev, lastAlert: alert }));
         toast({
           title: "Risk Alert",
-          description: JSON.stringify(alert),
+          description: alert.message || JSON.stringify(alert),
           variant: "destructive",
         });
       })

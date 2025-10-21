@@ -11,6 +11,9 @@ export class TechnicalIndicators {
   // Simple Moving Average
   public static SMA(data: number[], period: number): number[] {
     const result: number[] = [];
+    if (period <= 0 || data.length < period) {
+      return result;
+    }
     
     for (let i = period - 1; i < data.length; i++) {
       let sum = 0;
@@ -26,6 +29,9 @@ export class TechnicalIndicators {
   // Exponential Moving Average
   public static EMA(data: number[], period: number): number[] {
     const result: number[] = [];
+    if (period <= 0 || data.length < period) {
+      return result;
+    }
     const multiplier = 2 / (period + 1);
     
     // Start with SMA
@@ -47,6 +53,9 @@ export class TechnicalIndicators {
   // Relative Strength Index
   public static RSI(data: number[], period: number = 14): number[] {
     const result: number[] = [];
+    if (data.length <= period) {
+      return result;
+    }
     const gains: number[] = [];
     const losses: number[] = [];
     
@@ -87,6 +96,10 @@ export class TechnicalIndicators {
     slowPeriod: number = 26,
     signalPeriod: number = 9
   ): { macd: number[]; signal: number[]; histogram: number[] } {
+    if (data.length < Math.max(fastPeriod, slowPeriod)) {
+      return { macd: [], signal: [], histogram: [] };
+    }
+
     const fastEMA = this.EMA(data, fastPeriod);
     const slowEMA = this.EMA(data, slowPeriod);
     
@@ -94,17 +107,32 @@ export class TechnicalIndicators {
     const macd: number[] = [];
     const offset = slowPeriod - fastPeriod;
     for (let i = 0; i < slowEMA.length; i++) {
-      macd.push(fastEMA[i + offset] - slowEMA[i]);
+      const fastIndex = i + offset;
+      if (fastIndex < 0 || fastIndex >= fastEMA.length) {
+        continue;
+      }
+      macd.push(fastEMA[fastIndex] - slowEMA[i]);
+    }
+
+    if (macd.length === 0) {
+      return { macd: [], signal: [], histogram: [] };
     }
     
     // Calculate signal line
     const signal = this.EMA(macd, signalPeriod);
+    if (signal.length === 0) {
+      return { macd, signal, histogram: [] };
+    }
     
     // Calculate histogram
     const histogram: number[] = [];
     const signalOffset = signalPeriod - 1;
     for (let i = 0; i < signal.length; i++) {
-      histogram.push(macd[i + signalOffset] - signal[i]);
+      const macdIndex = i + signalOffset;
+      if (macdIndex >= macd.length) {
+        break;
+      }
+      histogram.push(macd[macdIndex] - signal[i]);
     }
     
     return { macd, signal, histogram };
@@ -116,6 +144,9 @@ export class TechnicalIndicators {
     period: number = 20,
     stdDev: number = 2
   ): { upper: number[]; middle: number[]; lower: number[] } {
+    if (data.length < period) {
+      return { upper: [], middle: [], lower: [] };
+    }
     const middle = this.SMA(data, period);
     const upper: number[] = [];
     const lower: number[] = [];
@@ -138,6 +169,9 @@ export class TechnicalIndicators {
   // VWAP (Volume Weighted Average Price)
   public static VWAP(candles: OHLCV[]): number[] {
     const result: number[] = [];
+    if (candles.length === 0) {
+      return result;
+    }
     let cumulativeTPV = 0;
     let cumulativeVolume = 0;
     
@@ -168,6 +202,9 @@ export class TechnicalIndicators {
   // ATR (Average True Range)
   public static ATR(candles: OHLCV[], period: number = 14): number[] {
     const trueRanges: number[] = [];
+    if (candles.length <= 1) {
+      return [];
+    }
     
     // Calculate true ranges
     for (let i = 1; i < candles.length; i++) {
@@ -190,6 +227,9 @@ export class TechnicalIndicators {
     const upper: number[] = [];
     const lower: number[] = [];
     const middle: number[] = [];
+    if (candles.length < period) {
+      return { upper, lower, middle };
+    }
     
     for (let i = period - 1; i < candles.length; i++) {
       let highest = -Infinity;
@@ -211,6 +251,9 @@ export class TechnicalIndicators {
   // Standard Deviation
   public static StandardDeviation(data: number[], period: number): number[] {
     const result: number[] = [];
+    if (period <= 0 || data.length < period) {
+      return result;
+    }
     const sma = this.SMA(data, period);
     
     for (let i = period - 1; i < data.length; i++) {
@@ -227,6 +270,9 @@ export class TechnicalIndicators {
   // Volume analysis
   public static VolumeProfile(candles: OHLCV[], bins: number = 20): Map<number, number> {
     const profile = new Map<number, number>();
+    if (candles.length === 0 || bins <= 0) {
+      return profile;
+    }
     
     // Find price range
     let minPrice = Infinity;
@@ -237,6 +283,9 @@ export class TechnicalIndicators {
     }
     
     const binSize = (maxPrice - minPrice) / bins;
+    if (binSize === 0) {
+      return profile;
+    }
     
     // Initialize bins
     for (let i = 0; i < bins; i++) {
@@ -263,6 +312,9 @@ export class TechnicalIndicators {
   ): { support: number[]; resistance: number[] } {
     const support: number[] = [];
     const resistance: number[] = [];
+    if (candles.length < lookback * 2 + 1) {
+      return { support, resistance };
+    }
     
     for (let i = lookback; i < candles.length - lookback; i++) {
       let isSupport = true;
