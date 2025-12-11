@@ -6,6 +6,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { useTradingEngine } from "@/hooks/useTradingEngine";
+import { useLiveTicker } from "@/hooks/useLiveTicker";
 import { useState } from "react";
 import { CandleChart } from "./CandleChart";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -16,14 +17,16 @@ interface ChartSectionProps {
 
 export const ChartSection = ({ symbol = "BTC-USD" }: ChartSectionProps) => {
   const { lastTicker } = useTradingEngine();
+  const { primaryTicker, isConnected: wsConnected, primaryCandles } = useLiveTicker([symbol]);
   const [timeframe, setTimeframe] = useState<"1m" | "5m" | "15m">("1m");
   const [showVwap, setShowVwap] = useState(true);
   const [showDonchian, setShowDonchian] = useState(true);
   
-  // Extract live price data from ticker
-  const livePrice = lastTicker?.price || lastTicker?.last;
+  // Prefer WebSocket live data, fallback to useTradingEngine polling
+  const livePrice = primaryTicker?.price || lastTicker?.price || lastTicker?.last;
   const vwap = lastTicker?.vwap;
   const atr = lastTicker?.atr;
+  const spread = primaryTicker ? ((primaryTicker.ask - primaryTicker.bid) / primaryTicker.price * 100).toFixed(3) : null;
   
   // Fallback to mock data if no live data
   const displayPrice = livePrice ? Number(livePrice).toFixed(2) : "—";
@@ -37,13 +40,19 @@ export const ChartSection = ({ symbol = "BTC-USD" }: ChartSectionProps) => {
           <div className="flex items-center gap-3">
             <Activity className="h-5 w-5 text-primary" />
             <CardTitle className="text-lg">{symbol}</CardTitle>
-            {lastTicker && (
-              <Badge variant="outline" className="text-xs bg-success/10 border-success/40 animate-pulse-glow">
-                LIVE
+            {(wsConnected || lastTicker) && (
+              <Badge variant="outline" className={`text-xs animate-pulse-glow ${wsConnected ? 'bg-success/10 border-success/40' : 'bg-warning/10 border-warning/40'}`}>
+                {wsConnected ? 'WS LIVE' : 'POLLING'}
+              </Badge>
+            )}
+            {spread && (
+              <Badge variant="outline" className="text-xs bg-card">
+                <span className="text-muted-foreground">Spread:</span>
+                <span className="ml-1 font-mono">{spread}%</span>
               </Badge>
             )}
             <div className="flex items-center gap-2">
-              <Tabs value={timeframe} onValueChange={(v) => setTimeframe(v as any)} className="w-auto">
+              <Tabs value={timeframe} onValueChange={(v) => setTimeframe(v as typeof timeframe)} className="w-auto">
                 <TabsList className="h-8 bg-muted/50">
                   <TabsTrigger value="1m" className="text-xs h-7">1m</TabsTrigger>
                   <TabsTrigger value="5m" className="text-xs h-7">5m</TabsTrigger>
@@ -115,6 +124,7 @@ export const ChartSection = ({ symbol = "BTC-USD" }: ChartSectionProps) => {
               timeframe={timeframe}
               showVwap={showVwap}
               showDonchian={showDonchian}
+              liveCandles={primaryCandles}
             />
           </div>
           

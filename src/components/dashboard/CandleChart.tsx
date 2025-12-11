@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useMemo } from "react";
 import { useTradingEngine } from "@/hooks/useTradingEngine";
-import { useRecentSignals, type Signal } from "@/hooks/useSignals";
+import { useRecentSignals } from "@/hooks/useSignals";
+import type { LiveCandle } from "@/hooks/useLiveTicker";
 
 interface Candle {
   time: number;
@@ -18,6 +19,7 @@ interface CandleChartProps {
   showVwap?: boolean;
   showDonchian?: boolean;
   donchianPeriod?: number;
+  liveCandles?: LiveCandle[];
 }
 
 export const CandleChart = ({ 
@@ -26,7 +28,8 @@ export const CandleChart = ({
   timeframe = "1m",
   showVwap = true,
   showDonchian = true,
-  donchianPeriod = 20 
+  donchianPeriod = 20,
+  liveCandles = []
 }: CandleChartProps) => {
   const { lastTicker } = useTradingEngine();
   const { data: recentSignals } = useRecentSignals(20);
@@ -43,8 +46,18 @@ export const CandleChart = ({
     }
   }, [timeframe]);
 
-  // Process ticker into candles
+  // Merge live WebSocket candles with polling-based candles
   useEffect(() => {
+    if (liveCandles.length > 0) {
+      // Use WebSocket candles as source of truth
+      setCandles(liveCandles);
+      return;
+    }
+  }, [liveCandles]);
+
+  // Process ticker into candles (fallback when no WS candles)
+  useEffect(() => {
+    if (liveCandles.length > 0) return; // Skip if WS provides candles
     if (!lastTicker?.price) return;
     
     const price = parseFloat(lastTicker.price);
@@ -80,7 +93,7 @@ export const CandleChart = ({
 
       return updated;
     });
-  }, [lastTicker, tfMs]);
+  }, [lastTicker, tfMs, liveCandles.length]);
 
   // Calculate indicators
   const { vwap, donchianHigh, donchianLow } = useMemo(() => {
