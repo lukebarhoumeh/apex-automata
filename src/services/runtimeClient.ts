@@ -15,6 +15,11 @@ export interface RuntimeStatus {
   restLatencyMs: number;
   spreadPctile: number;
   regime: 'trend' | 'chop';
+  // Warmup & symbols info (L1-4)
+  warmupComplete?: boolean;
+  candlesBuffered?: number;
+  requiredWarmup?: number;
+  symbols?: string[];
 }
 
 export interface RiskConfig {

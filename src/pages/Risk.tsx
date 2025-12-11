@@ -6,13 +6,16 @@ import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { useRiskSettings } from "@/hooks/useRiskSettings";
-import { Shield, AlertTriangle, TrendingDown, Save, Calculator } from "lucide-react";
+import { useActiveRiskEvents } from "@/hooks/useRiskEvents";
+import { RiskEventsTable } from "@/components/dashboard/RiskEventsTable";
+import { Shield, AlertTriangle, TrendingDown, Save, Calculator, Activity } from "lucide-react";
 import { useState, useEffect } from "react";
 import { useToast } from "@/hooks/use-toast";
 
 const Risk = () => {
   const { toast } = useToast();
   const { data: settings, isLoading } = useRiskSettings();
+  const { data: activeRiskEvents } = useActiveRiskEvents();
   const [hasChanges, setHasChanges] = useState(false);
 
   // Local state for form
@@ -292,20 +295,23 @@ const Risk = () => {
         {/* Active Risk Events */}
         <Card className="lg:col-span-3">
           <CardHeader>
-            <div className="flex items-center gap-3">
-              <TrendingDown className="h-5 w-5 text-warning" />
-              <div>
-                <CardTitle className="font-mono">Active Risk Events</CardTitle>
-                <CardDescription>Current risk alerts and triggered conditions</CardDescription>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <Activity className="h-5 w-5 text-warning" />
+                <div>
+                  <CardTitle className="font-mono">Risk Events History</CardTitle>
+                  <CardDescription>Past and current risk alerts and triggered conditions</CardDescription>
+                </div>
               </div>
+              {activeRiskEvents && activeRiskEvents.length > 0 && (
+                <Badge variant="destructive" className="font-mono">
+                  {activeRiskEvents.length} Active
+                </Badge>
+              )}
             </div>
           </CardHeader>
           <CardContent>
-            <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
-              <Badge variant="outline" className="font-mono">
-                No active risk events
-              </Badge>
-            </div>
+            <RiskEventsTable />
           </CardContent>
         </Card>
       </div>
