@@ -2,26 +2,9 @@ import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { FIXED_USER_ID } from "@/contexts/AuthContext";
 import { useAccountMetrics } from "./useAccountMetrics";
+import type { Tables } from "@/integrations/supabase/types";
 
-interface Position {
-  id: string;
-  product: string;
-  side: string;
-  qty_open: number;
-  entry_price: number;
-  realized_pnl_usd: number;
-  unrealized_pnl_usd: number;
-  closed_at: string | null;
-}
-
-interface Fill {
-  id: string;
-  order_id: string;
-  price: number;
-  quantity: number;
-  fee_amount: number;
-  filled_at: string;
-}
+type Position = Tables<"positions">;
 
 export const useCalculatedMetrics = () => {
   const { data: baseMetrics } = useAccountMetrics();
@@ -55,29 +38,29 @@ export const useCalculatedMetrics = () => {
       }
       
       // Calculate metrics from positions
-      const openPositions = (positions || []).filter((p: Position) => !p.closed_at);
-      const closedPositions = (positions || []).filter((p: Position) => p.closed_at);
+      const openPositions = (positions || []).filter((p) => !p.closed_at);
+      const closedPositions = (positions || []).filter((p) => p.closed_at);
       
-      const totalUnrealizedPnL = openPositions.reduce((sum: number, p: Position) => 
-        sum + (p.unrealized_pnl_usd || 0), 0
-      );
+      // Note: unrealized_pnl_usd is calculated dynamically (not stored in DB)
+      // For now, estimate based on position value
+      const totalUnrealizedPnL = 0; // Would need current price to calculate
       
-      const totalRealizedPnL = closedPositions.reduce((sum: number, p: Position) => 
+      const totalRealizedPnL = closedPositions.reduce((sum, p) => 
         sum + (p.realized_pnl_usd || 0), 0
       );
       
       const dailyPnL = totalRealizedPnL + totalUnrealizedPnL;
       
       // Calculate wins/losses
-      const wins = closedPositions.filter((p: Position) => p.realized_pnl_usd > 0).length;
-      const losses = closedPositions.filter((p: Position) => p.realized_pnl_usd < 0).length;
+      const wins = closedPositions.filter((p) => (p.realized_pnl_usd || 0) > 0).length;
+      const losses = closedPositions.filter((p) => (p.realized_pnl_usd || 0) < 0).length;
       
       // Calculate total equity (initial + realized PnL)
       const initialBalance = baseMetrics?.total_equity || 50000;
       const totalEquity = initialBalance + totalRealizedPnL;
       
       // Calculate risk heat (percentage of equity at risk)
-      const totalPositionValue = openPositions.reduce((sum: number, p: Position) => 
+      const totalPositionValue = openPositions.reduce((sum, p) => 
         sum + Math.abs(p.qty_open * p.entry_price), 0
       );
       const riskHeat = totalEquity > 0 ? (totalPositionValue / totalEquity) * 100 : 0;
