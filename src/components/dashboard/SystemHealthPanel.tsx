@@ -1,9 +1,11 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Activity, Database, Wifi, WifiOff, Server } from "lucide-react";
+import { Activity, Database, Wifi, WifiOff, Server, Coins } from "lucide-react";
 import { useRuntimeStatus, useRuntimeHealth } from "@/hooks/useRuntimeStatus";
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
+import { WarmupIndicator, EngineStateIndicator } from "./WarmupIndicator";
+import { Separator } from "@/components/ui/separator";
 
 export const SystemHealthPanel = () => {
   const { data: runtimeStatus, isError: runtimeError } = useRuntimeStatus();
@@ -34,6 +36,8 @@ export const SystemHealthPanel = () => {
     ? formatLatency(runtimeStatus.restLatencyMs)
     : { text: "—", color: "text-muted-foreground" };
 
+  const symbols = runtimeStatus?.symbols ?? [];
+
   return (
     <Card>
       <CardHeader>
@@ -43,6 +47,21 @@ export const SystemHealthPanel = () => {
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
+        {/* Engine State */}
+        <div className="pb-2">
+          <EngineStateIndicator />
+        </div>
+
+        {/* Warmup Progress */}
+        {runtimeHealthy && (
+          <>
+            <Separator />
+            <WarmupIndicator />
+          </>
+        )}
+
+        <Separator />
+
         {/* Runtime Backend */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -76,6 +95,28 @@ export const SystemHealthPanel = () => {
             </Badge>
           )}
         </div>
+
+        {/* Connected Symbols */}
+        {symbols.length > 0 && (
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Coins className="h-4 w-4 text-muted-foreground" />
+              <span className="text-sm">Symbols</span>
+            </div>
+            <div className="flex gap-1 flex-wrap justify-end">
+              {symbols.slice(0, 2).map((symbol: string) => (
+                <Badge key={symbol} variant="outline" className="text-xs font-mono">
+                  {symbol}
+                </Badge>
+              ))}
+              {symbols.length > 2 && (
+                <Badge variant="outline" className="text-xs font-mono">
+                  +{symbols.length - 2}
+                </Badge>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* WebSocket Latency */}
         <div className="flex items-center justify-between">
