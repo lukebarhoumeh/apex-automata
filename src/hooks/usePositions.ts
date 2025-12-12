@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
+import { FIXED_USER_ID } from "@/contexts/AuthContext";
 
 export interface Position {
   id: string;
@@ -22,18 +23,19 @@ export interface Position {
 
 export const usePositions = () => {
   return useQuery({
-    queryKey: ["positions"],
+    queryKey: ["positions", FIXED_USER_ID],
     queryFn: async () => {
       const { data, error } = await supabase
         .from("positions")
         .select("*")
+        .eq("user_id", FIXED_USER_ID)
         .is("closed_at", null)
         .order("opened_at", { ascending: false });
 
       if (error) throw error;
       return data;
     },
-    refetchInterval: 5000, // Refresh every 5 seconds
+    refetchInterval: 5000,
   });
 };
 
