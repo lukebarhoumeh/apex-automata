@@ -5,7 +5,10 @@ import { ChartSection } from "@/components/dashboard/ChartSection";
 import { PositionsPanelConnected } from "@/components/dashboard/PositionsPanelConnected";
 import { OrdersBlotter } from "@/components/dashboard/OrdersBlotter";
 import { RiskControls } from "@/components/dashboard/RiskControls";
+import { RiskDashboard } from "@/components/dashboard/RiskDashboard";
 import { SignalsPanel } from "@/components/dashboard/SignalsPanel";
+import { LiveSignalsTable } from "@/components/dashboard/LiveSignalsTable";
+import { LiveTickersPanel } from "@/components/dashboard/LiveTickersPanel";
 import { MarketConditions } from "@/components/dashboard/MarketConditions";
 import { AlertsPanel } from "@/components/dashboard/AlertsPanel";
 import { StrategiesPanel } from "@/components/dashboard/StrategiesPanel";
@@ -55,6 +58,10 @@ const Index = () => {
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 lg:gap-6">
           <div className="xl:col-span-2 space-y-4 lg:space-y-6">
             <ChartSection />
+            
+            {/* Live Signals - Real-time from WebSocket */}
+            <LiveSignalsTable />
+            
             <OrdersBlotter onViewDetails={handleViewDetails} />
             <PositionsPanelConnected />
           </div>
@@ -62,17 +69,23 @@ const Index = () => {
           <div className="space-y-4 lg:space-y-6">
             <SystemHealthPanel />
             
+            {/* Live Price Tickers */}
+            <LiveTickersPanel />
+            
+            {/* Risk Dashboard with real-time metrics */}
+            <RiskDashboard />
+            
             <Tabs defaultValue="strategies" className="w-full">
               <TabsList className="grid w-full grid-cols-4 bg-card text-xs">
                 <TabsTrigger value="strategies">Strategies</TabsTrigger>
-                <TabsTrigger value="risk">Risk</TabsTrigger>
-                <TabsTrigger value="signals">Signals</TabsTrigger>
+                <TabsTrigger value="risk-config">Risk Config</TabsTrigger>
+                <TabsTrigger value="signals">Strategy Cfg</TabsTrigger>
                 <TabsTrigger value="alerts">Alerts</TabsTrigger>
               </TabsList>
               <TabsContent value="strategies" className="mt-4">
                 <StrategiesPanel />
               </TabsContent>
-              <TabsContent value="risk" className="mt-4">
+              <TabsContent value="risk-config" className="mt-4">
                 <RiskControls />
               </TabsContent>
               <TabsContent value="signals" className="mt-4">
