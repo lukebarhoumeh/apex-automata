@@ -1,6 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Power, Pause, Play, AlertTriangle, Ban } from "lucide-react";
+import { Power, Pause, Play, AlertTriangle, Ban, Square, PlayCircle } from "lucide-react";
 import { useAccountMetrics } from "@/hooks/useAccountMetrics";
 import {
   AlertDialog,
@@ -13,8 +13,15 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { runtimeClient } from "@/services/runtimeClient";
-import { useRuntimeStatus } from "@/hooks/useRuntimeStatus";
+import { useRuntimeStatus, useRuntimeHealth } from "@/hooks/useRuntimeStatus";
 import { useToast } from "@/hooks/use-toast";
 import { useState } from "react";
 
@@ -26,8 +33,10 @@ interface DashboardHeaderProps {
 export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProps) => {
   const { toast } = useToast();
   const [isLoading, setIsLoading] = useState(false);
+  const [startMode, setStartMode] = useState<'paper' | 'live'>('paper');
   const { data: metrics } = useAccountMetrics();
   const { data: runtimeStatus } = useRuntimeStatus();
+  const { data: runtimeHealthy } = useRuntimeHealth();
 
   const formatCurrency = (val: number) => 
     new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0 }).format(val);
@@ -36,6 +45,47 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   const isLive = runtimeStatus?.mode === 'live';
   const killSwitchActive = runtimeStatus?.killSwitch?.active ?? false;
   const dailyStopHit = runtimeStatus?.dailyStopHit ?? false;
+  const engineRunning = runtimeHealthy && runtimeStatus?.mode !== undefined;
+
+  const handleStartEngine = async () => {
+    setIsLoading(true);
+    try {
+      await runtimeClient.startEngine(startMode);
+      toast({
+        title: "Engine Started",
+        description: `Trading engine started in ${startMode.toUpperCase()} mode`,
+      });
+      onStateChange(startMode);
+    } catch (error) {
+      toast({
+        title: "Failed to Start Engine",
+        description: error instanceof Error ? error.message : 'Unknown error',
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleStopEngine = async () => {
+    setIsLoading(true);
+    try {
+      await runtimeClient.stopEngine();
+      toast({
+        title: "Engine Stopped",
+        description: "Trading engine stopped gracefully",
+      });
+      onStateChange('paused');
+    } catch (error) {
+      toast({
+        title: "Failed to Stop Engine",
+        description: error instanceof Error ? error.message : 'Unknown error',
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   const handlePauseResume = async () => {
     setIsLoading(true);
@@ -67,7 +117,7 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   const handleKillSwitch = async () => {
     setIsLoading(true);
     try {
-      await runtimeClient.closeAll("KILL_SWITCH_MANUAL", "CLOSE ALL");
+      await runtimeClient.killEngine();
       toast({
         title: "Kill Switch Activated",
         description: "All positions closed. Engine stopped.",
@@ -115,82 +165,172 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
         <div className="flex flex-col gap-4">
           {/* Top Row: Branding + Mode + Controls */}
           <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
-            {/* Left: Branding + Mode Badge */}
+            {/* Left: Branding + Mode Badge + Engine Status */}
             <div className="flex items-center gap-3">
               <h1 className="text-xl font-bold tracking-tight font-mono">AtlasBot v2</h1>
-              <Badge 
-                variant={isLive ? "destructive" : "default"}
-                className="font-mono"
-              >
-                {isLive ? "LIVE" : "PAPER"}
-              </Badge>
+              {engineRunning ? (
+                <Badge 
+                  variant={isLive ? "destructive" : "default"}
+                  className="font-mono"
+                >
+                  {isLive ? "LIVE" : "PAPER"}
+                </Badge>
+              ) : (
+                <Badge variant="outline" className="font-mono text-muted-foreground">
+                  STOPPED
+                </Badge>
+              )}
             </div>
             
             {/* Right: Controls */}
             <div className="flex flex-wrap items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handlePauseResume}
-                disabled={isLoading || killSwitchActive}
-                className="gap-2 font-mono"
-              >
-                {isPaused ? (
-                  <>
-                    <Play className="h-4 w-4" />
-                    <span>Resume</span>
-                  </>
-                ) : (
-                  <>
-                    <Pause className="h-4 w-4" />
-                    <span>Pause</span>
-                  </>
-                )}
-              </Button>
-
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Button 
-                    variant="destructive" 
+              {/* Engine Start/Stop */}
+              {!engineRunning ? (
+                <div className="flex items-center gap-2">
+                  <Select value={startMode} onValueChange={(v) => setStartMode(v as 'paper' | 'live')}>
+                    <SelectTrigger className="w-24 h-8 font-mono text-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="paper">Paper</SelectItem>
+                      <SelectItem value="live">Live</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <AlertDialog>
+                    <AlertDialogTrigger asChild>
+                      <Button 
+                        variant="default" 
+                        size="sm"
+                        disabled={isLoading}
+                        className="gap-2 font-mono bg-success hover:bg-success/90"
+                      >
+                        <PlayCircle className="h-4 w-4" />
+                        <span>Start Engine</span>
+                      </Button>
+                    </AlertDialogTrigger>
+                    <AlertDialogContent>
+                      <AlertDialogHeader>
+                        <AlertDialogTitle>Start Trading Engine</AlertDialogTitle>
+                        <AlertDialogDescription className="space-y-2">
+                          <p>You are about to start the trading engine in <strong className="text-foreground">{startMode.toUpperCase()}</strong> mode.</p>
+                          {startMode === 'live' && (
+                            <p className="text-warning font-semibold">
+                              ⚠️ LIVE mode will execute real trades with real money!
+                            </p>
+                          )}
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogCancel>Cancel</AlertDialogCancel>
+                        <AlertDialogAction 
+                          onClick={handleStartEngine}
+                          disabled={isLoading}
+                          className={startMode === 'live' ? 'bg-destructive' : 'bg-success'}
+                        >
+                          Start {startMode.toUpperCase()}
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </AlertDialogContent>
+                  </AlertDialog>
+                </div>
+              ) : (
+                <>
+                  {/* Pause/Resume when running */}
+                  <Button
+                    variant="outline"
                     size="sm"
-                    disabled={killSwitchActive}
+                    onClick={handlePauseResume}
+                    disabled={isLoading || killSwitchActive}
                     className="gap-2 font-mono"
                   >
-                    <Power className="h-4 w-4" />
-                    <span className="hidden sm:inline">Kill Switch</span>
+                    {isPaused ? (
+                      <>
+                        <Play className="h-4 w-4" />
+                        <span>Resume</span>
+                      </>
+                    ) : (
+                      <>
+                        <Pause className="h-4 w-4" />
+                        <span>Pause</span>
+                      </>
+                    )}
                   </Button>
-                </AlertDialogTrigger>
-                <AlertDialogContent className="border-destructive/50">
-                  <AlertDialogHeader>
-                    <AlertDialogTitle className="flex items-center gap-2 text-destructive">
-                      <AlertTriangle className="h-5 w-5" />
-                      Activate Emergency Kill Switch
-                    </AlertDialogTitle>
-                    <AlertDialogDescription className="space-y-2">
-                      <p>This will immediately:</p>
-                      <ul className="list-disc list-inside space-y-1 text-sm">
-                        <li>Close all open positions at market</li>
-                        <li>Cancel all pending orders</li>
-                        <li>Halt all new trading activity</li>
-                        <li>Lock the trading engine</li>
-                      </ul>
-                      <p className="font-semibold text-foreground mt-4">
-                        This action cannot be undone. Are you absolutely sure?
-                      </p>
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>Cancel</AlertDialogCancel>
-                    <AlertDialogAction 
-                      onClick={handleKillSwitch}
-                      disabled={isLoading}
-                      className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                    >
-                      Confirm Kill Switch
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
+
+                  {/* Stop Engine */}
+                  <AlertDialog>
+                    <AlertDialogTrigger asChild>
+                      <Button 
+                        variant="outline" 
+                        size="sm"
+                        disabled={isLoading}
+                        className="gap-2 font-mono"
+                      >
+                        <Square className="h-4 w-4" />
+                        <span className="hidden sm:inline">Stop</span>
+                      </Button>
+                    </AlertDialogTrigger>
+                    <AlertDialogContent>
+                      <AlertDialogHeader>
+                        <AlertDialogTitle>Stop Trading Engine</AlertDialogTitle>
+                        <AlertDialogDescription>
+                          This will gracefully stop the trading engine. Open positions will be closed first.
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogCancel>Cancel</AlertDialogCancel>
+                        <AlertDialogAction onClick={handleStopEngine} disabled={isLoading}>
+                          Stop Engine
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </AlertDialogContent>
+                  </AlertDialog>
+
+                  {/* Kill Switch */}
+                  <AlertDialog>
+                    <AlertDialogTrigger asChild>
+                      <Button 
+                        variant="destructive" 
+                        size="sm"
+                        disabled={killSwitchActive}
+                        className="gap-2 font-mono"
+                      >
+                        <Power className="h-4 w-4" />
+                        <span className="hidden sm:inline">Kill</span>
+                      </Button>
+                    </AlertDialogTrigger>
+                    <AlertDialogContent className="border-destructive/50">
+                      <AlertDialogHeader>
+                        <AlertDialogTitle className="flex items-center gap-2 text-destructive">
+                          <AlertTriangle className="h-5 w-5" />
+                          Activate Emergency Kill Switch
+                        </AlertDialogTitle>
+                        <AlertDialogDescription className="space-y-2">
+                          <p>This will immediately:</p>
+                          <ul className="list-disc list-inside space-y-1 text-sm">
+                            <li>Close all open positions at market</li>
+                            <li>Cancel all pending orders</li>
+                            <li>Halt all new trading activity</li>
+                            <li>Lock the trading engine</li>
+                          </ul>
+                          <p className="font-semibold text-foreground mt-4">
+                            This action cannot be undone. Are you absolutely sure?
+                          </p>
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogCancel>Cancel</AlertDialogCancel>
+                        <AlertDialogAction 
+                          onClick={handleKillSwitch}
+                          disabled={isLoading}
+                          className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                        >
+                          Confirm Kill Switch
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </AlertDialogContent>
+                  </AlertDialog>
+                </>
+              )}
             </div>
           </div>
 

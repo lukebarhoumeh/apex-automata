@@ -9,16 +9,25 @@ export interface RuntimeStatus {
   killSwitch: {
     active: boolean;
     reasons: string[];
-    since?: number;
+    since?: number | null;
   };
   wsLatencyMs: number;
   restLatencyMs: number;
   spreadPctile: number;
   regime: 'trend' | 'chop';
-  // Warmup & symbols info (L1-4)
+  // Risk info
+  risk?: {
+    exposureUsd: number;
+    dailyPnLUsd: number;
+    maxDrawdownPct: number;
+    killSwitchActive: boolean;
+  };
+  // Warmup & symbols info
+  activeSymbols?: string[];
   warmupComplete?: boolean;
-  candlesBuffered?: number;
+  candlesBuffered?: Record<string, number>; // Per-symbol: { "BTC-USD": 150, "ETH-USD": 200 }
   requiredWarmup?: number;
+  // Legacy fallback
   symbols?: string[];
 }
 
@@ -126,6 +135,43 @@ class RuntimeClient {
     } catch {
       return false;
     }
+  }
+
+  async startEngine(mode: 'paper' | 'live' = 'paper'): Promise<{ ok: boolean }> {
+    const response = await fetch(`${API_URL}/api/engine/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: response.statusText }));
+      throw new Error(error.error || 'Failed to start engine');
+    }
+    return response.json();
+  }
+
+  async stopEngine(): Promise<{ ok: boolean }> {
+    const response = await fetch(`${API_URL}/api/engine/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: response.statusText }));
+      throw new Error(error.error || 'Failed to stop engine');
+    }
+    return response.json();
+  }
+
+  async killEngine(): Promise<{ ok: boolean }> {
+    const response = await fetch(`${API_URL}/api/engine/kill`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: response.statusText }));
+      throw new Error(error.error || 'Failed to kill engine');
+    }
+    return response.json();
   }
 }
 
