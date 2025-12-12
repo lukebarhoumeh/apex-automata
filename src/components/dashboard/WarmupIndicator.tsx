@@ -3,27 +3,49 @@ import { Badge } from "@/components/ui/badge";
 import { Loader2, CheckCircle2, Flame } from "lucide-react";
 import { useRuntimeStatus } from "@/hooks/useRuntimeStatus";
 
+interface SymbolWarmup {
+  symbol: string;
+  buffered: number;
+  required: number;
+  progress: number;
+}
+
 export const WarmupIndicator = () => {
   const { data: status } = useRuntimeStatus();
 
   // Extract warmup info from status
   const warmupComplete = status?.warmupComplete ?? false;
-  const candlesBuffered = status?.candlesBuffered ?? 0;
-  const requiredWarmup = status?.requiredWarmup ?? 50;
-  const symbols = status?.symbols ?? [];
+  const requiredWarmup = status?.requiredWarmup ?? 200;
+  const activeSymbols = status?.activeSymbols ?? status?.symbols ?? [];
+  
+  // Handle both legacy (number) and new (per-symbol object) candlesBuffered formats
+  const candlesBuffered = status?.candlesBuffered;
+  
+  // Build per-symbol warmup data
+  const symbolWarmups: SymbolWarmup[] = activeSymbols.map((symbol: string) => {
+    let buffered = 0;
+    if (typeof candlesBuffered === 'object' && candlesBuffered !== null) {
+      buffered = candlesBuffered[symbol] ?? 0;
+    } else if (typeof candlesBuffered === 'number') {
+      buffered = candlesBuffered;
+    }
+    const progress = requiredWarmup > 0 ? Math.min((buffered / requiredWarmup) * 100, 100) : 0;
+    return { symbol, buffered, required: requiredWarmup, progress };
+  });
 
-  const warmupProgress = requiredWarmup > 0 
-    ? Math.min((candlesBuffered / requiredWarmup) * 100, 100) 
-    : 0;
+  // Calculate overall progress
+  const totalBuffered = symbolWarmups.reduce((sum, s) => sum + s.buffered, 0);
+  const totalRequired = symbolWarmups.length * requiredWarmup;
+  const overallProgress = totalRequired > 0 ? Math.min((totalBuffered / totalRequired) * 100, 100) : 0;
 
   if (warmupComplete) {
     return (
       <div className="flex items-center gap-2 text-sm">
         <CheckCircle2 className="h-4 w-4 text-success" />
         <span className="text-success font-mono">LIVE</span>
-        {symbols.length > 0 && (
+        {activeSymbols.length > 0 && (
           <Badge variant="outline" className="text-xs font-mono ml-2">
-            {symbols.length} symbol{symbols.length !== 1 ? "s" : ""}
+            {activeSymbols.length} symbol{activeSymbols.length !== 1 ? "s" : ""}
           </Badge>
         )}
       </div>
@@ -31,27 +53,33 @@ export const WarmupIndicator = () => {
   }
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-3">
       <div className="flex items-center gap-2">
         <Loader2 className="h-4 w-4 animate-spin text-warning" />
         <span className="text-sm font-mono text-warning">WARMING UP</span>
-        <span className="text-xs text-muted-foreground font-mono tabular-nums">
-          {candlesBuffered}/{requiredWarmup} bars
-        </span>
       </div>
-      <Progress value={warmupProgress} className="h-1.5" />
-      {symbols.length > 0 && (
-        <div className="flex flex-wrap gap-1 mt-1">
-          {symbols.slice(0, 3).map((symbol: string) => (
-            <Badge key={symbol} variant="outline" className="text-xs font-mono">
-              {symbol}
-            </Badge>
+      
+      {/* Per-symbol progress */}
+      {symbolWarmups.length > 0 ? (
+        <div className="space-y-2">
+          {symbolWarmups.map((sw) => (
+            <div key={sw.symbol} className="space-y-1">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-mono text-muted-foreground">{sw.symbol}</span>
+                <span className="font-mono tabular-nums text-muted-foreground">
+                  {sw.buffered}/{sw.required}
+                </span>
+              </div>
+              <Progress value={sw.progress} className="h-1" />
+            </div>
           ))}
-          {symbols.length > 3 && (
-            <Badge variant="outline" className="text-xs font-mono">
-              +{symbols.length - 3} more
-            </Badge>
-          )}
+        </div>
+      ) : (
+        <div className="space-y-1">
+          <Progress value={overallProgress} className="h-1.5" />
+          <span className="text-xs text-muted-foreground font-mono">
+            Waiting for symbol data...
+          </span>
         </div>
       )}
     </div>

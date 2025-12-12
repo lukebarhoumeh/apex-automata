@@ -119,6 +119,36 @@ export type Database = {
         }
         Relationships: []
       }
+      daily_equity: {
+        Row: {
+          created_at: string | null
+          daily_pnl: number | null
+          date: string
+          end_equity: number | null
+          id: string
+          start_equity: number
+          user_id: string
+        }
+        Insert: {
+          created_at?: string | null
+          daily_pnl?: number | null
+          date: string
+          end_equity?: number | null
+          id?: string
+          start_equity: number
+          user_id: string
+        }
+        Update: {
+          created_at?: string | null
+          daily_pnl?: number | null
+          date?: string
+          end_equity?: number | null
+          id?: string
+          start_equity?: number
+          user_id?: string
+        }
+        Relationships: []
+      }
       fills: {
         Row: {
           fee_amount: number | null
@@ -585,6 +615,45 @@ export type Database = {
           event_type?: string
           id?: string
           triggered_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
+      risk_metrics: {
+        Row: {
+          consecutive_losses: number | null
+          created_at: string | null
+          daily_pnl: number | null
+          error_rate: number | null
+          exposure_usd: number | null
+          id: string
+          kill_switch_active: boolean | null
+          max_drawdown: number | null
+          updated_at: string | null
+          user_id: string
+        }
+        Insert: {
+          consecutive_losses?: number | null
+          created_at?: string | null
+          daily_pnl?: number | null
+          error_rate?: number | null
+          exposure_usd?: number | null
+          id?: string
+          kill_switch_active?: boolean | null
+          max_drawdown?: number | null
+          updated_at?: string | null
+          user_id: string
+        }
+        Update: {
+          consecutive_losses?: number | null
+          created_at?: string | null
+          daily_pnl?: number | null
+          error_rate?: number | null
+          exposure_usd?: number | null
+          id?: string
+          kill_switch_active?: boolean | null
+          max_drawdown?: number | null
+          updated_at?: string | null
           user_id?: string
         }
         Relationships: []
