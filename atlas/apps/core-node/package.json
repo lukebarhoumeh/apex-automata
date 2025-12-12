@@ -12,6 +12,9 @@
     "start:live": "node --enable-source-maps dist/cli/index.js -- --config ../../config/live.local.yaml",
     "build": "rimraf dist && tsc -p tsconfig.json",
     "lint": "echo 'add ruff/eslint later'",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "backtest": "tsx src/cli/backtest.ts",
     "paper-test": "tsx src/cli/paper-test.ts",
     "api": "tsx src/api/server.ts",
@@ -44,6 +47,7 @@
     "rimraf": "^6.0.1",
     "ts-node": "^10.9.2",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "vitest": "^1.6.0"
   }
 }

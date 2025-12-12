@@ -8,6 +8,12 @@ export interface PositionTrackerConfig {
   supabaseKey: string;
   updateInterval: number; // milliseconds
   pnlCalculationMethod: 'fifo' | 'lifo' | 'average';
+  
+  // Risk limits (from guardrails)
+  maxPositionValueUsd: number;      // Max value per position
+  maxUnrealizedLossUsd: number;     // Max unrealized loss before alert
+  drawdownWarningPct: number;       // Drawdown % for warning alert
+  drawdownCriticalPct: number;      // Drawdown % for critical alert
 }
 
 export interface Position {
@@ -55,6 +61,13 @@ export interface RiskAlert {
   threshold: number;
 }
 
+export interface FlattenResult {
+  symbol: string;
+  success: boolean;
+  orderId?: string;
+  error?: string;
+}
+
 export class PositionTracker extends EventEmitter {
   private config: PositionTrackerConfig;
   private logger: Logger;
@@ -62,6 +75,12 @@ export class PositionTracker extends EventEmitter {
   private positions: Map<string, Position> = new Map();
   private marketPrices: Map<string, number> = new Map();
   private updateTimer: NodeJS.Timeout | null = null;
+  
+  // Order creator for placing flatten orders
+  private orderCreator: ((symbol: string, side: 'buy' | 'sell', size: number, tag?: string) => Promise<string | null>) | null = null;
+  
+  // Mutex to prevent double-flattening
+  private flatteningInProgress = false;
 
   constructor(config: PositionTrackerConfig, logger: Logger) {
     super();
@@ -70,6 +89,16 @@ export class PositionTracker extends EventEmitter {
     this.supabase = createClient(config.supabaseUrl, config.supabaseKey);
 
     this.startUpdateLoop();
+  }
+  
+  /**
+   * Set the order creator function for placing flatten orders.
+   * Returns the order ID if successful, null if failed.
+   */
+  public setOrderCreator(
+    creator: (symbol: string, side: 'buy' | 'sell', size: number, tag?: string) => Promise<string | null>
+  ): void {
+    this.orderCreator = creator;
   }
 
   private startUpdateLoop(): void {
@@ -240,32 +269,35 @@ export class PositionTracker extends EventEmitter {
   }
 
   private checkRiskLimits(position: Position): void {
-    // Check drawdown
+    // Check drawdown using config values
     if (position.maxDrawdown > 0) {
       const drawdownPercent = (position.maxDrawdown / (position.maxSize * position.averagePrice)) * 100;
       
-      if (drawdownPercent > 10) {
+      const criticalThreshold = this.config.drawdownCriticalPct;
+      const warningThreshold = this.config.drawdownWarningPct;
+      
+      if (drawdownPercent > criticalThreshold) {
         this.emit('risk:alert', position.symbol, {
           type: 'drawdown',
           severity: 'critical',
-          message: `Drawdown exceeded 10%: ${drawdownPercent.toFixed(2)}%`,
+          message: `Drawdown exceeded ${criticalThreshold}%: ${drawdownPercent.toFixed(2)}%`,
           value: drawdownPercent,
-          threshold: 10
+          threshold: criticalThreshold
         });
-      } else if (drawdownPercent > 5) {
+      } else if (drawdownPercent > warningThreshold) {
         this.emit('risk:alert', position.symbol, {
           type: 'drawdown',
           severity: 'warning',
           message: `Drawdown warning: ${drawdownPercent.toFixed(2)}%`,
           value: drawdownPercent,
-          threshold: 5
+          threshold: warningThreshold
         });
       }
     }
 
-    // Check position size limits (example: max $10,000 per position)
+    // Check position size limits from config
     const positionValue = position.size * position.averagePrice;
-    const maxPositionValue = 10000;
+    const maxPositionValue = this.config.maxPositionValueUsd;
 
     if (positionValue > maxPositionValue) {
       this.emit('risk:alert', position.symbol, {
@@ -277,14 +309,15 @@ export class PositionTracker extends EventEmitter {
       });
     }
 
-    // Check loss limits
-    if (position.unrealizedPnL < -500) {
+    // Check loss limits from config
+    const maxLoss = this.config.maxUnrealizedLossUsd;
+    if (position.unrealizedPnL < -maxLoss) {
       this.emit('risk:alert', position.symbol, {
         type: 'loss_limit',
         severity: 'critical',
         message: `Unrealized loss exceeded limit: $${position.unrealizedPnL.toFixed(2)}`,
         value: position.unrealizedPnL,
-        threshold: -500
+        threshold: -maxLoss
       });
     }
   }
@@ -365,21 +398,89 @@ export class PositionTracker extends EventEmitter {
     };
   }
 
-  // Close all positions (for emergency shutdown)
-  public async closeAllPositions(): Promise<void> {
-    this.logger.warn('Closing all positions');
-    
-    for (const position of this.positions.values()) {
-      if (position.side !== 'flat') {
-        // Mark position as closed
-        position.side = 'flat';
-        position.size = 0;
-        position.unrealizedPnL = 0;
-        position.lastUpdateTime = new Date();
-        
-        await this.persistPosition(position);
-        this.emit('position:closed', position);
-      }
+  /**
+   * Close all positions by placing real market orders.
+   * Returns array of results for each position flatten attempt.
+   */
+  public async closeAllPositions(): Promise<FlattenResult[]> {
+    // Prevent double-flattening
+    if (this.flatteningInProgress) {
+      this.logger.warn('Flatten already in progress, skipping duplicate request');
+      return [];
     }
+    
+    this.flatteningInProgress = true;
+    this.logger.warn('Closing all positions with real orders');
+    
+    const results: FlattenResult[] = [];
+    const openPositions = this.getOpenPositions();
+    
+    if (openPositions.length === 0) {
+      this.logger.info('No open positions to close');
+      this.flatteningInProgress = false;
+      return results;
+    }
+    
+    for (const position of openPositions) {
+      const result: FlattenResult = {
+        symbol: position.symbol,
+        success: false,
+      };
+      
+      try {
+        // Determine exit side (opposite of position)
+        const exitSide: 'buy' | 'sell' = position.side === 'long' ? 'sell' : 'buy';
+        const size = Math.abs(position.size);
+        
+        if (this.orderCreator) {
+          this.logger.info(`Flattening ${position.symbol}: ${exitSide} ${size}`, {
+            positionId: position.id,
+            side: position.side,
+          });
+          
+          // Place market order to flatten
+          const orderId = await this.orderCreator(position.symbol, exitSide, size, 'flatten');
+          
+          if (orderId) {
+            result.success = true;
+            result.orderId = orderId;
+            this.logger.info(`Flatten order placed for ${position.symbol}`, { orderId });
+          } else {
+            result.error = 'Order creation returned null';
+            this.logger.error(`Failed to flatten ${position.symbol}: order creation returned null`);
+          }
+        } else {
+          // Fallback: just mark as closed (legacy behavior)
+          this.logger.warn(`No order creator set - marking ${position.symbol} as closed without order`);
+          position.side = 'flat';
+          position.size = 0;
+          position.unrealizedPnL = 0;
+          position.lastUpdateTime = new Date();
+          
+          await this.persistPosition(position);
+          this.emit('position:closed', position);
+          result.success = true;
+        }
+      } catch (error) {
+        result.error = error instanceof Error ? error.message : String(error);
+        this.logger.error(`Error flattening ${position.symbol}:`, error);
+      }
+      
+      results.push(result);
+    }
+    
+    this.flatteningInProgress = false;
+    
+    const successCount = results.filter(r => r.success).length;
+    this.logger.info(`Flatten complete: ${successCount}/${results.length} positions closed`);
+    
+    return results;
+  }
+  
+  /**
+   * Check if a flatten operation is in progress.
+   */
+  public isFlatteningInProgress(): boolean {
+    return this.flatteningInProgress;
   }
 }

@@ -7,11 +7,13 @@ import { TradingEngine, TradingEngineConfig } from '../trading/trading-engine';
 import { SignalProcessor } from '../strategies/signal-processor';
 import { createClient } from '@supabase/supabase-js';
 import path from 'path';
-import { loadEnv } from '../core/env';
+import { loadAndValidateEnv } from '../core/env';
 import client from 'prom-client';
 import { OHLCV } from '../indicators/technical';
 import { loadGuardrails } from '../config/loadGuardrails';
+import { validateSchemaOrFail } from '../config/validateSchema';
 import { OrderRequest } from '../exchanges/coinbase';
+import { MetricsTracker } from '../trading/metrics-tracker';
 
 const app = express();
 const server = createServer(app);
@@ -78,20 +80,31 @@ const runtimeState = {
     dailyPnLUsd: 0,
     maxDrawdownPct: 0,
     killSwitchActive: false
-  }
+  },
+  // Warmup state (C1-6)
+  warmupComplete: false,
+  candlesBuffered: {} as Record<string, number>,
 };
 
 // In-memory configs (will be persisted/hot-reloaded later)
 let riskConfig: any = null;
 let signalsConfig: any = null;
 
-// Load environment
+// Load and validate environment - fails fast with clear errors if misconfigured
 const atlasRoot = path.resolve(process.cwd(), '../..');
-const env = loadEnv(atlasRoot);
+const env = loadAndValidateEnv(atlasRoot);
 const guardrails = loadGuardrails(atlasRoot);
 
 // Logger
 const logger = createLogger(path.join(atlasRoot, 'var/logs/api-server.jsonl'));
+
+// Real-time metrics tracker (replaces mock values)
+const metricsTracker = new MetricsTracker({
+  spreadWindowSize: 100,
+  latencyWindowSize: 50,
+  regimeAtrPeriod: 14,
+  regimeAtrThreshold: 0.015,
+}, logger);
 
 // Fixed USER_ID for single-user mode
 const USER_ID = 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f';
@@ -160,6 +173,7 @@ function processTickerForCandles(ticker: { product_id: string; price: string; la
       };
       try {
         signalProcessor.addCandle(symbol, candle);
+        metricsTracker.addCandle(symbol, candle);
         logger.debug(`Added candle for ${symbol}: O=${candle.open} H=${candle.high} L=${candle.low} C=${candle.close} V=${candle.volume}`);
       } catch (err) {
         logger.error('Failed to add candle to signal processor', err);
@@ -196,14 +210,13 @@ if (tradingEngine?.engineRunning) {
 setInterval(() => {
   if (wsClients.size === 0) return;
   
-  // TODO: Calculate actual latency and spread from exchange data
-  // For now, using mock values
-if (tradingEngine?.engineRunning) {
-    runtimeState.wsLatencyMs = Math.round(50 + Math.random() * 20);
-    runtimeState.restLatencyMs = Math.round(100 + Math.random() * 50);
-    runtimeState.spreadPctile = Math.round(Math.random() * 100);
-    // Simple regime detection based on mock volatility
-    runtimeState.regime = Math.random() > 0.7 ? 'trend' : 'chop';
+  // Use real metrics from tracker
+  if (tradingEngine?.engineRunning) {
+    const realMetrics = metricsTracker.getMetrics();
+    runtimeState.wsLatencyMs = realMetrics.wsLatencyMs;
+    runtimeState.restLatencyMs = realMetrics.restLatencyMs;
+    runtimeState.spreadPctile = realMetrics.spreadPctile;
+    runtimeState.regime = realMetrics.regime;
   }
   
   broadcast({
@@ -217,6 +230,9 @@ if (tradingEngine?.engineRunning) {
       restLatencyMs: runtimeState.restLatencyMs,
       spreadPctile: runtimeState.spreadPctile,
       regime: runtimeState.regime,
+      activeSymbols: tradingEngine?.getActiveSymbols() || [],
+      warmupComplete: runtimeState.warmupComplete,
+      candlesBuffered: runtimeState.candlesBuffered,
     }
   });
 }, 1500);
@@ -247,6 +263,9 @@ wss.on('connection', (ws) => {
       restLatencyMs: runtimeState.restLatencyMs,
       spreadPctile: runtimeState.spreadPctile,
       regime: runtimeState.regime,
+      activeSymbols: tradingEngine?.getActiveSymbols() || [],
+      warmupComplete: runtimeState.warmupComplete,
+      candlesBuffered: runtimeState.candlesBuffered,
     }
   }));
 });
@@ -281,10 +300,13 @@ app.get('/api/status', (req, res) => {
     dailyStopHit: runtimeState.dailyStopHit,
     killSwitch: runtimeState.killSwitch,
     wsLatencyMs: runtimeState.wsLatencyMs,
-   restLatencyMs: runtimeState.restLatencyMs,
-   spreadPctile: runtimeState.spreadPctile,
-   regime: runtimeState.regime,
-    risk: runtimeState.risk
+    restLatencyMs: runtimeState.restLatencyMs,
+    spreadPctile: runtimeState.spreadPctile,
+    regime: runtimeState.regime,
+    risk: runtimeState.risk,
+    activeSymbols: tradingEngine?.getActiveSymbols() || [],
+    warmupComplete: runtimeState.warmupComplete ?? false,
+    candlesBuffered: runtimeState.candlesBuffered ?? {},
   });
 });
 
@@ -420,6 +442,73 @@ app.post('/api/engine/start', async (req, res) => {
 
     signalProcessor = new SignalProcessor(signalConfig, logger);
 
+    // Set up data loader from exchange for historical data
+    signalProcessor.setDataLoader(async (symbol: string, limit: number) => {
+      if (!tradingEngine) {
+        return [];
+      }
+      try {
+        // Get exchange from trading engine to fetch candles
+        const exchange = (tradingEngine as any).exchange;
+        if (!exchange) {
+          logger.warn('No exchange available for historical data loading');
+          return [];
+        }
+        
+        // Calculate time range for historical candles (1 minute granularity)
+        const end = new Date();
+        const start = new Date(end.getTime() - limit * 60 * 1000);
+        
+        const candles = await exchange.getCandles(symbol, {
+          start: start.toISOString(),
+          end: end.toISOString(),
+          granularity: 60, // 1 minute
+        });
+        
+        return candles.map((c: any) => ({
+          time: c.time * 1000, // Convert to milliseconds
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          volume: c.volume,
+        }));
+      } catch (error) {
+        logger.warn(`Failed to load historical candles for ${symbol} from exchange:`, error);
+        return [];
+      }
+    });
+    
+    // Listen for warmup events
+    signalProcessor.on('warmup:complete', (symbol: string) => {
+      logger.info(`Warmup complete for ${symbol}`);
+      runtimeState.candlesBuffered[symbol] = signalProcessor!.getCandleCount(symbol);
+      runtimeState.warmupComplete = signalProcessor!.isAllWarmedUp();
+      broadcast({ 
+        type: 'WarmupUpdate', 
+        payload: { 
+          symbol, 
+          complete: true, 
+          candlesBuffered: runtimeState.candlesBuffered,
+          allWarmedUp: runtimeState.warmupComplete,
+        } 
+      });
+    });
+    
+    signalProcessor.on('warmup:progress', (symbol: string, loaded: number, required: number) => {
+      runtimeState.candlesBuffered[symbol] = loaded;
+      broadcast({ 
+        type: 'WarmupUpdate', 
+        payload: { 
+          symbol, 
+          complete: false, 
+          loaded, 
+          required,
+          candlesBuffered: runtimeState.candlesBuffered,
+        } 
+      });
+    });
+
     // Listen for signals and create orders
     signalProcessor.on('signal:generated', async (signal) => {
       logger.info('Signal generated', signal);
@@ -542,10 +631,27 @@ app.post('/api/engine/start', async (req, res) => {
 
     // Start the engine
     await tradingEngine.start();
+    
+    // Load historical data for warmup (don't await - do in background)
+    const activeSymbols = tradingEngine.getActiveSymbols();
+    logger.info(`Starting warmup for ${activeSymbols.length} symbols`);
+    
+    Promise.all(
+      activeSymbols.map(symbol => 
+        signalProcessor!.loadHistoricalData(symbol).catch(err => {
+          logger.warn(`Warmup failed for ${symbol}:`, err);
+        })
+      )
+    ).then(() => {
+      logger.info('All symbol warmup attempts completed');
+      runtimeState.warmupComplete = signalProcessor!.isAllWarmedUp();
+      runtimeState.candlesBuffered = signalProcessor!.getAllCandleCounts();
+    });
 
-    res.json({ 
-      success: true, 
-      message: `Trading engine started in ${mode} mode` 
+    res.json({
+      success: true,
+      message: `Trading engine started in ${mode} mode`,
+      activeSymbols,
     });
 
   } catch (error) {
@@ -853,11 +959,17 @@ async function updateAccountMetrics() {
     const { data, error } = await supabase.rpc('upsert_account_metrics', {
       p_user_id: USER_ID
     });
-    
+
     if (error) {
-      // Silently ignore if RPC doesn't exist
-      if (error.code !== 'PGRST202') {
-        logger.error('Failed to update account metrics:', error);
+      // RPC doesn't exist is less severe
+      if (error.code === 'PGRST202' || error.code === '42883') {
+        logger.debug('upsert_account_metrics RPC not available');
+      } else {
+        logger.error('Failed to update account metrics:', {
+          code: error.code,
+          message: error.message,
+          details: error.details,
+        });
       }
     }
   } catch (error) {
@@ -1110,20 +1222,33 @@ async function createSupabaseAlert(alert: any) {
   }
 }
 
-// Check database connection on startup
+// Check database connection and validate schema on startup
 (async () => {
   try {
+    // First check basic connectivity
     const { error } = await supabase.from('symbols').select('count').limit(1);
-    if (error) {
-      logger.error('Database connection failed:', error);
-      dbConnectionGauge.set(0);
-    } else {
-      logger.info('Database connection successful');
-      dbConnectionGauge.set(1);
+    if (error && error.code !== '42P01') {
+      // Ignore missing symbols table, check actual connection
+      logger.warn('Symbols table check returned error:', error.message);
     }
+    
+    logger.info('Database connection successful');
+    dbConnectionGauge.set(1);
+
+    // Validate required schema (tables and RPCs)
+    // allowLimitedMode: true means we warn but don't crash if schema is incomplete
+    await validateSchemaOrFail(supabase, logger, { allowLimitedMode: true });
+    
   } catch (error) {
-    logger.error('Database connection check failed:', error);
-    dbConnectionGauge.set(0);
+    if (error instanceof Error && error.name === 'SchemaValidationError') {
+      logger.error('Schema validation failed:', error.message);
+      logger.error('The trading engine will not function correctly. Please run migrations.');
+      dbConnectionGauge.set(0);
+      // In production, you might want to: process.exit(1);
+    } else {
+      logger.error('Database connection check failed:', error);
+      dbConnectionGauge.set(0);
+    }
   }
 })();
 

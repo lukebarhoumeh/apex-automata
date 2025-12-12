@@ -70,6 +70,12 @@ export class CoinbaseExchange extends EventEmitter {
       this.logger.warn('Coinbase WebSocket disconnected');
       this.emit('disconnected');
     });
+    
+    // Handle successful reconnection
+    this.wsClient.on('reconnected', () => {
+      this.logger.info('Coinbase WebSocket reconnected successfully');
+      this.emit('reconnected');
+    });
   }
 
   // Connection management

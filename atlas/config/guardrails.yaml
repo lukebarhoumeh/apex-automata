@@ -13,6 +13,18 @@ risk:
   funding_cost_tolerance_bps: 20
   slippage_estimate_bps: 3
 
+# Per-symbol risk limits (optional, overrides global limits)
+per_symbol:
+  BTC-USD:
+    max_notional_usd: 5000
+    max_daily_loss_usd: 200
+  ETH-USD:
+    max_notional_usd: 3000
+    max_daily_loss_usd: 150
+  SOL-USD:
+    max_notional_usd: 2000
+    max_daily_loss_usd: 100
+
 strategy:
   mode: momentum_futures
   donchian_len: 20

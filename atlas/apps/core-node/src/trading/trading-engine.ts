@@ -7,6 +7,7 @@ import { PositionTracker, PositionTrackerConfig, Position } from './position-tra
 import { RiskEngine, RiskEngineConfig, RiskMetrics } from './risk-engine';
 import { SecretManager, SecretConfig } from '../config/secrets';
 import { PaperTradingSimulator, PaperTradingConfig } from './paper-trading-simulator';
+import { PositionMonitor, PositionMonitorConfig } from './position-monitor';
 import { GuardrailConfig } from '../config/loadGuardrails';
 
 export interface TradingEngineConfig {
@@ -40,6 +41,15 @@ export interface TradingEngineEvents {
   'signal:generated': (signal: any) => void;
 }
 
+// Startup grace period before data gap checks begin (ms)
+const STARTUP_GRACE_PERIOD_MS = 60_000; // 60 seconds
+
+// Environment-specific data gap thresholds (in seconds)
+const DATA_GAP_THRESHOLDS: Record<string, number> = {
+  sandbox: 30,    // More lenient for sandbox/dev
+  production: 2,  // Strict for live trading
+};
+
 export class TradingEngine extends EventEmitter {
   private config: TradingEngineConfig;
   private logger: Logger;
@@ -47,13 +57,20 @@ export class TradingEngine extends EventEmitter {
   private orderManager: OrderManager | null = null;
   private positionTracker: PositionTracker | null = null;
   private riskEngine: RiskEngine | null = null;
+  private positionMonitor: PositionMonitor | null = null;
   private secretManager: SecretManager;
   private paperSimulator: PaperTradingSimulator | null = null;
   private isRunning = false;
   private marketPrices: Map<string, number> = new Map();
   private guardrails: GuardrailConfig;
-  private lastMarketDataTimestamp = 0;
+  
+  // Per-symbol market data timestamp tracking for data gap detection
+  private lastMarketDataPerSymbol: Map<string, number> = new Map();
   private dataGapMonitor: NodeJS.Timeout | null = null;
+  private engineStartTime = 0;
+  
+  // Active symbols that are actually subscribed (may differ from config if some aren't available)
+  private activeSymbols: string[] = [];
 
   constructor(config: TradingEngineConfig, logger: Logger) {
     super();
@@ -101,6 +118,7 @@ export class TradingEngine extends EventEmitter {
       this.initializeOrderManager();
       this.initializePositionTracker();
       this.initializeRiskEngine();
+      this.initializePositionMonitor();
 
       // Setup event handlers
       this.setupEventHandlers();
@@ -111,15 +129,27 @@ export class TradingEngine extends EventEmitter {
       // Wait a bit for WebSocket to fully establish
       await new Promise(resolve => setTimeout(resolve, 1000));
 
-      // Subscribe to market data
-      this.subscribeToMarketData();
-      this.lastMarketDataTimestamp = Date.now();
+      // Validate products and subscribe to market data
+      await this.validateAndSubscribeToMarketData();
+      
+      // Record engine start time for grace period
+      this.engineStartTime = Date.now();
+      
+      // Initialize per-symbol data timestamps
+      for (const symbol of this.activeSymbols) {
+        this.lastMarketDataPerSymbol.set(symbol, Date.now());
+      }
+      
       this.startDataGapMonitor();
 
       this.isRunning = true;
       this.emit('engine:started');
       
-      this.logger.info('Trading engine started successfully');
+      this.logger.info('Trading engine started successfully', {
+        mode: this.config.mode,
+        activeSymbols: this.activeSymbols,
+        gracePeriodMs: STARTUP_GRACE_PERIOD_MS,
+      });
     } catch (error) {
       this.logger.error('Failed to start trading engine:', error);
       this.emit('engine:error', error as Error);
@@ -156,6 +186,10 @@ export class TradingEngine extends EventEmitter {
 
       if (this.riskEngine) {
         this.riskEngine.stop();
+      }
+      
+      if (this.positionMonitor) {
+        this.positionMonitor.stop();
       }
 
       if (this.dataGapMonitor) {
@@ -242,14 +276,50 @@ export class TradingEngine extends EventEmitter {
   }
 
   private initializePositionTracker(): void {
+    // Calculate risk limits from guardrails
+    const accountEquity = this.guardrails.account.equity_usd;
+    const maxPositionValue = accountEquity * this.guardrails.risk.max_position_exposure_pct;
+    const maxUnrealizedLoss = accountEquity * Math.abs(this.guardrails.risk.daily_loss_limit);
+    const maxDrawdownPct = Math.abs(this.guardrails.risk.max_drawdown_limit) * 100;
+    
     const config: PositionTrackerConfig = {
       supabaseUrl: this.config.supabase.url,
       supabaseKey: this.config.supabase.serviceKey,
       updateInterval: 5000, // 5 seconds
-      pnlCalculationMethod: 'fifo'
+      pnlCalculationMethod: 'fifo',
+      // Risk limits from guardrails
+      maxPositionValueUsd: maxPositionValue,
+      maxUnrealizedLossUsd: maxUnrealizedLoss,
+      drawdownWarningPct: maxDrawdownPct * 0.5, // Warning at half of max drawdown
+      drawdownCriticalPct: maxDrawdownPct,
     };
 
     this.positionTracker = new PositionTracker(config, this.logger);
+    
+    // Set up order creator for flatten operations
+    // Note: This uses a self-reference that will work after all components are initialized
+    this.positionTracker.setOrderCreator(async (symbol, side, size, tag) => {
+      try {
+        const order = await this.createOrder({
+          product_id: symbol,
+          side,
+          type: 'market',
+          size: size.toString(),
+        });
+        
+        if (order) {
+          // Tag the order as a flatten order in metadata
+          if (tag === 'flatten') {
+            this.logger.info(`Flatten order created for ${symbol}`, { orderId: order.id });
+          }
+          return order.id;
+        }
+        return null;
+      } catch (error) {
+        this.logger.error(`Failed to create flatten order for ${symbol}:`, error);
+        return null;
+      }
+    });
   }
 
   private initializeRiskEngine(): void {
@@ -289,6 +359,49 @@ export class TradingEngine extends EventEmitter {
 
     this.riskEngine = new RiskEngine(config, this.logger, this.positionTracker!);
   }
+  
+  private initializePositionMonitor(): void {
+    const config: PositionMonitorConfig = {
+      guardrails: this.guardrails,
+      checkIntervalMs: 1000, // Check positions every second
+    };
+    
+    this.positionMonitor = new PositionMonitor(config, this.logger, this.positionTracker!);
+    
+    // Set up order creator for exit orders
+    this.positionMonitor.setOrderCreator(async (symbol, side, size) => {
+      try {
+        const order = await this.createOrder({
+          product_id: symbol,
+          side,
+          type: 'market',
+          size: size.toString(),
+        });
+        return order !== null;
+      } catch (error) {
+        this.logger.error('Position monitor failed to create exit order:', error);
+        return false;
+      }
+    });
+    
+    // Listen for exit events
+    this.positionMonitor.on('exit:triggered', (condition) => {
+      this.emit('position:exit:triggered', condition);
+    });
+    
+    this.positionMonitor.on('exit:executed', (positionId, condition) => {
+      this.logger.info('Position exit executed', { positionId, type: condition.type });
+    });
+    
+    this.positionMonitor.on('exit:failed', (positionId, error) => {
+      this.logger.error('Position exit failed', { positionId, error: error.message });
+    });
+    
+    // Start monitoring
+    this.positionMonitor.start();
+    
+    this.logger.info('Position monitor initialized');
+  }
 
   private initializePaperSimulator(): void {
     const config: PaperTradingConfig = {
@@ -319,6 +432,12 @@ export class TradingEngine extends EventEmitter {
     this.exchange!.on('orderbook', this.handleOrderBook.bind(this));
     this.exchange!.on('fill', this.handleFill.bind(this));
     this.exchange!.on('error', (error) => this.emit('engine:error', error));
+    
+    // Handle WebSocket reconnection - reset data gap tracking
+    this.exchange!.on('reconnected', () => {
+      this.logger.info('Exchange reconnected - resetting data gap tracking');
+      this.resetDataGapTracking();
+    });
 
     // Order manager events
     this.orderManager!.on('order:created', (order) => this.emit('order:created', order));
@@ -336,51 +455,164 @@ export class TradingEngine extends EventEmitter {
     this.riskEngine!.on('risk:metrics:update', (metrics) => this.emit('risk:metrics', metrics));
   }
 
-  private subscribeToMarketData(): void {
-    // Subscribe to ticker for all products
-    this.exchange!.subscribeTicker(this.config.products);
+  private async validateAndSubscribeToMarketData(): Promise<void> {
+    const configuredProducts = this.config.products;
+    
+    // Try to fetch available products from exchange
+    let availableProductIds: Set<string>;
+    try {
+      const products = await this.exchange!.getProducts();
+      availableProductIds = new Set(products.map(p => p.id));
+      this.logger.info(`Exchange has ${availableProductIds.size} available products`);
+    } catch (error) {
+      // If we can't fetch products (e.g., no auth in sandbox), use all configured
+      this.logger.warn('Could not fetch available products from exchange, using all configured:', error);
+      availableProductIds = new Set(configuredProducts);
+    }
+    
+    // Intersect configured with available
+    const validProducts: string[] = [];
+    const skippedProducts: string[] = [];
+    
+    for (const product of configuredProducts) {
+      if (availableProductIds.has(product)) {
+        validProducts.push(product);
+      } else {
+        skippedProducts.push(product);
+      }
+    }
+    
+    // Log skipped products
+    if (skippedProducts.length > 0) {
+      this.logger.warn(`Skipping unavailable products: ${skippedProducts.join(', ')}`);
+    }
+    
+    if (validProducts.length === 0) {
+      this.logger.error('No valid products available for subscription');
+      throw new Error('No valid products available - check exchange environment and product configuration');
+    }
+    
+    // Set active symbols
+    this.activeSymbols = validProducts;
+    
+    // Subscribe to ticker for all valid products
+    this.exchange!.subscribeTicker(this.activeSymbols);
+    
+    this.logger.info(`Subscribed to ${this.activeSymbols.length} symbols: ${this.activeSymbols.join(', ')}`);
     
     // Note: level2 orderbook requires authentication in sandbox
     // For paper trading, ticker data is sufficient
+  }
+  
+  // Deprecated - use validateAndSubscribeToMarketData instead
+  private subscribeToMarketData(): void {
+    // Call async version and don't await (for backwards compatibility during transition)
+    this.validateAndSubscribeToMarketData().catch(error => {
+      this.logger.error('Failed to validate and subscribe to market data:', error);
+    });
+  }
+  
+  // Public getter for active symbols (used by API/status endpoints)
+  public getActiveSymbols(): string[] {
+    return [...this.activeSymbols];
   }
 
   private startDataGapMonitor(): void {
     if (this.dataGapMonitor) {
       clearInterval(this.dataGapMonitor);
     }
-    const gapMs = this.guardrails.circuit_breakers.data_gap_sec * 1000;
+    
+    // Use environment-specific threshold or fall back to config
+    const envThreshold = DATA_GAP_THRESHOLDS[this.config.exchange.environment];
+    const configThreshold = this.guardrails.circuit_breakers.data_gap_sec;
+    const dataGapSec = envThreshold ?? configThreshold;
+    const gapMs = dataGapSec * 1000;
+    
     if (gapMs <= 0) {
+      this.logger.warn('Data gap monitoring disabled (threshold <= 0)');
       return;
     }
+    
+    this.logger.info(`Data gap monitor started: threshold=${dataGapSec}s, gracePeriod=${STARTUP_GRACE_PERIOD_MS}ms`);
+    
+    // Check more frequently than the threshold
+    const checkIntervalMs = Math.max(1000, gapMs / 2);
+    
     this.dataGapMonitor = setInterval(() => {
       if (!this.isRunning) {
         return;
       }
-      if (this.lastMarketDataTimestamp === 0) {
+      
+      // Skip checks during startup grace period
+      const timeSinceStart = Date.now() - this.engineStartTime;
+      if (timeSinceStart < STARTUP_GRACE_PERIOD_MS) {
         return;
       }
-      const elapsed = Date.now() - this.lastMarketDataTimestamp;
-      if (elapsed > gapMs) {
-        this.logger.error(`Market data gap detected (${elapsed}ms) - triggering kill switch`);
-        this.riskEngine?.activateKillSwitch('Market data gap detected');
+      
+      // Check each symbol's last data timestamp
+      const now = Date.now();
+      const staleSymbols: Array<{ symbol: string; elapsedMs: number }> = [];
+      let allSymbolsStale = true;
+      
+      for (const symbol of this.activeSymbols) {
+        const lastTs = this.lastMarketDataPerSymbol.get(symbol) || 0;
+        const elapsed = now - lastTs;
+        
+        if (elapsed > gapMs) {
+          staleSymbols.push({ symbol, elapsedMs: elapsed });
+        } else {
+          allSymbolsStale = false;
+        }
       }
-    }, gapMs);
+      
+      // Only trigger kill switch if ALL active symbols have stale data
+      if (staleSymbols.length > 0 && allSymbolsStale && this.activeSymbols.length > 0) {
+        const symbolDetails = staleSymbols
+          .map(s => `${s.symbol}(${Math.round(s.elapsedMs / 1000)}s)`)
+          .join(', ');
+        
+        this.logger.error(`Market data gap detected on ALL symbols: ${symbolDetails} - triggering kill switch`);
+        this.riskEngine?.activateKillSwitch(`Market data gap detected: ${symbolDetails}`);
+      } else if (staleSymbols.length > 0) {
+        // Log warning for partial staleness
+        const symbolDetails = staleSymbols
+          .map(s => `${s.symbol}(${Math.round(s.elapsedMs / 1000)}s)`)
+          .join(', ');
+        this.logger.warn(`Stale data on some symbols (not all): ${symbolDetails}`);
+      }
+    }, checkIntervalMs);
+  }
+  
+  // Reset data gap tracking (called after WS reconnect)
+  public resetDataGapTracking(): void {
+    const now = Date.now();
+    for (const symbol of this.activeSymbols) {
+      this.lastMarketDataPerSymbol.set(symbol, now);
+    }
+    this.logger.info('Data gap tracking reset after reconnection');
   }
 
   private handleTicker(ticker: Ticker): void {
-    this.lastMarketDataTimestamp = Date.now();
+    // Update per-symbol data timestamp for data gap tracking
+    this.lastMarketDataPerSymbol.set(ticker.product_id, Date.now());
+
     // Update market price
     const price = parseFloat(ticker.price);
     this.marketPrices.set(ticker.product_id, price);
-    
+
     // Update position tracker
     this.positionTracker!.updateMarketPrice(ticker.product_id, price);
     
+    // Update position monitor for stop/target checking
+    if (this.positionMonitor) {
+      this.positionMonitor.updatePrice(ticker.product_id, price);
+    }
+
     // Update paper simulator if in paper mode
     if (this.config.mode === 'paper' && this.paperSimulator) {
       this.paperSimulator.updateFromTicker(ticker);
     }
-    
+
     // Emit ticker event
     this.emit('market:ticker', ticker);
   }

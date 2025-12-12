@@ -7,8 +7,31 @@ export interface PaperTradingConfig {
   initialBalances: Map<string, number>; // currency -> amount (e.g., 'USD' -> 10000, 'BTC' -> 0)
   makerFee: number; // 0.004 for 0.4%
   takerFee: number; // 0.006 for 0.6%
-  slippage: number; // 0.001 for 0.1%
+  slippage: number; // 0.001 for 0.1% base slippage
   latencyMs: number; // Simulated order latency
+  
+  // Advanced realism settings
+  depthAware?: boolean;           // Enable depth-aware price impact
+  simulatedBookDepthUsd?: number; // Simulated book depth per price level (default $50k)
+  avgDailyVolumeUsd?: number;     // Average daily volume for slippage calculation
+  enablePartialFills?: boolean;   // Enable partial fills for large orders
+  maxPartialFillPct?: number;     // Max fill percentage per tick (default 25%)
+}
+
+// TWAP order tracking
+interface TWAPOrder {
+  parentOrderId: string;
+  productId: string;
+  side: 'buy' | 'sell';
+  totalSize: number;
+  remainingSize: number;
+  sliceSize: number;
+  numSlices: number;
+  executedSlices: number;
+  startTime: Date;
+  endTime: Date;
+  childOrderIds: string[];
+  status: 'active' | 'completed' | 'cancelled';
 }
 
 interface SimulatedOrder {
@@ -52,12 +75,184 @@ export class PaperTradingSimulator extends EventEmitter {
   private marketPrices: Map<string, number> = new Map();
   private orderSequence = 0;
   private fillSequence = 0;
+  
+  // TWAP order tracking
+  private twapOrders: Map<string, TWAPOrder> = new Map();
+  private twapTimer: NodeJS.Timeout | null = null;
 
   constructor(config: PaperTradingConfig, logger: Logger) {
     super();
-    this.config = config;
+    this.config = {
+      // Defaults for new realism settings
+      depthAware: true,
+      simulatedBookDepthUsd: 50000,
+      avgDailyVolumeUsd: 1000000,
+      enablePartialFills: false,
+      maxPartialFillPct: 0.25,
+      ...config,
+    };
     this.logger = logger;
     this.balances = new Map(config.initialBalances);
+  }
+  
+  /**
+   * Calculate depth-aware price impact for market orders.
+   * Larger orders relative to book depth = more slippage.
+   */
+  private calculatePriceImpact(notionalUsd: number, side: 'buy' | 'sell'): number {
+    if (!this.config.depthAware) {
+      return this.config.slippage;
+    }
+    
+    const bookDepth = this.config.simulatedBookDepthUsd || 50000;
+    const avgVolume = this.config.avgDailyVolumeUsd || 1000000;
+    
+    // Base slippage + depth impact + volume impact
+    const depthImpact = (notionalUsd / bookDepth) * 0.001; // 0.1% per full book depth
+    const volumeImpact = (notionalUsd / avgVolume) * 0.0005; // 0.05% per avg daily volume
+    
+    const totalImpact = this.config.slippage + depthImpact + volumeImpact;
+    
+    // Cap slippage at 2%
+    return Math.min(totalImpact, 0.02);
+  }
+  
+  /**
+   * Create a TWAP order that executes over a time period.
+   */
+  public async createTWAPOrder(
+    productId: string,
+    side: 'buy' | 'sell',
+    totalSize: number,
+    durationMs: number,
+    numSlices: number = 10
+  ): Promise<{ parentOrderId: string; sliceSize: number }> {
+    const parentOrderId = `twap_${uuidv4()}`;
+    const sliceSize = totalSize / numSlices;
+    const sliceIntervalMs = durationMs / numSlices;
+    
+    const twapOrder: TWAPOrder = {
+      parentOrderId,
+      productId,
+      side,
+      totalSize,
+      remainingSize: totalSize,
+      sliceSize,
+      numSlices,
+      executedSlices: 0,
+      startTime: new Date(),
+      endTime: new Date(Date.now() + durationMs),
+      childOrderIds: [],
+      status: 'active',
+    };
+    
+    this.twapOrders.set(parentOrderId, twapOrder);
+    
+    this.logger.info('TWAP order created', {
+      parentOrderId,
+      productId,
+      side,
+      totalSize,
+      numSlices,
+      sliceSize,
+      durationMs,
+    });
+    
+    // Execute slices over time
+    this.executeTWAPSlices(parentOrderId, sliceIntervalMs);
+    
+    return { parentOrderId, sliceSize };
+  }
+  
+  /**
+   * Execute TWAP slices at intervals.
+   */
+  private async executeTWAPSlices(parentOrderId: string, intervalMs: number): Promise<void> {
+    const twap = this.twapOrders.get(parentOrderId);
+    if (!twap || twap.status !== 'active') {
+      return;
+    }
+    
+    // Add randomization to timing (+/- 20%)
+    const randomizedInterval = intervalMs * (0.8 + Math.random() * 0.4);
+    
+    setTimeout(async () => {
+      const currentTwap = this.twapOrders.get(parentOrderId);
+      if (!currentTwap || currentTwap.status !== 'active') {
+        return;
+      }
+      
+      // Add randomization to slice size (+/- 10%)
+      const randomizedSize = currentTwap.sliceSize * (0.9 + Math.random() * 0.2);
+      const actualSize = Math.min(randomizedSize, currentTwap.remainingSize);
+      
+      if (actualSize <= 0) {
+        currentTwap.status = 'completed';
+        this.logger.info('TWAP order completed', { parentOrderId });
+        return;
+      }
+      
+      try {
+        // Execute slice as market order
+        const response = await this.placeOrder({
+          product_id: currentTwap.productId,
+          side: currentTwap.side,
+          type: 'market',
+          size: actualSize.toString(),
+          client_oid: `${parentOrderId}_slice_${currentTwap.executedSlices}`,
+        });
+        
+        currentTwap.childOrderIds.push(response.id);
+        currentTwap.executedSlices++;
+        currentTwap.remainingSize -= actualSize;
+        
+        this.logger.debug('TWAP slice executed', {
+          parentOrderId,
+          sliceNum: currentTwap.executedSlices,
+          size: actualSize,
+          remaining: currentTwap.remainingSize,
+        });
+        
+        // Schedule next slice if more remain
+        if (currentTwap.remainingSize > 0 && currentTwap.executedSlices < currentTwap.numSlices) {
+          this.executeTWAPSlices(parentOrderId, intervalMs);
+        } else {
+          currentTwap.status = 'completed';
+          this.logger.info('TWAP order completed', { 
+            parentOrderId,
+            totalSlices: currentTwap.executedSlices,
+          });
+        }
+      } catch (error) {
+        this.logger.error('TWAP slice execution failed', { parentOrderId, error });
+      }
+    }, randomizedInterval);
+  }
+  
+  /**
+   * Cancel a TWAP order.
+   */
+  public cancelTWAPOrder(parentOrderId: string): boolean {
+    const twap = this.twapOrders.get(parentOrderId);
+    if (!twap || twap.status !== 'active') {
+      return false;
+    }
+    
+    twap.status = 'cancelled';
+    this.logger.info('TWAP order cancelled', {
+      parentOrderId,
+      executedSlices: twap.executedSlices,
+      remainingSize: twap.remainingSize,
+    });
+    
+    return true;
+  }
+  
+  /**
+   * Get TWAP order status.
+   */
+  public getTWAPOrder(parentOrderId: string): TWAPOrder | undefined {
+    return this.twapOrders.get(parentOrderId);
   }
 
   /**
@@ -257,7 +452,7 @@ export class PaperTradingSimulator extends EventEmitter {
   }
 
   /**
-   * Execute market order
+   * Execute market order with depth-aware price impact.
    */
   private async executeMarketOrder(order: SimulatedOrder): Promise<void> {
     const marketPrice = this.marketPrices.get(order.productId);
@@ -267,10 +462,16 @@ export class PaperTradingSimulator extends EventEmitter {
       return;
     }
 
-    // Apply slippage
+    // Calculate notional value for price impact
+    const notionalUsd = order.size * marketPrice;
+    
+    // Calculate depth-aware slippage
+    const priceImpact = this.calculatePriceImpact(notionalUsd, order.side);
+    
+    // Apply slippage with price impact
     const executionPrice = order.side === 'buy' 
-      ? marketPrice * (1 + this.config.slippage)
-      : marketPrice * (1 - this.config.slippage);
+      ? marketPrice * (1 + priceImpact)
+      : marketPrice * (1 - priceImpact);
 
     // Create fill
     const fillId = ++this.fillSequence;
@@ -307,7 +508,9 @@ export class PaperTradingSimulator extends EventEmitter {
       orderId: order.id,
       price: executionPrice,
       size: order.size,
-      side: order.side
+      side: order.side,
+      slippage: (priceImpact * 100).toFixed(4) + '%',
+      notionalUsd: notionalUsd.toFixed(2),
     });
   }
 

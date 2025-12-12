@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
 import { EventEmitter } from 'events';
+import { Counter } from 'prom-client';
 import { Logger } from '../../core/logger';
 import { 
   CoinbaseConfig, 
@@ -9,6 +10,17 @@ import {
   OrderBook
 } from './types';
 
+// Prometheus metrics for WebSocket
+const wsReconnectCounter = new Counter({
+  name: 'atlas_ws_reconnect_count',
+  help: 'Total number of WebSocket reconnection attempts',
+});
+
+const wsReconnectSuccessCounter = new Counter({
+  name: 'atlas_ws_reconnect_success_count',
+  help: 'Total number of successful WebSocket reconnections',
+});
+
 export interface WebSocketEvents {
   ticker: (ticker: Ticker) => void;
   orderbook: (orderbook: OrderBook) => void;
@@ -16,24 +28,40 @@ export interface WebSocketEvents {
   open: () => void;
   close: (code: number, reason: string) => void;
   message: (data: WebSocketMessage) => void;
+  reconnected: () => void; // New event for successful reconnection
 }
+
+// Configuration for reconnection behavior
+const RECONNECT_CONFIG = {
+  maxAttempts: 10,           // Increased from 5
+  initialDelayMs: 1000,      // Start with 1 second
+  maxDelayMs: 60000,         // Cap at 60 seconds
+  backoffMultiplier: 2,      // Double delay each attempt
+};
 
 export class CoinbaseWebSocket extends EventEmitter {
   private ws: WebSocket | null = null;
   private config: CoinbaseConfig;
   private logger: Logger;
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
-  private reconnectDelay = 1000; // Start with 1 second
+  private maxReconnectAttempts = RECONNECT_CONFIG.maxAttempts;
+  private reconnectDelay = RECONNECT_CONFIG.initialDelayMs;
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private isConnected = false;
   private subscribedChannels: Set<string> = new Set();
   private subscribedProducts: Set<string> = new Set();
+  private wasConnectedBefore = false; // Track if this is a reconnection
+  private lastPongTime = 0;
 
   constructor(config: CoinbaseConfig, logger: Logger) {
     super();
     this.config = config;
     this.logger = logger;
+  }
+  
+  // Public getter for reconnect count (for monitoring)
+  public getReconnectAttempts(): number {
+    return this.reconnectAttempts;
   }
 
   public connect(): void {
@@ -53,10 +81,16 @@ export class CoinbaseWebSocket extends EventEmitter {
   }
 
   private handleOpen(): void {
-    this.logger.info('WebSocket connection established');
+    const isReconnection = this.wasConnectedBefore;
+    
+    this.logger.info('WebSocket connection established', { isReconnection });
     this.isConnected = true;
+    this.lastPongTime = Date.now();
+    
+    // Reset reconnection state
+    const previousAttempts = this.reconnectAttempts;
     this.reconnectAttempts = 0;
-    this.reconnectDelay = 1000;
+    this.reconnectDelay = RECONNECT_CONFIG.initialDelayMs;
     
     // Start heartbeat
     this.startHeartbeat();
@@ -67,6 +101,15 @@ export class CoinbaseWebSocket extends EventEmitter {
     }
     
     this.emit('open');
+    
+    // Emit reconnected event if this was a reconnection
+    if (isReconnection) {
+      wsReconnectSuccessCounter.inc();
+      this.logger.info(`Successfully reconnected after ${previousAttempts} attempts`);
+      this.emit('reconnected');
+    }
+    
+    this.wasConnectedBefore = true;
   }
 
   private handleMessage(data: WebSocket.Data): void {
@@ -129,7 +172,13 @@ export class CoinbaseWebSocket extends EventEmitter {
     // Attempt to reconnect with exponential backoff
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
-      const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+      wsReconnectCounter.inc();
+      
+      // Calculate delay with exponential backoff, capped at max
+      const delay = Math.min(
+        RECONNECT_CONFIG.initialDelayMs * Math.pow(RECONNECT_CONFIG.backoffMultiplier, this.reconnectAttempts - 1),
+        RECONNECT_CONFIG.maxDelayMs
+      );
       
       this.logger.info(`Attempting to reconnect in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
       
@@ -137,7 +186,13 @@ export class CoinbaseWebSocket extends EventEmitter {
         this.connect();
       }, delay);
     } else {
-      this.logger.error('Max reconnection attempts reached. Manual intervention required.');
+      this.logger.error('Max reconnection attempts reached. Manual intervention required.', {
+        maxAttempts: this.maxReconnectAttempts,
+        subscribedChannels: Array.from(this.subscribedChannels),
+        subscribedProducts: Array.from(this.subscribedProducts),
+      });
+      // Emit error for upstream handling
+      this.emit('error', new Error(`WebSocket reconnection failed after ${this.maxReconnectAttempts} attempts`));
     }
   }
 

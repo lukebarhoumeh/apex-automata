@@ -1,0 +1,251 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "AtlasBot Trading System Monitoring Dashboard",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "System Status",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "atlas_engine_running",
+          "legendFormat": "Engine Running"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "STOPPED", "color": "red" }, "1": { "text": "RUNNING", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 4 },
+      "id": 2,
+      "title": "Kill Switch Status",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "atlas_kill_switch_active",
+          "legendFormat": "Kill Switch"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "INACTIVE", "color": "green" }, "1": { "text": "ACTIVE", "color": "red" } } }
+          ]
+        }
+      }
+    },
+    {
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 4 },
+      "id": 3,
+      "title": "Daily P&L",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "atlas_daily_pnl_usd",
+          "legendFormat": "Daily P&L"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0 },
+              { "color": "green", "value": 100 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 4 },
+      "id": 4,
+      "title": "Total Exposure",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "atlas_exposure_usd",
+          "legendFormat": "Exposure"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        }
+      }
+    },
+    {
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 4 },
+      "id": 5,
+      "title": "Database Connection",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "atlas_db_connection_status",
+          "legendFormat": "DB Status"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DISCONNECTED", "color": "red" }, "1": { "text": "CONNECTED", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 6,
+      "title": "Orders Created vs Filled",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(atlas_orders_created_total[5m])",
+          "legendFormat": "Orders Created"
+        },
+        {
+          "expr": "rate(atlas_orders_filled_total[5m])",
+          "legendFormat": "Orders Filled"
+        }
+      ]
+    },
+    {
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 7,
+      "title": "WebSocket Reconnections",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(atlas_ws_reconnect_count[5m])",
+          "legendFormat": "Reconnects/5m"
+        },
+        {
+          "expr": "rate(atlas_ws_reconnect_success_count[5m])",
+          "legendFormat": "Successful Reconnects/5m"
+        }
+      ]
+    },
+    {
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "id": 8,
+      "title": "Risk Metrics Write Failures",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(atlas_risk_metrics_write_failures_total[5m])",
+          "legendFormat": "Risk Metrics Failures"
+        },
+        {
+          "expr": "rate(atlas_account_metrics_upsert_failures_total[5m])",
+          "legendFormat": "Account Metrics Failures"
+        },
+        {
+          "expr": "rate(atlas_daily_equity_write_failures_total[5m])",
+          "legendFormat": "Daily Equity Failures"
+        }
+      ]
+    },
+    {
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "id": 9,
+      "title": "Exposure Over Time",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "atlas_exposure_usd",
+          "legendFormat": "Exposure USD"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        }
+      }
+    },
+    {
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "id": 10,
+      "title": "Daily P&L Over Time",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "atlas_daily_pnl_usd",
+          "legendFormat": "Daily P&L"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        }
+      }
+    },
+    {
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 24 },
+      "id": 11,
+      "title": "System Metrics",
+      "type": "table",
+      "targets": [
+        {
+          "expr": "process_cpu_seconds_total",
+          "legendFormat": "CPU Seconds"
+        },
+        {
+          "expr": "process_resident_memory_bytes / 1024 / 1024",
+          "legendFormat": "Memory (MB)"
+        },
+        {
+          "expr": "nodejs_active_handles_total",
+          "legendFormat": "Active Handles"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["atlasbot", "trading", "monitoring"],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "AtlasBot Trading Dashboard",
+  "uid": "atlasbot-main",
+  "version": 1,
+  "weekStart": ""
+}

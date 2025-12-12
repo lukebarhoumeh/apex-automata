@@ -3,6 +3,14 @@ import path from 'node:path';
 import YAML from 'yaml';
 import { z } from 'zod';
 
+// Per-symbol risk limit configuration
+const PerSymbolLimitSchema = z.object({
+  max_notional_usd: z.number().nonnegative(),
+  max_daily_loss_usd: z.number().nonnegative(),
+});
+
+export type PerSymbolLimit = z.infer<typeof PerSymbolLimitSchema>;
+
 const GuardrailsSchema = z.object({
   account: z.object({
     equity_usd: z.number().positive(),
@@ -19,6 +27,8 @@ const GuardrailsSchema = z.object({
     funding_cost_tolerance_bps: z.number().nonnegative(),
     slippage_estimate_bps: z.number().nonnegative()
   }),
+  // Per-symbol risk limits (optional)
+  per_symbol: z.record(z.string(), PerSymbolLimitSchema).optional(),
   strategy: z.object({
     mode: z.string(),
     donchian_len: z.number().int().positive(),

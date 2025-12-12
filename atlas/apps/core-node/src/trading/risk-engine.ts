@@ -1,9 +1,26 @@
 import { EventEmitter } from 'events';
+import { Counter } from 'prom-client';
 import { Logger } from '../core/logger';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { OrderRequest } from '../exchanges/coinbase';
 import { Position, PositionTracker } from './position-tracker';
 import { GuardrailConfig } from '../config/loadGuardrails';
+
+// Prometheus metrics for risk engine reliability
+const riskMetricsWriteFailures = new Counter({
+  name: 'atlas_risk_metrics_write_failures_total',
+  help: 'Total number of failed risk_metrics database writes',
+});
+
+const accountMetricsUpsertFailures = new Counter({
+  name: 'atlas_account_metrics_upsert_failures_total',
+  help: 'Total number of failed account_metrics upsert calls',
+});
+
+const dailyEquityWriteFailures = new Counter({
+  name: 'atlas_daily_equity_write_failures_total',
+  help: 'Total number of failed daily_equity database writes',
+});
 
 export interface RiskEngineConfig {
   supabaseUrl: string;
@@ -89,6 +106,10 @@ export class RiskEngine extends EventEmitter {
   private minOrderNotionalUsd: number;
   private rapidLossThresholdUsd: number;
   private maxOpenPositionsLimit: number;
+  
+  // Per-symbol tracking
+  private dailyLossPerSymbol: Map<string, number> = new Map();
+  private blockedSymbols: Set<string> = new Set();
 
   constructor(
     config: RiskEngineConfig,
@@ -120,6 +141,143 @@ export class RiskEngine extends EventEmitter {
     this.metrics = this.initializeMetrics();
     this.startMetricsUpdate();
     this.loadDailyStartEquity();
+    this.loadRiskState();
+  }
+  
+  /**
+   * Load persisted risk state from database on startup.
+   * This ensures risk tracking continues across restarts.
+   */
+  private async loadRiskState(): Promise<void> {
+    try {
+      // Get today's date
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const todayStr = today.toISOString().split('T')[0];
+      
+      // Load latest risk metrics for today
+      const { data: latestMetrics, error: metricsError } = await this.supabase
+        .from('risk_metrics')
+        .select('*')
+        .gte('timestamp', todayStr)
+        .order('timestamp', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      
+      if (metricsError && metricsError.code !== 'PGRST116') {
+        this.logger.warn('Failed to load risk metrics state:', metricsError);
+      } else if (latestMetrics) {
+        // Restore metrics
+        this.metrics.dailyPnL = latestMetrics.daily_pnl || 0;
+        this.metrics.dailyLossPercentage = latestMetrics.daily_loss_percentage || 0;
+        this.metrics.maxDrawdown = latestMetrics.max_drawdown || 0;
+        this.metrics.consecutiveLosses = latestMetrics.consecutive_losses || 0;
+        this.metrics.errorRate = latestMetrics.error_rate || 0;
+        this.metrics.killSwitchActive = latestMetrics.kill_switch_active || false;
+        
+        if (this.metrics.killSwitchActive) {
+          this.killSwitchActive = true;
+          this.logger.warn('Restored kill switch active state from previous session');
+        }
+        
+        this.logger.info('Restored risk state from database', {
+          dailyPnL: this.metrics.dailyPnL,
+          consecutiveLosses: this.metrics.consecutiveLosses,
+          killSwitchActive: this.killSwitchActive,
+        });
+      }
+      
+      // Load account metrics for today to get weekly tracking
+      const { data: accountMetrics, error: accountError } = await this.supabase
+        .from('account_metrics')
+        .select('*')
+        .eq('date', todayStr)
+        .maybeSingle();
+      
+      if (accountError && accountError.code !== 'PGRST116') {
+        this.logger.warn('Failed to load account metrics state:', accountError);
+      } else if (accountMetrics) {
+        // Calculate weekly start from 7 days ago
+        const weekStart = new Date();
+        weekStart.setDate(weekStart.getDate() - 7);
+        weekStart.setHours(0, 0, 0, 0);
+        
+        const { data: weekStartMetrics } = await this.supabase
+          .from('account_metrics')
+          .select('total_equity')
+          .eq('date', weekStart.toISOString().split('T')[0])
+          .maybeSingle();
+        
+        if (weekStartMetrics) {
+          this.weeklyStartEquity = weekStartMetrics.total_equity;
+          this.logger.debug('Restored weekly start equity:', this.weeklyStartEquity);
+        }
+      }
+      
+    } catch (error) {
+      this.logger.error('Error loading risk state:', error);
+      // Don't throw - use initialized defaults
+    }
+  }
+  
+  /**
+   * Get per-symbol limits from guardrails config.
+   */
+  private getPerSymbolLimits(symbol: string): { maxNotionalUsd: number; maxDailyLossUsd: number } | null {
+    const perSymbol = this.guardrails.per_symbol;
+    if (!perSymbol || !perSymbol[symbol]) {
+      return null;
+    }
+    const limits = perSymbol[symbol];
+    return {
+      maxNotionalUsd: limits.max_notional_usd,
+      maxDailyLossUsd: limits.max_daily_loss_usd,
+    };
+  }
+  
+  /**
+   * Record a loss for a specific symbol.
+   */
+  public recordSymbolLoss(symbol: string, lossUsd: number): void {
+    const currentLoss = this.dailyLossPerSymbol.get(symbol) || 0;
+    const newLoss = currentLoss + lossUsd;
+    this.dailyLossPerSymbol.set(symbol, newLoss);
+    
+    // Check if symbol should be blocked
+    const limits = this.getPerSymbolLimits(symbol);
+    if (limits && newLoss >= limits.maxDailyLossUsd) {
+      if (!this.blockedSymbols.has(symbol)) {
+        this.blockedSymbols.add(symbol);
+        this.logger.warn(`Symbol ${symbol} blocked due to daily loss limit`, {
+          dailyLoss: newLoss,
+          limit: limits.maxDailyLossUsd,
+        });
+        this.emit('risk:symbol:blocked', symbol, newLoss, limits.maxDailyLossUsd);
+      }
+    }
+  }
+  
+  /**
+   * Check if a symbol is blocked from trading.
+   */
+  public isSymbolBlocked(symbol: string): boolean {
+    return this.blockedSymbols.has(symbol);
+  }
+  
+  /**
+   * Get daily loss for a symbol.
+   */
+  public getSymbolDailyLoss(symbol: string): number {
+    return this.dailyLossPerSymbol.get(symbol) || 0;
+  }
+  
+  /**
+   * Reset per-symbol daily tracking (call at start of day).
+   */
+  public resetSymbolDailyTracking(): void {
+    this.dailyLossPerSymbol.clear();
+    this.blockedSymbols.clear();
+    this.logger.info('Per-symbol daily tracking reset');
   }
 
   private initializeMetrics(): RiskMetrics {
@@ -171,13 +329,30 @@ export class RiskEngine extends EventEmitter {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    await this.supabase
-      .from('daily_equity')
-      .upsert({
-        date: today.toISOString().split('T')[0],
-        equity,
-        created_at: new Date().toISOString()
-      });
+    try {
+      const { error } = await this.supabase
+        .from('daily_equity')
+        .upsert({
+          date: today.toISOString().split('T')[0],
+          equity,
+          created_at: new Date().toISOString()
+        });
+      
+      if (error) {
+        if (error.code === 'PGRST205' || error.code === '42P01') {
+          this.logger.debug('daily_equity table not available');
+        } else {
+          dailyEquityWriteFailures.inc();
+          this.logger.error('Failed to save daily start equity:', {
+            code: error.code,
+            message: error.message,
+          });
+        }
+      }
+    } catch (error) {
+      dailyEquityWriteFailures.inc();
+      this.logger.error('Error saving daily start equity:', error);
+    }
   }
 
   private async calculateCurrentEquity(): Promise<number> {
@@ -211,8 +386,26 @@ export class RiskEngine extends EventEmitter {
       this.emit('risk:check:failed', order.client_oid || '', check.reason);
       return check;
     }
+    
+    // Check if symbol is blocked due to per-symbol daily loss limit
+    const symbol = order.product_id;
+    if (this.isSymbolBlocked(symbol)) {
+      check.passed = false;
+      check.reason = `Symbol ${symbol} is blocked due to daily loss limit`;
+      check.checks.dailyLoss = false;
+      this.emit('risk:check:failed', order.client_oid || '', check.reason);
+      return check;
+    }
 
     const orderValue = this.calculateOrderValue(order, currentPrice);
+    
+    // Check per-symbol notional limit
+    const perSymbolLimits = this.getPerSymbolLimits(symbol);
+    if (perSymbolLimits && orderValue > perSymbolLimits.maxNotionalUsd) {
+      check.passed = false;
+      check.reason = `Order $${orderValue.toFixed(2)} exceeds ${symbol} max notional $${perSymbolLimits.maxNotionalUsd}`;
+      check.checks.orderSize = false;
+    }
 
     // Check minimum order size
     if (orderValue < this.config.limits.minOrderSize) {
@@ -546,12 +739,20 @@ export class RiskEngine extends EventEmitter {
         });
 
       if (error) {
-        // Silently ignore if table doesn't exist in development
-        if (error.code !== 'PGRST205') {
-          this.logger.error('Failed to persist risk metrics:', error);
+        // Table doesn't exist is less severe, but still track it
+        if (error.code === 'PGRST205' || error.code === '42P01') {
+          this.logger.debug('risk_metrics table not available');
+        } else {
+          riskMetricsWriteFailures.inc();
+          this.logger.error('Failed to persist risk metrics:', {
+            code: error.code,
+            message: error.message,
+            details: error.details,
+          });
         }
       }
     } catch (error) {
+      riskMetricsWriteFailures.inc();
       this.logger.error('Error persisting risk metrics:', error);
     }
   }
