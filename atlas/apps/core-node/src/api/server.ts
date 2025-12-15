@@ -219,10 +219,13 @@ setInterval(() => {
     runtimeState.regime = realMetrics.regime;
   }
   
+  const isEngineRunning = tradingEngine !== null && tradingEngine.engineRunning;
+  
   broadcast({
     type: 'StatusUpdate',
     payload: {
-      mode: (tradingEngine?.getConfig().mode || 'paper'),
+      engineRunning: isEngineRunning,
+      mode: isEngineRunning ? tradingEngine!.getConfig().mode : null,
       paused: runtimeState.paused,
       dailyStopHit: runtimeState.dailyStopHit,
       killSwitch: runtimeState.killSwitch,
@@ -252,10 +255,13 @@ wss.on('connection', (ws) => {
   });
 
   // Send initial StatusUpdate
+  const isEngineRunningOnConnect = tradingEngine !== null && tradingEngine.engineRunning;
+  
   ws.send(JSON.stringify({
     type: 'StatusUpdate',
     payload: {
-      mode: (tradingEngine?.getConfig().mode || 'paper'),
+      engineRunning: isEngineRunningOnConnect,
+      mode: isEngineRunningOnConnect ? tradingEngine!.getConfig().mode : null,
       paused: runtimeState.paused,
       dailyStopHit: runtimeState.dailyStopHit,
       killSwitch: runtimeState.killSwitch,
@@ -294,8 +300,11 @@ app.get('/api/health', (req, res) => {
 
 // Get trading engine status (UI contract)
 app.get('/api/status', (req, res) => {
+  const isEngineRunning = tradingEngine !== null && tradingEngine.engineRunning;
+  
   res.json({
-    mode: (tradingEngine?.getConfig().mode || 'paper'),
+    engineRunning: isEngineRunning,
+    mode: isEngineRunning ? tradingEngine!.getConfig().mode : null,
     paused: runtimeState.paused,
     dailyStopHit: runtimeState.dailyStopHit,
     killSwitch: runtimeState.killSwitch,
@@ -720,14 +729,16 @@ app.post('/api/engine/kill', async (req, res) => {
 // Control: pause
 app.post('/api/control/pause', (req, res) => {
   runtimeState.paused = true;
-  broadcast({ type: 'StatusUpdate', payload: { ...runtimeState, mode: (tradingEngine?.getConfig().mode || 'paper') } });
+  const isRunning = tradingEngine !== null && tradingEngine.engineRunning;
+  broadcast({ type: 'StatusUpdate', payload: { ...runtimeState, engineRunning: isRunning, mode: isRunning ? tradingEngine!.getConfig().mode : null } });
   res.json({ ok: true });
 });
 
 // Control: resume
 app.post('/api/control/resume', (req, res) => {
   runtimeState.paused = false;
-  broadcast({ type: 'StatusUpdate', payload: { ...runtimeState, mode: (tradingEngine?.getConfig().mode || 'paper') } });
+  const isRunning = tradingEngine !== null && tradingEngine.engineRunning;
+  broadcast({ type: 'StatusUpdate', payload: { ...runtimeState, engineRunning: isRunning, mode: isRunning ? tradingEngine!.getConfig().mode : null } });
   res.json({ ok: true });
 });
 

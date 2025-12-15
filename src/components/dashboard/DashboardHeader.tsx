@@ -45,7 +45,7 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   const isLive = runtimeStatus?.mode === 'live';
   const killSwitchActive = runtimeStatus?.killSwitch?.active ?? false;
   const dailyStopHit = runtimeStatus?.dailyStopHit ?? false;
-  const engineRunning = runtimeHealthy && runtimeStatus?.mode !== undefined;
+  const engineRunning = runtimeHealthy && (runtimeStatus?.engineRunning ?? false);
 
   const handleStartEngine = async () => {
     setIsLoading(true);
