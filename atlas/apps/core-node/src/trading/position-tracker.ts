@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { Fill } from '../exchanges/coinbase';
+import { v4 as uuidv4 } from 'uuid';
 
 export interface PositionTrackerConfig {
   supabaseUrl: string;
@@ -19,6 +20,12 @@ export interface PositionTrackerConfig {
 export interface Position {
   id: string;
   symbol: string;
+  // Strategy metadata (populated when available)
+  strategy?: string;
+  signalId?: string;
+  stopPrice?: number;
+  takeProfit?: number;
+  exitReason?: string;
   side: 'long' | 'short' | 'flat';
   size: number;
   averagePrice: number;
@@ -27,6 +34,8 @@ export interface Position {
   realizedPnL: number;
   totalPnL: number;
   openTime: Date;
+  closedAt?: Date;
+  exitPrice?: number;
   lastUpdateTime: Date;
   trades: Trade[];
   maxSize: number;
@@ -43,6 +52,14 @@ export interface Trade {
   fee: number;
   timestamp: Date;
   realizedPnL?: number;
+}
+
+export interface FillContext {
+  strategy?: string;
+  signalId?: string;
+  stopPrice?: number;
+  takeProfit?: number;
+  tag?: string;
 }
 
 export interface PositionTrackerEvents {
@@ -115,7 +132,7 @@ export class PositionTracker extends EventEmitter {
   }
 
   // Process a fill to update positions
-  public async processFill(fill: Fill): Promise<void> {
+  public async processFill(fill: Fill, context?: FillContext): Promise<void> {
     const symbol = fill.product_id;
     const side = fill.side;
     const size = parseFloat(fill.size);
@@ -136,9 +153,43 @@ export class PositionTracker extends EventEmitter {
 
     if (!position) {
       // Create new position
-      position = this.createNewPosition(symbol);
+      position = this.createNewPosition(symbol, trade.timestamp);
+      // Attach strategy context if available
+      if (context?.strategy) {
+        position.strategy = context.strategy;
+      }
+      if (context?.signalId) {
+        position.signalId = context.signalId;
+      }
+      if (typeof context?.stopPrice === 'number' && Number.isFinite(context.stopPrice) && context.stopPrice > 0) {
+        position.stopPrice = context.stopPrice;
+      }
+      if (typeof context?.takeProfit === 'number' && Number.isFinite(context.takeProfit) && context.takeProfit > 0) {
+        position.takeProfit = context.takeProfit;
+      }
+      position.metadata = {
+        ...(position.metadata ?? {}),
+        entryOrderId: fill.order_id,
+        entryTag: context?.tag,
+      };
       this.positions.set(symbol, position);
+    } else {
+      // Backfill context if we didn't have it at open
+      if (!position.strategy && context?.strategy) {
+        position.strategy = context.strategy;
+      }
+      if (!position.signalId && context?.signalId) {
+        position.signalId = context.signalId;
+      }
+      if ((!position.stopPrice || position.stopPrice <= 0) && typeof context?.stopPrice === 'number' && Number.isFinite(context.stopPrice) && context.stopPrice > 0) {
+        position.stopPrice = context.stopPrice;
+      }
+      if ((!position.takeProfit || position.takeProfit <= 0) && typeof context?.takeProfit === 'number' && Number.isFinite(context.takeProfit) && context.takeProfit > 0) {
+        position.takeProfit = context.takeProfit;
+      }
     }
+
+    const preTradeSide = position.side;
 
     // Update position based on trade
     this.updatePositionWithTrade(position, trade);
@@ -149,12 +200,20 @@ export class PositionTracker extends EventEmitter {
     // Check risk limits
     this.checkRiskLimits(position);
 
-    // Persist to database
+    // Persist to database (handled upstream in API layer)
     await this.persistPosition(position);
 
     // Emit events
     if (position.size === 0) {
+      position.closedAt = trade.timestamp;
+      position.exitPrice = trade.price;
+      if (preTradeSide !== 'flat') {
+        // Preserve last non-flat side for downstream persistence (Supabase enum doesn't allow 'flat')
+        position.side = preTradeSide;
+      }
       this.emit('position:closed', position);
+      // Remove closed positions so a new trade creates a fresh position (new id/openTime)
+      this.positions.delete(symbol);
     } else if (position.trades.length === 1) {
       this.emit('position:opened', position);
     } else {
@@ -162,9 +221,9 @@ export class PositionTracker extends EventEmitter {
     }
   }
 
-  private createNewPosition(symbol: string): Position {
+  private createNewPosition(symbol: string, openedAt: Date): Position {
     return {
-      id: `${symbol}_${Date.now()}`,
+      id: uuidv4(),
       symbol,
       side: 'flat',
       size: 0,
@@ -173,8 +232,8 @@ export class PositionTracker extends EventEmitter {
       unrealizedPnL: 0,
       realizedPnL: 0,
       totalPnL: 0,
-      openTime: new Date(),
-      lastUpdateTime: new Date(),
+      openTime: openedAt,
+      lastUpdateTime: openedAt,
       trades: [],
       maxSize: 0,
       maxDrawdown: 0
@@ -182,51 +241,66 @@ export class PositionTracker extends EventEmitter {
   }
 
   private updatePositionWithTrade(position: Position, trade: Trade): void {
+    const previousSide = position.side;
     const previousSize = position.size;
     const previousAvgPrice = position.averagePrice;
 
-    if (trade.side === 'buy') {
-      // Increasing or opening long position
-      if (position.side === 'short') {
-        // Closing short position
-        const closingSize = Math.min(Math.abs(position.size), trade.size);
-        const realizedPnL = closingSize * (previousAvgPrice - trade.price) - trade.fee;
-        trade.realizedPnL = realizedPnL;
-        position.realizedPnL += realizedPnL;
-
-        position.size += trade.size;
-        if (position.size > 0) {
-          position.side = 'long';
-          position.averagePrice = trade.price;
-        }
-      } else {
-        // Adding to long position
-        const newSize = position.size + trade.size;
+    // Opening from flat
+    if (previousSide === 'flat' || previousSize === 0) {
+      position.side = trade.side === 'buy' ? 'long' : 'short';
+      position.size = trade.size;
+      position.averagePrice = trade.price;
+    } else if (previousSide === 'long') {
+      if (trade.side === 'buy') {
+        // Add to long
+        const newSize = previousSize + trade.size;
         position.averagePrice = ((previousSize * previousAvgPrice) + (trade.size * trade.price)) / newSize;
         position.size = newSize;
         position.side = 'long';
-      }
-    } else {
-      // Sell trade
-      if (position.side === 'long') {
-        // Closing long position
-        const closingSize = Math.min(position.size, trade.size);
+      } else {
+        // Sell reduces long or flips to short
+        const closingSize = Math.min(previousSize, trade.size);
         const realizedPnL = closingSize * (trade.price - previousAvgPrice) - trade.fee;
         trade.realizedPnL = realizedPnL;
         position.realizedPnL += realizedPnL;
 
-        position.size -= trade.size;
-        if (position.size < 0) {
+        const remainingLong = previousSize - closingSize;
+        const flipSize = trade.size - closingSize;
+
+        if (flipSize > 0) {
           position.side = 'short';
+          position.size = flipSize;
           position.averagePrice = trade.price;
-          position.size = Math.abs(position.size);
+        } else {
+          position.size = remainingLong;
+          position.side = position.size === 0 ? 'flat' : 'long';
         }
-      } else {
-        // Adding to short position
-        const newSize = position.size + trade.size;
+      }
+    } else if (previousSide === 'short') {
+      if (trade.side === 'sell') {
+        // Add to short
+        const newSize = previousSize + trade.size;
         position.averagePrice = ((previousSize * previousAvgPrice) + (trade.size * trade.price)) / newSize;
         position.size = newSize;
         position.side = 'short';
+      } else {
+        // Buy reduces short or flips to long
+        const closingSize = Math.min(previousSize, trade.size);
+        const realizedPnL = closingSize * (previousAvgPrice - trade.price) - trade.fee;
+        trade.realizedPnL = realizedPnL;
+        position.realizedPnL += realizedPnL;
+
+        const remainingShort = previousSize - closingSize;
+        const flipSize = trade.size - closingSize;
+
+        if (flipSize > 0) {
+          position.side = 'long';
+          position.size = flipSize;
+          position.averagePrice = trade.price;
+        } else {
+          position.size = remainingShort;
+          position.side = position.size === 0 ? 'flat' : 'short';
+        }
       }
     }
 
@@ -235,9 +309,8 @@ export class PositionTracker extends EventEmitter {
     position.lastUpdateTime = new Date();
     position.maxSize = Math.max(position.maxSize, Math.abs(position.size));
 
-    if (position.size === 0) {
-      position.side = 'flat';
-      position.averagePrice = 0;
+    if (!Number.isFinite(position.size) || position.size < 0) {
+      position.size = Math.max(0, Number.isFinite(position.size) ? position.size : 0);
     }
   }
 

@@ -9,6 +9,7 @@ import { SecretManager, SecretConfig } from '../config/secrets';
 import { PaperTradingSimulator, PaperTradingConfig } from './paper-trading-simulator';
 import { PositionMonitor, PositionMonitorConfig } from './position-monitor';
 import { GuardrailConfig } from '../config/loadGuardrails';
+import { v4 as uuidv4 } from 'uuid';
 
 export interface TradingEngineConfig {
   mode: 'paper' | 'live';
@@ -21,6 +22,7 @@ export interface TradingEngineConfig {
     url: string;
     serviceKey: string;
     anonKey: string;
+    userId?: string;
   };
   security: {
     encryptionKey: string;
@@ -170,7 +172,22 @@ export class TradingEngine extends EventEmitter {
       if (this.orderManager) {
         const activeOrders = this.orderManager.getActiveOrders();
         for (const order of activeOrders) {
-          await this.orderManager.cancelOrder(order.id);
+          await this.cancelOrder(order.id);
+        }
+      }
+      
+      // Flatten positions on shutdown if configured
+      if (this.guardrails?.compliance?.flatten_on_shutdown && this.positionTracker) {
+        try {
+          if (!this.positionTracker.isFlatteningInProgress()) {
+            await this.positionTracker.closeAllPositions();
+          }
+          
+          // Best-effort wait for closes to be processed (paper fills are immediate; live fills rely on polling/WS).
+          const timeoutMs = Math.max(5000, (this.guardrails.execution.order_timeout_sec || 5) * 1000 * 3);
+          await this.waitForPositionsToClose(timeoutMs);
+        } catch (err) {
+          this.logger.error('Flatten-on-shutdown failed:', err);
         }
       }
 
@@ -204,6 +221,27 @@ export class TradingEngine extends EventEmitter {
     } catch (error) {
       this.logger.error('Error stopping trading engine:', error);
       this.emit('engine:error', error as Error);
+    }
+  }
+
+  private async waitForPositionsToClose(timeoutMs: number): Promise<void> {
+    const started = Date.now();
+    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+    
+    while (Date.now() - started < timeoutMs) {
+      const open = this.positionTracker?.getOpenPositions() || [];
+      if (open.length === 0) {
+        return;
+      }
+      await sleep(250);
+    }
+    
+    const remaining = this.positionTracker?.getOpenPositions() || [];
+    if (remaining.length > 0) {
+      this.logger.warn('Timeout waiting for positions to close', {
+        remaining: remaining.map(p => ({ symbol: p.symbol, side: p.side, size: p.size })),
+        timeoutMs,
+      });
     }
   }
 
@@ -305,6 +343,12 @@ export class TradingEngine extends EventEmitter {
           side,
           type: 'market',
           size: size.toString(),
+        }, {
+          strategy: 'system',
+          metadata: {
+            tag: tag || 'flatten',
+            reason: tag === 'flatten' ? 'flatten' : 'position_action',
+          }
         });
         
         if (order) {
@@ -334,6 +378,7 @@ export class TradingEngine extends EventEmitter {
     const config: RiskEngineConfig = {
       supabaseUrl: this.config.supabase.url,
       supabaseKey: this.config.supabase.serviceKey,
+      userId: this.config.supabase.userId,
       limits: {
         maxPositionSize: maxPositionSizeUsd,
         maxTotalExposure: maxTotalExposureUsd,
@@ -376,6 +421,12 @@ export class TradingEngine extends EventEmitter {
           side,
           type: 'market',
           size: size.toString(),
+        }, {
+          strategy: 'system',
+          metadata: {
+            tag: 'exit',
+            reason: 'position_exit',
+          }
         });
         return order !== null;
       } catch (error) {
@@ -420,7 +471,13 @@ export class TradingEngine extends EventEmitter {
     
     // Listen for fills from simulator
     this.paperSimulator.on('fill', (fill: Fill) => {
-      this.handleFill(fill);
+      // Re-emit through the exchange event pipeline so OrderManager + engine handlers stay consistent.
+      // This ensures paper fills produce order:filled events just like live trading.
+      if (this.exchange) {
+        this.exchange.emit('fill', fill);
+      } else {
+        void this.handleFill(fill);
+      }
     });
     
     this.logger.info('Paper trading simulator initialized');
@@ -444,7 +501,9 @@ export class TradingEngine extends EventEmitter {
     this.orderManager!.on('order:filled', (order, fill) => this.emit('order:filled', order, fill));
 
     // Position tracker events
+    this.positionTracker!.on('position:opened', (position) => this.emit('position:update', position));
     this.positionTracker!.on('position:updated', (position) => this.emit('position:update', position));
+    this.positionTracker!.on('position:closed', (position) => this.emit('position:update', position));
 
     // Risk engine events
     this.riskEngine!.on('risk:alert', (symbol, alert) => this.emit('risk:alert', { symbol, alert }));
@@ -515,6 +574,13 @@ export class TradingEngine extends EventEmitter {
   // Public getter for active symbols (used by API/status endpoints)
   public getActiveSymbols(): string[] {
     return [...this.activeSymbols];
+  }
+  
+  // Notify engine components that a new candle has been produced for a symbol (used for time stops).
+  public notifyNewCandle(symbol: string): void {
+    if (this.positionMonitor) {
+      this.positionMonitor.incrementBarCount(symbol);
+    }
   }
 
   private startDataGapMonitor(): void {
@@ -623,15 +689,32 @@ export class TradingEngine extends EventEmitter {
   }
 
   private async handleFill(fill: Fill): Promise<void> {
-    // Update position tracker
-    await this.positionTracker!.processFill(fill);
+    // Try to associate fills with their originating managed order (for stop/target + strategy metadata)
+    const managedOrder = this.orderManager?.getOrderByExchangeOrderId(fill.order_id);
+    await this.positionTracker!.processFill(fill, {
+      strategy: managedOrder?.strategy,
+      signalId: managedOrder?.metadata?.signalId,
+      stopPrice: managedOrder?.metadata?.stopPrice,
+      takeProfit: managedOrder?.metadata?.takeProfit,
+      tag: managedOrder?.metadata?.tag,
+    });
     
     // Update risk engine metrics
     this.riskEngine!.recordOrderResult(fill.order_id, true, 0);
+    
+    // Update open order count after fills (both paper + live)
+    const activeOrders = this.orderManager?.getActiveOrders() || [];
+    this.riskEngine!.updateOpenOrderCount(activeOrders.length);
   }
 
   // Public API for placing orders
-  public async createOrder(request: Omit<OrderRequest, 'client_oid'>): Promise<ManagedOrder | null> {
+  public async createOrder(
+    request: Omit<OrderRequest, 'client_oid'>,
+    context?: {
+      strategy?: string;
+      metadata?: Record<string, any>;
+    }
+  ): Promise<ManagedOrder | null> {
     if (!this.isRunning) {
       throw new Error('Trading engine not running');
     }
@@ -653,31 +736,68 @@ export class TradingEngine extends EventEmitter {
         this.logger.info('Paper trading mode - simulating order execution');
         
         try {
-          const paperOrder = await this.paperSimulator.placeOrder(request);
-          
-          // Create managed order from paper order
+          if (!this.orderManager) {
+            throw new Error('OrderManager not initialized');
+          }
+
+          // Create/track the order BEFORE simulating execution so immediate fills can be matched
+          const clientOrderId = uuidv4();
           const parsedSize = request.size ? parseFloat(request.size) : 0;
           const managedOrder: ManagedOrder = {
-            id: paperOrder.id,
-            clientOrderId: paperOrder.id,
-            exchangeOrderId: paperOrder.id,
+            id: clientOrderId,
+            clientOrderId,
+            exchangeOrderId: undefined,
             product: request.product_id,
             productId: request.product_id,
             side: request.side,
             type: request.type,
             size: Number.isFinite(parsedSize) ? parsedSize : 0,
             price: request.price ? parseFloat(request.price) : undefined,
-            status: paperOrder.status,
-            filledSize: parseFloat(paperOrder.filled_size),
-            executedValue: parseFloat(paperOrder.executed_value),
-            fee: parseFloat(paperOrder.fill_fees),
-            createdAt: new Date(paperOrder.created_at),
-            updatedAt: new Date(paperOrder.created_at),
-            fills: []
+            status: 'pending',
+            filledSize: 0,
+            executedValue: 0,
+            fee: 0,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            fills: [],
+            metadata: context?.metadata ?? {},
+            strategy: context?.strategy,
           };
+
+          await this.orderManager.trackPaperOrder(managedOrder);
+
+          const paperOrder = await this.paperSimulator.placeOrder({
+            ...(request as any),
+            client_oid: clientOrderId,
+          } as OrderRequest);
           
-          // Track order in order manager
-          await this.orderManager!.trackPaperOrder(managedOrder);
+          // Best-effort state sync from simulator response (fills/events may have already updated the order)
+          managedOrder.exchangeOrderId = paperOrder.id;
+          const responseCreatedAt = new Date(paperOrder.created_at);
+          if (Number.isFinite(responseCreatedAt.getTime())) {
+            managedOrder.updatedAt = new Date(Math.max(managedOrder.updatedAt.getTime(), responseCreatedAt.getTime()));
+          }
+          const currentStatus = String(managedOrder.status || '').toLowerCase();
+          const terminalStatuses = new Set(['filled', 'done', 'cancelled', 'canceled', 'rejected', 'failed']);
+          if (!terminalStatuses.has(currentStatus)) {
+            managedOrder.status = paperOrder.status;
+          }
+          const filled = Number.parseFloat(paperOrder.filled_size);
+          const executed = Number.parseFloat(paperOrder.executed_value);
+          const fees = Number.parseFloat(paperOrder.fill_fees);
+          if (Number.isFinite(filled) && filled > managedOrder.filledSize) {
+            managedOrder.filledSize = filled;
+          }
+          if (Number.isFinite(executed) && executed > managedOrder.executedValue) {
+            managedOrder.executedValue = executed;
+          }
+          if (Number.isFinite(fees) && fees > managedOrder.fee) {
+            managedOrder.fee = fees;
+          }
+          
+          // Update open order count after this order (paper mode)
+          const activeOrders = this.orderManager.getActiveOrders();
+          this.riskEngine!.updateOpenOrderCount(activeOrders.length);
           
           return managedOrder;
         } catch (error) {
@@ -687,7 +807,10 @@ export class TradingEngine extends EventEmitter {
       }
 
       // Place order
-      const order = await this.orderManager!.createOrder(request);
+      const order = await this.orderManager!.createOrder(request, {
+        metadata: context?.metadata,
+        strategy: context?.strategy,
+      });
       
       // Update open order count
       const activeOrders = this.orderManager!.getActiveOrders();
@@ -752,7 +875,22 @@ export class TradingEngine extends EventEmitter {
       throw new Error('Trading engine not running');
     }
 
-    return await this.orderManager!.cancelOrder(orderId);
+    // Paper mode cancellations must go through the simulator (no authenticated REST available)
+    if (this.config.mode === 'paper' && this.paperSimulator && this.orderManager) {
+      const cancelled = await this.paperSimulator.cancelOrder(orderId);
+      if (cancelled) {
+        this.orderManager.cancelLocalOrder(orderId);
+      }
+      // Update open order count after cancel attempt
+      const activeOrders = this.orderManager.getActiveOrders();
+      this.riskEngine!.updateOpenOrderCount(activeOrders.length);
+      return cancelled;
+    }
+    
+    const result = await this.orderManager!.cancelOrder(orderId);
+    const activeOrders = this.orderManager!.getActiveOrders();
+    this.riskEngine!.updateOpenOrderCount(activeOrders.length);
+    return result;
   }
 
   // Get current positions

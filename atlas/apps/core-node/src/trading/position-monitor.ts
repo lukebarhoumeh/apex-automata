@@ -183,16 +183,26 @@ export class PositionMonitor extends EventEmitter {
     
     // Calculate default stop/target based on entry price
     const entryPrice = position.averagePrice;
-    const stopPercent = 0.02; // Default 2% stop
-    const targetPercent = 0.03; // Default 3% target
     
-    const stopLoss = position.side === 'long'
+    // Prefer strategy-provided stop/target if available (from signal → order metadata)
+    const providedStop = position.stopPrice;
+    const providedTarget = position.takeProfit;
+    const hasProvidedStop = typeof providedStop === 'number' && Number.isFinite(providedStop) && providedStop > 0;
+    const hasProvidedTarget = typeof providedTarget === 'number' && Number.isFinite(providedTarget) && providedTarget > 0;
+    
+    const stopPercent = 0.02; // Fallback 2% stop
+    const targetPercent = 0.03; // Fallback 3% target
+    
+    const fallbackStop = position.side === 'long'
       ? entryPrice * (1 - stopPercent)
       : entryPrice * (1 + stopPercent);
       
-    const takeProfit = position.side === 'long'
+    const fallbackTarget = position.side === 'long'
       ? entryPrice * (1 + targetPercent)
       : entryPrice * (1 - targetPercent);
+    
+    const stopLoss = hasProvidedStop ? providedStop : fallbackStop;
+    const takeProfit = hasProvidedTarget ? providedTarget : fallbackTarget;
     
     this.registerPosition(position, stopLoss, takeProfit);
   }

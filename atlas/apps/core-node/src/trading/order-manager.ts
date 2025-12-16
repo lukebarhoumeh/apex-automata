@@ -73,6 +73,7 @@ export class OrderManager extends EventEmitter {
   private logger: Logger;
   private exchange: CoinbaseExchange;
   private orders: Map<string, ManagedOrder> = new Map();
+  private exchangeIdToManagedId: Map<string, string> = new Map();
   private twapOrders: Map<string, TWAPOrder> = new Map();
   private twapTimers: Map<string, NodeJS.Timeout[]> = new Map();
 
@@ -93,11 +94,53 @@ export class OrderManager extends EventEmitter {
     this.exchange.on('order', this.handleExchangeOrder.bind(this));
     this.exchange.on('fill', this.handleExchangeFill.bind(this));
   }
+  
+  private resolveManagedOrderByExchangeId(exchangeOrderId: string): ManagedOrder | undefined {
+    // Paper mode often uses the client order id as the order id.
+    const direct = this.orders.get(exchangeOrderId);
+    if (direct) {
+      return direct;
+    }
+    
+    const managedId = this.exchangeIdToManagedId.get(exchangeOrderId);
+    if (!managedId) {
+      return undefined;
+    }
+    return this.orders.get(managedId);
+  }
+  
+  private resolveManagedOrderFromExchangeOrder(order: CoinbaseOrder): ManagedOrder | undefined {
+    const byExchangeId = this.resolveManagedOrderByExchangeId(order.id);
+    if (byExchangeId) {
+      return byExchangeId;
+    }
+    
+    // Coinbase often echoes client_oid (or similar) back on order payloads.
+    const clientOid = (order as any).client_oid || (order as any).client_order_id || (order as any).clientOrderId;
+    if (typeof clientOid === 'string' && clientOid.length > 0) {
+      const byClient = this.orders.get(clientOid);
+      if (byClient) {
+        byClient.exchangeOrderId = order.id;
+        this.exchangeIdToManagedId.set(order.id, byClient.id);
+        return byClient;
+      }
+    }
+    
+    return undefined;
+  }
 
   private async handleExchangeOrder(order: CoinbaseOrder): Promise<void> {
-    const managedOrder = this.orders.get(order.id);
+    const managedOrder = this.resolveManagedOrderFromExchangeOrder(order);
     if (!managedOrder) {
       return;
+    }
+    
+    // Ensure the exchange id mapping exists for subsequent fills.
+    if (managedOrder.exchangeOrderId) {
+      this.exchangeIdToManagedId.set(managedOrder.exchangeOrderId, managedOrder.id);
+    } else {
+      managedOrder.exchangeOrderId = order.id;
+      this.exchangeIdToManagedId.set(order.id, managedOrder.id);
     }
 
     // Update order status
@@ -112,17 +155,35 @@ export class OrderManager extends EventEmitter {
   }
 
   private async handleExchangeFill(fill: Fill): Promise<void> {
-    const managedOrder = this.orders.get(fill.order_id);
+    const managedOrder = this.resolveManagedOrderByExchangeId(fill.order_id);
     if (!managedOrder) {
       return;
     }
 
-    managedOrder.filledSize = parseFloat(fill.size);
-    const executedValue = fill.usd_volume
-      ? parseFloat(fill.usd_volume)
-      : parseFloat(fill.price) * parseFloat(fill.size);
-    managedOrder.executedValue = executedValue;
-    managedOrder.fee = parseFloat(fill.fee);
+    const fillSize = Number.parseFloat(fill.size);
+    const fillPrice = Number.parseFloat(fill.price);
+    const fillFee = Number.parseFloat(fill.fee);
+    const fillUsdValue = fill.usd_volume
+      ? Number.parseFloat(fill.usd_volume)
+      : (fillPrice * fillSize);
+
+    const safeFillSize = Number.isFinite(fillSize) ? fillSize : 0;
+    const safeFillUsdValue = Number.isFinite(fillUsdValue) ? fillUsdValue : 0;
+    const safeFillFee = Number.isFinite(fillFee) ? fillFee : 0;
+
+    // Accumulate fills (Coinbase can emit multiple fills per order)
+    managedOrder.filledSize = Math.max(0, managedOrder.filledSize + safeFillSize);
+    managedOrder.executedValue = Math.max(0, managedOrder.executedValue + safeFillUsdValue);
+    managedOrder.fee = Math.max(0, managedOrder.fee + safeFillFee);
+
+    // Best-effort status update from fill progress
+    const epsilon = 1e-12;
+    if (managedOrder.size > 0 && managedOrder.filledSize + epsilon >= managedOrder.size) {
+      managedOrder.status = 'filled';
+      managedOrder.filledSize = managedOrder.size;
+    } else if (safeFillSize > 0) {
+      managedOrder.status = 'partially_filled';
+    }
     managedOrder.updatedAt = new Date(fill.created_at);
     managedOrder.fills = [...managedOrder.fills, fill];
 
@@ -152,7 +213,13 @@ export class OrderManager extends EventEmitter {
   }
 
   // Create a standard order
-  public async createOrder(request: Omit<OrderRequest, 'client_oid'>): Promise<ManagedOrder> {
+  public async createOrder(
+    request: Omit<OrderRequest, 'client_oid'>,
+    init?: {
+      metadata?: Record<string, any>;
+      strategy?: string;
+    }
+  ): Promise<ManagedOrder> {
     const clientOrderId = uuidv4();
     const parsedSize = request.size ? parseFloat(request.size) : 0;
     const parsedPrice = request.price ? parseFloat(request.price) : undefined;
@@ -171,9 +238,13 @@ export class OrderManager extends EventEmitter {
       fee: 0,
       createdAt: new Date(),
       updatedAt: new Date(),
-      metadata: {},
+      metadata: init?.metadata ?? {},
       fills: []
     };
+    
+    if (init?.strategy) {
+      managedOrder.strategy = init.strategy;
+    }
 
     this.orders.set(clientOrderId, managedOrder);
     await this.persistOrder(managedOrder);
@@ -187,6 +258,7 @@ export class OrderManager extends EventEmitter {
       });
 
       managedOrder.exchangeOrderId = exchangeOrder.id;
+      this.exchangeIdToManagedId.set(exchangeOrder.id, managedOrder.id);
       managedOrder.status = 'open';
       await this.persistOrder(managedOrder);
 
@@ -502,11 +574,39 @@ export class OrderManager extends EventEmitter {
   public getOrder(orderId: string): ManagedOrder | undefined {
     return this.orders.get(orderId) || this.twapOrders.get(orderId);
   }
+  
+  public getOrderByExchangeOrderId(exchangeOrderId: string): ManagedOrder | undefined {
+    return this.resolveManagedOrderByExchangeId(exchangeOrderId);
+  }
 
   // Track paper trading order
   public async trackPaperOrder(order: ManagedOrder): Promise<void> {
     this.orders.set(order.id, order);
+    if (order.exchangeOrderId) {
+      this.exchangeIdToManagedId.set(order.exchangeOrderId, order.id);
+    } else {
+      // In paper mode, we typically use the client id as the order id.
+      this.exchangeIdToManagedId.set(order.id, order.id);
+    }
     await this.persistOrder(order);
     this.emit('order:created', order);
+  }
+  
+  // Mark an order cancelled without calling the exchange (paper mode, local cancels)
+  public cancelLocalOrder(orderId: string): ManagedOrder | null {
+    const order = this.orders.get(orderId);
+    if (!order) {
+      return null;
+    }
+    
+    const terminal = new Set(['filled', 'done', 'cancelled', 'canceled', 'rejected', 'failed']);
+    if (terminal.has(String(order.status || '').toLowerCase())) {
+      return order;
+    }
+    
+    order.status = 'cancelled';
+    order.updatedAt = new Date();
+    this.emit('order:cancelled', order);
+    return order;
   }
 }

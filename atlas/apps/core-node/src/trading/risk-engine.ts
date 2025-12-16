@@ -25,6 +25,7 @@ const dailyEquityWriteFailures = new Counter({
 export interface RiskEngineConfig {
   supabaseUrl: string;
   supabaseKey: string;
+  userId?: string;
   limits: {
     maxPositionSize: number;        // Max USD value per position
     maxTotalExposure: number;       // Max total USD exposure
@@ -87,6 +88,7 @@ export class RiskEngine extends EventEmitter {
   private config: RiskEngineConfig;
   private logger: Logger;
   private supabase: SupabaseClient;
+  private userId?: string;
   private positionTracker: PositionTracker;
   private metrics: RiskMetrics;
   private killSwitchActive = false;
@@ -121,6 +123,7 @@ export class RiskEngine extends EventEmitter {
     this.logger = logger;
     this.positionTracker = positionTracker;
     this.supabase = createClient(config.supabaseUrl, config.supabaseKey);
+    this.userId = config.userId;
 
     this.guardrails = config.guardrails;
     this.accountEquity = config.accountEquity;
@@ -150,30 +153,30 @@ export class RiskEngine extends EventEmitter {
    */
   private async loadRiskState(): Promise<void> {
     try {
-      // Get today's date
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const todayStr = today.toISOString().split('T')[0];
-      
-      // Load latest risk metrics for today
-      const { data: latestMetrics, error: metricsError } = await this.supabase
+      const todayStr = new Date().toISOString().split('T')[0];
+
+      let query = this.supabase
         .from('risk_metrics')
         .select('*')
-        .gte('timestamp', todayStr)
-        .order('timestamp', { ascending: false })
-        .limit(1)
-        .maybeSingle();
+        .order('updated_at', { ascending: false })
+        .limit(1);
+
+      if (this.userId) {
+        query = query.eq('user_id', this.userId);
+      }
+
+      const { data: latestMetrics, error: metricsError } = await query.maybeSingle();
       
       if (metricsError && metricsError.code !== 'PGRST116') {
         this.logger.warn('Failed to load risk metrics state:', metricsError);
       } else if (latestMetrics) {
         // Restore metrics
-        this.metrics.dailyPnL = latestMetrics.daily_pnl || 0;
-        this.metrics.dailyLossPercentage = latestMetrics.daily_loss_percentage || 0;
-        this.metrics.maxDrawdown = latestMetrics.max_drawdown || 0;
-        this.metrics.consecutiveLosses = latestMetrics.consecutive_losses || 0;
-        this.metrics.errorRate = latestMetrics.error_rate || 0;
-        this.metrics.killSwitchActive = latestMetrics.kill_switch_active || false;
+        this.metrics.dailyPnL = Number(latestMetrics.daily_pnl ?? 0);
+        this.metrics.maxDrawdown = Number(latestMetrics.max_drawdown ?? 0);
+        this.metrics.consecutiveLosses = Number(latestMetrics.consecutive_losses ?? 0);
+        this.metrics.errorRate = Number(latestMetrics.error_rate ?? 0);
+        this.metrics.currentExposure = Number(latestMetrics.exposure_usd ?? 0);
+        this.metrics.killSwitchActive = Boolean(latestMetrics.kill_switch_active);
         
         if (this.metrics.killSwitchActive) {
           this.killSwitchActive = true;
@@ -188,13 +191,17 @@ export class RiskEngine extends EventEmitter {
       }
       
       // Load account metrics for today to get weekly tracking
-      const { data: accountMetrics, error: accountError } = await this.supabase
+      let acctQuery = this.supabase
         .from('account_metrics')
         .select('*')
         .eq('date', todayStr)
-        .maybeSingle();
+        .limit(1);
+      if (this.userId) {
+        acctQuery = acctQuery.eq('user_id', this.userId);
+      }
+      const { data: accountMetrics, error: accountError } = await acctQuery.maybeSingle();
       
-      if (accountError && accountError.code !== 'PGRST116') {
+      if (accountError && !['PGRST116', 'PGRST205', '42P01'].includes(accountError.code)) {
         this.logger.warn('Failed to load account metrics state:', accountError);
       } else if (accountMetrics) {
         // Calculate weekly start from 7 days ago
@@ -202,11 +209,15 @@ export class RiskEngine extends EventEmitter {
         weekStart.setDate(weekStart.getDate() - 7);
         weekStart.setHours(0, 0, 0, 0);
         
-        const { data: weekStartMetrics } = await this.supabase
+        let weekQuery = this.supabase
           .from('account_metrics')
           .select('total_equity')
           .eq('date', weekStart.toISOString().split('T')[0])
-          .maybeSingle();
+          .limit(1);
+        if (this.userId) {
+          weekQuery = weekQuery.eq('user_id', this.userId);
+        }
+        const { data: weekStartMetrics } = await weekQuery.maybeSingle();
         
         if (weekStartMetrics) {
           this.weeklyStartEquity = weekStartMetrics.total_equity;
@@ -302,23 +313,42 @@ export class RiskEngine extends EventEmitter {
   }
 
   private async loadDailyStartEquity(): Promise<void> {
-    // Load today's starting equity from database
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const todayStr = new Date().toISOString().split('T')[0];
 
-    const { data, error } = await this.supabase
-      .from('daily_equity')
-      .select('equity')
-      .eq('date', today.toISOString().split('T')[0])
-      .single();
+    // If userId isn't provided, fall back to in-memory only
+    if (!this.userId) {
+      this.dailyStartEquity = await this.calculateCurrentEquity();
+      this.weeklyStartEquity = this.dailyStartEquity;
+      this.weeklyStartTimestamp = Date.now();
+      return;
+    }
 
-    if (data) {
-      this.dailyStartEquity = data.equity;
-    } else {
-      // If no record for today, get current equity
-      const equity = await this.calculateCurrentEquity();
-      this.dailyStartEquity = equity;
-      await this.saveDailyStartEquity(equity);
+    try {
+      const { data, error } = await this.supabase
+        .from('daily_equity')
+        .select('start_equity')
+        .eq('user_id', this.userId)
+        .eq('date', todayStr)
+        .maybeSingle();
+
+      if (error) {
+        if (error.code === 'PGRST205' || error.code === '42P01') {
+          this.logger.debug('daily_equity table not available');
+          this.dailyStartEquity = await this.calculateCurrentEquity();
+        } else if (error.code !== 'PGRST116') {
+          this.logger.warn('Failed to load daily_equity start equity:', error);
+          this.dailyStartEquity = await this.calculateCurrentEquity();
+        }
+      } else if (data && data.start_equity !== undefined) {
+        this.dailyStartEquity = Number(data.start_equity);
+      } else {
+        const equity = await this.calculateCurrentEquity();
+        this.dailyStartEquity = equity;
+        await this.saveDailyStartEquity(equity);
+      }
+    } catch (err) {
+      this.logger.warn('Error loading daily start equity (fallback to in-memory):', err);
+      this.dailyStartEquity = await this.calculateCurrentEquity();
     }
 
     this.weeklyStartEquity = this.dailyStartEquity;
@@ -326,17 +356,20 @@ export class RiskEngine extends EventEmitter {
   }
 
   private async saveDailyStartEquity(equity: number): Promise<void> {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    if (!this.userId) {
+      return;
+    }
+
+    const todayStr = new Date().toISOString().split('T')[0];
 
     try {
       const { error } = await this.supabase
         .from('daily_equity')
         .upsert({
-          date: today.toISOString().split('T')[0],
-          equity,
-          created_at: new Date().toISOString()
-        });
+          user_id: this.userId,
+          date: todayStr,
+          start_equity: equity,
+        }, { onConflict: 'user_id,date' });
       
       if (error) {
         if (error.code === 'PGRST205' || error.code === '42P01') {
@@ -378,89 +411,101 @@ export class RiskEngine extends EventEmitter {
       }
     };
 
-    // Check if kill switch is active
-    if (this.killSwitchActive) {
+    const symbol = order.product_id;
+    const position = this.positionTracker.getPosition(symbol);
+    const exposureSim = this.simulatePositionAfterOrder(position, order, currentPrice);
+    const orderValue = this.calculateOrderValue(order, currentPrice);
+    const isReduceOnly = exposureSim.isReduceOnly;
+    
+    // Spot safety: if shorts are disabled, reject any order that would create/increase a short position.
+    const shortsAllowed = Boolean(this.guardrails?.strategy?.allow_short);
+    if (!shortsAllowed && exposureSim.newSide === 'short') {
       check.passed = false;
-      check.reason = 'Kill switch is active';
+      check.reason = `Short selling is disabled; cannot create/increase short position on ${symbol}`;
+      check.checks.positionSize = false;
+      this.emit('risk:check:failed', order.client_oid || '', check.reason);
+      return check;
+    }
+    
+    // Check if kill switch is active (allow reduce-only exits)
+    if (this.killSwitchActive && !isReduceOnly) {
+      check.passed = false;
+      check.reason = 'Kill switch is active (entries disabled)';
       check.checks.killSwitch = false;
       this.emit('risk:check:failed', order.client_oid || '', check.reason);
       return check;
     }
     
-    // Check if symbol is blocked due to per-symbol daily loss limit
-    const symbol = order.product_id;
-    if (this.isSymbolBlocked(symbol)) {
+    // Check if symbol is blocked due to per-symbol daily loss limit (allow reduce-only exits)
+    if (this.isSymbolBlocked(symbol) && !isReduceOnly) {
       check.passed = false;
       check.reason = `Symbol ${symbol} is blocked due to daily loss limit`;
       check.checks.dailyLoss = false;
       this.emit('risk:check:failed', order.client_oid || '', check.reason);
       return check;
     }
-
-    const orderValue = this.calculateOrderValue(order, currentPrice);
     
-    // Check per-symbol notional limit
-    const perSymbolLimits = this.getPerSymbolLimits(symbol);
-    if (perSymbolLimits && orderValue > perSymbolLimits.maxNotionalUsd) {
-      check.passed = false;
-      check.reason = `Order $${orderValue.toFixed(2)} exceeds ${symbol} max notional $${perSymbolLimits.maxNotionalUsd}`;
-      check.checks.orderSize = false;
-    }
-
-    // Check minimum order size
-    if (orderValue < this.config.limits.minOrderSize) {
-      check.passed = false;
-      check.reason = `Order size $${orderValue.toFixed(2)} below minimum $${this.config.limits.minOrderSize}`;
-      check.checks.orderSize = false;
-    }
-
-    const openPositions = this.positionTracker.getOpenPositions();
-    if (openPositions.length >= this.maxOpenPositionsLimit) {
-      check.passed = false;
-      check.reason = `Open position limit reached (${openPositions.length}/${this.maxOpenPositionsLimit})`;
-      check.checks.openPositions = false;
-    }
-
-    // Check maximum order size
-    if (orderValue > this.config.limits.maxOrderSize) {
-      check.passed = false;
-      check.reason = `Order size $${orderValue.toFixed(2)} exceeds maximum $${this.config.limits.maxOrderSize}`;
-      check.checks.orderSize = false;
-    }
-
-    // Check position size limit
-    const position = this.positionTracker.getPosition(order.product_id);
-    const currentPositionValue = position ? position.size * position.marketPrice : 0;
-    const newPositionValue = currentPositionValue + (order.side === 'buy' ? orderValue : -orderValue);
-
-    if (Math.abs(newPositionValue) > this.config.limits.maxPositionSize || Math.abs(newPositionValue) > this.maxPositionExposureUsd) {
-      check.passed = false;
-      check.reason = `Position size would exceed limit: $${Math.abs(newPositionValue).toFixed(2)} > $${this.config.limits.maxPositionSize}`;
-      check.checks.positionSize = false;
-    }
-
-    // Check total exposure
-    const currentExposure = this.calculateTotalExposure();
-    const newExposure = currentExposure + orderValue;
-
-    if (newExposure > this.config.limits.maxTotalExposure || newExposure > this.maxPositionExposureUsd) {
-      check.passed = false;
-      check.reason = `Total exposure would exceed limit: $${newExposure.toFixed(2)} > $${this.config.limits.maxTotalExposure}`;
-      check.checks.totalExposure = false;
-    }
-
-    // Check daily loss limit
-    if (this.metrics.dailyPnL < -this.config.limits.maxDailyLoss) {
-      check.passed = false;
-      check.reason = `Daily loss limit reached: $${Math.abs(this.metrics.dailyPnL).toFixed(2)}`;
-      check.checks.dailyLoss = false;
-    }
-
-    // Check open orders limit
-    if (this.metrics.openOrderCount >= this.config.limits.maxOpenOrders) {
-      check.passed = false;
-      check.reason = `Maximum open orders limit reached: ${this.metrics.openOrderCount}`;
-      check.checks.openOrders = false;
+    // Reduce-only exits are allowed even when limits are breached; we still validate sizing best-effort.
+    if (!isReduceOnly) {
+      // Per-symbol notional limit should apply to resulting position exposure (not just order notional)
+      const perSymbolLimits = this.getPerSymbolLimits(symbol);
+      if (perSymbolLimits && exposureSim.newAbsNotional > perSymbolLimits.maxNotionalUsd) {
+        check.passed = false;
+        check.reason = `Position notional $${exposureSim.newAbsNotional.toFixed(2)} exceeds ${symbol} max notional $${perSymbolLimits.maxNotionalUsd}`;
+        check.checks.positionSize = false;
+      }
+      
+      // Minimum order size
+      if (orderValue < this.config.limits.minOrderSize) {
+        check.passed = false;
+        check.reason = `Order size $${orderValue.toFixed(2)} below minimum $${this.config.limits.minOrderSize}`;
+        check.checks.orderSize = false;
+      }
+      
+      // Open position limit only blocks orders that would open a NEW position (not adds to existing)
+      const openPositions = this.positionTracker.getOpenPositions();
+      if (exposureSim.opensNewPosition && openPositions.length >= this.maxOpenPositionsLimit) {
+        check.passed = false;
+        check.reason = `Open position limit reached (${openPositions.length}/${this.maxOpenPositionsLimit})`;
+        check.checks.openPositions = false;
+      }
+      
+      // Maximum order size
+      if (orderValue > this.config.limits.maxOrderSize) {
+        check.passed = false;
+        check.reason = `Order size $${orderValue.toFixed(2)} exceeds maximum $${this.config.limits.maxOrderSize}`;
+        check.checks.orderSize = false;
+      }
+      
+      // Position size limit (absolute notional after the order)
+      if (exposureSim.newAbsNotional > this.config.limits.maxPositionSize || exposureSim.newAbsNotional > this.maxPositionExposureUsd) {
+        check.passed = false;
+        check.reason = `Position size would exceed limit: $${exposureSim.newAbsNotional.toFixed(2)} > $${this.config.limits.maxPositionSize}`;
+        check.checks.positionSize = false;
+      }
+      
+      // Total exposure (portfolio) after the order (accounting for sells reducing exposure)
+      const currentExposure = this.calculateTotalExposure();
+      const newExposure = Math.max(0, currentExposure - exposureSim.currentAbsNotional + exposureSim.newAbsNotional);
+      if (newExposure > this.config.limits.maxTotalExposure) {
+        check.passed = false;
+        check.reason = `Total exposure would exceed limit: $${newExposure.toFixed(2)} > $${this.config.limits.maxTotalExposure}`;
+        check.checks.totalExposure = false;
+      }
+      
+      // Daily loss limit
+      if (this.metrics.dailyPnL <= -this.config.limits.maxDailyLoss) {
+        check.passed = false;
+        check.reason = `Daily loss limit reached: $${Math.abs(this.metrics.dailyPnL).toFixed(2)}`;
+        check.checks.dailyLoss = false;
+      }
+      
+      // Open orders limit
+      if (this.metrics.openOrderCount >= this.config.limits.maxOpenOrders) {
+        check.passed = false;
+        check.reason = `Maximum open orders limit reached: ${this.metrics.openOrderCount}`;
+        check.checks.openOrders = false;
+      }
     }
 
     // Log risk check result
@@ -474,14 +519,128 @@ export class RiskEngine extends EventEmitter {
   }
 
   private calculateOrderValue(order: OrderRequest, currentPrice: number): number {
-    if (order.type === 'market') {
-      const size = parseFloat(order.size || '0');
-      return size * currentPrice;
-    } else {
-      const size = parseFloat(order.size || '0');
-      const price = parseFloat(order.price || '0');
-      return size * price;
+    const size = this.getOrderBaseSize(order, currentPrice);
+    if (!Number.isFinite(size) || size <= 0) {
+      const funds = Number.parseFloat(order.funds || '0');
+      return Number.isFinite(funds) ? funds : 0;
     }
+    
+    if (order.type === 'market') {
+      return size * currentPrice;
+    }
+    
+    const price = Number.parseFloat(order.price || '0');
+    return size * price;
+  }
+  
+  private getOrderBaseSize(order: OrderRequest, currentPrice: number): number {
+    const rawSize = Number.parseFloat(order.size || '');
+    if (Number.isFinite(rawSize) && rawSize > 0) {
+      return rawSize;
+    }
+    
+    // Some APIs allow market buys using quote "funds" instead of base "size"
+    const rawFunds = Number.parseFloat(order.funds || '');
+    if (Number.isFinite(rawFunds) && rawFunds > 0 && Number.isFinite(currentPrice) && currentPrice > 0) {
+      return rawFunds / currentPrice;
+    }
+    
+    return 0;
+  }
+  
+  private simulatePositionAfterOrder(
+    position: Position | undefined,
+    order: OrderRequest,
+    currentPrice: number
+  ): {
+    currentSide: Position['side'];
+    currentSize: number;
+    currentAbsNotional: number;
+    newSide: Position['side'];
+    newSize: number;
+    newAbsNotional: number;
+    opensNewPosition: boolean;
+    isReduceOnly: boolean;
+  } {
+    const epsilon = 1e-12;
+    const currentSide: Position['side'] = position?.side && position.size > 0 ? position.side : 'flat';
+    const currentSize = Number.isFinite(position?.size) ? Math.max(0, position!.size) : 0;
+    const priceForNotional = Number.isFinite(position?.marketPrice) && (position!.marketPrice > 0)
+      ? position!.marketPrice
+      : currentPrice;
+    const currentAbsNotional = (currentSide === 'flat' || currentSize <= 0 || !Number.isFinite(priceForNotional) || priceForNotional <= 0)
+      ? 0
+      : Math.abs(currentSize * priceForNotional);
+    
+    const orderSize = this.getOrderBaseSize(order, currentPrice);
+    const safeOrderSize = Number.isFinite(orderSize) ? Math.max(0, orderSize) : 0;
+    
+    let newSide: Position['side'] = currentSide;
+    let newSize = currentSize;
+    
+    if (currentSide === 'flat' || currentSize <= 0) {
+      if (safeOrderSize > 0) {
+        newSide = order.side === 'buy' ? 'long' : 'short';
+        newSize = safeOrderSize;
+      } else {
+        newSide = 'flat';
+        newSize = 0;
+      }
+    } else if (currentSide === 'long') {
+      if (order.side === 'buy') {
+        newSide = 'long';
+        newSize = currentSize + safeOrderSize;
+      } else {
+        if (safeOrderSize < currentSize - epsilon) {
+          newSide = 'long';
+          newSize = currentSize - safeOrderSize;
+        } else if (Math.abs(safeOrderSize - currentSize) <= epsilon) {
+          newSide = 'flat';
+          newSize = 0;
+        } else {
+          newSide = 'short';
+          newSize = safeOrderSize - currentSize;
+        }
+      }
+    } else if (currentSide === 'short') {
+      if (order.side === 'sell') {
+        newSide = 'short';
+        newSize = currentSize + safeOrderSize;
+      } else {
+        if (safeOrderSize < currentSize - epsilon) {
+          newSide = 'short';
+          newSize = currentSize - safeOrderSize;
+        } else if (Math.abs(safeOrderSize - currentSize) <= epsilon) {
+          newSide = 'flat';
+          newSize = 0;
+        } else {
+          newSide = 'long';
+          newSize = safeOrderSize - currentSize;
+        }
+      }
+    }
+    
+    const newAbsNotional = (newSide === 'flat' || newSize <= 0 || !Number.isFinite(currentPrice) || currentPrice <= 0)
+      ? 0
+      : Math.abs(newSize * currentPrice);
+    
+    const opensNewPosition = (currentSide === 'flat' || currentSize <= 0) && newSide !== 'flat' && newSize > 0;
+    
+    // Reduce-only means it decreases exposure without flipping direction.
+    const reducesDirection = (currentSide === 'long' && order.side === 'sell') || (currentSide === 'short' && order.side === 'buy');
+    const doesNotFlip = newSide === currentSide || newSide === 'flat';
+    const isReduceOnly = reducesDirection && doesNotFlip && newAbsNotional <= currentAbsNotional + epsilon;
+    
+    return {
+      currentSide,
+      currentSize,
+      currentAbsNotional,
+      newSide,
+      newSize,
+      newAbsNotional,
+      opensNewPosition,
+      isReduceOnly,
+    };
   }
 
   public computeOrderSize(productId: string, entryPrice: number, stopPrice: number): number {
@@ -617,22 +776,22 @@ export class RiskEngine extends EventEmitter {
     }
 
     // Check daily loss kill switch
-    if (Math.abs(this.metrics.dailyPnL) > this.config.killSwitches.dailyLossLimit) {
-      this.triggerKillSwitch(`Daily loss limit exceeded: $${Math.abs(this.metrics.dailyPnL).toFixed(2)}`);
+    if (this.metrics.dailyPnL <= -this.config.killSwitches.dailyLossLimit) {
+      this.triggerKillSwitch(`Daily loss limit exceeded: -$${Math.abs(this.metrics.dailyPnL).toFixed(2)}`);
     }
 
     // Check consecutive losses
-    if (this.metrics.consecutiveLosses > this.config.killSwitches.consecutiveLossLimit) {
+    if (this.metrics.consecutiveLosses >= this.config.killSwitches.consecutiveLossLimit) {
       this.triggerKillSwitch(`Consecutive losses exceeded: ${this.metrics.consecutiveLosses}`);
     }
 
     // Check error rate
-    if (this.metrics.errorRate > this.config.killSwitches.errorRateLimit) {
+    if (this.metrics.errorRate >= this.config.killSwitches.errorRateLimit) {
       this.triggerKillSwitch(`Error rate too high: ${this.metrics.errorRate.toFixed(2)}%`);
     }
 
     // Check latency
-    if (this.metrics.averageLatency > this.config.killSwitches.latencyLimit) {
+    if (this.metrics.averageLatency >= this.config.killSwitches.latencyLimit) {
       this.triggerKillSwitch(`Latency too high: ${this.metrics.averageLatency.toFixed(0)}ms`);
     }
   }
@@ -722,20 +881,22 @@ export class RiskEngine extends EventEmitter {
 
   // Persist metrics to database
   private async persistMetrics(): Promise<void> {
+    if (!this.userId) {
+      this.logger.debug('Skipping risk_metrics persist: userId not provided');
+      return;
+    }
     try {
       const { error } = await this.supabase
         .from('risk_metrics')
         .insert({
-          current_exposure: this.metrics.currentExposure,
+          user_id: this.userId,
           daily_pnl: this.metrics.dailyPnL,
-          daily_loss_percentage: this.metrics.dailyLossPercentage,
           max_drawdown: this.metrics.maxDrawdown,
-          open_order_count: this.metrics.openOrderCount,
           consecutive_losses: this.metrics.consecutiveLosses,
           error_rate: this.metrics.errorRate,
-          average_latency: this.metrics.averageLatency,
           kill_switch_active: this.metrics.killSwitchActive,
-          timestamp: this.metrics.lastUpdated.toISOString()
+          exposure_usd: this.metrics.currentExposure,
+          updated_at: this.metrics.lastUpdated.toISOString(),
         });
 
       if (error) {

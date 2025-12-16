@@ -24,7 +24,7 @@ strategy:
   stop_init_atr: 1.5
   stop_trail_atr: 1.0
   time_stop_bars: 96
-  allow_short: true
+  allow_short: false
   trade_cooldown_min: 15
 
 execution:

@@ -126,7 +126,10 @@ const wsClients = new Set<any>();
 
 // Broadcast to all WebSocket clients
 function broadcast(data: any) {
-  const message = JSON.stringify(data);
+  const envelope = (data && typeof data === 'object' && !Array.isArray(data))
+    ? (Object.prototype.hasOwnProperty.call(data, 'timestamp') ? data : { ...data, timestamp: Date.now() })
+    : { type: 'Alert', payload: data, timestamp: Date.now() };
+  const message = JSON.stringify(envelope);
   wsClients.forEach(client => {
     if (client.readyState === 1) { // OPEN
       client.send(message);
@@ -157,6 +160,11 @@ function processTickerForCandles(ticker: { product_id: string; price: string; la
   const size = ticker.last_size ? parseFloat(ticker.last_size) : 0;
   const bucketMs = floorToMinute(ticker.time);
 
+  if (!Number.isFinite(price)) {
+    logger.warn('Skipping ticker with non-finite price', { symbol, price: ticker.price });
+    return;
+  }
+
   const key = symbol;
   const agg = candleAggregates.get(key);
 
@@ -174,7 +182,21 @@ function processTickerForCandles(ticker: { product_id: string; price: string; la
       try {
         signalProcessor.addCandle(symbol, candle);
         metricsTracker.addCandle(symbol, candle);
+        tradingEngine?.notifyNewCandle(symbol);
         logger.debug(`Added candle for ${symbol}: O=${candle.open} H=${candle.high} L=${candle.low} C=${candle.close} V=${candle.volume}`);
+        broadcast({
+          type: 'CandleUpdate',
+          payload: {
+            symbol,
+            timeframe: '1m',
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close,
+            volume: candle.volume,
+            timestamp: candle.time,
+          }
+        });
       } catch (err) {
         logger.error('Failed to add candle to signal processor', err);
       }
@@ -259,6 +281,7 @@ wss.on('connection', (ws) => {
   
   ws.send(JSON.stringify({
     type: 'StatusUpdate',
+    timestamp: Date.now(),
     payload: {
       engineRunning: isEngineRunningOnConnect,
       mode: isEngineRunningOnConnect ? tradingEngine!.getConfig().mode : null,
@@ -322,32 +345,35 @@ app.get('/api/status', (req, res) => {
 // Start trading engine
 app.post('/api/engine/start', async (req, res) => {
   try {
-    const { mode = 'paper' } = req.body;
+    const { mode = 'paper', marketDataEnv } = req.body;
+    const requestedMarketEnv = marketDataEnv === 'sandbox' ? 'sandbox' : 'production';
 
     if (tradingEngine) {
       return res.status(400).json({ error: 'Trading engine already running' });
     }
 
-    logger.info(`Starting trading engine in ${mode} mode`);
-
-    // Configure trading engine
     const engineConfig: TradingEngineConfig = {
       mode: mode as 'paper' | 'live',
       exchange: {
         name: 'coinbase',
-        environment: mode === 'live' ? 'production' : 'sandbox'
+        environment: mode === 'live' ? 'production' : requestedMarketEnv
       },
       products: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
       supabase: {
         url: env.SUPABASE_URL || '',
         serviceKey: env.SUPABASE_SERVICE_KEY || '',
-        anonKey: env.SUPABASE_ANON_KEY || ''
+        anonKey: env.SUPABASE_ANON_KEY || '',
+        userId: USER_ID
       },
       security: {
         encryptionKey: env.ENCRYPTION_KEY || ''
       },
       guardrails
     };
+
+    logger.info(`Starting trading engine in ${mode} mode`, {
+      marketDataEnv: engineConfig.exchange.environment
+    });
 
     // Create trading engine
     tradingEngine = new TradingEngine(engineConfig, logger);
@@ -357,10 +383,36 @@ app.post('/api/engine/start', async (req, res) => {
 
     // Set up event listeners to update frontend
     tradingEngine.on('market:ticker', (ticker) => {
-      broadcast({ type: 'TickerUpdate', payload: ticker });
+      const toNumber = (value: unknown, fallback: number): number => {
+        const parsed = typeof value === 'number' ? value : parseFloat(String(value ?? ''));
+        return Number.isFinite(parsed) ? parsed : fallback;
+      };
+
+      const price = toNumber(ticker.price, NaN);
+      if (!Number.isFinite(price)) {
+        logger.warn('Skipping ticker with non-finite price', { product_id: ticker.product_id, price: ticker.price });
+        return;
+      }
+
+      const bid = toNumber((ticker as any).best_bid ?? (ticker as any).bestBid, price);
+      const ask = toNumber((ticker as any).best_ask ?? (ticker as any).bestAsk, price);
+      const volume = toNumber((ticker as any).last_size ?? (ticker as any).volume_24h, 0);
+      const ts = ticker.time ? new Date(ticker.time).getTime() : Date.now();
+      const timestamp = Number.isFinite(ts) ? ts : Date.now();
+
+      const normalizedTicker = {
+        symbol: ticker.product_id,
+        price,
+        bid,
+        ask,
+        volume,
+        timestamp,
+      };
+
+      broadcast({ type: 'TickerUpdate', payload: normalizedTicker });
       
       // Update Supabase (for frontend queries)
-      updateSupabasePrice(ticker.product_id, parseFloat(ticker.price));
+      updateSupabasePrice(ticker.product_id, normalizedTicker.price);
 
       // Feed bar aggregator → signal processor
       processTickerForCandles({
@@ -379,7 +431,10 @@ app.post('/api/engine/start', async (req, res) => {
 
     tradingEngine.on('order:filled', async (order, fill) => {
       ordersFilledCounter.inc();
+      // Broadcast order status update + fill
+      broadcast({ type: 'OrderUpdate', payload: order });
       broadcast({ type: 'Fill', payload: fill });
+      await syncOrderToSupabase(order);
       await syncFillToSupabase(fill);
       // Update account metrics after fills
       await updateAccountMetrics();
@@ -425,7 +480,7 @@ app.post('/api/engine/start', async (req, res) => {
           period: strategyGuard.donchian_len,
           atrPeriod: strategyGuard.atr_len_15m,
           atrMultiplier: strategyGuard.stop_init_atr,
-          volumeThreshold: 1.5
+          volumeThreshold: 1.1
         },
         vwapMeanReversion: {
           enabled: true,
@@ -528,7 +583,11 @@ app.post('/api/engine/start', async (req, res) => {
       
       // Create order if risk checks pass
       try {
-        if (runtimeState.paused || runtimeState.dailyStopHit || runtimeState.killSwitch.active) {
+        const shortAllowed = Boolean(guardrails.strategy.allow_short);
+        const isExitSignal = signal.direction === 'sell' && !shortAllowed;
+        
+        // Suppress NEW entries when paused/dailyStop/killSwitch, but always allow exits.
+        if (!isExitSignal && (runtimeState.paused || runtimeState.dailyStopHit || runtimeState.killSwitch.active)) {
           logger.warn('Signal suppressed due to runtime state (paused/dailyStop/killSwitch)');
           return;
         }
@@ -539,6 +598,37 @@ app.post('/api/engine/start', async (req, res) => {
           ? entryPrice * 0.985
           : entryPrice * 1.015;
         const stopPrice = signal.stopLoss ?? fallbackStop;
+
+        // If shorts are disabled (spot mode), treat SELL signals as "exit long" signals.
+        if (isExitSignal) {
+          const openPosition = tradingEngine!.getOpenPositions().find(p => p.symbol === signal.symbol && p.side === 'long' && p.size > 0);
+          if (!openPosition) {
+            logger.info('Sell signal ignored (no long position to exit)', { symbol: signal.symbol, signalId: signal.id, strategy: signal.strategy });
+            return;
+          }
+          
+          const closeOrder: Omit<OrderRequest, 'client_oid'> = {
+            product_id: signal.symbol,
+            side: 'sell',
+            type: 'market',
+            size: openPosition.size.toString(),
+          };
+          
+          const exit = await tradingEngine!.createOrder(closeOrder, {
+            strategy: signal.strategy,
+            metadata: {
+              tag: 'signal_exit',
+              signalId: signal.id,
+              signalTimestamp: signalTime.toISOString(),
+              reason: 'sell_signal_exit_long',
+            }
+          });
+          
+          if (exit) {
+            logger.info('Exited long position from sell signal', { orderId: exit.id, symbol: signal.symbol, size: openPosition.size });
+          }
+          return;
+        }
 
         // Time filter guardrail
         if (guardrails.filters.time_filter_enabled) {
@@ -579,7 +669,7 @@ app.post('/api/engine/start', async (req, res) => {
 
         const computedSize = tradingEngine!.computeOrderSize(signal.symbol, entryPrice, stopPrice);
         if (!Number.isFinite(computedSize) || computedSize <= 0) {
-          logger.warn('Guardrail sizing returned zero size, skipping signal', {
+          logger.warn('Guardrail sizing returned zero/invalid size, skipping signal', {
             signalId: signal.id,
             symbol: signal.symbol,
             entryPrice,
@@ -629,7 +719,18 @@ app.post('/api/engine/start', async (req, res) => {
           limitPrice: limitPriceStr
         });
 
-        const order = await tradingEngine!.createOrder(orderRequest);
+        const order = await tradingEngine!.createOrder(orderRequest, {
+          strategy: signal.strategy,
+          metadata: {
+            tag: 'entry',
+            signalId: signal.id,
+            signalTimestamp: signalTime.toISOString(),
+            stopPrice,
+            takeProfit: signal.takeProfit,
+            intendedEntryPrice: entryPrice,
+            notionalUsd: computedSize * entryPrice,
+          }
+        });
         if (order) {
           logger.info('Order placed from signal', { orderId: order.id, signal: signal.id });
         }
@@ -880,7 +981,7 @@ app.post('/api/backtest/run', async (req, res) => {
         const volume = 100 + Math.random() * 900; // Random volume 100-1000
         
         bars.push({
-          timestamp: current.toISOString(),
+          time: current.getTime(),
           open,
           high,
           low,
@@ -1131,7 +1232,7 @@ async function syncFillToSupabase(fill: any) {
       .insert({
         user_id: USER_ID,
         order_id: fill.order_id,
-        trade_id: fill.trade_id,
+        trade_id: fill.trade_id !== undefined ? String(fill.trade_id) : null,
         price: parseFloat(fill.price),
         quantity: parseFloat(fill.size),
         fee_currency: 'USD',
@@ -1150,21 +1251,44 @@ async function syncFillToSupabase(fill: any) {
 
 async function syncPositionToSupabase(position: any) {
   try {
-    // Map backend Position interface to Supabase positions table
+    const symbol = position.symbol || position.product;
+    const side = position.side as 'long' | 'short' | 'flat' | undefined;
+    const entryPriceRaw = Number(position.averagePrice ?? position.avgPrice ?? position.entry_price ?? 0);
+    const entryPrice = Number.isFinite(entryPriceRaw) ? entryPriceRaw : 0;
+
+    // Supabase schema expects position_side enum ('long'|'short'); skip invalid/flat snapshots
+    if (!symbol || (side !== 'long' && side !== 'short') || entryPrice <= 0) {
+      return;
+    }
+
+    const openedAt = position.openTime instanceof Date
+      ? position.openTime.toISOString()
+      : new Date(position.openTime ?? Date.now()).toISOString();
+    const closedAt = position.closedAt
+      ? (position.closedAt instanceof Date ? position.closedAt.toISOString() : new Date(position.closedAt).toISOString())
+      : null;
+    const exitPriceRaw = Number(position.exitPrice ?? position.exit_price ?? 0);
+    const exitPrice = Number.isFinite(exitPriceRaw) && exitPriceRaw > 0 ? exitPriceRaw : null;
+
+    // Default stop/target if strategy-specific levels aren't provided
+    const defaultStop = side === 'long' ? entryPrice * 0.98 : entryPrice * 1.02;
+    const defaultTakeProfit = side === 'long' ? entryPrice * 1.03 : entryPrice * 0.97;
+
     const mappedPosition = {
-      id: position.id || `pos_${position.symbol}_${Date.now()}`,
+      id: position.id, // must be UUID-compatible
       user_id: USER_ID,
-      symbol: position.symbol || position.product,
-      strategy: position.strategy || 'breakout', // Default strategy
-      side: position.side === 'flat' ? 'flat' : position.side, // position_side enum
-      qty_open: Math.abs(position.size || 0),
-      entry_price: position.averagePrice || position.avgPrice || 0,
-      stop_price_at_entry: position.stopPrice || position.entry_price * 0.98, // Default 2% stop
-      opened_at: position.openTime ? position.openTime.toISOString() : new Date().toISOString(),
-      closed_at: position.closedAt || null,
-      exit_price: position.exitPrice || null,
-      realized_pnl_usd: position.realizedPnL || position.realizedPnl || 0,
-      realized_r: position.realizedR || null
+      symbol,
+      strategy: (position.strategy || 'breakout') as any,
+      side,
+      qty_open: Math.abs(Number(position.size || 0)),
+      entry_price: entryPrice,
+      stop_price_at_entry: Number(position.stopPrice ?? position.stop_price_at_entry ?? defaultStop),
+      take_profit_price: Number(position.takeProfit ?? position.take_profit_price ?? defaultTakeProfit),
+      opened_at: openedAt,
+      closed_at: closedAt,
+      exit_price: exitPrice,
+      exit_reason: position.exitReason ?? position.exit_reason ?? null,
+      realized_pnl_usd: Number(position.realizedPnL ?? position.realizedPnl ?? position.realized_pnl_usd ?? 0),
     };
 
     const { error } = await supabase
@@ -1181,15 +1305,29 @@ async function syncPositionToSupabase(position: any) {
 
 async function syncSignalToSupabase(signal: any) {
   try {
+    const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const maybeId = (typeof signal.id === 'string' && uuidV4.test(signal.id)) ? signal.id : undefined;
+
+    const decidedAt = signal.timestamp instanceof Date
+      ? signal.timestamp.toISOString()
+      : new Date(signal.timestamp ?? Date.now()).toISOString();
+
+    const direction = (signal.direction || signal.side) as string | undefined;
+    const side = direction === 'buy'
+      ? 'long'
+      : direction === 'sell'
+        ? 'short'
+        : (signal.side === 'long' || signal.side === 'short' ? signal.side : null);
+
     const { error } = await supabase
       .from('signals')
       .insert({
-        id: signal.id || `sig_${signal.symbol}_${Date.now()}`,
+        ...(maybeId ? { id: maybeId } : {}),
         user_id: USER_ID,
         symbol: signal.symbol,
         strategy: signal.strategy, // strategy_name enum
-        decided_at: signal.timestamp ? signal.timestamp.toISOString() : new Date().toISOString(),
-        side: signal.direction === 'buy' ? 'long' : signal.direction === 'sell' ? 'short' : signal.side, // position_side enum
+        decided_at: decidedAt,
+        side, // position_side enum
         score: signal.strength || signal.score || 0,
         confidence: signal.confidence || signal.strength || 0,
         meta_prob: signal.metaLabel || signal.metaProb || null,

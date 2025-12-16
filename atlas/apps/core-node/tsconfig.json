@@ -2,7 +2,7 @@
   "compilerOptions": {
     "target": "ES2022",
     "module": "ES2022",
-    "moduleResolution": "Bundler",
+    "moduleResolution": "Node",
     "strict": true,
     "noUncheckedIndexedAccess": false,
     "forceConsistentCasingInFileNames": true,
@@ -17,6 +17,16 @@
     "sourceMap": true
   },
   "include": ["src/**/*"],
+  "exclude": [
+    "src/__tests__/**/*",
+    "src/backtesting/advanced-backtest-engine.ts",
+    "src/backtesting/data-loader.ts",
+    "src/exchanges/coinbase/advanced-trade-client.ts",
+    "src/exchanges/multi-exchange-connector.ts",
+    "src/exchanges/ultra-fast-websocket.ts",
+    "src/trading/native-engine.ts",
+    "src/native/**/*"
+  ],
   "ts-node": {
     "transpileOnly": true
   }

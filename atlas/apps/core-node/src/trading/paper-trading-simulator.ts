@@ -127,7 +127,7 @@ export class PaperTradingSimulator extends EventEmitter {
     durationMs: number,
     numSlices: number = 10
   ): Promise<{ parentOrderId: string; sliceSize: number }> {
-    const parentOrderId = `twap_${uuidv4()}`;
+    const parentOrderId = uuidv4();
     const sliceSize = totalSize / numSlices;
     const sliceIntervalMs = durationMs / numSlices;
     
@@ -294,7 +294,8 @@ export class PaperTradingSimulator extends EventEmitter {
     // Simulate network latency
     await new Promise(resolve => setTimeout(resolve, this.config.latencyMs));
 
-    const orderId = `paper_${uuidv4()}`;
+    const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const orderId = (request.client_oid && uuidV4.test(request.client_oid)) ? request.client_oid : uuidv4();
     const [baseCurrency, quoteCurrency] = request.product_id.split('-');
     
     // Validate order
@@ -312,7 +313,7 @@ export class PaperTradingSimulator extends EventEmitter {
 
     const order: SimulatedOrder = {
       id: orderId,
-      clientOrderId: request.client_oid || uuidv4(),
+      clientOrderId: request.client_oid || orderId,
       productId: request.product_id,
       side: request.side,
       type: request.type,

@@ -212,7 +212,9 @@ describe('RiskEngine', () => {
 
   describe('Risk Checks', () => {
     test('should reject order when kill switch is active', async () => {
-      riskEngine.activateKillSwitch('Test reason');
+      // Force kill switch active without triggering flatten side-effects
+      (riskEngine as any).killSwitchActive = true;
+      (riskEngine as any).metrics.killSwitchActive = true;
       
       const check = await riskEngine.checkOrder({
         product_id: 'BTC-USD',
@@ -224,6 +226,55 @@ describe('RiskEngine', () => {
 
       expect(check.passed).toBe(false);
       expect(check.reason).toContain('Kill switch');
+    });
+    
+    test('should allow reduce-only exit orders even when kill switch is active', async () => {
+      // Open a long position first
+      await positionTracker.processFill({
+        trade_id: 1,
+        product_id: 'BTC-USD',
+        order_id: 'order-1',
+        user_id: 'u',
+        profile_id: 'p',
+        liquidity: 'T',
+        price: '50000',
+        size: '0.1',
+        fee: '0',
+        side: 'buy',
+        settled: true,
+        created_at: new Date().toISOString(),
+        usd_volume: '5000',
+      } as any);
+      positionTracker.updateMarketPrice('BTC-USD', 50000);
+      
+      // Force kill switch active without triggering flatten side-effects
+      (riskEngine as any).killSwitchActive = true;
+      (riskEngine as any).metrics.killSwitchActive = true;
+      
+      // Reduce long exposure
+      const orderReq = {
+        product_id: 'BTC-USD',
+        side: 'sell',
+        type: 'market',
+        size: '0.05',
+        client_oid: 'exit-123',
+      } as any;
+      
+      const sim = (riskEngine as any).simulatePositionAfterOrder(positionTracker.getPosition('BTC-USD'), orderReq, 50000);
+      expect(sim.currentSide).toBe('long');
+      expect(sim.isReduceOnly).toBe(true);
+      
+      const check = await riskEngine.checkOrder(orderReq, 50000);
+      
+      expect(check.passed).toBe(true);
+    });
+    
+    test('should not trigger daily loss kill switch on profits', () => {
+      // Directly invoke internal kill-switch checks (private at type-level only)
+      (riskEngine as any).metrics.dailyPnL = 1000; // +$1,000 day
+      (riskEngine as any).checkKillSwitches();
+      
+      expect(riskEngine.getMetrics().killSwitchActive).toBe(false);
     });
 
     test('should reject order for blocked symbol', async () => {

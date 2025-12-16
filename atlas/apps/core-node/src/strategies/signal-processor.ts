@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
 import { TechnicalIndicators, OHLCV } from '../indicators/technical';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { v4 as uuidv4 } from 'uuid';
 
 export interface SignalProcessorConfig {
   supabaseUrl: string;
@@ -313,6 +314,9 @@ export class SignalProcessor extends EventEmitter {
     const indicators: Record<string, number[]> = {};
 
     // Calculate all indicators
+    const breakoutCfg = this.config.strategies.breakout;
+    const donchianPeriod = breakoutCfg?.period ?? 20;
+    const atrPeriod = breakoutCfg?.atrPeriod ?? 14;
     indicators.sma20 = TechnicalIndicators.SMA(closes, 20);
     indicators.sma50 = TechnicalIndicators.SMA(closes, 50);
     indicators.ema12 = TechnicalIndicators.EMA(closes, 12);
@@ -330,9 +334,9 @@ export class SignalProcessor extends EventEmitter {
     indicators.bbLower = bb.lower;
 
     indicators.vwap = TechnicalIndicators.VWAP(candles);
-    indicators.atr = TechnicalIndicators.ATR(candles, 14);
+    indicators.atr = TechnicalIndicators.ATR(candles, atrPeriod);
 
-    const donchian = TechnicalIndicators.DonchianChannels(candles, 20);
+    const donchian = TechnicalIndicators.DonchianChannels(candles, donchianPeriod);
     indicators.donchianUpper = donchian.upper;
     indicators.donchianLower = donchian.lower;
     indicators.donchianMiddle = donchian.middle;
@@ -394,24 +398,30 @@ export class SignalProcessor extends EventEmitter {
       return;
     }
 
-    const currentUpper = donchianUpper[donchianUpper.length - 1];
-    const currentLower = donchianLower[donchianLower.length - 1];
+    // Use previous-period highs/lows to avoid self-referencing current candle
+    const prevUpper = donchianUpper.length > 1 ? donchianUpper[donchianUpper.length - 2] : undefined;
+    const prevLower = donchianLower.length > 1 ? donchianLower[donchianLower.length - 2] : undefined;
     const currentATR = atr[atr.length - 1];
     const avgVolume = volumeSMA[volumeSMA.length - 1];
 
+    if (!prevUpper || !prevLower || !Number.isFinite(prevUpper) || !Number.isFinite(prevLower)) {
+      return;
+    }
+
     // Volume filter
     const volumeRatio = latestCandle.volume / avgVolume;
-    if (volumeRatio < config.volumeThreshold) {
+    if (!Number.isFinite(volumeRatio) || volumeRatio < config.volumeThreshold) {
+      this.logger.debug('Breakout filtered by volume', { symbol, volumeRatio, threshold: config.volumeThreshold });
       return;
     }
 
     // Check for breakout
     let signal: Signal | null = null;
 
-    if (latestCandle.close > currentUpper && latestCandle.volume > avgVolume * config.volumeThreshold) {
+    if (latestCandle.close > prevUpper && latestCandle.volume > avgVolume * config.volumeThreshold) {
       // Bullish breakout
       signal = {
-        id: `${symbol}_breakout_${Date.now()}`,
+        id: uuidv4(),
         timestamp: new Date(),
         symbol,
         strategy: 'breakout',
@@ -422,17 +432,17 @@ export class SignalProcessor extends EventEmitter {
         takeProfit: latestCandle.close + (currentATR * config.atrMultiplier * 2),
         metadata: {
           indicators: {
-            donchianUpper: currentUpper,
+            donchianUpper: prevUpper,
             atr: currentATR,
             volumeRatio
           },
           reason: `Price broke above ${config.period}-period high with ${volumeRatio.toFixed(2)}x volume`
         }
       };
-    } else if (latestCandle.close < currentLower && latestCandle.volume > avgVolume * config.volumeThreshold) {
+    } else if (latestCandle.close < prevLower && latestCandle.volume > avgVolume * config.volumeThreshold) {
       // Bearish breakout
       signal = {
-        id: `${symbol}_breakout_${Date.now()}`,
+        id: uuidv4(),
         timestamp: new Date(),
         symbol,
         strategy: 'breakout',
@@ -443,7 +453,7 @@ export class SignalProcessor extends EventEmitter {
         takeProfit: latestCandle.close - (currentATR * config.atrMultiplier * 2),
         metadata: {
           indicators: {
-            donchianLower: currentLower,
+            donchianLower: prevLower,
             atr: currentATR,
             volumeRatio
           },
@@ -454,6 +464,14 @@ export class SignalProcessor extends EventEmitter {
 
     if (signal) {
       this.processSignal(signal);
+    } else {
+      this.logger.debug('No breakout signal', {
+        symbol,
+        close: latestCandle.close,
+        prevUpper,
+        prevLower,
+        volumeRatio
+      });
     }
   }
 
@@ -488,7 +506,7 @@ export class SignalProcessor extends EventEmitter {
     if (deviation < -config.deviationEntry) {
       // Price significantly below VWAP - potential long
       signal = {
-        id: `${symbol}_vwap_${Date.now()}`,
+        id: uuidv4(),
         timestamp: new Date(),
         symbol,
         strategy: 'vwap_mr',
@@ -509,7 +527,7 @@ export class SignalProcessor extends EventEmitter {
     } else if (deviation > config.deviationEntry) {
       // Price significantly above VWAP - potential short
       signal = {
-        id: `${symbol}_vwap_${Date.now()}`,
+        id: uuidv4(),
         timestamp: new Date(),
         symbol,
         strategy: 'vwap_mr',
@@ -564,7 +582,7 @@ export class SignalProcessor extends EventEmitter {
         ema12[ema12.length - 1] > ema26[ema26.length - 1]) {
       
       signal = {
-        id: `${symbol}_momentum_${Date.now()}`,
+        id: uuidv4(),
         timestamp: new Date(),
         symbol,
         strategy: 'momentum',
@@ -589,7 +607,7 @@ export class SignalProcessor extends EventEmitter {
              ema12[ema12.length - 1] < ema26[ema26.length - 1]) {
       
       signal = {
-        id: `${symbol}_momentum_${Date.now()}`,
+        id: uuidv4(),
         timestamp: new Date(),
         symbol,
         strategy: 'momentum',
@@ -654,7 +672,6 @@ export class SignalProcessor extends EventEmitter {
 
     // Store signal
     this.lastSignals.set(signal.symbol, signal);
-    await this.persistSignal(signal);
 
     // Emit signal
     this.emit('signal:generated', signal);
@@ -671,33 +688,6 @@ export class SignalProcessor extends EventEmitter {
     // TODO: Implement ONNX model inference
     // For now, return a mock score based on signal strength
     return signal.strength * 0.8 + Math.random() * 0.2;
-  }
-
-  private async persistSignal(signal: Signal): Promise<void> {
-    try {
-      const { error } = await this.supabase
-        .from('signals')
-        .insert({
-          id: signal.id,
-          timestamp: signal.timestamp.toISOString(),
-          symbol: signal.symbol,
-          strategy: signal.strategy,
-          direction: signal.direction,
-          strength: signal.strength,
-          price: signal.price,
-          stop_loss: signal.stopLoss,
-          take_profit: signal.takeProfit,
-          meta_label: signal.metaLabel,
-          metadata: signal.metadata,
-          created_at: new Date().toISOString()
-        });
-
-      if (error) {
-        this.logger.error('Failed to persist signal:', error);
-      }
-    } catch (error) {
-      this.logger.error('Error persisting signal:', error);
-    }
   }
 
   /**
