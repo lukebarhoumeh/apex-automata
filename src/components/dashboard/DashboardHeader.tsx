@@ -140,7 +140,7 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   };
 
   return (
-    <header className="border-b border-border bg-card/50 backdrop-blur supports-[backdrop-filter]:bg-card/30 sticky top-0 z-50">
+    <header className="border-b border-slate-800 bg-slate-900/90 backdrop-blur-xl supports-[backdrop-filter]:bg-slate-900/80 sticky top-0 z-50">
       <div className="container mx-auto px-4 lg:px-6 py-3">
         {/* Critical Status Badges - Always Visible */}
         {(killSwitchActive || dailyStopHit || isPaused) && (

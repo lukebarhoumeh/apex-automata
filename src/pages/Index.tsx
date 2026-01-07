@@ -26,9 +26,19 @@ import { useTradingEngine } from "@/hooks/useTradingEngine";
 import { Badge } from "@/components/ui/badge";
 import { StaleDataWarning } from "@/components/dashboard/StaleDataWarning";
 import { ConnectionStatusBanner } from "@/components/dashboard/ConnectionStatusBanner";
+import { 
+  LayoutDashboard, 
+  LineChart, 
+  Shield, 
+  Settings, 
+  Activity,
+  TrendingUp,
+  BarChart3
+} from "lucide-react";
 
 const Index = () => {
   const [botState, setBotState] = useState<"paper" | "live" | "paused">("paper");
+  const [activeView, setActiveView] = useState<"overview" | "trading" | "risk" | "settings">("overview");
   const tradingEngine = useTradingEngine();
 
   const handleViewDetails = (id: string) => {
@@ -36,11 +46,15 @@ const Index = () => {
   };
 
   return (
-    <div className="relative">
-      <div className="terminal-grid fixed inset-0 pointer-events-none" />
+    <div className="relative min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950">
+      {/* Subtle grid overlay */}
+      <div className="fixed inset-0 pointer-events-none opacity-[0.02]" 
+           style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.1) 1px, transparent 1px)', backgroundSize: '20px 20px' }} 
+      />
+      
       <DashboardHeader botState={botState} onStateChange={setBotState} />
       
-      <main className="container mx-auto p-4 lg:p-6 space-y-4 lg:space-y-6 relative z-10">
+      <main className="container mx-auto px-4 lg:px-6 py-4 lg:py-6 space-y-4 relative z-10">
         {/* Connection & Status Banners */}
         <ConnectionStatusBanner 
           isConnected={tradingEngine.isConnected} 
@@ -52,83 +66,118 @@ const Index = () => {
           onRefresh={() => window.location.reload()}
         />
         
-        {/* Status Bar */}
-        <div className="flex justify-end items-center">
-          <Badge variant={tradingEngine.backendAvailable ? "default" : "secondary"}>
-            {tradingEngine.backendAvailable ? "Backend Connected" : "DB Only Mode"}
-          </Badge>
-        </div>
-        
-        <MetricsGridConnected />
-        
-        {/* Real-Time Performance Telemetry Section */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 lg:gap-6">
-          <EquityCurveChart />
-          <SessionStatsPanel />
-        </div>
-        
-        <MarketConditions />
-        
-        {/* Regime Detection Panel */}
-        <RegimePanel />
-        
-        <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 lg:gap-6">
-          <div className="xl:col-span-2 space-y-4 lg:space-y-6">
+        {/* Navigation Tabs */}
+        <Tabs value={activeView} onValueChange={(v) => setActiveView(v as any)} className="w-full">
+          <div className="flex items-center justify-between mb-4">
+            <TabsList className="bg-slate-800/50 border border-slate-700/50 p-1">
+              <TabsTrigger value="overview" className="flex items-center gap-2 data-[state=active]:bg-emerald-600 data-[state=active]:text-white">
+                <LayoutDashboard className="h-4 w-4" />
+                <span className="hidden sm:inline">Overview</span>
+              </TabsTrigger>
+              <TabsTrigger value="trading" className="flex items-center gap-2 data-[state=active]:bg-emerald-600 data-[state=active]:text-white">
+                <TrendingUp className="h-4 w-4" />
+                <span className="hidden sm:inline">Trading</span>
+              </TabsTrigger>
+              <TabsTrigger value="risk" className="flex items-center gap-2 data-[state=active]:bg-emerald-600 data-[state=active]:text-white">
+                <Shield className="h-4 w-4" />
+                <span className="hidden sm:inline">Risk</span>
+              </TabsTrigger>
+              <TabsTrigger value="settings" className="flex items-center gap-2 data-[state=active]:bg-emerald-600 data-[state=active]:text-white">
+                <Settings className="h-4 w-4" />
+                <span className="hidden sm:inline">Config</span>
+              </TabsTrigger>
+            </TabsList>
+            
+            <Badge 
+              variant={tradingEngine.backendAvailable ? "default" : "secondary"}
+              className={tradingEngine.backendAvailable 
+                ? "bg-emerald-600/20 text-emerald-400 border border-emerald-600/30" 
+                : "bg-slate-700/50 text-slate-400"
+              }
+            >
+              <Activity className="h-3 w-3 mr-1" />
+              {tradingEngine.backendAvailable ? "Engine Connected" : "Offline"}
+            </Badge>
+          </div>
+
+          {/* Overview Tab - Key Metrics at a Glance */}
+          <TabsContent value="overview" className="mt-0 space-y-4">
+            {/* Top Metrics Row */}
+            <MetricsGridConnected />
+            
+            {/* Performance + Session Stats */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="lg:col-span-2">
+                <EquityCurveChart />
+              </div>
+              <SessionStatsPanel />
+            </div>
+            
+            {/* Market Regime + System Health */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <RegimePanel />
+              <SystemHealthPanel />
+            </div>
+            
+            {/* Live Tickers */}
+            <LiveTickersPanel />
+          </TabsContent>
+
+          {/* Trading Tab - Positions, Orders, Signals */}
+          <TabsContent value="trading" className="mt-0 space-y-4">
+            {/* Quick Metrics */}
+            <MetricsGridConnected />
+            
+            {/* Charts */}
             <ChartSection />
             
-            {/* Live Signals - Real-time from WebSocket */}
-            <LiveSignalsTable />
+            {/* Signals + Market Conditions */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveSignalsTable />
+              <MarketConditions />
+            </div>
             
-            {/* Trade Log - Recent trade outcomes */}
+            {/* Positions and Orders */}
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+              <PositionsPanelConnected />
+              <OrdersBlotter onViewDetails={handleViewDetails} />
+            </div>
+            
+            {/* Trade Log */}
             <TradeLogPanel />
+          </TabsContent>
+
+          {/* Risk Tab - All Risk Controls and Analytics */}
+          <TabsContent value="risk" className="mt-0 space-y-4">
+            {/* Risk Summary Grid */}
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              <RiskControlsPanel />
+              <MetaFilterPanel />
+              <SystemMetricsPanel />
+            </div>
             
-            <OrdersBlotter onViewDetails={handleViewDetails} />
-            <PositionsPanelConnected />
-          </div>
-          
-          <div className="space-y-4 lg:space-y-6">
-            {/* Enhanced System Metrics Panel */}
-            <SystemMetricsPanel />
-            
-            {/* Meta Filter (Trade Quality) Panel */}
-            <MetaFilterPanel />
-            
-            {/* Strategy Plugins Panel */}
-            <StrategiesPluginPanel />
-            
-            {/* Extended Risk Controls Panel */}
-            <RiskControlsPanel />
-            
-            <SystemHealthPanel />
-            
-            {/* Live Price Tickers */}
-            <LiveTickersPanel />
-            
-            {/* Risk Dashboard with real-time metrics */}
+            {/* Risk Dashboard */}
             <RiskDashboard />
             
-            <Tabs defaultValue="strategies" className="w-full">
-              <TabsList className="grid w-full grid-cols-4 bg-card text-xs">
-                <TabsTrigger value="strategies">Strategies</TabsTrigger>
-                <TabsTrigger value="risk-config">Risk Config</TabsTrigger>
-                <TabsTrigger value="signals">Strategy Cfg</TabsTrigger>
-                <TabsTrigger value="alerts">Alerts</TabsTrigger>
-              </TabsList>
-              <TabsContent value="strategies" className="mt-4">
-                <StrategiesPanel />
-              </TabsContent>
-              <TabsContent value="risk-config" className="mt-4">
-                <RiskControls />
-              </TabsContent>
-              <TabsContent value="signals" className="mt-4">
-                <SignalsPanel />
-              </TabsContent>
-              <TabsContent value="alerts" className="mt-4">
-                <AlertsPanel />
-              </TabsContent>
-            </Tabs>
-          </div>
-        </div>
+            {/* Alerts */}
+            <AlertsPanel />
+          </TabsContent>
+
+          {/* Settings Tab - Strategy and Risk Configuration */}
+          <TabsContent value="settings" className="mt-0 space-y-4">
+            {/* Strategy Configuration */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <StrategiesPluginPanel />
+              <StrategiesPanel />
+            </div>
+            
+            {/* Risk Configuration */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <RiskControls />
+              <SignalsPanel />
+            </div>
+          </TabsContent>
+        </Tabs>
       </main>
     </div>
   );
