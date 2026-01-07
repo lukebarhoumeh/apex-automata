@@ -14,6 +14,8 @@ import { loadGuardrails } from '../config/loadGuardrails';
 import { validateSchemaOrFail } from '../config/validateSchema';
 import { OrderRequest } from '../exchanges/coinbase';
 import { MetricsTracker } from '../trading/metrics-tracker';
+import { SecretManager } from '../config/secrets';
+import { CoinbaseExchange } from '../exchanges/coinbase';
 
 const app = express();
 const server = createServer(app);
@@ -110,6 +112,8 @@ const metricsTracker = new MetricsTracker({
 const USER_ID = 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f';
 const INITIAL_BALANCE = 50000; // Starting balance for paper trading
 logger.info('Using fixed USER_ID for single-user mode:', USER_ID);
+
+const DEFAULT_LIVE_CONFIRM_PHRASE = 'ENABLE LIVE';
 
 // Supabase client
 const supabase = createClient(
@@ -345,11 +349,45 @@ app.get('/api/status', (req, res) => {
 // Start trading engine
 app.post('/api/engine/start', async (req, res) => {
   try {
-    const { mode = 'paper', marketDataEnv } = req.body;
+    const { mode = 'paper', marketDataEnv, confirm } = req.body || {};
     const requestedMarketEnv = marketDataEnv === 'sandbox' ? 'sandbox' : 'production';
 
     if (tradingEngine) {
       return res.status(400).json({ error: 'Trading engine already running' });
+    }
+
+    // Enhanced gating for live mode (hard stop unless explicitly confirmed)
+    if (mode === 'live') {
+      if (env.CONFIRM_LIVE !== 'YES') {
+        return res.status(403).json({
+          error: 'Live trading is blocked. Set CONFIRM_LIVE=YES in your environment and restart the API server.',
+        });
+      }
+      
+      const expectedPhrase = DEFAULT_LIVE_CONFIRM_PHRASE;
+      if (confirm !== expectedPhrase) {
+        return res.status(400).json({
+          error: `Confirmation phrase '${expectedPhrase}' required to start live trading`,
+        });
+      }
+    }
+
+    // Clone guardrails so live preflight can safely adjust session-specific parameters
+    const engineGuardrails = structuredClone(guardrails);
+
+    // Live preflight checklist (fails fast with explicit errors)
+    if (mode === 'live') {
+      const preflight = await runLivePreflight({
+        engineGuardrails,
+        products: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+      });
+      if (!preflight.ok) {
+        return res.status(400).json({
+          error: preflight.error,
+          details: preflight.details,
+          warnings: preflight.warnings,
+        });
+      }
     }
 
     const engineConfig: TradingEngineConfig = {
@@ -368,7 +406,7 @@ app.post('/api/engine/start', async (req, res) => {
       security: {
         encryptionKey: env.ENCRYPTION_KEY || ''
       },
-      guardrails
+      guardrails: engineGuardrails
     };
 
     logger.info(`Starting trading engine in ${mode} mode`, {
@@ -573,6 +611,68 @@ app.post('/api/engine/start', async (req, res) => {
       });
     });
 
+    // Listen for regime updates and broadcast
+    signalProcessor.on('regime:updated', (symbol: string, regimeState: any) => {
+      runtimeState.regime = regimeState.regime;
+      broadcast({
+        type: 'RegimeUpdate',
+        payload: {
+          symbol,
+          regime: regimeState.regime,
+          confidence: regimeState.confidence,
+          trendDirection: regimeState.trendDirection,
+          adx: regimeState.adx,
+          choppiness: regimeState.choppiness,
+          mtfAlignment: regimeState.mtfAlignment,
+        },
+      });
+    });
+
+    signalProcessor.on('regime:changed', (symbol: string, oldRegime: string, newRegime: string) => {
+      logger.info('Regime changed', { symbol, from: oldRegime, to: newRegime });
+      broadcast({
+        type: 'RegimeChanged',
+        payload: {
+          symbol,
+          oldRegime,
+          newRegime,
+          timestamp: Date.now(),
+        },
+      });
+    });
+
+    // Listen for regime-filtered signals
+    signalProcessor.on('signal:regime_filtered', (signal: any, regimeState: any, reason: string) => {
+      broadcast({
+        type: 'SignalFiltered',
+        payload: {
+          signal,
+          regime: regimeState.regime,
+          reason,
+          filterType: 'regime',
+        },
+      });
+    });
+
+    // Listen for meta-filtered signals (trade quality)
+    signalProcessor.on('signal:meta_filtered', (signal: any, result: any, reason: string) => {
+      broadcast({
+        type: 'SignalFiltered',
+        payload: {
+          signal,
+          qualityScore: result.qualityScore,
+          coldStreakActive: result.coldStreakActive,
+          reason,
+          filterType: 'meta',
+          rulesEvaluated: result.rulesEvaluated?.map((r: any) => ({
+            rule: r.rule,
+            passed: r.passed,
+            reason: r.reason,
+          })),
+        },
+      });
+    });
+
     // Listen for signals and create orders
     signalProcessor.on('signal:generated', async (signal) => {
       logger.info('Signal generated', signal);
@@ -770,6 +870,146 @@ app.post('/api/engine/start', async (req, res) => {
   }
 });
 
+type LivePreflightResult =
+  | { ok: true; warnings: string[] }
+  | { ok: false; error: string; details?: Record<string, any>; warnings: string[] };
+
+async function runLivePreflight(input: {
+  engineGuardrails: typeof guardrails;
+  products: string[];
+}): Promise<LivePreflightResult> {
+  const warnings: string[] = [];
+  
+  // This API server currently uses the legacy Exchange (Coinbase Pro) endpoints via `CoinbaseRestClient`.
+  if (env.COINBASE_API_VERSION !== 'exchange') {
+    return {
+      ok: false,
+      error: `COINBASE_API_VERSION must be 'exchange' for live trading (current engine integration). Got: ${env.COINBASE_API_VERSION}`,
+      warnings,
+    };
+  }
+  
+  if (!env.COINBASE_API_KEY || !env.COINBASE_API_SECRET) {
+    return {
+      ok: false,
+      error: 'Missing COINBASE_API_KEY / COINBASE_API_SECRET for live trading',
+      warnings,
+    };
+  }
+  
+  if (!env.COINBASE_API_PASSPHRASE) {
+    return {
+      ok: false,
+      error: 'Missing COINBASE_API_PASSPHRASE for live trading (required for Coinbase Exchange API auth)',
+      warnings,
+    };
+  }
+  
+  // Ensure exchange credentials are stored in Supabase (the trading engine loads secrets from Supabase).
+  const secretManager = new SecretManager(
+    {
+      supabaseUrl: env.SUPABASE_URL || '',
+      supabaseServiceKey: env.SUPABASE_SERVICE_KEY || '',
+      encryptionKey: env.ENCRYPTION_KEY || '',
+    },
+    logger
+  );
+  
+  try {
+    let credentialsOk = false;
+    try {
+      const existing = await secretManager.getExchangeCredentials('coinbase', 'production');
+      credentialsOk = Boolean(existing?.apiKey && existing?.apiSecret);
+    } catch (err) {
+      // Likely encryption key mismatch or corrupt record; we'll re-seed from env below.
+      warnings.push('Existing exchange credentials could not be decrypted; re-seeding from environment');
+    }
+    
+    if (!credentialsOk) {
+      await secretManager.storeExchangeCredentials('coinbase', {
+        apiKey: env.COINBASE_API_KEY,
+        apiSecret: env.COINBASE_API_SECRET,
+        apiPassphrase: env.COINBASE_API_PASSPHRASE,
+        environment: 'production',
+      });
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      error: 'Failed to ensure exchange credentials are available in Supabase',
+      details: { message: error instanceof Error ? error.message : String(error) },
+      warnings,
+    };
+  }
+  
+  // Fetch credentials from Supabase and validate live REST connectivity.
+  let credentials: { apiKey: string; apiSecret: string; apiPassphrase?: string } | null = null;
+  try {
+    const fetched = await secretManager.getExchangeCredentials('coinbase', 'production');
+    credentials = fetched ? { apiKey: fetched.apiKey, apiSecret: fetched.apiSecret, apiPassphrase: fetched.apiPassphrase } : null;
+  } catch (error) {
+    return {
+      ok: false,
+      error: 'Failed to load exchange credentials from Supabase (decryption or schema issue)',
+      details: { message: error instanceof Error ? error.message : String(error) },
+      warnings,
+    };
+  }
+  
+  if (!credentials) {
+    return { ok: false, error: 'No Coinbase production credentials found', warnings };
+  }
+  
+  try {
+    const exchange = new CoinbaseExchange(
+      {
+        apiKey: credentials.apiKey,
+        apiSecret: credentials.apiSecret,
+        apiPassphrase: credentials.apiPassphrase,
+        environment: 'production',
+        wsUrl: 'wss://ws-feed.exchange.coinbase.com',
+        restUrl: 'https://api.exchange.coinbase.com',
+      },
+      logger
+    );
+    
+    // REST ping (safe): list accounts + validate required products exist
+    const accounts = await exchange.getAccounts();
+    const usd = accounts.find(a => a.currency === 'USD');
+    const usdBalance = usd ? Number.parseFloat(usd.balance) : NaN;
+    if (!Number.isFinite(usdBalance) || usdBalance <= 0) {
+      warnings.push('Could not determine positive USD balance from Coinbase accounts (equity sanity check skipped)');
+    } else {
+      const configuredEquity = input.engineGuardrails.account.equity_usd;
+      if (usdBalance < configuredEquity * 0.95) {
+        // Safety: scale down equity to avoid over-risking the live account.
+        input.engineGuardrails.account.equity_usd = usdBalance;
+        warnings.push(`Guardrails equity_usd scaled down for live session (${configuredEquity} → ${usdBalance})`);
+      }
+    }
+    
+    const products = await exchange.getProducts();
+    const productIds = new Set(products.map(p => p.id));
+    const missing = input.products.filter(p => !productIds.has(p));
+    if (missing.length > 0) {
+      return {
+        ok: false,
+        error: `Live preflight failed: missing products on Coinbase: ${missing.join(', ')}`,
+        warnings,
+      };
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      error: 'Live preflight failed: Coinbase REST connectivity check failed',
+      details: { message: error instanceof Error ? error.message : String(error) },
+      warnings,
+    };
+  }
+  
+  return { ok: true, warnings };
+}
+
 // Stop trading engine
 app.post('/api/engine/stop', async (req, res) => {
   try {
@@ -895,6 +1135,834 @@ app.post('/api/config/signals', (req, res) => {
   signalsConfig = req.body || {};
   logger.info('Signals config updated', { signalsConfig });
   res.json({ ok: true });
+});
+
+// ============================================================================
+// Analytics Endpoints - Real-time Performance Tracking & Telemetry
+// ============================================================================
+
+// Get session statistics
+app.get('/api/analytics/session', (req, res) => {
+  if (!tradingEngine) {
+    return res.status(400).json({ error: 'Trading engine not running' });
+  }
+  
+  const stats = tradingEngine.getSessionStats();
+  if (!stats) {
+    return res.status(500).json({ error: 'Analytics not available' });
+  }
+  
+  // Return stats without equity curve (large payload)
+  const { equityCurve, ...statsWithoutCurve } = stats;
+  res.json(statsWithoutCurve);
+});
+
+// Get equity curve data
+app.get('/api/analytics/equity-curve', (req, res) => {
+  if (!tradingEngine) {
+    return res.status(400).json({ error: 'Trading engine not running' });
+  }
+  
+  const curve = tradingEngine.getEquityCurve();
+  const stats = tradingEngine.getSessionStats();
+  
+  res.json({
+    equityCurve: curve,
+    highWaterMark: stats?.highWaterMark ?? 0,
+    currentEquity: stats?.totalPnl ? guardrails.account.equity_usd + stats.totalPnl : guardrails.account.equity_usd,
+    maxDrawdown: stats?.maxDrawdown ?? 0,
+  });
+});
+
+// Get recent trades
+app.get('/api/analytics/trades', (req, res) => {
+  if (!tradingEngine) {
+    return res.status(400).json({ error: 'Trading engine not running' });
+  }
+  
+  const limit = Math.min(parseInt(req.query.limit as string) || 50, 500);
+  const trades = tradingEngine.getRecentTrades(limit);
+  
+  res.json({ trades });
+});
+
+// Get historical trade log from database
+app.get('/api/analytics/trade-history', async (req, res) => {
+  const startDate = req.query.start as string || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+  const endDate = req.query.end as string || new Date().toISOString().split('T')[0];
+  const limit = Math.min(parseInt(req.query.limit as string) || 100, 1000);
+  
+  try {
+    const { data, error } = await supabase
+      .from('trade_log')
+      .select('*')
+      .eq('user_id', USER_ID)
+      .gte('entry_time', `${startDate}T00:00:00Z`)
+      .lte('entry_time', `${endDate}T23:59:59Z`)
+      .order('entry_time', { ascending: false })
+      .limit(limit);
+    
+    if (error) {
+      // Table may not exist yet
+      if (error.code === '42P01') {
+        return res.json({ trades: [], message: 'Trade log table not yet created' });
+      }
+      throw error;
+    }
+    
+    res.json({ trades: data || [] });
+  } catch (error) {
+    logger.error('Failed to fetch trade history:', error);
+    res.status(500).json({ error: 'Failed to fetch trade history' });
+  }
+});
+
+// Get daily trade summary
+app.get('/api/analytics/daily-summary', async (req, res) => {
+  const days = Math.min(parseInt(req.query.days as string) || 30, 365);
+  const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+  
+  try {
+    // First try the view
+    const { data, error } = await supabase
+      .from('daily_trade_summary')
+      .select('*')
+      .eq('user_id', USER_ID)
+      .gte('trade_date', startDate)
+      .order('trade_date', { ascending: false });
+    
+    if (error) {
+      // View/table may not exist
+      if (error.code === '42P01' || error.code === 'PGRST116') {
+        return res.json({ summary: [], message: 'Daily summary not yet available' });
+      }
+      throw error;
+    }
+    
+    res.json({ summary: data || [] });
+  } catch (error) {
+    logger.error('Failed to fetch daily summary:', error);
+    res.status(500).json({ error: 'Failed to fetch daily summary' });
+  }
+});
+
+// Get historical sessions
+app.get('/api/analytics/sessions', async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+  
+  try {
+    const { data, error } = await supabase
+      .from('trading_sessions')
+      .select('*')
+      .eq('user_id', USER_ID)
+      .order('start_time', { ascending: false })
+      .limit(limit);
+    
+    if (error) {
+      if (error.code === '42P01') {
+        return res.json({ sessions: [], message: 'Sessions table not yet created' });
+      }
+      throw error;
+    }
+    
+    res.json({ sessions: data || [] });
+  } catch (error) {
+    logger.error('Failed to fetch sessions:', error);
+    res.status(500).json({ error: 'Failed to fetch sessions' });
+  }
+});
+
+// Get real-time system metrics (for Grafana / monitoring)
+app.get('/api/analytics/system-metrics', (req, res) => {
+  const memoryUsage = process.memoryUsage();
+  const uptime = process.uptime();
+  const realMetrics = metricsTracker.getMetrics();
+  
+  const engineStats = tradingEngine?.getSessionStats();
+  const riskMetrics = tradingEngine?.getRiskMetrics();
+  
+  res.json({
+    system: {
+      uptimeSeconds: uptime,
+      memoryUsedMB: Math.round(memoryUsage.heapUsed / 1024 / 1024),
+      memoryTotalMB: Math.round(memoryUsage.heapTotal / 1024 / 1024),
+      rssMB: Math.round(memoryUsage.rss / 1024 / 1024),
+    },
+    latency: {
+      wsLatencyMs: realMetrics.wsLatencyMs,
+      restLatencyMs: realMetrics.restLatencyMs,
+    },
+    market: {
+      spreadBps: realMetrics.spreadBps,
+      spreadPctile: realMetrics.spreadPctile,
+      regime: realMetrics.regime,
+      atr: realMetrics.atr,
+    },
+    trading: {
+      engineRunning: tradingEngine?.engineRunning ?? false,
+      mode: tradingEngine?.getConfig().mode ?? null,
+      totalTrades: engineStats?.totalTrades ?? 0,
+      winRate: engineStats?.winRate ?? 0,
+      sessionPnl: engineStats?.totalPnl ?? 0,
+      maxDrawdown: engineStats?.maxDrawdown ?? 0,
+    },
+    risk: {
+      exposureUsd: riskMetrics?.currentExposure ?? 0,
+      dailyPnl: riskMetrics?.dailyPnL ?? 0,
+      killSwitchActive: riskMetrics?.killSwitchActive ?? false,
+      consecutiveLosses: riskMetrics?.consecutiveLosses ?? 0,
+    },
+  });
+});
+
+// ============ Regime Detection Endpoints ============
+
+// Get current regime state for all symbols
+// Alias for /api/regime/state for consistency
+app.get('/api/regime/status', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+  
+  const allStates = signalProcessor.getAllRegimeStates();
+  const statesObj: Record<string, any> = {};
+  
+  for (const [symbol, state] of allStates) {
+    statesObj[symbol] = {
+      regime: state.regime,
+      confidence: state.confidence,
+      trendDirection: state.trendDirection,
+      adx: state.adx,
+      choppiness: state.choppiness,
+      lastUpdated: state.lastUpdated,
+    };
+  }
+
+  res.json({
+    regimes: statesObj,
+    count: allStates.size,
+  });
+});
+
+app.get('/api/regime/state', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const allStates = signalProcessor.getAllRegimeStates();
+  const statesObj: Record<string, any> = {};
+  
+  for (const [symbol, state] of allStates) {
+    statesObj[symbol] = {
+      regime: state.regime,
+      confidence: state.confidence,
+      trendDirection: state.trendDirection,
+      adx: state.adx,
+      plusDI: state.plusDI,
+      minusDI: state.minusDI,
+      atrPercent: state.atrPercent,
+      bbWidth: state.bbWidth,
+      choppiness: state.choppiness,
+      directionConsistency: state.directionConsistency,
+      mtfAlignment: state.mtfAlignment,
+      lastUpdated: state.lastUpdated,
+      regimeSince: state.regimeSince,
+    };
+  }
+
+  res.json({
+    states: statesObj,
+    summary: {
+      trending: Array.from(allStates.entries())
+        .filter(([, s]) => s.regime === 'strong_trend' || s.regime === 'weak_trend')
+        .map(([symbol]) => symbol),
+      ranging: Array.from(allStates.entries())
+        .filter(([, s]) => s.regime === 'ranging' || s.regime === 'choppy')
+        .map(([symbol]) => symbol),
+    },
+  });
+});
+
+// Get regime state for a specific symbol
+app.get('/api/regime/state/:symbol', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { symbol } = req.params;
+  const state = signalProcessor.getRegimeState(symbol);
+
+  if (!state) {
+    return res.status(404).json({ error: `No regime data for symbol: ${symbol}` });
+  }
+
+  res.json(state);
+});
+
+// Get regime filter statistics
+app.get('/api/regime/filter/stats', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  res.json(signalProcessor.getRegimeFilterStats());
+});
+
+// Enable/disable regime filtering
+app.post('/api/regime/filter/toggle', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { enabled } = req.body;
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+
+  signalProcessor.setRegimeFilterEnabled(enabled);
+  
+  res.json({ 
+    success: true, 
+    message: `Regime filtering ${enabled ? 'enabled' : 'disabled'}`,
+    enabled,
+  });
+});
+
+// Update regime filter configuration
+app.post('/api/regime/filter/config', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const config = req.body;
+  signalProcessor.updateRegimeFilterConfig(config);
+
+  logger.info('Regime filter config updated via API', { config });
+  
+  res.json({ 
+    success: true, 
+    message: 'Regime filter configuration updated',
+    config: signalProcessor.getRegimeFilterStats().config,
+  });
+});
+
+// ============ Meta Filter (Trade Quality) Endpoints ============
+
+// Get meta filter statistics
+app.get('/api/metafilter/stats', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  res.json(signalProcessor.getMetaFilterStats());
+});
+
+// Get strategy performance
+app.get('/api/metafilter/performance', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const performances = signalProcessor.getAllStrategyPerformances();
+  const result: Record<string, any> = {};
+  
+  for (const [strategy, perf] of performances) {
+    result[strategy] = {
+      totalTrades: perf.totalTrades,
+      wins: perf.wins,
+      losses: perf.losses,
+      breakeven: perf.breakeven,
+      winRate: perf.winRate,
+      avgWinPnl: perf.avgWinPnl,
+      avgLossPnl: perf.avgLossPnl,
+      profitFactor: perf.profitFactor,
+      consecutiveLosses: perf.consecutiveLosses,
+      consecutiveWins: perf.consecutiveWins,
+      maxConsecutiveLosses: perf.maxConsecutiveLosses,
+      avgWinningStrength: perf.avgWinningStrength,
+      strengthPercentile25: perf.strengthPercentile25,
+      strengthPercentile50: perf.strengthPercentile50,
+      lastTradeTime: perf.lastTradeTime,
+    };
+  }
+
+  res.json({
+    strategies: result,
+    totalStrategies: performances.size,
+  });
+});
+
+// Get performance for a specific strategy
+app.get('/api/metafilter/performance/:strategy', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { strategy } = req.params;
+  const perf = signalProcessor.getStrategyPerformance(strategy);
+
+  if (!perf) {
+    return res.status(404).json({ error: `No performance data for strategy: ${strategy}` });
+  }
+
+  res.json(perf);
+});
+
+// Get recent filter decisions (for ML training data export)
+app.get('/api/metafilter/decisions', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const limit = parseInt(req.query.limit as string) || 50;
+  const decisions = signalProcessor.getRecentFilterDecisions(limit);
+
+  res.json({
+    decisions,
+    count: decisions.length,
+  });
+});
+
+// Enable/disable meta filter
+app.post('/api/metafilter/toggle', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { enabled } = req.body;
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+
+  signalProcessor.setMetaFilterEnabled(enabled);
+  
+  res.json({ 
+    success: true, 
+    message: `Meta filter ${enabled ? 'enabled' : 'disabled'}`,
+    enabled,
+  });
+});
+
+// Update meta filter configuration
+app.post('/api/metafilter/config', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const config = req.body;
+  signalProcessor.updateMetaFilterConfig(config);
+
+  logger.info('Meta filter config updated via API', { config });
+  
+  res.json({ 
+    success: true, 
+    message: 'Meta filter configuration updated',
+    config: signalProcessor.getMetaFilterStats().config,
+  });
+});
+
+// Record a trade outcome (for learning)
+app.post('/api/metafilter/outcome', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const outcome = req.body;
+  
+  // Validate required fields
+  if (!outcome.signalId || !outcome.strategy || !outcome.symbol || !outcome.outcome) {
+    return res.status(400).json({ 
+      error: 'Missing required fields: signalId, strategy, symbol, outcome' 
+    });
+  }
+
+  // Add timestamps if not provided
+  outcome.entryTime = outcome.entryTime ? new Date(outcome.entryTime) : new Date();
+  outcome.exitTime = outcome.exitTime ? new Date(outcome.exitTime) : new Date();
+  outcome.hourOfDay = outcome.hourOfDay ?? new Date().getUTCHours();
+  outcome.dayOfWeek = outcome.dayOfWeek ?? new Date().getUTCDay();
+  outcome.filtersPassed = outcome.filtersPassed ?? [];
+  outcome.filtersBlocked = outcome.filtersBlocked ?? [];
+
+  signalProcessor.recordTradeOutcome(outcome);
+
+  logger.info('Trade outcome recorded', { 
+    signalId: outcome.signalId, 
+    strategy: outcome.strategy, 
+    outcome: outcome.outcome,
+    pnl: outcome.pnl,
+  });
+  
+  res.json({ 
+    success: true, 
+    message: 'Trade outcome recorded',
+    performance: signalProcessor.getStrategyPerformance(outcome.strategy),
+  });
+});
+
+// ============ Strategy Plugin Management Endpoints ============
+
+// Get all registered strategies
+app.get('/api/strategies', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const strategies = signalProcessor.getRegisteredStrategies();
+  res.json({
+    strategies: strategies.map(s => ({
+      id: s.id,
+      name: s.name,
+      description: s.description,
+      version: s.version,
+      category: s.category,
+      tags: s.tags,
+      enabled: s.enabled,
+      config: s.config,
+      stats: s.getStats?.(),
+    })),
+    total: strategies.length,
+    enabled: signalProcessor.getEnabledStrategies().length,
+  });
+});
+
+// Get strategy registry stats
+app.get('/api/strategies/stats', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  res.json(signalProcessor.getStrategyRegistryStats());
+});
+
+// Get a specific strategy
+app.get('/api/strategies/:strategyId', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { strategyId } = req.params;
+  const info = signalProcessor.getStrategyInfo(strategyId);
+
+  if (!info) {
+    return res.status(404).json({ error: `Strategy not found: ${strategyId}` });
+  }
+
+  res.json({
+    id: info.plugin.id,
+    name: info.plugin.name,
+    description: info.plugin.description,
+    version: info.plugin.version,
+    author: info.plugin.author,
+    category: info.plugin.category,
+    tags: info.plugin.tags,
+    enabled: info.registration.enabled,
+    config: info.plugin.config,
+    configSchema: info.plugin.configSchema,
+    requiredIndicators: info.plugin.requiredIndicators,
+    regimeCompatibility: info.plugin.regimeCompatibility,
+    registration: info.registration,
+    stats: info.stats,
+    state: info.state,
+  });
+});
+
+// Enable a strategy
+app.post('/api/strategies/:strategyId/enable', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { strategyId } = req.params;
+  const success = signalProcessor.enableStrategy(strategyId);
+
+  if (!success) {
+    return res.status(404).json({ error: `Strategy not found: ${strategyId}` });
+  }
+
+  logger.info(`Strategy enabled via API: ${strategyId}`);
+  res.json({ success: true, message: `Strategy ${strategyId} enabled` });
+});
+
+// Disable a strategy
+app.post('/api/strategies/:strategyId/disable', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { strategyId } = req.params;
+  const success = signalProcessor.disableStrategy(strategyId);
+
+  if (!success) {
+    return res.status(404).json({ error: `Strategy not found: ${strategyId}` });
+  }
+
+  logger.info(`Strategy disabled via API: ${strategyId}`);
+  res.json({ success: true, message: `Strategy ${strategyId} disabled` });
+});
+
+// Update strategy configuration
+app.post('/api/strategies/:strategyId/config', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { strategyId } = req.params;
+  const config = req.body;
+
+  const success = signalProcessor.updateStrategyConfig(strategyId, config);
+
+  if (!success) {
+    return res.status(404).json({ error: `Strategy not found: ${strategyId}` });
+  }
+
+  logger.info(`Strategy config updated via API: ${strategyId}`, { config });
+  
+  const updatedInfo = signalProcessor.getStrategyInfo(strategyId);
+  res.json({ 
+    success: true, 
+    message: `Strategy ${strategyId} config updated`,
+    config: updatedInfo?.plugin.config,
+  });
+});
+
+// Export all strategy configurations
+app.get('/api/strategies/config/export', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const configs = signalProcessor.exportStrategyConfigs();
+  res.json({
+    exported: new Date().toISOString(),
+    strategies: configs,
+  });
+});
+
+// Import strategy configurations
+app.post('/api/strategies/config/import', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { strategies } = req.body;
+  if (!strategies || typeof strategies !== 'object') {
+    return res.status(400).json({ error: 'Invalid import format. Expected: { strategies: {...} }' });
+  }
+
+  signalProcessor.importStrategyConfigs(strategies);
+  
+  logger.info('Strategy configs imported via API');
+  res.json({ 
+    success: true, 
+    message: 'Strategy configurations imported',
+    imported: Object.keys(strategies),
+  });
+});
+
+// Toggle plugin strategy mode
+app.post('/api/strategies/plugin-mode', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { enabled } = req.body;
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+
+  signalProcessor.setPluginStrategiesEnabled(enabled);
+  
+  res.json({ 
+    success: true, 
+    message: `Plugin strategy mode ${enabled ? 'enabled' : 'disabled'}`,
+    pluginModeEnabled: signalProcessor.isPluginStrategiesEnabled(),
+  });
+});
+
+// ============ Extended Risk Control Endpoints ============
+
+// Get risk controller status
+app.get('/api/risk/status', (req, res) => {
+  const riskEngine = tradingEngine?.getRiskEngineInstance();
+  if (!riskEngine) {
+    return res.status(400).json({ error: 'Risk engine not running' });
+  }
+
+  const metrics = riskEngine.getMetrics();
+  const positionTracker = tradingEngine?.getPositionTrackerInstance();
+  const positions = positionTracker?.getOpenPositions() || [];
+  
+  res.json({
+    tradingAllowed: !metrics.killSwitchActive,
+    killSwitchActive: metrics.killSwitchActive,
+    metrics: {
+      currentExposure: metrics.currentExposure,
+      dailyPnL: metrics.dailyPnL,
+      dailyLossPercentage: metrics.dailyLossPercentage,
+      maxDrawdown: metrics.maxDrawdown,
+      consecutiveLosses: metrics.consecutiveLosses,
+      openOrders: metrics.openOrderCount,
+      lastUpdated: metrics.lastUpdated,
+    },
+    positions: {
+      open: positions.length,
+      max: (riskEngine as any).maxOpenPositionsLimit || 5,
+    },
+  });
+});
+
+// Get risk analytics 
+app.get('/api/risk/analytics', (req, res) => {
+  const riskEngine = tradingEngine?.getRiskEngineInstance();
+  if (!riskEngine) {
+    return res.status(400).json({ error: 'Risk engine not running' });
+  }
+
+  const metrics = riskEngine.getMetrics();
+  const positionTracker = tradingEngine?.getPositionTrackerInstance();
+  const summary = positionTracker?.getPortfolioSummary();
+  
+  res.json({
+    session: {
+      trades: summary?.trades || 0,
+      wins: 0, // Would need TradeAnalytics
+      losses: 0,
+      winRate: 0,
+      profitFactor: 0,
+    },
+    equity: {
+      current: summary?.totalValue || 0,
+      dailyPnL: metrics.dailyPnL,
+      maxDrawdown: metrics.maxDrawdown,
+    },
+    streaks: {
+      consecutiveWins: 0,
+      consecutiveLosses: metrics.consecutiveLosses,
+      maxConsecutiveLosses: metrics.consecutiveLosses,
+    },
+    riskMetrics: metrics,
+  });
+});
+
+// Get blocked symbols
+app.get('/api/risk/blocked/symbols', (req, res) => {
+  const riskEngine = tradingEngine?.getRiskEngineInstance();
+  if (!riskEngine) {
+    return res.status(400).json({ error: 'Risk engine not running' });
+  }
+
+  const blocked: string[] = [];
+  // Access internal state
+  const blockedSymbols = (riskEngine as any).blockedSymbols;
+  if (blockedSymbols instanceof Set) {
+    blocked.push(...blockedSymbols);
+  }
+  
+  res.json({
+    blockedSymbols: blocked,
+    count: blocked.length,
+  });
+});
+
+// Unblock a symbol
+app.post('/api/risk/unblock/symbol/:symbol', (req, res) => {
+  const riskEngine = tradingEngine?.getRiskEngineInstance();
+  if (!riskEngine) {
+    return res.status(400).json({ error: 'Risk engine not running' });
+  }
+
+  const { symbol } = req.params;
+  const blockedSymbols = (riskEngine as any).blockedSymbols as Set<string>;
+  
+  if (blockedSymbols?.has(symbol)) {
+    blockedSymbols.delete(symbol);
+    logger.info(`Symbol manually unblocked: ${symbol}`);
+    res.json({ success: true, message: `Symbol ${symbol} unblocked` });
+  } else {
+    res.json({ success: false, message: `Symbol ${symbol} was not blocked` });
+  }
+});
+
+// Get per-symbol daily loss
+app.get('/api/risk/symbols/:symbol', (req, res) => {
+  const riskEngine = tradingEngine?.getRiskEngineInstance();
+  if (!riskEngine) {
+    return res.status(400).json({ error: 'Risk engine not running' });
+  }
+
+  const { symbol } = req.params;
+  const dailyLoss = riskEngine.getSymbolDailyLoss(symbol);
+  const isBlocked = riskEngine.isSymbolBlocked(symbol);
+  
+  res.json({
+    symbol,
+    dailyLoss,
+    isBlocked,
+  });
+});
+
+// Reset daily tracking
+app.post('/api/risk/reset/daily', (req, res) => {
+  const riskEngine = tradingEngine?.getRiskEngineInstance();
+  if (!riskEngine) {
+    return res.status(400).json({ error: 'Risk engine not running' });
+  }
+
+  riskEngine.resetSymbolDailyTracking();
+  logger.info('Daily risk tracking reset via API');
+  
+  res.json({
+    success: true,
+    message: 'Daily tracking reset (per-symbol losses and blocks cleared)',
+  });
+});
+
+// Get soft launch status
+app.get('/api/risk/soft-launch', (req, res) => {
+  const riskEngine = tradingEngine?.getRiskEngineInstance();
+  if (!riskEngine) {
+    return res.status(400).json({ error: 'Risk engine not running' });
+  }
+
+  const softLaunchActive = (riskEngine as any).isSoftLaunchActive?.() || false;
+  const softLaunchTrades = (riskEngine as any).softLaunchEntryTrades || 0;
+  const softLaunchConfig = (riskEngine as any).config?.softLaunch;
+  
+  res.json({
+    active: softLaunchActive,
+    tradesDone: softLaunchTrades,
+    maxTrades: softLaunchConfig?.maxEntryTrades || 0,
+    config: softLaunchConfig || null,
+  });
+});
+
+// Toggle kill switch manually
+app.post('/api/risk/killswitch', (req, res) => {
+  const riskEngine = tradingEngine?.getRiskEngineInstance();
+  if (!riskEngine) {
+    return res.status(400).json({ error: 'Risk engine not running' });
+  }
+
+  const { active, reason } = req.body;
+  
+  if (typeof active !== 'boolean') {
+    return res.status(400).json({ error: 'active must be a boolean' });
+  }
+
+  if (active) {
+    riskEngine.triggerKillSwitch(reason || 'Manual activation via API');
+    logger.warn('Kill switch activated via API', { reason });
+  } else {
+    riskEngine.resetKillSwitch();
+    logger.info('Kill switch deactivated via API');
+  }
+  
+  res.json({
+    success: true,
+    killSwitchActive: active,
+    message: active ? 'Kill switch activated' : 'Kill switch deactivated',
+  });
 });
 
 // Backtest endpoint

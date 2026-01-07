@@ -47,6 +47,21 @@ export interface RiskEngineConfig {
   kellyFraction: number;           // Kelly criterion fraction (0.25 = quarter Kelly)
   guardrails: GuardrailConfig;
   accountEquity: number;
+  /**
+   * Soft-launch safety clamps (intended for early live trading).
+   * These are applied dynamically for the first N new positions opened.
+   */
+  softLaunch?: {
+    enabled: boolean;
+    maxEntryTrades: number;               // Number of position opens to treat as "soft launch"
+    riskPerTradeMultiplier: number;       // Multiplies risk sizing (0.25 = quarter risk)
+    maxPositionSizeMultiplier: number;    // Multiplies max position notional limits
+    maxTotalExposureMultiplier: number;   // Multiplies max total exposure
+    maxOrderSizeMultiplier: number;       // Multiplies max order notional
+    maxDailyLossMultiplier: number;       // Multiplies daily loss guardrails/limits (stricter if < 1)
+    perSymbolNotionalCapUsd?: number;     // Absolute cap on per-symbol notional during soft launch
+    minOrderSizeUsd?: number;             // Absolute minimum order size override during soft launch
+  };
 }
 
 export interface RiskCheck {
@@ -93,6 +108,7 @@ export class RiskEngine extends EventEmitter {
   private metrics: RiskMetrics;
   private killSwitchActive = false;
   private dailyStartEquity = 0;
+  private dailyHighEquity = 0;
   private weeklyStartEquity = 0;
   private weeklyStartTimestamp = 0;
   private equityHistory: Array<{ timestamp: number; equity: number }> = [];
@@ -108,6 +124,9 @@ export class RiskEngine extends EventEmitter {
   private minOrderNotionalUsd: number;
   private rapidLossThresholdUsd: number;
   private maxOpenPositionsLimit: number;
+  
+  // Soft launch state
+  private softLaunchEntryTrades = 0;
   
   // Per-symbol tracking
   private dailyLossPerSymbol: Map<string, number> = new Map();
@@ -138,13 +157,103 @@ export class RiskEngine extends EventEmitter {
     this.maxOpenPositionsLimit = accountCfg.max_open_positions;
     this.minOrderNotionalUsd = this.accountEquity * accountCfg.risk_per_trade * accountCfg.min_notional_buffer;
     this.rapidLossThresholdUsd = Math.abs(circuitCfg.rapid_loss_trigger) * this.accountEquity;
+    
+    // Safe defaults until async loaders complete (prevents metrics from using 0 start equity).
+    this.dailyStartEquity = this.accountEquity;
+    this.dailyHighEquity = this.dailyStartEquity;
     this.weeklyStartEquity = this.accountEquity;
     this.weeklyStartTimestamp = Date.now();
 
     this.metrics = this.initializeMetrics();
+    
+    // Trade outcome hooks (drives consecutive loss + per-symbol loss tracking)
+    this.positionTracker.on('position:closed', (position: Position) => {
+      this.handleClosedPosition(position);
+    });
+    
+    // Soft launch trade counter (counts new position opens)
+    this.positionTracker.on('position:opened', () => {
+      if (!this.isSoftLaunchActive()) {
+        return;
+      }
+      this.softLaunchEntryTrades += 1;
+    });
+    
     this.startMetricsUpdate();
     this.loadDailyStartEquity();
     this.loadRiskState();
+  }
+  
+  private isSoftLaunchActive(): boolean {
+    const cfg = this.config.softLaunch;
+    if (!cfg?.enabled) return false;
+    if (!Number.isFinite(cfg.maxEntryTrades) || cfg.maxEntryTrades <= 0) return false;
+    return this.softLaunchEntryTrades < cfg.maxEntryTrades;
+  }
+  
+  private getSoftLaunch(): NonNullable<RiskEngineConfig['softLaunch']> | null {
+    return this.isSoftLaunchActive() ? (this.config.softLaunch ?? null) : null;
+  }
+  
+  private scaleUsd(value: number, multiplier: number | undefined): number {
+    if (!Number.isFinite(value)) return 0;
+    const m = (typeof multiplier === 'number' && Number.isFinite(multiplier)) ? multiplier : 1;
+    return Math.max(0, value * m);
+  }
+  
+  private getEffectiveMinOrderUsd(): number {
+    const soft = this.getSoftLaunch();
+    if (soft?.minOrderSizeUsd && Number.isFinite(soft.minOrderSizeUsd) && soft.minOrderSizeUsd > 0) {
+      return Math.min(this.config.limits.minOrderSize, soft.minOrderSizeUsd);
+    }
+    return this.config.limits.minOrderSize;
+  }
+  
+  private getEffectiveMaxPositionUsd(): number {
+    const soft = this.getSoftLaunch();
+    return soft ? this.scaleUsd(this.config.limits.maxPositionSize, soft.maxPositionSizeMultiplier) : this.config.limits.maxPositionSize;
+  }
+  
+  private getEffectiveMaxOrderUsd(): number {
+    const soft = this.getSoftLaunch();
+    return soft ? this.scaleUsd(this.config.limits.maxOrderSize, soft.maxOrderSizeMultiplier) : this.config.limits.maxOrderSize;
+  }
+  
+  private getEffectiveMaxTotalExposureUsd(): number {
+    const soft = this.getSoftLaunch();
+    return soft ? this.scaleUsd(this.config.limits.maxTotalExposure, soft.maxTotalExposureMultiplier) : this.config.limits.maxTotalExposure;
+  }
+  
+  private getEffectiveMaxDailyLossUsd(): number {
+    const soft = this.getSoftLaunch();
+    return soft ? this.scaleUsd(this.config.limits.maxDailyLoss, soft.maxDailyLossMultiplier) : this.config.limits.maxDailyLoss;
+  }
+  
+  private getEffectiveKillSwitchDailyLossUsd(): number {
+    const soft = this.getSoftLaunch();
+    return soft ? this.scaleUsd(this.config.killSwitches.dailyLossLimit, soft.maxDailyLossMultiplier) : this.config.killSwitches.dailyLossLimit;
+  }
+  
+  private getEffectivePerSymbolNotionalCapUsd(): number | null {
+    const soft = this.getSoftLaunch();
+    if (!soft?.perSymbolNotionalCapUsd) return null;
+    const cap = soft.perSymbolNotionalCapUsd;
+    return (Number.isFinite(cap) && cap > 0) ? cap : null;
+  }
+  
+  private handleClosedPosition(position: Position): void {
+    const realized = Number(position.realizedPnL ?? 0);
+    if (!Number.isFinite(realized)) {
+      return;
+    }
+    
+    // Consecutive losses are based on CLOSED trade outcomes (not order placement success).
+    if (realized < 0) {
+      this.metrics.consecutiveLosses += 1;
+      this.recordSymbolLoss(position.symbol, Math.abs(realized));
+    } else {
+      this.metrics.consecutiveLosses = 0;
+    }
   }
   
   /**
@@ -318,6 +427,7 @@ export class RiskEngine extends EventEmitter {
     // If userId isn't provided, fall back to in-memory only
     if (!this.userId) {
       this.dailyStartEquity = await this.calculateCurrentEquity();
+      this.dailyHighEquity = this.dailyStartEquity;
       this.weeklyStartEquity = this.dailyStartEquity;
       this.weeklyStartTimestamp = Date.now();
       return;
@@ -351,6 +461,7 @@ export class RiskEngine extends EventEmitter {
       this.dailyStartEquity = await this.calculateCurrentEquity();
     }
 
+    this.dailyHighEquity = this.dailyStartEquity;
     this.weeklyStartEquity = this.dailyStartEquity;
     this.weeklyStartTimestamp = Date.now();
   }
@@ -449,16 +560,22 @@ export class RiskEngine extends EventEmitter {
     if (!isReduceOnly) {
       // Per-symbol notional limit should apply to resulting position exposure (not just order notional)
       const perSymbolLimits = this.getPerSymbolLimits(symbol);
-      if (perSymbolLimits && exposureSim.newAbsNotional > perSymbolLimits.maxNotionalUsd) {
+      const softCap = this.getEffectivePerSymbolNotionalCapUsd();
+      if (softCap !== null && exposureSim.newAbsNotional > softCap) {
+        check.passed = false;
+        check.reason = `Soft launch cap: position notional $${exposureSim.newAbsNotional.toFixed(2)} exceeds per-symbol cap $${softCap}`;
+        check.checks.positionSize = false;
+      } else if (perSymbolLimits && exposureSim.newAbsNotional > perSymbolLimits.maxNotionalUsd) {
         check.passed = false;
         check.reason = `Position notional $${exposureSim.newAbsNotional.toFixed(2)} exceeds ${symbol} max notional $${perSymbolLimits.maxNotionalUsd}`;
         check.checks.positionSize = false;
       }
       
       // Minimum order size
-      if (orderValue < this.config.limits.minOrderSize) {
+      const minOrderUsd = this.getEffectiveMinOrderUsd();
+      if (orderValue < minOrderUsd) {
         check.passed = false;
-        check.reason = `Order size $${orderValue.toFixed(2)} below minimum $${this.config.limits.minOrderSize}`;
+        check.reason = `Order size $${orderValue.toFixed(2)} below minimum $${minOrderUsd}`;
         check.checks.orderSize = false;
       }
       
@@ -471,30 +588,37 @@ export class RiskEngine extends EventEmitter {
       }
       
       // Maximum order size
-      if (orderValue > this.config.limits.maxOrderSize) {
+      const maxOrderUsd = this.getEffectiveMaxOrderUsd();
+      if (orderValue > maxOrderUsd) {
         check.passed = false;
-        check.reason = `Order size $${orderValue.toFixed(2)} exceeds maximum $${this.config.limits.maxOrderSize}`;
+        check.reason = `Order size $${orderValue.toFixed(2)} exceeds maximum $${maxOrderUsd}`;
         check.checks.orderSize = false;
       }
       
       // Position size limit (absolute notional after the order)
-      if (exposureSim.newAbsNotional > this.config.limits.maxPositionSize || exposureSim.newAbsNotional > this.maxPositionExposureUsd) {
+      const maxPositionUsd = this.getEffectiveMaxPositionUsd();
+      const effectiveExposureCapUsd = this.getSoftLaunch()
+        ? this.scaleUsd(this.maxPositionExposureUsd, this.getSoftLaunch()!.maxPositionSizeMultiplier)
+        : this.maxPositionExposureUsd;
+      if (exposureSim.newAbsNotional > maxPositionUsd || exposureSim.newAbsNotional > effectiveExposureCapUsd) {
         check.passed = false;
-        check.reason = `Position size would exceed limit: $${exposureSim.newAbsNotional.toFixed(2)} > $${this.config.limits.maxPositionSize}`;
+        check.reason = `Position size would exceed limit: $${exposureSim.newAbsNotional.toFixed(2)} > $${maxPositionUsd}`;
         check.checks.positionSize = false;
       }
       
       // Total exposure (portfolio) after the order (accounting for sells reducing exposure)
       const currentExposure = this.calculateTotalExposure();
       const newExposure = Math.max(0, currentExposure - exposureSim.currentAbsNotional + exposureSim.newAbsNotional);
-      if (newExposure > this.config.limits.maxTotalExposure) {
+      const maxTotalExposureUsd = this.getEffectiveMaxTotalExposureUsd();
+      if (newExposure > maxTotalExposureUsd) {
         check.passed = false;
-        check.reason = `Total exposure would exceed limit: $${newExposure.toFixed(2)} > $${this.config.limits.maxTotalExposure}`;
+        check.reason = `Total exposure would exceed limit: $${newExposure.toFixed(2)} > $${maxTotalExposureUsd}`;
         check.checks.totalExposure = false;
       }
       
       // Daily loss limit
-      if (this.metrics.dailyPnL <= -this.config.limits.maxDailyLoss) {
+      const maxDailyLossUsd = this.getEffectiveMaxDailyLossUsd();
+      if (this.metrics.dailyPnL <= -maxDailyLossUsd) {
         check.passed = false;
         check.reason = `Daily loss limit reached: $${Math.abs(this.metrics.dailyPnL).toFixed(2)}`;
         check.checks.dailyLoss = false;
@@ -649,20 +773,28 @@ export class RiskEngine extends EventEmitter {
       return 0;
     }
 
-    const riskUsd = this.accountEquity * this.guardrails.account.risk_per_trade;
+    let riskUsd = this.accountEquity * this.guardrails.account.risk_per_trade;
+    const soft = this.getSoftLaunch();
+    if (soft) {
+      riskUsd = this.scaleUsd(riskUsd, soft.riskPerTradeMultiplier);
+    }
     let size = riskUsd / stopDistance;
     if (!Number.isFinite(size) || size <= 0) {
       return 0;
     }
 
     // Cap by max exposure
-    const maxSizeByExposure = this.maxPositionExposureUsd / entryPrice;
+    const exposureCapUsd = soft ? this.scaleUsd(this.maxPositionExposureUsd, soft.maxPositionSizeMultiplier) : this.maxPositionExposureUsd;
+    const maxSizeByExposure = exposureCapUsd / entryPrice;
     if (Number.isFinite(maxSizeByExposure)) {
       size = Math.min(size, maxSizeByExposure);
     }
 
     const notional = size * entryPrice;
-    if (notional < this.minOrderNotionalUsd) {
+    const minNotionalUsd = soft?.minOrderSizeUsd && Number.isFinite(soft.minOrderSizeUsd) && soft.minOrderSizeUsd > 0
+      ? Math.min(this.minOrderNotionalUsd, soft.minOrderSizeUsd)
+      : this.minOrderNotionalUsd;
+    if (notional < minNotionalUsd) {
       return 0;
     }
 
@@ -680,7 +812,9 @@ export class RiskEngine extends EventEmitter {
   private enforceLossGuardrails(currentEquity: number): void {
     const now = Date.now();
     const dailyLoss = this.dailyStartEquity - currentEquity;
-    if (!this.killSwitchActive && dailyLoss >= this.dailyLossLimitUsd) {
+    const soft = this.getSoftLaunch();
+    const dailyLimitUsd = soft ? this.scaleUsd(this.dailyLossLimitUsd, soft.maxDailyLossMultiplier) : this.dailyLossLimitUsd;
+    if (!this.killSwitchActive && dailyLoss >= dailyLimitUsd) {
       this.triggerKillSwitch(`Daily loss guardrail tripped: -$${dailyLoss.toFixed(2)}`);
       return;
     }
@@ -698,7 +832,8 @@ export class RiskEngine extends EventEmitter {
     }
 
     const absoluteDrawdown = this.accountEquity - currentEquity;
-    if (!this.killSwitchActive && absoluteDrawdown >= this.maxDrawdownUsd) {
+    const drawdownLimitUsd = soft ? this.scaleUsd(this.maxDrawdownUsd, soft.maxDailyLossMultiplier) : this.maxDrawdownUsd;
+    if (!this.killSwitchActive && absoluteDrawdown >= drawdownLimitUsd) {
       this.triggerKillSwitch(`Max drawdown exceeded: -$${absoluteDrawdown.toFixed(2)}`);
       return;
     }
@@ -709,7 +844,8 @@ export class RiskEngine extends EventEmitter {
     if (this.rapidLossThresholdUsd > 0 && this.equityHistory.length > 0) {
       const maxEquityWindow = Math.max(...this.equityHistory.map(point => point.equity));
       const drop = maxEquityWindow - currentEquity;
-      if (!this.killSwitchActive && drop >= this.rapidLossThresholdUsd) {
+      const rapidLimitUsd = soft ? this.scaleUsd(this.rapidLossThresholdUsd, soft.maxDailyLossMultiplier) : this.rapidLossThresholdUsd;
+      if (!this.killSwitchActive && drop >= rapidLimitUsd) {
         this.triggerKillSwitch(`Rapid loss guardrail tripped: -$${drop.toFixed(2)} in <10m`);
       }
     }
@@ -717,9 +853,6 @@ export class RiskEngine extends EventEmitter {
 
   // Update risk metrics
   private async updateMetrics(): Promise<void> {
-    const positions = this.positionTracker.getPositions();
-    const portfolioSummary = this.positionTracker.getPortfolioSummary();
-
     // Update exposure
     this.metrics.currentExposure = this.calculateTotalExposure();
 
@@ -730,15 +863,15 @@ export class RiskEngine extends EventEmitter {
       ? (this.metrics.dailyPnL / this.dailyStartEquity) * 100
       : 0;
 
-    // Calculate max drawdown
-    let maxEquity = this.dailyStartEquity;
-    let currentDrawdown = 0;
-    for (const position of positions) {
-      const equity = this.dailyStartEquity + position.totalPnL;
-      maxEquity = Math.max(maxEquity, equity);
-      currentDrawdown = ((maxEquity - equity) / maxEquity) * 100;
-      this.metrics.maxDrawdown = Math.max(this.metrics.maxDrawdown, currentDrawdown);
+    // Portfolio-level drawdown from intraday high water mark.
+    if (this.dailyHighEquity <= 0) {
+      this.dailyHighEquity = this.dailyStartEquity > 0 ? this.dailyStartEquity : currentEquity;
     }
+    this.dailyHighEquity = Math.max(this.dailyHighEquity, currentEquity);
+    const currentDrawdownPct = this.dailyHighEquity > 0
+      ? ((this.dailyHighEquity - currentEquity) / this.dailyHighEquity) * 100
+      : 0;
+    this.metrics.maxDrawdown = Math.max(this.metrics.maxDrawdown, currentDrawdownPct);
 
     // Update error rate
     const recentOrders = this.orderHistory.filter(
@@ -776,7 +909,8 @@ export class RiskEngine extends EventEmitter {
     }
 
     // Check daily loss kill switch
-    if (this.metrics.dailyPnL <= -this.config.killSwitches.dailyLossLimit) {
+    const dailyLossLimit = this.getEffectiveKillSwitchDailyLossUsd();
+    if (this.metrics.dailyPnL <= -dailyLossLimit) {
       this.triggerKillSwitch(`Daily loss limit exceeded: -$${Math.abs(this.metrics.dailyPnL).toFixed(2)}`);
     }
 
@@ -865,13 +999,6 @@ export class RiskEngine extends EventEmitter {
     if (this.latencyHistory.length > 100) {
       this.latencyHistory.shift();
     }
-
-    // Update consecutive losses
-    if (!success) {
-      this.metrics.consecutiveLosses++;
-    } else {
-      this.metrics.consecutiveLosses = 0;
-    }
   }
 
   // Update open order count
@@ -927,7 +1054,9 @@ export class RiskEngine extends EventEmitter {
   public async resetDailyMetrics(): Promise<void> {
     const currentEquity = await this.calculateCurrentEquity();
     this.dailyStartEquity = currentEquity;
+    this.dailyHighEquity = currentEquity;
     await this.saveDailyStartEquity(currentEquity);
+    this.resetSymbolDailyTracking();
 
     this.metrics.dailyPnL = 0;
     this.metrics.dailyLossPercentage = 0;

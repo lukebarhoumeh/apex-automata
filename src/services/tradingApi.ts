@@ -107,11 +107,14 @@ class TradingApiService {
     return response.json();
   }
 
-  public async startEngine(mode: 'paper' | 'live' = 'paper'): Promise<any> {
+  public async startEngine(
+    mode: 'paper' | 'live' = 'paper',
+    opts?: { confirm?: string; marketDataEnv?: 'sandbox' | 'production' }
+  ): Promise<any> {
     const response = await fetch(`${API_URL}/api/engine/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode })
+      body: JSON.stringify({ mode, ...opts })
     });
     
     if (!response.ok) {

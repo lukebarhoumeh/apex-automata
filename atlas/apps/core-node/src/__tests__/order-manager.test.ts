@@ -102,5 +102,63 @@ describe('OrderManager', () => {
     expect(updated.status).toBe('filled');
     expect(updated.filledSize).toBeCloseTo(0.1, 8);
   });
+  
+  test('handles multiple partial fills and marks order filled when cumulative size reaches target', async () => {
+    const managed = await orderManager.createOrder({
+      product_id: 'BTC-USD',
+      side: 'buy',
+      type: 'limit',
+      size: '0.1',
+      price: '50000',
+    });
+    
+    const fill1: Fill = {
+      trade_id: 201,
+      product_id: 'BTC-USD',
+      order_id: 'exch-1',
+      user_id: 'u',
+      profile_id: 'p',
+      liquidity: 'T',
+      price: '50000',
+      size: '0.03',
+      fee: '0',
+      created_at: new Date().toISOString(),
+      side: 'buy',
+      settled: true,
+      usd_volume: '1500',
+    };
+    
+    exchange.emit('fill', fill1);
+    await new Promise(r => setTimeout(r, 10));
+    
+    let updated = orderManager.getOrder(managed.id)!;
+    expect(updated.status).toBe('partially_filled');
+    expect(updated.filledSize).toBeCloseTo(0.03, 8);
+    expect(updated.fills).toHaveLength(1);
+    
+    const fill2: Fill = {
+      trade_id: 202,
+      product_id: 'BTC-USD',
+      order_id: 'exch-1',
+      user_id: 'u',
+      profile_id: 'p',
+      liquidity: 'T',
+      price: '50000',
+      size: '0.07',
+      fee: '0',
+      created_at: new Date().toISOString(),
+      side: 'buy',
+      settled: true,
+      usd_volume: '3500',
+    };
+    
+    exchange.emit('fill', fill2);
+    await new Promise(r => setTimeout(r, 10));
+    
+    updated = orderManager.getOrder(managed.id)!;
+    expect(updated.status).toBe('filled');
+    expect(updated.filledSize).toBeCloseTo(0.1, 8);
+    expect(updated.fills).toHaveLength(2);
+  });
 });
 

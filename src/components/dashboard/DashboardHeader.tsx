@@ -24,6 +24,7 @@ import { runtimeClient } from "@/services/runtimeClient";
 import { useRuntimeStatus, useRuntimeHealth } from "@/hooks/useRuntimeStatus";
 import { useToast } from "@/hooks/use-toast";
 import { useState } from "react";
+import { Input } from "@/components/ui/input";
 
 interface DashboardHeaderProps {
   botState: "paper" | "live" | "paused";
@@ -34,6 +35,7 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   const { toast } = useToast();
   const [isLoading, setIsLoading] = useState(false);
   const [startMode, setStartMode] = useState<'paper' | 'live'>('paper');
+  const [liveConfirmText, setLiveConfirmText] = useState('');
   const { data: metrics } = useAccountMetrics();
   const { data: runtimeStatus } = useRuntimeStatus();
   const { data: runtimeHealthy } = useRuntimeHealth();
@@ -46,11 +48,13 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   const killSwitchActive = runtimeStatus?.killSwitch?.active ?? false;
   const dailyStopHit = runtimeStatus?.dailyStopHit ?? false;
   const engineRunning = runtimeHealthy && (runtimeStatus?.engineRunning ?? false);
+  const liveConfirmPhrase = "ENABLE LIVE";
+  const liveConfirmOk = startMode !== 'live' || liveConfirmText.trim() === liveConfirmPhrase;
 
   const handleStartEngine = async () => {
     setIsLoading(true);
     try {
-      await runtimeClient.startEngine(startMode);
+      await runtimeClient.startEngine(startMode, startMode === 'live' ? { confirm: liveConfirmText.trim() } : undefined);
       toast({
         title: "Engine Started",
         description: `Trading engine started in ${startMode.toUpperCase()} mode`,
@@ -187,7 +191,11 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
               {/* Engine Start/Stop */}
               {!engineRunning ? (
                 <div className="flex items-center gap-2">
-                  <Select value={startMode} onValueChange={(v) => setStartMode(v as 'paper' | 'live')}>
+                  <Select value={startMode} onValueChange={(v) => {
+                    const next = v as 'paper' | 'live';
+                    setStartMode(next);
+                    if (next !== 'live') setLiveConfirmText('');
+                  }}>
                     <SelectTrigger className="w-24 h-8 font-mono text-xs">
                       <SelectValue />
                     </SelectTrigger>
@@ -220,11 +228,25 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
                           )}
                         </AlertDialogDescription>
                       </AlertDialogHeader>
+                      {startMode === 'live' && (
+                        <div className="space-y-2">
+                          <div className="text-sm text-muted-foreground">
+                            Type <span className="font-mono font-semibold text-foreground">{liveConfirmPhrase}</span> to confirm live trading.
+                          </div>
+                          <Input
+                            value={liveConfirmText}
+                            onChange={(e) => setLiveConfirmText(e.target.value)}
+                            placeholder={liveConfirmPhrase}
+                            className="font-mono"
+                            autoFocus
+                          />
+                        </div>
+                      )}
                       <AlertDialogFooter>
                         <AlertDialogCancel>Cancel</AlertDialogCancel>
                         <AlertDialogAction 
                           onClick={handleStartEngine}
-                          disabled={isLoading}
+                          disabled={isLoading || !liveConfirmOk}
                           className={startMode === 'live' ? 'bg-destructive' : 'bg-success'}
                         >
                           Start {startMode.toUpperCase()}

@@ -138,11 +138,14 @@ class RuntimeClient {
     }
   }
 
-  async startEngine(mode: 'paper' | 'live' = 'paper'): Promise<{ ok: boolean }> {
+  async startEngine(
+    mode: 'paper' | 'live' = 'paper',
+    opts?: { confirm?: string; marketDataEnv?: 'sandbox' | 'production' }
+  ): Promise<{ ok: boolean }> {
     const response = await fetch(`${API_URL}/api/engine/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify({ mode, ...opts }),
     });
     if (!response.ok) {
       const error = await response.json().catch(() => ({ error: response.statusText }));

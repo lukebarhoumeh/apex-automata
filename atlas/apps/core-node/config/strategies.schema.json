@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AtlasBot Strategy Configuration",
+  "description": "Configuration schema for trading strategy plugins",
+  "type": "object",
+  "required": ["strategies"],
+  "properties": {
+    "description": {
+      "type": "string",
+      "description": "Configuration description"
+    },
+    "version": {
+      "type": "string",
+      "description": "Configuration version"
+    },
+    "strategies": {
+      "type": "object",
+      "description": "Strategy configurations keyed by strategy ID",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["enabled"],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether strategy is enabled"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "registry": {
+      "type": "object",
+      "description": "Strategy registry settings",
+      "properties": {
+        "maxErrorsBeforeDisable": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5,
+          "description": "Max errors before auto-disabling strategy"
+        },
+        "signalDedupeWindowMs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 300000,
+          "description": "Deduplication window in milliseconds"
+        }
+      }
+    },
+    "global": {
+      "type": "object",
+      "description": "Global strategy settings",
+      "properties": {
+        "parallelExecution": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run strategies in parallel"
+        },
+        "logSignals": {
+          "type": "boolean",
+          "default": true,
+          "description": "Log generated signals"
+        },
+        "persistSignals": {
+          "type": "boolean",
+          "default": true,
+          "description": "Persist signals to database"
+        }
+      }
+    }
+  }
+}
+

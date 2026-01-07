@@ -1,0 +1,53 @@
+{
+  "$schema": "./strategies.schema.json",
+  "description": "AtlasBot Strategy Configuration",
+  "version": "1.0.0",
+  
+  "strategies": {
+    "breakout": {
+      "enabled": true,
+      "period": 20,
+      "atrPeriod": 14,
+      "atrMultiplier": 2.0,
+      "volumeThreshold": 1.1,
+      "targetMultiplier": 2.0,
+      "confirmWithClose": true
+    },
+    
+    "vwap_mr": {
+      "enabled": true,
+      "deviationEntry": 2.0,
+      "deviationExit": 0.0,
+      "minVolume": 0,
+      "stopMultiplier": 1.0,
+      "useBollinger": false,
+      "maxDeviation": 4.0
+    },
+    
+    "momentum": {
+      "enabled": true,
+      "rsiPeriod": 14,
+      "rsiOverbought": 70,
+      "rsiOversold": 30,
+      "macdFast": 12,
+      "macdSlow": 26,
+      "macdSignal": 9,
+      "requireMacdConfirm": true,
+      "requireMacdCrossover": false,
+      "atrMultiplier": 2.0,
+      "targetMultiplier": 2.0
+    }
+  },
+  
+  "registry": {
+    "maxErrorsBeforeDisable": 5,
+    "signalDedupeWindowMs": 300000
+  },
+  
+  "global": {
+    "parallelExecution": false,
+    "logSignals": true,
+    "persistSignals": true
+  }
+}
+

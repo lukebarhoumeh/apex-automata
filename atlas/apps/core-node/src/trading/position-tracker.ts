@@ -92,6 +92,8 @@ export class PositionTracker extends EventEmitter {
   private positions: Map<string, Position> = new Map();
   private marketPrices: Map<string, number> = new Map();
   private updateTimer: NodeJS.Timeout | null = null;
+  // Accumulator to preserve realized P&L after positions are closed and removed from memory.
+  private realizedPnLClosed = 0;
   
   // Order creator for placing flatten orders
   private orderCreator: ((symbol: string, side: 'buy' | 'sell', size: number, tag?: string) => Promise<string | null>) | null = null;
@@ -138,6 +140,19 @@ export class PositionTracker extends EventEmitter {
     const size = parseFloat(fill.size);
     const price = parseFloat(fill.price);
     const fee = parseFloat(fill.fee);
+    
+    if (!Number.isFinite(size) || size <= 0 || !Number.isFinite(price) || price <= 0) {
+      this.logger.warn('Ignoring fill with non-finite/invalid size or price', {
+        symbol,
+        side,
+        size: fill.size,
+        price: fill.price,
+        fee: fill.fee,
+        orderId: fill.order_id,
+        tradeId: fill.trade_id,
+      });
+      return;
+    }
 
     const trade: Trade = {
       id: fill.trade_id.toString(),
@@ -211,6 +226,10 @@ export class PositionTracker extends EventEmitter {
         // Preserve last non-flat side for downstream persistence (Supabase enum doesn't allow 'flat')
         position.side = preTradeSide;
       }
+      // Preserve realized P&L after we delete the position object (needed for correct daily P&L / equity).
+      if (Number.isFinite(position.realizedPnL)) {
+        this.realizedPnLClosed += position.realizedPnL;
+      }
       this.emit('position:closed', position);
       // Remove closed positions so a new trade creates a fresh position (new id/openTime)
       this.positions.delete(symbol);
@@ -244,62 +263,94 @@ export class PositionTracker extends EventEmitter {
     const previousSide = position.side;
     const previousSize = position.size;
     const previousAvgPrice = position.averagePrice;
+    
+    const size = Number.isFinite(trade.size) ? trade.size : 0;
+    const price = Number.isFinite(trade.price) ? trade.price : 0;
+    const fee = Number.isFinite(trade.fee) ? trade.fee : 0;
+    
+    if (size <= 0 || price <= 0) {
+      this.logger.warn('Ignoring trade with non-positive size/price', {
+        symbol: position.symbol,
+        size,
+        price,
+        fee,
+        orderId: trade.orderId,
+      });
+      return;
+    }
+    
+    const allocateFee = (portionSize: number): number => {
+      if (fee === 0 || portionSize <= 0) return 0;
+      return fee * (portionSize / size);
+    };
 
     // Opening from flat
     if (previousSide === 'flat' || previousSize === 0) {
       position.side = trade.side === 'buy' ? 'long' : 'short';
-      position.size = trade.size;
-      position.averagePrice = trade.price;
+      position.size = size;
+      // Incorporate entry fee into cost basis / proceeds so P&L matches fills.
+      position.averagePrice = position.side === 'long'
+        ? ((size * price) + fee) / size
+        : ((size * price) - fee) / size;
     } else if (previousSide === 'long') {
       if (trade.side === 'buy') {
         // Add to long
-        const newSize = previousSize + trade.size;
-        position.averagePrice = ((previousSize * previousAvgPrice) + (trade.size * trade.price)) / newSize;
+        const newSize = previousSize + size;
+        const totalCost = (previousSize * previousAvgPrice) + (size * price) + fee;
+        position.averagePrice = totalCost / newSize;
         position.size = newSize;
         position.side = 'long';
       } else {
         // Sell reduces long or flips to short
-        const closingSize = Math.min(previousSize, trade.size);
-        const realizedPnL = closingSize * (trade.price - previousAvgPrice) - trade.fee;
+        const closingSize = Math.min(previousSize, size);
+        const feeClose = allocateFee(closingSize);
+        const realizedPnL = closingSize * (price - previousAvgPrice) - feeClose;
         trade.realizedPnL = realizedPnL;
         position.realizedPnL += realizedPnL;
 
         const remainingLong = previousSize - closingSize;
-        const flipSize = trade.size - closingSize;
+        const flipSize = size - closingSize;
+        const feeOpen = fee - feeClose;
 
         if (flipSize > 0) {
           position.side = 'short';
           position.size = flipSize;
-          position.averagePrice = trade.price;
+          position.averagePrice = ((flipSize * price) - feeOpen) / flipSize;
         } else {
           position.size = remainingLong;
           position.side = position.size === 0 ? 'flat' : 'long';
+          // Keep existing cost basis for remaining position (or for post-close reporting).
+          position.averagePrice = previousAvgPrice;
         }
       }
     } else if (previousSide === 'short') {
       if (trade.side === 'sell') {
         // Add to short
-        const newSize = previousSize + trade.size;
-        position.averagePrice = ((previousSize * previousAvgPrice) + (trade.size * trade.price)) / newSize;
+        const newSize = previousSize + size;
+        const totalProceeds = (previousSize * previousAvgPrice) + (size * price) - fee;
+        position.averagePrice = totalProceeds / newSize;
         position.size = newSize;
         position.side = 'short';
       } else {
         // Buy reduces short or flips to long
-        const closingSize = Math.min(previousSize, trade.size);
-        const realizedPnL = closingSize * (previousAvgPrice - trade.price) - trade.fee;
+        const closingSize = Math.min(previousSize, size);
+        const feeClose = allocateFee(closingSize);
+        const realizedPnL = closingSize * (previousAvgPrice - price) - feeClose;
         trade.realizedPnL = realizedPnL;
         position.realizedPnL += realizedPnL;
 
         const remainingShort = previousSize - closingSize;
-        const flipSize = trade.size - closingSize;
+        const flipSize = size - closingSize;
+        const feeOpen = fee - feeClose;
 
         if (flipSize > 0) {
           position.side = 'long';
           position.size = flipSize;
-          position.averagePrice = trade.price;
+          position.averagePrice = ((flipSize * price) + feeOpen) / flipSize;
         } else {
           position.size = remainingShort;
           position.side = position.size === 0 ? 'flat' : 'short';
+          position.averagePrice = previousAvgPrice;
         }
       }
     }
@@ -308,6 +359,10 @@ export class PositionTracker extends EventEmitter {
     position.trades.push(trade);
     position.lastUpdateTime = new Date();
     position.maxSize = Math.max(position.maxSize, Math.abs(position.size));
+    
+    if (!Number.isFinite(position.averagePrice) || position.averagePrice < 0) {
+      position.averagePrice = Number.isFinite(price) ? price : 0;
+    }
 
     if (!Number.isFinite(position.size) || position.size < 0) {
       position.size = Math.max(0, Number.isFinite(position.size) ? position.size : 0);
@@ -449,7 +504,7 @@ export class PositionTracker extends EventEmitter {
     totalValue: number;
   } {
     let totalUnrealizedPnL = 0;
-    let totalRealizedPnL = 0;
+    let totalRealizedPnL = this.realizedPnLClosed;
     let totalValue = 0;
     let positionCount = 0;
 
@@ -525,13 +580,22 @@ export class PositionTracker extends EventEmitter {
         } else {
           // Fallback: just mark as closed (legacy behavior)
           this.logger.warn(`No order creator set - marking ${position.symbol} as closed without order`);
-          position.side = 'flat';
+          const preCloseSide = position.side;
           position.size = 0;
           position.unrealizedPnL = 0;
+          position.closedAt = new Date();
+          position.exitPrice = position.marketPrice;
           position.lastUpdateTime = new Date();
           
           await this.persistPosition(position);
+          if (preCloseSide !== 'flat') {
+            position.side = preCloseSide;
+          }
+          if (Number.isFinite(position.realizedPnL)) {
+            this.realizedPnLClosed += position.realizedPnL;
+          }
           this.emit('position:closed', position);
+          this.positions.delete(position.symbol);
           result.success = true;
         }
       } catch (error) {

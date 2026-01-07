@@ -369,4 +369,249 @@ export class TechnicalIndicators {
     
     return filtered;
   }
+
+  /**
+   * ADX (Average Directional Index) - measures trend strength (0-100)
+   * > 25 = trending market, < 20 = ranging/choppy
+   */
+  public static ADX(candles: OHLCV[], period: number = 14): { 
+    adx: number[]; 
+    plusDI: number[]; 
+    minusDI: number[] 
+  } {
+    if (candles.length <= period + 1) {
+      return { adx: [], plusDI: [], minusDI: [] };
+    }
+
+    const plusDM: number[] = [];
+    const minusDM: number[] = [];
+    const trueRanges: number[] = [];
+
+    // Calculate +DM, -DM, and TR
+    for (let i = 1; i < candles.length; i++) {
+      const highDiff = candles[i].high - candles[i - 1].high;
+      const lowDiff = candles[i - 1].low - candles[i].low;
+
+      // +DM: if high movement > low movement and is positive
+      const pDM = highDiff > lowDiff && highDiff > 0 ? highDiff : 0;
+      // -DM: if low movement > high movement and is positive  
+      const mDM = lowDiff > highDiff && lowDiff > 0 ? lowDiff : 0;
+
+      plusDM.push(pDM);
+      minusDM.push(mDM);
+
+      // True Range
+      const highLow = candles[i].high - candles[i].low;
+      const highPrevClose = Math.abs(candles[i].high - candles[i - 1].close);
+      const lowPrevClose = Math.abs(candles[i].low - candles[i - 1].close);
+      trueRanges.push(Math.max(highLow, highPrevClose, lowPrevClose));
+    }
+
+    // Smooth with Wilder's smoothing (similar to EMA but different formula)
+    const smoothPlusDM = this.wilderSmooth(plusDM, period);
+    const smoothMinusDM = this.wilderSmooth(minusDM, period);
+    const smoothTR = this.wilderSmooth(trueRanges, period);
+
+    if (smoothTR.length === 0) {
+      return { adx: [], plusDI: [], minusDI: [] };
+    }
+
+    // Calculate +DI and -DI
+    const plusDI: number[] = [];
+    const minusDI: number[] = [];
+    const dx: number[] = [];
+
+    for (let i = 0; i < smoothTR.length; i++) {
+      const tr = smoothTR[i];
+      if (tr === 0) {
+        plusDI.push(0);
+        minusDI.push(0);
+        dx.push(0);
+        continue;
+      }
+
+      const pDI = (smoothPlusDM[i] / tr) * 100;
+      const mDI = (smoothMinusDM[i] / tr) * 100;
+      
+      plusDI.push(pDI);
+      minusDI.push(mDI);
+
+      // DX = |+DI - -DI| / (+DI + -DI) * 100
+      const diSum = pDI + mDI;
+      const dxValue = diSum === 0 ? 0 : (Math.abs(pDI - mDI) / diSum) * 100;
+      dx.push(dxValue);
+    }
+
+    // ADX is the smoothed DX
+    const adx = this.wilderSmooth(dx, period);
+
+    return { adx, plusDI, minusDI };
+  }
+
+  /**
+   * Wilder's smoothing method (used in ADX, RSI, ATR)
+   */
+  private static wilderSmooth(data: number[], period: number): number[] {
+    if (data.length < period) {
+      return [];
+    }
+
+    const result: number[] = [];
+    
+    // First value is SMA
+    let sum = 0;
+    for (let i = 0; i < period; i++) {
+      sum += data[i];
+    }
+    let smoothed = sum / period;
+    result.push(smoothed);
+
+    // Subsequent values use Wilder's formula
+    for (let i = period; i < data.length; i++) {
+      smoothed = (smoothed * (period - 1) + data[i]) / period;
+      result.push(smoothed);
+    }
+
+    return result;
+  }
+
+  /**
+   * Bollinger Band Width - measures volatility squeeze/expansion
+   * Width = (Upper - Lower) / Middle * 100
+   * Low width = squeeze (potential breakout), High width = expansion
+   */
+  public static BollingerBandWidth(
+    data: number[], 
+    period: number = 20, 
+    stdDev: number = 2
+  ): number[] {
+    const bb = this.BollingerBands(data, period, stdDev);
+    const width: number[] = [];
+
+    for (let i = 0; i < bb.upper.length; i++) {
+      const middle = bb.middle[i];
+      if (middle === 0) {
+        width.push(0);
+        continue;
+      }
+      width.push(((bb.upper[i] - bb.lower[i]) / middle) * 100);
+    }
+
+    return width;
+  }
+
+  /**
+   * Bollinger Band %B - where price is within the bands
+   * 0 = at lower band, 1 = at upper band, 0.5 = at middle
+   * < 0 = below lower, > 1 = above upper
+   */
+  public static BollingerPercentB(
+    data: number[],
+    period: number = 20,
+    stdDev: number = 2
+  ): number[] {
+    const bb = this.BollingerBands(data, period, stdDev);
+    const percentB: number[] = [];
+    const startIndex = period - 1;
+
+    for (let i = 0; i < bb.upper.length; i++) {
+      const range = bb.upper[i] - bb.lower[i];
+      if (range === 0) {
+        percentB.push(0.5);
+        continue;
+      }
+      percentB.push((data[startIndex + i] - bb.lower[i]) / range);
+    }
+
+    return percentB;
+  }
+
+  /**
+   * Keltner Channels - ATR-based channels for trend/breakout detection
+   */
+  public static KeltnerChannels(
+    candles: OHLCV[],
+    emaPeriod: number = 20,
+    atrPeriod: number = 10,
+    atrMultiplier: number = 2
+  ): { upper: number[]; middle: number[]; lower: number[] } {
+    const closes = candles.map(c => c.close);
+    const middle = this.EMA(closes, emaPeriod);
+    const atr = this.ATR(candles, atrPeriod);
+
+    const upper: number[] = [];
+    const lower: number[] = [];
+
+    // Align arrays (EMA starts at emaPeriod-1, ATR starts at atrPeriod-1)
+    const emaStart = emaPeriod - 1;
+    const atrStart = atrPeriod - 1;
+    const offset = Math.max(emaStart, atrStart);
+
+    for (let i = 0; i < middle.length; i++) {
+      const candleIndex = emaStart + i;
+      const atrIndex = candleIndex - atrStart;
+
+      if (atrIndex < 0 || atrIndex >= atr.length) {
+        continue;
+      }
+
+      const currentATR = atr[atrIndex];
+      upper.push(middle[i] + currentATR * atrMultiplier);
+      lower.push(middle[i] - currentATR * atrMultiplier);
+    }
+
+    // Trim middle to match upper/lower length
+    const trimmedMiddle = middle.slice(middle.length - upper.length);
+
+    return { upper, middle: trimmedMiddle, lower };
+  }
+
+  /**
+   * Choppiness Index - measures market chop/consolidation (0-100)
+   * High values (> 61.8) = choppy, Low values (< 38.2) = trending
+   */
+  public static ChoppinessIndex(candles: OHLCV[], period: number = 14): number[] {
+    if (candles.length <= period) {
+      return [];
+    }
+
+    const result: number[] = [];
+    const trueRanges: number[] = [];
+
+    // Calculate true ranges
+    for (let i = 1; i < candles.length; i++) {
+      const highLow = candles[i].high - candles[i].low;
+      const highPrevClose = Math.abs(candles[i].high - candles[i - 1].close);
+      const lowPrevClose = Math.abs(candles[i].low - candles[i - 1].close);
+      trueRanges.push(Math.max(highLow, highPrevClose, lowPrevClose));
+    }
+
+    for (let i = period; i < candles.length; i++) {
+      // Sum of ATR for period
+      let atrSum = 0;
+      for (let j = i - period; j < i; j++) {
+        atrSum += trueRanges[j - 1] || 0;
+      }
+
+      // Highest high and lowest low for period
+      let highestHigh = -Infinity;
+      let lowestLow = Infinity;
+      for (let j = i - period; j <= i; j++) {
+        highestHigh = Math.max(highestHigh, candles[j].high);
+        lowestLow = Math.min(lowestLow, candles[j].low);
+      }
+
+      const range = highestHigh - lowestLow;
+      if (range === 0) {
+        result.push(50); // Neutral
+        continue;
+      }
+
+      // CHOP = 100 * LOG10(SUM(ATR, period) / (Highest - Lowest)) / LOG10(period)
+      const chop = 100 * Math.log10(atrSum / range) / Math.log10(period);
+      result.push(Math.max(0, Math.min(100, chop)));
+    }
+
+    return result;
+  }
 }

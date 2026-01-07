@@ -8,6 +8,7 @@ import { RiskEngine, RiskEngineConfig, RiskMetrics } from './risk-engine';
 import { SecretManager, SecretConfig } from '../config/secrets';
 import { PaperTradingSimulator, PaperTradingConfig } from './paper-trading-simulator';
 import { PositionMonitor, PositionMonitorConfig } from './position-monitor';
+import { TradeAnalytics, TradeAnalyticsConfig, SessionStats, TradeRecord } from './trade-analytics';
 import { GuardrailConfig } from '../config/loadGuardrails';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -60,11 +61,15 @@ export class TradingEngine extends EventEmitter {
   private positionTracker: PositionTracker | null = null;
   private riskEngine: RiskEngine | null = null;
   private positionMonitor: PositionMonitor | null = null;
+  private tradeAnalytics: TradeAnalytics | null = null;
   private secretManager: SecretManager;
   private paperSimulator: PaperTradingSimulator | null = null;
   private isRunning = false;
   private marketPrices: Map<string, number> = new Map();
   private guardrails: GuardrailConfig;
+  
+  // Order timing for latency tracking
+  private orderTimestamps: Map<string, number> = new Map();
   
   // Per-symbol market data timestamp tracking for data gap detection
   private lastMarketDataPerSymbol: Map<string, number> = new Map();
@@ -121,6 +126,7 @@ export class TradingEngine extends EventEmitter {
       this.initializePositionTracker();
       this.initializeRiskEngine();
       this.initializePositionMonitor();
+      this.initializeTradeAnalytics();
 
       // Setup event handlers
       this.setupEventHandlers();
@@ -207,6 +213,11 @@ export class TradingEngine extends EventEmitter {
       
       if (this.positionMonitor) {
         this.positionMonitor.stop();
+      }
+      
+      if (this.tradeAnalytics) {
+        await this.tradeAnalytics.stop();
+        this.tradeAnalytics = null;
       }
 
       if (this.dataGapMonitor) {
@@ -374,6 +385,20 @@ export class TradingEngine extends EventEmitter {
     const maxDailyLossUsd = Math.abs(guardrails.risk.daily_loss_limit) * accountEquity;
     const maxDrawdownPercent = Math.abs(guardrails.risk.max_drawdown_limit) * 100;
     const minOrderUsd = accountEquity * guardrails.account.risk_per_trade * guardrails.account.min_notional_buffer;
+    
+    const softLaunch = this.config.mode === 'live'
+      ? {
+          enabled: true,
+          maxEntryTrades: 10,
+          riskPerTradeMultiplier: 0.25,
+          maxPositionSizeMultiplier: 0.25,
+          maxTotalExposureMultiplier: 0.5,
+          maxOrderSizeMultiplier: 0.25,
+          maxDailyLossMultiplier: 0.5,
+          perSymbolNotionalCapUsd: 250,
+          minOrderSizeUsd: 25,
+        }
+      : undefined;
 
     const config: RiskEngineConfig = {
       supabaseUrl: this.config.supabase.url,
@@ -399,7 +424,8 @@ export class TradingEngine extends EventEmitter {
       riskPerTrade: guardrails.account.risk_per_trade * 100,
       kellyFraction: 0.25,
       guardrails,
-      accountEquity
+      accountEquity,
+      softLaunch
     };
 
     this.riskEngine = new RiskEngine(config, this.logger, this.positionTracker!);
@@ -452,6 +478,84 @@ export class TradingEngine extends EventEmitter {
     this.positionMonitor.start();
     
     this.logger.info('Position monitor initialized');
+  }
+  
+  private initializeTradeAnalytics(): void {
+    const analyticsConfig: TradeAnalyticsConfig = {
+      supabaseUrl: this.config.supabase.url,
+      supabaseKey: this.config.supabase.serviceKey,
+      userId: this.config.supabase.userId,
+      initialEquity: this.guardrails.account.equity_usd,
+      mode: this.config.mode,
+      equitySampleIntervalMs: 60_000, // Sample equity every minute
+    };
+    
+    this.tradeAnalytics = new TradeAnalytics(analyticsConfig, this.logger);
+    
+    // Hook into position events for trade tracking
+    this.positionTracker!.on('position:opened', (position: Position) => {
+      this.tradeAnalytics!.recordEntry({
+        tradeId: position.id,
+        symbol: position.symbol,
+        side: position.side === 'long' ? 'long' : 'short',
+        entryPrice: position.averagePrice,
+        size: position.size,
+        strategy: position.strategy,
+        signalId: position.signalId,
+        reasonCode: position.metadata?.entryTag,
+        entryOrderId: position.metadata?.entryOrderId,
+      });
+    });
+    
+    this.positionTracker!.on('position:updated', (position: Position) => {
+      // Update open trade with current price for MFE/MAE tracking
+      this.tradeAnalytics!.updateOpenTrade(
+        position.id,
+        position.marketPrice,
+        0 // Fees already tracked in position
+      );
+    });
+    
+    this.positionTracker!.on('position:closed', (position: Position) => {
+      this.tradeAnalytics!.recordExit({
+        tradeId: position.id,
+        exitPrice: position.exitPrice ?? position.marketPrice,
+        realizedPnl: position.realizedPnL,
+        fees: position.trades.reduce((sum, t) => sum + t.fee, 0),
+        exitReason: position.exitReason,
+        exitOrderId: position.metadata?.exitOrderId,
+      });
+      
+      // Also record outcome to meta-filter for learning
+      if (this.signalProcessor) {
+        const outcome: 'win' | 'loss' | 'breakeven' = 
+          position.realizedPnL > 0 ? 'win' : 
+          position.realizedPnL < 0 ? 'loss' : 'breakeven';
+        
+        this.signalProcessor.recordTradeOutcome({
+          signalId: position.signalId || position.id,
+          strategy: position.strategy || 'unknown',
+          symbol: position.symbol,
+          direction: position.side === 'long' ? 'buy' : 'sell',
+          signalStrength: position.metadata?.signalStrength || 0.5,
+          entryTime: position.openTime,
+          exitTime: position.closeTime || new Date(),
+          pnl: position.realizedPnL,
+          outcome,
+          regime: position.metadata?.regime,
+          hourOfDay: position.openTime.getUTCHours(),
+          dayOfWeek: position.openTime.getUTCDay(),
+          metaScore: position.metadata?.metaQualityScore,
+          filtersPassed: [],
+          filtersBlocked: [],
+        });
+      }
+    });
+    
+    this.logger.info('TradeAnalytics initialized', {
+      mode: this.config.mode,
+      initialEquity: this.guardrails.account.equity_usd,
+    });
   }
 
   private initializePaperSimulator(): void {
@@ -907,10 +1011,48 @@ export class TradingEngine extends EventEmitter {
   public getRiskMetrics(): RiskMetrics | null {
     return this.riskEngine?.getMetrics() || null;
   }
+  
+  public getRiskEngineInstance(): RiskEngine | null {
+    return this.riskEngine;
+  }
+  
+  public getPositionTrackerInstance(): PositionTracker | null {
+    return this.positionTracker;
+  }
 
   // Get active orders
   public getActiveOrders(): ManagedOrder[] {
     return this.orderManager?.getActiveOrders() || [];
+  }
+
+  // Get session statistics
+  public getSessionStats(): SessionStats | null {
+    return this.tradeAnalytics?.getSessionStats() || null;
+  }
+
+  // Get recent closed trades
+  public getRecentTrades(limit: number = 50): TradeRecord[] {
+    return this.tradeAnalytics?.getRecentTrades(limit) || [];
+  }
+
+  // Get equity curve
+  public getEquityCurve(): Array<{ timestamp: number; equity: number; pnl: number }> {
+    return this.tradeAnalytics?.getEquityCurve() || [];
+  }
+
+  // Record order latency for analytics
+  public recordOrderLatency(orderId: string, latencyMs: number, orderType: string = 'market'): void {
+    this.tradeAnalytics?.recordOrderLatency(latencyMs, orderType);
+  }
+
+  // Start tick processing timer
+  public startTickProcessing(): void {
+    this.tradeAnalytics?.startTickProcessing();
+  }
+
+  // End tick processing timer
+  public endTickProcessing(): void {
+    this.tradeAnalytics?.endTickProcessing();
   }
 
   // Emergency stop

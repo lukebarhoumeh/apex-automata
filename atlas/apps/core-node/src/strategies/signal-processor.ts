@@ -3,6 +3,17 @@ import { Logger } from '../core/logger';
 import { TechnicalIndicators, OHLCV } from '../indicators/technical';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { v4 as uuidv4 } from 'uuid';
+import { RegimeDetector, RegimeDetectorConfig, RegimeState, MarketRegime } from './regime-detector';
+import { RegimeFilter, RegimeFilterConfig, FilterResult } from './regime-filter';
+import { MetaFilter, MetaFilterConfig, MetaFilterResult, TradeOutcome, StrategyPerformance } from './meta-filter';
+import {
+  StrategyRegistry,
+  StrategyRegistryConfig,
+  StrategyPlugin,
+  StrategySignal,
+  MarketContext,
+  createBuiltinStrategies,
+} from './plugins';
 
 export interface SignalProcessorConfig {
   supabaseUrl: string;
@@ -17,6 +28,15 @@ export interface SignalProcessorConfig {
     modelPath?: string;
     threshold: number;
   };
+  // Regime detection configuration
+  regimeDetector?: Partial<RegimeDetectorConfig>;
+  regimeFilter?: Partial<RegimeFilterConfig>;
+  // Meta filter (rule-based trade quality) configuration
+  metaFilter?: Partial<MetaFilterConfig>;
+  // Strategy plugin registry configuration
+  strategyRegistry?: Partial<StrategyRegistryConfig>;
+  // Whether to use the new plugin-based strategy system
+  usePluginStrategies?: boolean;
 }
 
 export interface BreakoutConfig {
@@ -58,13 +78,24 @@ export interface Signal {
   metadata: {
     indicators: Record<string, number>;
     reason: string;
+    // Regime-related metadata (added by regime filter)
+    regime?: MarketRegime;
+    regimeConfidence?: number;
+    compatibilityScore?: number;
+    positionMultiplier?: number;
+    regimeCompatibility?: number;
+    [key: string]: unknown;  // Allow additional properties
   };
 }
 
 export interface SignalProcessorEvents {
   'signal:generated': (signal: Signal) => void;
   'signal:filtered': (signal: Signal, reason: string) => void;
+  'signal:regime_filtered': (signal: Signal, regimeState: RegimeState, reason: string) => void;
+  'signal:meta_filtered': (signal: Signal, result: MetaFilterResult, reason: string) => void;
   'indicator:update': (symbol: string, indicators: Record<string, number>) => void;
+  'regime:updated': (symbol: string, regimeState: RegimeState) => void;
+  'regime:changed': (symbol: string, oldRegime: MarketRegime, newRegime: MarketRegime) => void;
   'warmup:progress': (symbol: string, candlesLoaded: number, required: number) => void;
   'warmup:complete': (symbol: string) => void;
 }
@@ -100,11 +131,120 @@ export class SignalProcessor extends EventEmitter {
   private warmupComplete: Map<string, boolean> = new Map();
   private dataLoader: ((symbol: string, limit: number) => Promise<OHLCV[]>) | null = null;
 
+  // Regime detection and filtering
+  private regimeDetector: RegimeDetector;
+  private regimeFilter: RegimeFilter;
+  private lastFilterResults: Map<string, FilterResult> = new Map();
+
+  // Meta filter (rule-based trade quality)
+  private metaFilter: MetaFilter;
+  private lastMetaFilterResults: Map<string, MetaFilterResult> = new Map();
+
+  // Strategy plugin registry
+  private strategyRegistry: StrategyRegistry;
+  private usePluginStrategies: boolean;
+
   constructor(config: SignalProcessorConfig, logger: Logger) {
     super();
     this.config = config;
     this.logger = logger;
     this.supabase = createClient(config.supabaseUrl, config.supabaseKey);
+
+    // Initialize regime detection
+    this.regimeDetector = new RegimeDetector(config.regimeDetector || {}, logger);
+    this.regimeFilter = new RegimeFilter(
+      this.regimeDetector,
+      config.regimeFilter || {},
+      logger
+    );
+
+    // Initialize meta filter
+    this.metaFilter = new MetaFilter(
+      config.metaFilter || {},
+      logger,
+      config.supabaseUrl,
+      config.supabaseKey
+    );
+
+    // Forward regime events
+    this.regimeDetector.on('regime:updated', (symbol: string, state: RegimeState) => {
+      this.emit('regime:updated', symbol, state);
+    });
+    this.regimeDetector.on('regime:changed', (symbol: string, oldRegime: MarketRegime, newRegime: MarketRegime) => {
+      this.emit('regime:changed', symbol, oldRegime, newRegime);
+    });
+
+    // Forward filter events
+    this.regimeFilter.on('signal:filtered', (signal: Signal, regimeState: RegimeState, reason: string) => {
+      this.emit('signal:regime_filtered', signal, regimeState, reason);
+    });
+
+    // Forward meta filter events
+    this.metaFilter.on('signal:blocked', (signal: Signal, score: number, rules: any[]) => {
+      this.emit('signal:meta_filtered', signal, { qualityScore: score, rulesEvaluated: rules } as MetaFilterResult, 'Meta filter blocked');
+    });
+
+    // Initialize strategy registry
+    this.usePluginStrategies = config.usePluginStrategies ?? true;
+    this.strategyRegistry = new StrategyRegistry(config.strategyRegistry || {}, logger);
+
+    // Register built-in strategies
+    this.initializeBuiltinStrategies();
+
+    // Forward strategy registry events
+    this.strategyRegistry.on('strategy:registered', (plugin: StrategyPlugin) => {
+      this.logger.info(`Strategy plugin registered: ${plugin.id}`);
+    });
+    this.strategyRegistry.on('strategy:error', (strategyId: string, error: Error) => {
+      this.logger.error(`Strategy plugin error (${strategyId}):`, error);
+    });
+  }
+
+  /**
+   * Initialize and register built-in strategy plugins.
+   */
+  private initializeBuiltinStrategies(): void {
+    // Create strategy configs from old-style config
+    const configs: Record<string, Record<string, unknown>> = {};
+    
+    if (this.config.strategies.breakout) {
+      configs.breakout = {
+        enabled: this.config.strategies.breakout.enabled,
+        period: this.config.strategies.breakout.period,
+        atrPeriod: this.config.strategies.breakout.atrPeriod,
+        atrMultiplier: this.config.strategies.breakout.atrMultiplier,
+        volumeThreshold: this.config.strategies.breakout.volumeThreshold,
+      };
+    }
+    
+    if (this.config.strategies.vwapMeanReversion) {
+      configs.vwap_mr = {
+        enabled: this.config.strategies.vwapMeanReversion.enabled,
+        deviationEntry: this.config.strategies.vwapMeanReversion.deviationEntry,
+        deviationExit: this.config.strategies.vwapMeanReversion.deviationExit,
+        minVolume: this.config.strategies.vwapMeanReversion.minVolume,
+      };
+    }
+    
+    if (this.config.strategies.momentum) {
+      configs.momentum = {
+        enabled: this.config.strategies.momentum.enabled,
+        rsiPeriod: this.config.strategies.momentum.rsiPeriod,
+        rsiOverbought: this.config.strategies.momentum.rsiOverbought,
+        rsiOversold: this.config.strategies.momentum.rsiOversold,
+        macdFast: this.config.strategies.momentum.macdFast,
+        macdSlow: this.config.strategies.momentum.macdSlow,
+        macdSignal: this.config.strategies.momentum.macdSignal,
+      };
+    }
+
+    // Create and register built-in strategies
+    const builtinStrategies = createBuiltinStrategies(configs);
+    for (const strategy of builtinStrategies) {
+      this.strategyRegistry.register(strategy);
+    }
+
+    this.logger.info(`Initialized ${builtinStrategies.length} built-in strategies`);
   }
   
   /**
@@ -355,6 +495,14 @@ export class SignalProcessor extends EventEmitter {
       }
     }
     this.emit('indicator:update', symbol, latestIndicators);
+
+    // Update regime detection with MTF data
+    const mtf = this.mtfCandles.get(symbol);
+    this.regimeDetector.update(symbol, candles, mtf ? {
+      m5: mtf['5m'],
+      m15: mtf['15m'],
+      h1: mtf['1h'],
+    } : undefined);
   }
 
   private checkSignals(symbol: string): void {
@@ -368,7 +516,13 @@ export class SignalProcessor extends EventEmitter {
     const latestCandle = candles[candles.length - 1];
     const previousCandle = candles[candles.length - 2];
 
-    // Check each strategy
+    // Use plugin-based strategy system if enabled
+    if (this.usePluginStrategies) {
+      this.checkSignalsViaPlugins(symbol, candles, indicators, latestCandle, previousCandle);
+      return;
+    }
+
+    // Legacy: Check each strategy directly
     if (this.config.strategies.breakout.enabled) {
       this.checkBreakoutSignal(symbol, candles, indicators, latestCandle);
     }
@@ -379,6 +533,77 @@ export class SignalProcessor extends EventEmitter {
 
     if (this.config.strategies.momentum.enabled) {
       this.checkMomentumSignal(symbol, candles, indicators, latestCandle);
+    }
+  }
+
+  /**
+   * Generate signals using the plugin-based strategy system.
+   */
+  private checkSignalsViaPlugins(
+    symbol: string,
+    candles: OHLCV[],
+    indicators: Record<string, number[]>,
+    latestCandle: OHLCV,
+    previousCandle: OHLCV
+  ): void {
+    // Get regime state
+    const regimeState = this.regimeDetector.getState(symbol);
+    if (!regimeState) {
+      return; // No regime data yet
+    }
+
+    // Get MTF candles
+    const mtf = this.mtfCandles.get(symbol);
+
+    // Calculate latest indicator values
+    const latestIndicators: Record<string, number> = {};
+    for (const [key, values] of Object.entries(indicators)) {
+      if (values.length > 0) {
+        latestIndicators[key] = values[values.length - 1];
+      }
+    }
+
+    // Build market context for strategies
+    const context: MarketContext = {
+      symbol,
+      timestamp: new Date(),
+      candles,
+      mtfCandles: mtf ? {
+        m5: mtf['5m'],
+        m15: mtf['15m'],
+        h1: mtf['1h'],
+      } : undefined,
+      indicators,
+      latestIndicators,
+      latestCandle,
+      previousCandle,
+      regime: regimeState,
+    };
+
+    // Generate signals from all enabled strategies
+    const signals = this.strategyRegistry.generateSignals(context);
+
+    // Process each generated signal through filters
+    for (const pluginSignal of signals) {
+      // Convert plugin signal to processor signal format
+      const signal: Signal = {
+        id: pluginSignal.id,
+        timestamp: pluginSignal.timestamp,
+        symbol: pluginSignal.symbol,
+        strategy: pluginSignal.strategy as Signal['strategy'],
+        direction: pluginSignal.direction,
+        strength: pluginSignal.strength,
+        price: pluginSignal.price,
+        stopLoss: pluginSignal.stopLoss,
+        takeProfit: pluginSignal.takeProfit,
+        metadata: {
+          ...pluginSignal.metadata,
+          source: 'plugin',
+        },
+      };
+
+      // Process through regime filter and meta filter
+      this.processSignal(signal);
     }
   }
 
@@ -659,28 +884,97 @@ export class SignalProcessor extends EventEmitter {
       return;
     }
 
-    // Apply meta-labeling if enabled
+    // Apply regime filtering BEFORE meta-labeling (faster filter first)
+    const filterResult = this.regimeFilter.filter(signal);
+    this.lastFilterResults.set(signal.symbol, filterResult);
+
+    if (!filterResult.allowed) {
+      this.emit('signal:filtered', signal, `Regime filter: ${filterResult.reason}`);
+      this.logger.debug('Signal filtered by regime', {
+        symbol: signal.symbol,
+        strategy: signal.strategy,
+        regime: filterResult.regimeState.regime,
+        reason: filterResult.reason,
+      });
+      return;
+    }
+
+    // Use the adjusted signal (has regime metadata)
+    let adjustedSignal = filterResult.adjustedSignal || signal;
+    
+    // Add position multiplier to metadata for downstream use
+    adjustedSignal.metadata = {
+      ...adjustedSignal.metadata,
+      positionMultiplier: filterResult.positionMultiplier,
+      regimeCompatibility: filterResult.compatibilityScore,
+    };
+
+    // Apply rule-based meta filter (trade quality filter)
+    const indicators = this.indicators.get(signal.symbol) || {};
+    const volumeSMA = indicators.volumeSMA;
+    const candles = this.candles.get(signal.symbol) || [];
+    const latestCandle = candles[candles.length - 1];
+    const volumeRatio = latestCandle && volumeSMA && volumeSMA.length > 0
+      ? latestCandle.volume / volumeSMA[volumeSMA.length - 1]
+      : undefined;
+
+    const metaFilterResult = this.metaFilter.filter(adjustedSignal, {
+      volumeRatio,
+      atr: indicators.atr?.[indicators.atr.length - 1],
+      regime: filterResult.regimeState.regime,
+      mtfAlignment: filterResult.regimeState.mtfAlignment,
+    });
+
+    this.lastMetaFilterResults.set(signal.symbol, metaFilterResult);
+
+    if (!metaFilterResult.allowed) {
+      this.emit('signal:filtered', adjustedSignal, `Meta filter: ${metaFilterResult.reason}`);
+      this.logger.debug('Signal filtered by meta filter', {
+        symbol: adjustedSignal.symbol,
+        strategy: adjustedSignal.strategy,
+        qualityScore: metaFilterResult.qualityScore,
+        reason: metaFilterResult.reason,
+        coldStreakActive: metaFilterResult.coldStreakActive,
+      });
+      return;
+    }
+
+    // Add meta filter info to signal metadata
+    adjustedSignal.metadata = {
+      ...adjustedSignal.metadata,
+      metaQualityScore: metaFilterResult.qualityScore,
+      adjustedStrength: metaFilterResult.adjustedStrength,
+    };
+
+    // Adjust position multiplier based on meta filter quality score
+    const combinedMultiplier = filterResult.positionMultiplier * metaFilterResult.qualityScore;
+    adjustedSignal.metadata.positionMultiplier = combinedMultiplier;
+
+    // Apply ML meta-labeling if enabled (future ONNX model)
     if (this.config.metaLabeling.enabled) {
-      const metaLabel = await this.applyMetaLabeling(signal);
-      signal.metaLabel = metaLabel;
+      const metaLabel = await this.applyMetaLabeling(adjustedSignal);
+      adjustedSignal.metaLabel = metaLabel;
 
       if (metaLabel < this.config.metaLabeling.threshold) {
-        this.emit('signal:filtered', signal, `Meta-label below threshold: ${metaLabel.toFixed(3)}`);
+        this.emit('signal:filtered', adjustedSignal, `ML Meta-label below threshold: ${metaLabel.toFixed(3)}`);
         return;
       }
     }
 
     // Store signal
-    this.lastSignals.set(signal.symbol, signal);
+    this.lastSignals.set(adjustedSignal.symbol, adjustedSignal);
 
     // Emit signal
-    this.emit('signal:generated', signal);
+    this.emit('signal:generated', adjustedSignal);
     this.logger.info('Signal generated', {
-      symbol: signal.symbol,
-      strategy: signal.strategy,
-      direction: signal.direction,
-      strength: signal.strength,
-      metaLabel: signal.metaLabel
+      symbol: adjustedSignal.symbol,
+      strategy: adjustedSignal.strategy,
+      direction: adjustedSignal.direction,
+      strength: adjustedSignal.strength,
+      regime: filterResult.regimeState.regime,
+      positionMultiplier: combinedMultiplier,
+      metaQualityScore: metaFilterResult.qualityScore,
+      metaLabel: adjustedSignal.metaLabel,
     });
   }
 
@@ -829,5 +1123,265 @@ export class SignalProcessor extends EventEmitter {
     return Array.from(this.lastSignals.values())
       .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
       .slice(0, limit);
+  }
+
+  // ============ Regime Detection Public API ============
+
+  /**
+   * Get current regime state for a symbol
+   */
+  public getRegimeState(symbol: string): RegimeState | undefined {
+    return this.regimeDetector.getState(symbol);
+  }
+
+  /**
+   * Get current regime for a symbol
+   */
+  public getRegime(symbol: string): MarketRegime {
+    return this.regimeDetector.getRegime(symbol);
+  }
+
+  /**
+   * Get all regime states
+   */
+  public getAllRegimeStates(): Map<string, RegimeState> {
+    return this.regimeDetector.getAllStates();
+  }
+
+  /**
+   * Check if market is trending
+   */
+  public isTrending(symbol: string): boolean {
+    return this.regimeDetector.isTrending(symbol);
+  }
+
+  /**
+   * Check if market is ranging/choppy
+   */
+  public isRanging(symbol: string): boolean {
+    return this.regimeDetector.isRanging(symbol);
+  }
+
+  /**
+   * Get last filter result for a symbol
+   */
+  public getLastFilterResult(symbol: string): FilterResult | undefined {
+    return this.lastFilterResults.get(symbol);
+  }
+
+  /**
+   * Get regime filter statistics
+   */
+  public getRegimeFilterStats() {
+    return this.regimeFilter.getStats();
+  }
+
+  /**
+   * Enable/disable regime filtering
+   */
+  public setRegimeFilterEnabled(enabled: boolean): void {
+    this.regimeFilter.setEnabled(enabled);
+  }
+
+  /**
+   * Update regime filter configuration
+   */
+  public updateRegimeFilterConfig(config: Partial<RegimeFilterConfig>): void {
+    this.regimeFilter.updateConfig(config);
+  }
+
+  /**
+   * Get the regime detector instance (for external use)
+   */
+  public getRegimeDetector(): RegimeDetector {
+    return this.regimeDetector;
+  }
+
+  /**
+   * Get the regime filter instance (for external use)
+   */
+  public getRegimeFilter(): RegimeFilter {
+    return this.regimeFilter;
+  }
+
+  // ============ Meta Filter Public API ============
+
+  /**
+   * Get the meta filter instance
+   */
+  public getMetaFilter(): MetaFilter {
+    return this.metaFilter;
+  }
+
+  /**
+   * Get meta filter statistics
+   */
+  public getMetaFilterStats() {
+    return this.metaFilter.getStats();
+  }
+
+  /**
+   * Get strategy performance from meta filter
+   */
+  public getStrategyPerformance(strategy: string): StrategyPerformance | undefined {
+    return this.metaFilter.getStrategyPerformance(strategy);
+  }
+
+  /**
+   * Get all strategy performances
+   */
+  public getAllStrategyPerformances(): Map<string, StrategyPerformance> {
+    return this.metaFilter.getPerformanceStats();
+  }
+
+  /**
+   * Get last meta filter result for a symbol
+   */
+  public getLastMetaFilterResult(symbol: string): MetaFilterResult | undefined {
+    return this.lastMetaFilterResults.get(symbol);
+  }
+
+  /**
+   * Record a trade outcome for learning
+   */
+  public recordTradeOutcome(outcome: TradeOutcome): void {
+    this.metaFilter.recordTradeOutcome(outcome);
+  }
+
+  /**
+   * Enable/disable meta filter
+   */
+  public setMetaFilterEnabled(enabled: boolean): void {
+    this.metaFilter.setEnabled(enabled);
+  }
+
+  /**
+   * Update meta filter configuration
+   */
+  public updateMetaFilterConfig(config: Partial<MetaFilterConfig>): void {
+    this.metaFilter.updateConfig(config);
+  }
+
+  /**
+   * Get recent filter decisions (for ML training data)
+   */
+  public getRecentFilterDecisions(limit = 50) {
+    return this.metaFilter.getRecentDecisions(limit);
+  }
+
+  /**
+   * Stop the signal processor and clean up
+   */
+  public async stop(): Promise<void> {
+    await this.metaFilter.stop();
+    await this.strategyRegistry.shutdown();
+  }
+
+  // ============ Strategy Plugin Public API ============
+
+  /**
+   * Get the strategy registry instance
+   */
+  public getStrategyRegistry(): StrategyRegistry {
+    return this.strategyRegistry;
+  }
+
+  /**
+   * Get all registered strategy plugins
+   */
+  public getRegisteredStrategies(): StrategyPlugin[] {
+    return this.strategyRegistry.getAll();
+  }
+
+  /**
+   * Get all enabled strategy plugins
+   */
+  public getEnabledStrategies(): StrategyPlugin[] {
+    return this.strategyRegistry.getEnabled();
+  }
+
+  /**
+   * Get a specific strategy plugin by ID
+   */
+  public getStrategy(strategyId: string): StrategyPlugin | undefined {
+    return this.strategyRegistry.get(strategyId);
+  }
+
+  /**
+   * Register a new strategy plugin
+   */
+  public registerStrategy(plugin: StrategyPlugin): boolean {
+    return this.strategyRegistry.register(plugin);
+  }
+
+  /**
+   * Unregister a strategy plugin
+   */
+  public async unregisterStrategy(strategyId: string): Promise<boolean> {
+    return this.strategyRegistry.unregister(strategyId);
+  }
+
+  /**
+   * Enable a strategy plugin
+   */
+  public enableStrategy(strategyId: string): boolean {
+    return this.strategyRegistry.enable(strategyId);
+  }
+
+  /**
+   * Disable a strategy plugin
+   */
+  public disableStrategy(strategyId: string): boolean {
+    return this.strategyRegistry.disable(strategyId);
+  }
+
+  /**
+   * Update strategy plugin configuration
+   */
+  public updateStrategyConfig(strategyId: string, config: Record<string, unknown>): boolean {
+    return this.strategyRegistry.updateConfig(strategyId, config);
+  }
+
+  /**
+   * Get strategy registry statistics
+   */
+  public getStrategyRegistryStats() {
+    return this.strategyRegistry.getStats();
+  }
+
+  /**
+   * Get detailed info for a specific strategy
+   */
+  public getStrategyInfo(strategyId: string) {
+    return this.strategyRegistry.getStrategyInfo(strategyId);
+  }
+
+  /**
+   * Export all strategy configurations
+   */
+  public exportStrategyConfigs(): Record<string, Record<string, unknown>> {
+    return this.strategyRegistry.exportConfigs();
+  }
+
+  /**
+   * Import strategy configurations
+   */
+  public importStrategyConfigs(configs: Record<string, Record<string, unknown>>): void {
+    this.strategyRegistry.importConfigs(configs);
+  }
+
+  /**
+   * Check if plugin-based strategies are enabled
+   */
+  public isPluginStrategiesEnabled(): boolean {
+    return this.usePluginStrategies;
+  }
+
+  /**
+   * Toggle between plugin and legacy strategy modes
+   */
+  public setPluginStrategiesEnabled(enabled: boolean): void {
+    this.usePluginStrategies = enabled;
+    this.logger.info(`Plugin strategies ${enabled ? 'enabled' : 'disabled'}`);
   }
 }

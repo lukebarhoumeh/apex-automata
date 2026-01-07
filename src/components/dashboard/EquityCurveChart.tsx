@@ -1,315 +1,189 @@
-import { useQuery } from "@tanstack/react-query";
-import { supabase } from "@/integrations/supabase/client";
-import { FIXED_USER_ID } from "@/contexts/AuthContext";
+import { useMemo } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { useMemo } from "react";
-import {
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  ReferenceLine,
-  ComposedChart,
-  Bar,
-} from "recharts";
+import { TrendingUp, TrendingDown, Activity } from "lucide-react";
+import { useEquityCurve } from "@/hooks/useEquityCurve";
 
-interface EquityDataPoint {
-  date: string;
-  equity: number;
-  dailyPnl: number;
-  drawdown: number;
-  drawdownPct: number;
-}
-
-export const EquityCurveChart = () => {
-  // Fetch account metrics history
-  const { data: metricsData, isLoading } = useQuery({
-    queryKey: ["equity-curve", FIXED_USER_ID],
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from("account_metrics")
-        .select("date, total_equity, daily_pnl, daily_pnl_r")
-        .eq("user_id", FIXED_USER_ID)
-        .order("date", { ascending: true })
-        .limit(90);
-
-      if (error) throw error;
-      return data;
-    },
-    refetchInterval: 30000,
-  });
-
-  // Calculate equity curve with drawdown
-  const chartData = useMemo(() => {
-    if (!metricsData?.length) return [];
-
-    let peakEquity = 0;
-    
-    return metricsData.map((m) => {
-      const equity = Number(m.total_equity);
-      peakEquity = Math.max(peakEquity, equity);
-      const drawdown = peakEquity - equity;
-      const drawdownPct = peakEquity > 0 ? (drawdown / peakEquity) * 100 : 0;
-
-      return {
-        date: m.date,
-        equity,
-        dailyPnl: Number(m.daily_pnl),
-        dailyPnlR: Number(m.daily_pnl_r),
-        drawdown,
-        drawdownPct,
-      };
-    });
-  }, [metricsData]);
-
-  // Calculate summary stats
-  const stats = useMemo(() => {
-    if (!chartData.length) return null;
-
-    const latestEquity = chartData[chartData.length - 1]?.equity || 0;
-    const startEquity = chartData[0]?.equity || 0;
-    const totalReturn = startEquity > 0 ? ((latestEquity - startEquity) / startEquity) * 100 : 0;
-    const maxDrawdown = Math.max(...chartData.map((d) => d.drawdownPct));
-    const currentDrawdown = chartData[chartData.length - 1]?.drawdownPct || 0;
-    const winningDays = chartData.filter((d) => d.dailyPnl > 0).length;
-    const losingDays = chartData.filter((d) => d.dailyPnl < 0).length;
-    const winRate = chartData.length > 0 ? (winningDays / chartData.length) * 100 : 0;
-
-    return {
-      latestEquity,
-      totalReturn,
-      maxDrawdown,
-      currentDrawdown,
-      winningDays,
-      losingDays,
-      winRate,
-    };
-  }, [chartData]);
-
-  const formatDate = (dateStr: string) => {
-    const date = new Date(dateStr);
-    return date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-  };
-
-  const formatCurrency = (value: number) =>
-    `$${value.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
-
-  if (isLoading) {
+// Simple SVG-based line chart (no external deps)
+const MiniLineChart = ({
+  data,
+  width = 400,
+  height = 120,
+  color = "#22c55e",
+  showArea = true,
+}: {
+  data: Array<{ x: number; y: number }>;
+  width?: number;
+  height?: number;
+  color?: string;
+  showArea?: boolean;
+}) => {
+  if (data.length < 2) {
     return (
-      <Card>
-        <CardHeader>
-          <CardTitle className="font-mono text-base">Equity Curve</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-[300px] flex items-center justify-center text-muted-foreground">
-            Loading equity data...
-          </div>
-        </CardContent>
-      </Card>
+      <div 
+        className="flex items-center justify-center text-muted-foreground text-sm"
+        style={{ width, height }}
+      >
+        Waiting for data...
+      </div>
     );
   }
 
-  if (!chartData.length) {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle className="font-mono text-base">Equity Curve</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-[300px] flex items-center justify-center text-muted-foreground">
-            No equity data available yet
-          </div>
-        </CardContent>
-      </Card>
-    );
-  }
+  const padding = { top: 10, right: 10, bottom: 10, left: 10 };
+  const chartWidth = width - padding.left - padding.right;
+  const chartHeight = height - padding.top - padding.bottom;
+
+  const minY = Math.min(...data.map(d => d.y));
+  const maxY = Math.max(...data.map(d => d.y));
+  const minX = Math.min(...data.map(d => d.x));
+  const maxX = Math.max(...data.map(d => d.x));
+
+  const yRange = maxY - minY || 1;
+  const xRange = maxX - minX || 1;
+
+  const scaleX = (x: number) => padding.left + ((x - minX) / xRange) * chartWidth;
+  const scaleY = (y: number) => padding.top + chartHeight - ((y - minY) / yRange) * chartHeight;
+
+  const linePath = data
+    .map((d, i) => `${i === 0 ? 'M' : 'L'} ${scaleX(d.x).toFixed(2)} ${scaleY(d.y).toFixed(2)}`)
+    .join(' ');
+
+  const areaPath = `${linePath} L ${scaleX(data[data.length - 1].x).toFixed(2)} ${height - padding.bottom} L ${scaleX(data[0].x).toFixed(2)} ${height - padding.bottom} Z`;
+
+  // Zero line if it's in view
+  const zeroY = scaleY(0);
+  const showZeroLine = minY < 0 && maxY > 0;
 
   return (
-    <div className="space-y-4">
-      {/* Stats Summary */}
-      <Card>
-        <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <CardTitle className="font-mono text-base">Equity & Performance</CardTitle>
-            {stats && (
-              <div className="flex gap-2">
-                <Badge variant={stats.totalReturn >= 0 ? "default" : "destructive"} className="font-mono">
-                  {stats.totalReturn >= 0 ? "+" : ""}{stats.totalReturn.toFixed(2)}% Total
-                </Badge>
-                <Badge variant={stats.currentDrawdown > 5 ? "destructive" : "secondary"} className="font-mono">
-                  -{stats.currentDrawdown.toFixed(2)}% DD
-                </Badge>
+    <svg width={width} height={height} className="overflow-visible">
+      {showArea && (
+        <path
+          d={areaPath}
+          fill={color}
+          fillOpacity={0.1}
+        />
+      )}
+      {showZeroLine && (
+        <line
+          x1={padding.left}
+          y1={zeroY}
+          x2={width - padding.right}
+          y2={zeroY}
+          stroke="currentColor"
+          strokeOpacity={0.2}
+          strokeDasharray="4,4"
+        />
+      )}
+      <path
+        d={linePath}
+        fill="none"
+        stroke={color}
+        strokeWidth={2}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      {/* Latest point indicator */}
+      <circle
+        cx={scaleX(data[data.length - 1].x)}
+        cy={scaleY(data[data.length - 1].y)}
+        r={4}
+        fill={color}
+      />
+    </svg>
+  );
+};
+
+export const EquityCurveChart = () => {
+  const { data: curveData, isLoading } = useEquityCurve();
+
+  const chartData = useMemo(() => {
+    if (!curveData?.equityCurve || curveData.equityCurve.length === 0) {
+      return [];
+    }
+    return curveData.equityCurve.map(point => ({
+      x: point.timestamp,
+      y: point.pnl,
+    }));
+  }, [curveData]);
+
+  const currentPnl = curveData?.equityCurve?.[curveData.equityCurve.length - 1]?.pnl ?? 0;
+  const isProfitable = currentPnl >= 0;
+  const color = isProfitable ? "#22c55e" : "#ef4444";
+
+  const formatCurrency = (val: number) =>
+    new Intl.NumberFormat('en-US', { 
+      style: 'currency', 
+      currency: 'USD',
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 0,
+    }).format(val);
+
+  const formatPnl = (val: number) => {
+    const formatted = formatCurrency(Math.abs(val));
+    return val >= 0 ? `+${formatted}` : `-${formatted}`;
+  };
+
+  return (
+    <Card className="col-span-full lg:col-span-2">
+      <CardHeader className="pb-2">
+        <div className="flex items-center justify-between">
+          <CardTitle className="flex items-center gap-2 text-base font-mono">
+            <Activity className="h-4 w-4" />
+            Session Equity Curve
+          </CardTitle>
+          {curveData && (
+            <div className="flex items-center gap-2">
+              <Badge 
+                variant={isProfitable ? "default" : "destructive"}
+                className={`font-mono ${isProfitable ? 'bg-success' : ''}`}
+              >
+                {isProfitable ? <TrendingUp className="h-3 w-3 mr-1" /> : <TrendingDown className="h-3 w-3 mr-1" />}
+                {formatPnl(currentPnl)}
+              </Badge>
+            </div>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent>
+        {isLoading ? (
+          <div className="h-[120px] flex items-center justify-center text-muted-foreground">
+            Loading...
+          </div>
+        ) : (
+          <div className="flex flex-col gap-2">
+            <div className="w-full overflow-hidden">
+              <MiniLineChart 
+                data={chartData} 
+                width={600}
+                height={120}
+                color={color}
+              />
+            </div>
+            {curveData && (
+              <div className="grid grid-cols-4 gap-2 text-xs font-mono">
+                <div className="text-center">
+                  <div className="text-muted-foreground">Equity</div>
+                  <div className="font-semibold">{formatCurrency(curveData.currentEquity)}</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-muted-foreground">HWM</div>
+                  <div className="font-semibold">{formatCurrency(curveData.highWaterMark)}</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-muted-foreground">Max DD</div>
+                  <div className={`font-semibold ${curveData.maxDrawdown > 0 ? 'text-destructive' : ''}`}>
+                    {formatCurrency(curveData.maxDrawdown)}
+                  </div>
+                </div>
+                <div className="text-center">
+                  <div className="text-muted-foreground">Points</div>
+                  <div className="font-semibold">{curveData.equityCurve.length}</div>
+                </div>
               </div>
             )}
           </div>
-        </CardHeader>
-        <CardContent>
-          {stats && (
-            <div className="grid grid-cols-6 gap-4 mb-4">
-              <div>
-                <div className="text-xs text-muted-foreground">Current Equity</div>
-                <div className="font-mono font-semibold text-lg">{formatCurrency(stats.latestEquity)}</div>
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground">Total Return</div>
-                <div className={`font-mono font-semibold text-lg ${stats.totalReturn >= 0 ? "text-green-500" : "text-destructive"}`}>
-                  {stats.totalReturn >= 0 ? "+" : ""}{stats.totalReturn.toFixed(2)}%
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground">Max Drawdown</div>
-                <div className="font-mono font-semibold text-lg text-destructive">
-                  -{stats.maxDrawdown.toFixed(2)}%
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground">Current DD</div>
-                <div className={`font-mono font-semibold text-lg ${stats.currentDrawdown > 5 ? "text-destructive" : "text-muted-foreground"}`}>
-                  -{stats.currentDrawdown.toFixed(2)}%
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground">Win Rate</div>
-                <div className="font-mono font-semibold text-lg">{stats.winRate.toFixed(0)}%</div>
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground">W/L Days</div>
-                <div className="font-mono font-semibold text-lg">
-                  <span className="text-green-500">{stats.winningDays}</span>
-                  <span className="text-muted-foreground">/</span>
-                  <span className="text-destructive">{stats.losingDays}</span>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Equity Curve Chart */}
-          <div className="h-[250px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="equityGradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="hsl(var(--primary))" stopOpacity={0.3} />
-                    <stop offset="95%" stopColor="hsl(var(--primary))" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis
-                  dataKey="date"
-                  tickFormatter={formatDate}
-                  stroke="hsl(var(--muted-foreground))"
-                  fontSize={10}
-                  tickLine={false}
-                />
-                <YAxis
-                  tickFormatter={(v) => `$${(v / 1000).toFixed(0)}k`}
-                  stroke="hsl(var(--muted-foreground))"
-                  fontSize={10}
-                  tickLine={false}
-                  axisLine={false}
-                />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: "hsl(var(--card))",
-                    border: "1px solid hsl(var(--border))",
-                    borderRadius: "8px",
-                    fontSize: "12px",
-                  }}
-                  formatter={(value: number, name: string) => [
-                    name === "equity" ? formatCurrency(value) : `${value.toFixed(2)}%`,
-                    name === "equity" ? "Equity" : "Drawdown",
-                  ]}
-                  labelFormatter={formatDate}
-                />
-                <Area
-                  type="monotone"
-                  dataKey="equity"
-                  stroke="hsl(var(--primary))"
-                  fill="url(#equityGradient)"
-                  strokeWidth={2}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Drawdown Chart */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="font-mono text-base">Drawdown & Daily PnL</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-[180px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis
-                  dataKey="date"
-                  tickFormatter={formatDate}
-                  stroke="hsl(var(--muted-foreground))"
-                  fontSize={10}
-                  tickLine={false}
-                />
-                <YAxis
-                  yAxisId="left"
-                  tickFormatter={(v) => `${v.toFixed(0)}%`}
-                  stroke="hsl(var(--muted-foreground))"
-                  fontSize={10}
-                  tickLine={false}
-                  axisLine={false}
-                  domain={["dataMin", 0]}
-                />
-                <YAxis
-                  yAxisId="right"
-                  orientation="right"
-                  tickFormatter={(v) => `$${v.toFixed(0)}`}
-                  stroke="hsl(var(--muted-foreground))"
-                  fontSize={10}
-                  tickLine={false}
-                  axisLine={false}
-                />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: "hsl(var(--card))",
-                    border: "1px solid hsl(var(--border))",
-                    borderRadius: "8px",
-                    fontSize: "12px",
-                  }}
-                  formatter={(value: number, name: string) => {
-                    if (name === "drawdownPct") return [`-${value.toFixed(2)}%`, "Drawdown"];
-                    return [formatCurrency(value), "Daily PnL"];
-                  }}
-                  labelFormatter={formatDate}
-                />
-                <ReferenceLine yAxisId="left" y={0} stroke="hsl(var(--border))" />
-                <Area
-                  yAxisId="left"
-                  type="monotone"
-                  dataKey="drawdownPct"
-                  stroke="hsl(var(--destructive))"
-                  fill="hsl(var(--destructive))"
-                  fillOpacity={0.2}
-                  strokeWidth={1}
-                  // Invert to show below zero
-                  data={chartData.map((d) => ({ ...d, drawdownPct: -d.drawdownPct }))}
-                />
-                <Bar
-                  yAxisId="right"
-                  dataKey="dailyPnl"
-                  fill="hsl(var(--primary))"
-                  opacity={0.6}
-                  radius={[2, 2, 0, 0]}
-                />
-              </ComposedChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
-    </div>
+        )}
+      </CardContent>
+    </Card>
   );
 };

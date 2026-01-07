@@ -12,7 +12,15 @@ import { LiveTickersPanel } from "@/components/dashboard/LiveTickersPanel";
 import { MarketConditions } from "@/components/dashboard/MarketConditions";
 import { AlertsPanel } from "@/components/dashboard/AlertsPanel";
 import { StrategiesPanel } from "@/components/dashboard/StrategiesPanel";
+import { StrategiesPluginPanel } from "@/components/dashboard/StrategiesPluginPanel";
+import { RiskControlsPanel } from "@/components/dashboard/RiskControlsPanel";
 import { SystemHealthPanel } from "@/components/dashboard/SystemHealthPanel";
+import { EquityCurveChart } from "@/components/dashboard/EquityCurveChart";
+import { SessionStatsPanel } from "@/components/dashboard/SessionStatsPanel";
+import { TradeLogPanel } from "@/components/dashboard/TradeLogPanel";
+import { SystemMetricsPanel } from "@/components/dashboard/SystemMetricsPanel";
+import { RegimePanel } from "@/components/dashboard/RegimePanel";
+import { MetaFilterPanel } from "@/components/dashboard/MetaFilterPanel";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useTradingEngine } from "@/hooks/useTradingEngine";
 import { Badge } from "@/components/ui/badge";
@@ -53,7 +61,16 @@ const Index = () => {
         
         <MetricsGridConnected />
         
+        {/* Real-Time Performance Telemetry Section */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 lg:gap-6">
+          <EquityCurveChart />
+          <SessionStatsPanel />
+        </div>
+        
         <MarketConditions />
+        
+        {/* Regime Detection Panel */}
+        <RegimePanel />
         
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 lg:gap-6">
           <div className="xl:col-span-2 space-y-4 lg:space-y-6">
@@ -62,11 +79,26 @@ const Index = () => {
             {/* Live Signals - Real-time from WebSocket */}
             <LiveSignalsTable />
             
+            {/* Trade Log - Recent trade outcomes */}
+            <TradeLogPanel />
+            
             <OrdersBlotter onViewDetails={handleViewDetails} />
             <PositionsPanelConnected />
           </div>
           
           <div className="space-y-4 lg:space-y-6">
+            {/* Enhanced System Metrics Panel */}
+            <SystemMetricsPanel />
+            
+            {/* Meta Filter (Trade Quality) Panel */}
+            <MetaFilterPanel />
+            
+            {/* Strategy Plugins Panel */}
+            <StrategiesPluginPanel />
+            
+            {/* Extended Risk Controls Panel */}
+            <RiskControlsPanel />
+            
             <SystemHealthPanel />
             
             {/* Live Price Tickers */}
