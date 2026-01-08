@@ -34,6 +34,7 @@ export const useTradingEngine = () => {
 
   const tickerDebounceRef = useRef<NodeJS.Timeout>();
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
+  const backendCheckIntervalRef = useRef<NodeJS.Timeout>();
 
   // Debounced ticker update to avoid excessive re-renders
   const updateTicker = useCallback((ticker: any) => {
@@ -49,20 +50,33 @@ export const useTradingEngine = () => {
     }, 150);
   }, []);
 
-  // Check backend availability on mount
+  // Check backend availability on mount and periodically
   useEffect(() => {
     const checkBackend = async () => {
       try {
-        await tradingApi.getStatus();
-        setState(prev => ({ ...prev, backendAvailable: true }));
-        console.log('Backend API available');
+        const status = await tradingApi.getStatus();
+        setState(prev => ({ 
+          ...prev, 
+          backendAvailable: true,
+          engineRunning: status.engineRunning,
+          mode: status.mode,
+        }));
       } catch (error) {
         setState(prev => ({ ...prev, backendAvailable: false }));
-        console.log('Backend not available - UI will use Supabase data only');
       }
     };
     
+    // Initial check
     checkBackend();
+    
+    // Periodic check every 5 seconds
+    backendCheckIntervalRef.current = setInterval(checkBackend, 5000);
+    
+    return () => {
+      if (backendCheckIntervalRef.current) {
+        clearInterval(backendCheckIntervalRef.current);
+      }
+    };
   }, []);
 
   useEffect(() => {

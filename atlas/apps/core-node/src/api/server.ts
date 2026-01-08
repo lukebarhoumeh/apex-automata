@@ -19,7 +19,22 @@ import { CoinbaseExchange } from '../exchanges/coinbase';
 
 const app = express();
 const server = createServer(app);
-const wss = new WebSocketServer({ server });
+// Use noServer mode for explicit path handling
+const wss = new WebSocketServer({ noServer: true });
+
+// Handle WebSocket upgrade for both root and /events paths
+server.on('upgrade', (request, socket, head) => {
+  const pathname = new URL(request.url || '/', `http://${request.headers.host}`).pathname;
+  
+  // Accept connections on both root path and /events path for compatibility
+  if (pathname === '/' || pathname === '/events' || pathname === '/ws') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
 
 // Middleware
 app.use(cors());
@@ -1903,18 +1918,19 @@ app.get('/api/risk/symbols/:symbol', (req, res) => {
 });
 
 // Reset daily tracking
-app.post('/api/risk/reset/daily', (req, res) => {
+app.post('/api/risk/reset/daily', async (req, res) => {
   const riskEngine = tradingEngine?.getRiskEngineInstance();
   if (!riskEngine) {
     return res.status(400).json({ error: 'Risk engine not running' });
   }
 
-  riskEngine.resetSymbolDailyTracking();
-  logger.info('Daily risk tracking reset via API');
+  // Reset full daily metrics including P&L
+  await riskEngine.resetDailyMetrics();
+  logger.info('Daily risk metrics fully reset via API');
   
   res.json({
     success: true,
-    message: 'Daily tracking reset (per-symbol losses and blocks cleared)',
+    message: 'Daily tracking reset (P&L, per-symbol losses, and blocks cleared)',
   });
 });
 
@@ -1951,10 +1967,10 @@ app.post('/api/risk/killswitch', (req, res) => {
   }
 
   if (active) {
-    riskEngine.triggerKillSwitch(reason || 'Manual activation via API');
+    riskEngine.activateKillSwitch(reason || 'Manual activation via API');
     logger.warn('Kill switch activated via API', { reason });
   } else {
-    riskEngine.resetKillSwitch();
+    riskEngine.deactivateKillSwitch();
     logger.info('Kill switch deactivated via API');
   }
   
@@ -2472,6 +2488,50 @@ async function createSupabaseAlert(alert: any) {
 // Initialize account metrics on startup
 initializeAccountMetrics().catch(err => {
   logger.error('Failed to initialize account metrics on startup:', err);
+});
+
+// Global error handlers for stability
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception - keeping server alive:', error);
+  // Don't exit - try to keep running
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Don't exit - try to keep running
+});
+
+// Graceful shutdown handler
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM received, shutting down gracefully...');
+  try {
+    if (tradingEngine) {
+      await tradingEngine.stop();
+    }
+    server.close(() => {
+      logger.info('Server closed');
+      process.exit(0);
+    });
+  } catch (error) {
+    logger.error('Error during shutdown:', error);
+    process.exit(1);
+  }
+});
+
+process.on('SIGINT', async () => {
+  logger.info('SIGINT received, shutting down gracefully...');
+  try {
+    if (tradingEngine) {
+      await tradingEngine.stop();
+    }
+    server.close(() => {
+      logger.info('Server closed');
+      process.exit(0);
+    });
+  } catch (error) {
+    logger.error('Error during shutdown:', error);
+    process.exit(1);
+  }
 });
 
 // Start server

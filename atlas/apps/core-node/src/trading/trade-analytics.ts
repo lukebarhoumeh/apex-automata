@@ -791,7 +791,8 @@ export class TradeAnalytics extends EventEmitter {
         .from('trading_sessions')
         .upsert(record, { onConflict: 'session_id' });
       
-      if (error && error.code !== '42P01') {
+      // Ignore table-not-found errors (42P01 = PostgreSQL, PGRST205 = PostgREST)
+      if (error && error.code !== '42P01' && error.code !== 'PGRST205') {
         this.logger.warn('Failed to persist session summary:', error);
       }
     } catch (err) {

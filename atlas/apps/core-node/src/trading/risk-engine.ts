@@ -279,24 +279,43 @@ export class RiskEngine extends EventEmitter {
       if (metricsError && metricsError.code !== 'PGRST116') {
         this.logger.warn('Failed to load risk metrics state:', metricsError);
       } else if (latestMetrics) {
-        // Restore metrics
-        this.metrics.dailyPnL = Number(latestMetrics.daily_pnl ?? 0);
-        this.metrics.maxDrawdown = Number(latestMetrics.max_drawdown ?? 0);
-        this.metrics.consecutiveLosses = Number(latestMetrics.consecutive_losses ?? 0);
-        this.metrics.errorRate = Number(latestMetrics.error_rate ?? 0);
-        this.metrics.currentExposure = Number(latestMetrics.exposure_usd ?? 0);
-        this.metrics.killSwitchActive = Boolean(latestMetrics.kill_switch_active);
+        // Check if this data is from today - if not, start fresh
+        const metricsDate = latestMetrics.updated_at 
+          ? new Date(latestMetrics.updated_at).toISOString().split('T')[0]
+          : null;
         
-        if (this.metrics.killSwitchActive) {
-          this.killSwitchActive = true;
-          this.logger.warn('Restored kill switch active state from previous session');
+        if (metricsDate !== todayStr) {
+          // Stale data from previous day - start fresh
+          this.logger.info('Risk metrics from previous day detected, starting fresh', {
+            storedDate: metricsDate,
+            today: todayStr,
+          });
+          this.metrics.dailyPnL = 0;
+          this.metrics.maxDrawdown = 0;
+          this.metrics.consecutiveLosses = 0;
+          this.metrics.errorRate = 0;
+          this.metrics.currentExposure = 0;
+          this.metrics.killSwitchActive = false;
+        } else {
+          // Restore metrics from today
+          this.metrics.dailyPnL = Number(latestMetrics.daily_pnl ?? 0);
+          this.metrics.maxDrawdown = Number(latestMetrics.max_drawdown ?? 0);
+          this.metrics.consecutiveLosses = Number(latestMetrics.consecutive_losses ?? 0);
+          this.metrics.errorRate = Number(latestMetrics.error_rate ?? 0);
+          this.metrics.currentExposure = Number(latestMetrics.exposure_usd ?? 0);
+          this.metrics.killSwitchActive = Boolean(latestMetrics.kill_switch_active);
+          
+          if (this.metrics.killSwitchActive) {
+            this.killSwitchActive = true;
+            this.logger.warn('Restored kill switch active state from previous session');
+          }
+          
+          this.logger.info('Restored risk state from database', {
+            dailyPnL: this.metrics.dailyPnL,
+            consecutiveLosses: this.metrics.consecutiveLosses,
+            killSwitchActive: this.killSwitchActive,
+          });
         }
-        
-        this.logger.info('Restored risk state from database', {
-          dailyPnL: this.metrics.dailyPnL,
-          consecutiveLosses: this.metrics.consecutiveLosses,
-          killSwitchActive: this.killSwitchActive,
-        });
       }
       
       // Load account metrics for today to get weekly tracking

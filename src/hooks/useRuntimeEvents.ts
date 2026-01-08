@@ -1,7 +1,8 @@
 // WebSocket hook for real-time runtime events from the Node backend
 import { useEffect, useRef, useState, useCallback } from 'react';
 
-const WS_URL = import.meta.env.VITE_RUNTIME_WS_URL || 'ws://localhost:3001/events';
+// Backend WebSocket is on root path, not /events
+const WS_URL = import.meta.env.VITE_RUNTIME_WS_URL || 'ws://localhost:3001';
 
 export type EventType = 
   | 'StatusUpdate'

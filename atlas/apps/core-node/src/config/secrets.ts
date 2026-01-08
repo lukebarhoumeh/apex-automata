@@ -127,6 +127,11 @@ export class SecretManager {
           // No credentials found
           return null;
         }
+        if (error.code === 'PGRST205' || error.message?.includes('not find the table')) {
+          // Table doesn't exist - return null gracefully
+          this.logger.warn('exchange_credentials table not found, returning null');
+          return null;
+        }
         throw error;
       }
 

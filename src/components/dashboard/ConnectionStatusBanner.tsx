@@ -1,5 +1,6 @@
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { WifiOff, Loader2 } from "lucide-react";
+import { useRuntimeHealth } from "@/hooks/useRuntimeStatus";
 
 interface ConnectionStatusBannerProps {
   isConnected: boolean;
@@ -10,7 +11,13 @@ export const ConnectionStatusBanner = ({
   isConnected, 
   isReconnecting = false 
 }: ConnectionStatusBannerProps) => {
-  if (isConnected) return null;
+  // Also check if backend health endpoint is reachable
+  const { data: backendHealthy } = useRuntimeHealth();
+  
+  // Consider connected if either WebSocket is connected OR backend API is healthy
+  const actuallyConnected = isConnected || backendHealthy;
+  
+  if (actuallyConnected) return null;
 
   return (
     <Alert variant="destructive" className="mb-4 border-warning/50 bg-warning/10">

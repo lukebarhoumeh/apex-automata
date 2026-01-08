@@ -118,30 +118,29 @@ interface MetricsGridProps {
 }
 
 export const MetricsGrid = ({ metrics }: MetricsGridProps) => {
-  // Use provided metrics or defaults
-  const equity = metrics?.total_equity || 52450;
-  const dailyPnl = metrics?.daily_pnl || 945.20;
-  const dailyPnlR = metrics?.daily_pnl_r || 1.8;
-  const riskHeat = metrics?.risk_heat || 2.1;
-  const spreadPercentile = metrics?.spread_percentile || 42;
-  const openPositions = metrics?.open_positions_count || 2;
-  const wins = metrics?.wins_today || 6;
-  const losses = metrics?.losses_today || 2;
+  // Use actual values only - no fake defaults
+  const equity = metrics?.total_equity ?? 50000; // Initial balance if no data
+  const dailyPnl = metrics?.daily_pnl ?? 0;
+  const dailyPnlR = metrics?.daily_pnl_r ?? 0;
+  const riskHeat = metrics?.risk_heat ?? 0;
+  const spreadPercentile = metrics?.spread_percentile ?? 50;
+  const openPositions = metrics?.open_positions_count ?? 0;
+  const wins = metrics?.wins_today ?? 0;
+  const losses = metrics?.losses_today ?? 0;
 
-  const dailyPnlVariant = dailyPnl >= 0 ? "success" : "destructive";
-  const dailyPnlTrend = dailyPnl >= 0 ? "up" : "down";
+  const dailyPnlVariant = dailyPnl > 0 ? "success" : dailyPnl < 0 ? "destructive" : "default";
+  const dailyPnlTrend = dailyPnl > 0 ? "up" : dailyPnl < 0 ? "down" : "neutral";
 
   return (
     <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 animate-slide-up">
       <MetricCard
         title="Total Equity"
         value={`$${equity.toLocaleString()}`}
-        change="+2.3%"
-        trend="up"
-        subtitle="All-time high"
+        change={dailyPnl !== 0 ? `${((dailyPnl / (equity - dailyPnl)) * 100).toFixed(1)}%` : undefined}
+        trend={dailyPnl > 0 ? "up" : dailyPnl < 0 ? "down" : "neutral"}
+        subtitle={dailyPnl > 0 ? "All-time high" : "Session equity"}
         icon={<DollarSign className="h-4 w-4" />}
-        variant="success"
-        animate
+        variant={dailyPnl > 0 ? "success" : dailyPnl < 0 ? "destructive" : "default"}
       />
       <MetricCard
         title="Daily P&L"
@@ -175,10 +174,10 @@ export const MetricsGrid = ({ metrics }: MetricsGridProps) => {
       />
       <MetricCard
         title="Daily Stop"
-        value="-2R"
-        subtitle="Not triggered"
+        value={dailyPnlR < 0 ? `${dailyPnlR.toFixed(1)}R` : "-2R"}
+        subtitle={dailyPnlR <= -2 ? "TRIGGERED" : "Not triggered"}
         icon={<AlertCircle className="h-4 w-4" />}
-        variant="default"
+        variant={dailyPnlR <= -2 ? "destructive" : "default"}
       />
     </div>
   );

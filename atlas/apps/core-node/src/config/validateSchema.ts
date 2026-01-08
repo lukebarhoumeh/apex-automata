@@ -2,7 +2,7 @@ import { SupabaseClient } from '@supabase/supabase-js';
 import { Logger } from '../core/logger';
 
 /**
- * Required tables for engine operation
+ * Required tables for engine operation (engine cannot start without these)
  */
 const REQUIRED_TABLES = [
   'orders',
@@ -13,7 +13,17 @@ const REQUIRED_TABLES = [
   'daily_equity',
   'account_metrics',
   'alerts',
-  'exchange_credentials',
+] as const;
+
+/**
+ * Optional tables (engine can run in limited mode without these)
+ */
+const OPTIONAL_TABLES = [
+  'exchange_credentials',  // Only needed for live trading
+  'trading_sessions',      // For session persistence
+  'trade_log',             // Extended trade logging
+  'equity_snapshots',      // Equity curve persistence
+  'meta_filter_decisions', // ML training data
 ] as const;
 
 /**
@@ -71,8 +81,8 @@ export async function validateSchema(
         // PGRST116 = single row expected but none found - also OK for validation
         if (error.code === 'PGRST204' || error.code === 'PGRST116') {
           logger.debug(`Table '${table}' exists (empty)`);
-        } else if (error.code === '42P01' || error.message.includes('does not exist')) {
-          // 42P01 = undefined_table
+        } else if (error.code === '42P01' || error.code === 'PGRST205' || error.message.includes('does not exist')) {
+          // 42P01 = undefined_table, PGRST205 = PostgREST table not found
           result.missingTables.push(table);
           result.errors.push(`Table '${table}' does not exist`);
           logger.error(`Missing table: ${table}`);
@@ -87,6 +97,36 @@ export async function validateSchema(
       const message = error instanceof Error ? error.message : String(error);
       logger.warn(`Error checking table '${table}': ${message}`);
     }
+  }
+
+  // Check optional tables (log warnings but don't fail validation)
+  const missingOptional: string[] = [];
+  for (const table of OPTIONAL_TABLES) {
+    try {
+      const { error } = await supabase
+        .from(table)
+        .select('*')
+        .limit(1);
+
+      if (error) {
+        if (error.code === 'PGRST204' || error.code === 'PGRST116') {
+          logger.debug(`Optional table '${table}' exists (empty)`);
+        } else if (error.code === '42P01' || error.code === 'PGRST205' || error.message.includes('does not exist')) {
+          missingOptional.push(table);
+          logger.debug(`Optional table '${table}' not found (non-critical)`);
+        } else {
+          logger.debug(`Optional table '${table}' check: ${error.message}`);
+        }
+      } else {
+        logger.debug(`Optional table '${table}' validated`);
+      }
+    } catch (error) {
+      // Ignore errors for optional tables
+    }
+  }
+  
+  if (missingOptional.length > 0) {
+    logger.info(`Optional tables not found (will use defaults): ${missingOptional.join(', ')}`);
   }
 
   // Check required RPCs by attempting to call them
