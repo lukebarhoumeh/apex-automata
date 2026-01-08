@@ -1,6 +1,6 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { TrendingUp, DollarSign, Activity, AlertCircle, Percent, Zap, ArrowUp, ArrowDown } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { cn, formatUsd, formatR, formatPercent } from "@/lib/utils";
 
 interface MetricCardProps {
   title: string;
@@ -135,8 +135,8 @@ export const MetricsGrid = ({ metrics }: MetricsGridProps) => {
     <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 animate-slide-up">
       <MetricCard
         title="Total Equity"
-        value={`$${equity.toLocaleString()}`}
-        change={dailyPnl !== 0 ? `${((dailyPnl / (equity - dailyPnl)) * 100).toFixed(1)}%` : undefined}
+        value={formatUsd(equity)}
+        change={dailyPnl !== 0 ? formatPercent(dailyPnl / (equity - dailyPnl)) : undefined}
         trend={dailyPnl > 0 ? "up" : dailyPnl < 0 ? "down" : "neutral"}
         subtitle={dailyPnl > 0 ? "All-time high" : "Session equity"}
         icon={<DollarSign className="h-4 w-4" />}
@@ -144,24 +144,24 @@ export const MetricsGrid = ({ metrics }: MetricsGridProps) => {
       />
       <MetricCard
         title="Daily P&L"
-        value={`${dailyPnlR >= 0 ? "+" : ""}${dailyPnlR.toFixed(1)}R`}
-        change={`${dailyPnl >= 0 ? "+" : ""}$${Math.abs(dailyPnl).toFixed(2)}`}
+        value={formatR(dailyPnlR)}
+        change={formatUsd(dailyPnl)}
         trend={dailyPnlTrend}
-        subtitle={`${wins} wins, ${losses} losses`}
+        subtitle={`${wins}W / ${losses}L`}
         icon={<TrendingUp className="h-4 w-4" />}
         variant={dailyPnlVariant}
       />
       <MetricCard
         title="Risk Heat"
-        value={`${riskHeat.toFixed(1)}%`}
+        value={formatPercent(riskHeat / 100)}
         subtitle="of 3% max limit"
         icon={<Activity className="h-4 w-4" />}
         variant={riskHeat > 2.5 ? "warning" : "default"}
       />
       <MetricCard
-        title="Spread Percentile"
+        title="Spread %tile"
         value={`${spreadPercentile}%`}
-        subtitle={spreadPercentile > 80 ? "High volatility" : "Normal conditions"}
+        subtitle={spreadPercentile > 80 ? "High volatility" : "Normal"}
         icon={<Percent className="h-4 w-4" />}
         variant={spreadPercentile > 90 ? "warning" : "default"}
       />
@@ -174,8 +174,8 @@ export const MetricsGrid = ({ metrics }: MetricsGridProps) => {
       />
       <MetricCard
         title="Daily Stop"
-        value={dailyPnlR < 0 ? `${dailyPnlR.toFixed(1)}R` : "-2R"}
-        subtitle={dailyPnlR <= -2 ? "TRIGGERED" : "Not triggered"}
+        value={dailyPnlR < 0 ? formatR(dailyPnlR) : formatR(-2)}
+        subtitle={dailyPnlR <= -2 ? "TRIGGERED" : "Remaining"}
         icon={<AlertCircle className="h-4 w-4" />}
         variant={dailyPnlR <= -2 ? "destructive" : "default"}
       />

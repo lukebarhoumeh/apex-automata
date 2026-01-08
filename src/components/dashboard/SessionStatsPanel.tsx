@@ -1,8 +1,10 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
+import { Skeleton } from "@/components/ui/skeleton";
 import { BarChart3, Target, TrendingUp, Clock, Zap, AlertTriangle } from "lucide-react";
 import { useSessionStats } from "@/hooks/useSessionStats";
+import { formatUsd, formatPercent, formatBps } from "@/lib/utils";
 
 export const SessionStatsPanel = () => {
   const { data: stats, isLoading } = useSessionStats();
@@ -10,8 +12,24 @@ export const SessionStatsPanel = () => {
   if (isLoading) {
     return (
       <Card>
-        <CardContent className="p-4 flex items-center justify-center h-[200px] text-muted-foreground">
-          Loading session stats...
+        <CardHeader className="pb-2">
+          <Skeleton className="h-5 w-40" />
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-4 gap-2">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <div key={i} className="text-center space-y-1">
+                <Skeleton className="h-8 w-12 mx-auto" />
+                <Skeleton className="h-3 w-10 mx-auto" />
+              </div>
+            ))}
+          </div>
+          <Skeleton className="h-2 w-full" />
+          <div className="grid grid-cols-2 gap-3">
+            {Array.from({ length: 8 }).map((_, i) => (
+              <Skeleton key={i} className="h-4 w-full" />
+            ))}
+          </div>
         </CardContent>
       </Card>
     );
@@ -30,15 +48,6 @@ export const SessionStatsPanel = () => {
     );
   }
 
-  const formatCurrency = (val: number) =>
-    new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD',
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 0,
-    }).format(val);
-
-  const formatPct = (val: number) => `${(val * 100).toFixed(1)}%`;
   const formatDuration = (seconds: number) => {
     if (seconds < 60) return `${Math.round(seconds)}s`;
     if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
@@ -91,7 +100,7 @@ export const SessionStatsPanel = () => {
               Win Rate
             </span>
             <span className={winRatePct >= 50 ? 'text-success' : 'text-destructive'}>
-              {formatPct(stats.winRate)}
+              {formatPercent(stats.winRate)}
             </span>
           </div>
           <Progress value={winRatePct} className="h-2" />
@@ -108,16 +117,16 @@ export const SessionStatsPanel = () => {
           <div className="flex justify-between">
             <span className="text-muted-foreground">Expectancy</span>
             <span className={stats.expectancy >= 0 ? 'text-success' : 'text-destructive'}>
-              {formatCurrency(stats.expectancy)}
+              {formatUsd(stats.expectancy)}
             </span>
           </div>
           <div className="flex justify-between">
             <span className="text-muted-foreground">Avg Win</span>
-            <span className="text-success">{formatCurrency(stats.avgWin)}</span>
+            <span className="text-success">{formatUsd(stats.avgWin)}</span>
           </div>
           <div className="flex justify-between">
             <span className="text-muted-foreground">Avg Loss</span>
-            <span className="text-destructive">{formatCurrency(stats.avgLoss)}</span>
+            <span className="text-destructive">{formatUsd(stats.avgLoss)}</span>
           </div>
           <div className="flex justify-between">
             <span className="text-muted-foreground flex items-center gap-1">
@@ -143,7 +152,7 @@ export const SessionStatsPanel = () => {
               Avg Slippage
             </span>
             <span className={Math.abs(stats.avgSlippageBps) > 10 ? 'text-warning' : ''}>
-              {stats.avgSlippageBps.toFixed(1)} bps
+              {formatBps(stats.avgSlippageBps)}
             </span>
           </div>
         </div>
@@ -152,16 +161,16 @@ export const SessionStatsPanel = () => {
         <div className="pt-2 border-t space-y-1">
           <div className="flex justify-between font-mono">
             <span className="text-muted-foreground">Gross Profit</span>
-            <span className="text-success">{formatCurrency(stats.grossProfit)}</span>
+            <span className="text-success">{formatUsd(stats.grossProfit)}</span>
           </div>
           <div className="flex justify-between font-mono">
             <span className="text-muted-foreground">Gross Loss</span>
-            <span className="text-destructive">{formatCurrency(stats.grossLoss)}</span>
+            <span className="text-destructive">{formatUsd(stats.grossLoss)}</span>
           </div>
           <div className="flex justify-between font-mono font-bold text-lg pt-1">
             <span>Net P&L</span>
             <span className={stats.totalPnl >= 0 ? 'text-success' : 'text-destructive'}>
-              {stats.totalPnl >= 0 ? '+' : ''}{formatCurrency(stats.totalPnl)}
+              {stats.totalPnl >= 0 ? '+' : ''}{formatUsd(stats.totalPnl)}
             </span>
           </div>
         </div>
