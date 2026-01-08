@@ -1,6 +1,9 @@
 // Runtime Client - Direct connection to Atlas Node.js backend
+// API Reference: https://github.com/atlasbot/core-node
 
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || 'http://localhost:3001';
+
+// ============= Types =============
 
 export interface RuntimeStatus {
   engineRunning: boolean;
@@ -16,20 +19,79 @@ export interface RuntimeStatus {
   restLatencyMs: number;
   spreadPctile: number;
   regime: 'trend' | 'chop';
-  // Risk info
   risk?: {
     exposureUsd: number;
     dailyPnLUsd: number;
     maxDrawdownPct: number;
     killSwitchActive: boolean;
   };
-  // Warmup & symbols info
   activeSymbols?: string[];
   warmupComplete?: boolean;
-  candlesBuffered?: Record<string, number>; // Per-symbol: { "BTC-USD": 150, "ETH-USD": 200 }
+  candlesBuffered?: Record<string, number>;
   requiredWarmup?: number;
-  // Legacy fallback
   symbols?: string[];
+}
+
+export interface RiskStatus {
+  killSwitchActive: boolean;
+  killSwitchReasons: string[];
+  dailyPnL: number;
+  dailyPnLR: number;
+  maxDailyLoss: number;
+  exposureUsd: number;
+  heatPct: number;
+  maxHeat: number;
+}
+
+export interface SessionStats {
+  totalTrades: number;
+  winRate: number;
+  pnlUsd: number;
+  pnlR: number;
+  avgWin: number;
+  avgLoss: number;
+  largestWin: number;
+  largestLoss: number;
+  expectancy: number;
+  profitFactor: number;
+}
+
+export interface EquityPoint {
+  timestamp: string;
+  equity: number;
+  pnl: number;
+}
+
+export interface RegimeStatus {
+  symbol: string;
+  regime: 'trend' | 'chop' | 'unknown';
+  confidence: number;
+  indicators: {
+    adx: number;
+    atr: number;
+    volatility: number;
+  };
+}
+
+export interface MetaFilterStats {
+  enabled: boolean;
+  threshold: number;
+  totalSignals: number;
+  allowedSignals: number;
+  rejectedSignals: number;
+  avgProbability: number;
+}
+
+export interface Strategy {
+  id: string;
+  name: string;
+  enabled: boolean;
+  params: Record<string, unknown>;
+  stats?: {
+    trades: number;
+    winRate: number;
+    avgR: number;
+  };
 }
 
 export interface RiskConfig {
@@ -60,76 +122,29 @@ export interface SignalsConfig {
   };
 }
 
+// ============= Client =============
+
 class RuntimeClient {
-  async getStatus(): Promise<RuntimeStatus> {
-    const response = await fetch(`${API_URL}/api/status`);
-    if (!response.ok) {
-      throw new Error(`Status request failed: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  async pause(): Promise<{ ok: boolean }> {
-    const response = await fetch(`${API_URL}/api/control/pause`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+  private async request<T>(path: string, options?: RequestInit): Promise<T> {
+    const response = await fetch(`${API_URL}${path}`, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...options?.headers,
+      },
     });
     if (!response.ok) {
-      throw new Error(`Pause request failed: ${response.statusText}`);
+      const error = await response.json().catch(() => ({ error: response.statusText }));
+      throw new Error(error.error || error.message || response.statusText);
     }
     return response.json();
   }
 
-  async resume(): Promise<{ ok: boolean }> {
-    const response = await fetch(`${API_URL}/api/control/resume`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-    });
-    if (!response.ok) {
-      throw new Error(`Resume request failed: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  async closeAll(reason: string, confirm: string): Promise<{ ok: boolean; submitted: number }> {
-    const response = await fetch(`${API_URL}/api/control/close-all`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reason, confirm }),
-    });
-    if (!response.ok) {
-      throw new Error(`Close all request failed: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  async updateRiskConfig(config: RiskConfig): Promise<{ ok: boolean }> {
-    const response = await fetch(`${API_URL}/api/config/risk`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config),
-    });
-    if (!response.ok) {
-      throw new Error(`Risk config update failed: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  async updateSignalsConfig(config: SignalsConfig): Promise<{ ok: boolean }> {
-    const response = await fetch(`${API_URL}/api/config/signals`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config),
-    });
-    if (!response.ok) {
-      throw new Error(`Signals config update failed: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
+  // ============= Health =============
+  
   async checkHealth(): Promise<boolean> {
     try {
-      const response = await fetch(`${API_URL}/api/health`, {
+      const response = await fetch(`${API_URL}/health`, {
         signal: AbortSignal.timeout(3000),
       });
       return response.ok;
@@ -138,44 +153,112 @@ class RuntimeClient {
     }
   }
 
+  // ============= Status =============
+  
+  async getStatus(): Promise<RuntimeStatus> {
+    return this.request<RuntimeStatus>('/api/status');
+  }
+
+  // ============= Risk =============
+  
+  async getRiskStatus(): Promise<RiskStatus> {
+    return this.request<RiskStatus>('/api/risk/status');
+  }
+
+  async toggleKillSwitch(): Promise<{ ok: boolean; active: boolean }> {
+    return this.request('/api/risk/killswitch', { method: 'POST' });
+  }
+
+  async resetDailyPnL(): Promise<{ ok: boolean }> {
+    return this.request('/api/risk/reset/daily', { method: 'POST' });
+  }
+
+  async updateRiskConfig(config: RiskConfig): Promise<{ ok: boolean }> {
+    return this.request('/api/config/risk', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    });
+  }
+
+  // ============= Analytics =============
+  
+  async getSessionStats(): Promise<SessionStats> {
+    return this.request<SessionStats>('/api/analytics/session');
+  }
+
+  async getEquityCurve(): Promise<EquityPoint[]> {
+    return this.request<EquityPoint[]>('/api/analytics/equity-curve');
+  }
+
+  // ============= Regime =============
+  
+  async getRegimeStatus(): Promise<RegimeStatus[]> {
+    return this.request<RegimeStatus[]>('/api/regime/status');
+  }
+
+  // ============= Meta Filter =============
+  
+  async getMetaFilterStats(): Promise<MetaFilterStats> {
+    return this.request<MetaFilterStats>('/api/metafilter/stats');
+  }
+
+  async toggleMetaFilter(): Promise<{ ok: boolean; enabled: boolean }> {
+    return this.request('/api/metafilter/toggle', { method: 'POST' });
+  }
+
+  // ============= Strategies =============
+  
+  async getStrategies(): Promise<Strategy[]> {
+    return this.request<Strategy[]>('/api/strategies');
+  }
+
+  async toggleStrategy(id: string): Promise<{ ok: boolean; enabled: boolean }> {
+    return this.request(`/api/strategies/${id}/toggle`, { method: 'POST' });
+  }
+
+  async updateSignalsConfig(config: SignalsConfig): Promise<{ ok: boolean }> {
+    return this.request('/api/config/signals', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    });
+  }
+
+  // ============= Engine Control =============
+  
   async startEngine(
     mode: 'paper' | 'live' = 'paper',
     opts?: { confirm?: string; marketDataEnv?: 'sandbox' | 'production' }
   ): Promise<{ ok: boolean }> {
-    const response = await fetch(`${API_URL}/api/engine/start`, {
+    return this.request('/api/engine/start', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode, ...opts }),
     });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: response.statusText }));
-      throw new Error(error.error || 'Failed to start engine');
-    }
-    return response.json();
   }
 
   async stopEngine(): Promise<{ ok: boolean }> {
-    const response = await fetch(`${API_URL}/api/engine/stop`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-    });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: response.statusText }));
-      throw new Error(error.error || 'Failed to stop engine');
-    }
-    return response.json();
+    return this.request('/api/engine/stop', { method: 'POST' });
   }
 
   async killEngine(): Promise<{ ok: boolean }> {
-    const response = await fetch(`${API_URL}/api/engine/kill`, {
+    // Activates kill switch and stops engine immediately
+    return this.request('/api/risk/killswitch', { method: 'POST' });
+  }
+
+  // ============= Position Control =============
+  
+  async pause(): Promise<{ ok: boolean }> {
+    return this.request('/api/control/pause', { method: 'POST' });
+  }
+
+  async resume(): Promise<{ ok: boolean }> {
+    return this.request('/api/control/resume', { method: 'POST' });
+  }
+
+  async closeAll(reason: string, confirm: string): Promise<{ ok: boolean; submitted: number }> {
+    return this.request('/api/control/close-all', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason, confirm }),
     });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: response.statusText }));
-      throw new Error(error.error || 'Failed to kill engine');
-    }
-    return response.json();
   }
 }
 
