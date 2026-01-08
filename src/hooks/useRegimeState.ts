@@ -47,7 +47,7 @@ export interface RegimeFilterStats {
 const API_BASE = 'http://localhost:3001';
 
 async function fetchRegimeStates(): Promise<RegimeStatesResponse> {
-  const response = await fetch(`${API_BASE}/api/regime/state`);
+  const response = await fetch(`${API_BASE}/api/regime/status`);
   if (!response.ok) {
     throw new Error('Failed to fetch regime states');
   }
