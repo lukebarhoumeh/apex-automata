@@ -95,7 +95,7 @@ const TradeRow = ({ trade }: { trade: TradeRecord }) => {
 };
 
 export const TradeLogPanel = () => {
-  const { data: trades, isLoading } = useRecentTrades(15);
+  const { data: trades = [], isLoading } = useRecentTrades(15);
 
   const totalPnl = trades.reduce((sum, t) => sum + (t.realizedPnl ?? t.unrealizedPnl), 0);
   const wins = trades.filter(t => t.outcome === 'win').length;
