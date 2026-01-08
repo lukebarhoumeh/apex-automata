@@ -1,7 +1,7 @@
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Power, Pause, Play, AlertTriangle, Ban, Square, PlayCircle } from "lucide-react";
-import { useAccountMetrics } from "@/hooks/useAccountMetrics";
+import { Power, Pause, Play, AlertTriangle, Ban, Square, PlayCircle, Database, Radio, Wifi, WifiOff } from "lucide-react";
+import { useSessionStats } from "@/hooks/useSessionStats";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -20,11 +20,18 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { runtimeClient } from "@/services/runtimeClient";
 import { useRuntimeStatus, useRuntimeHealth } from "@/hooks/useRuntimeStatus";
 import { useToast } from "@/hooks/use-toast";
 import { useState } from "react";
 import { Input } from "@/components/ui/input";
+import { useCalculatedMetrics } from "@/hooks/useCalculatedMetrics";
 
 interface DashboardHeaderProps {
   botState: "paper" | "live" | "paused";
@@ -36,9 +43,13 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   const [isLoading, setIsLoading] = useState(false);
   const [startMode, setStartMode] = useState<'paper' | 'live'>('paper');
   const [liveConfirmText, setLiveConfirmText] = useState('');
-  const { data: metrics } = useAccountMetrics();
+  const { data: metrics } = useCalculatedMetrics();
   const { data: runtimeStatus } = useRuntimeStatus();
   const { data: runtimeHealthy } = useRuntimeHealth();
+  const { data: sessionStats } = useSessionStats();
+
+  // Determine data source: live backend vs Supabase fallback
+  const dataSource = sessionStats ? 'live' : (runtimeStatus?.engineRunning ? 'runtime' : 'fallback');
 
   const formatCurrency = (val: number) => 
     new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0 }).format(val);
@@ -169,7 +180,7 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
         <div className="flex flex-col gap-4">
           {/* Top Row: Branding + Mode + Controls */}
           <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
-            {/* Left: Branding + Mode Badge + Engine Status */}
+            {/* Left: Branding + Mode Badge + Engine Status + Data Source */}
             <div className="flex items-center gap-3">
               <h1 className="text-xl font-bold tracking-tight font-mono">AtlasBot v2</h1>
               {engineRunning ? (
@@ -184,6 +195,52 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
                   STOPPED
                 </Badge>
               )}
+              
+              {/* Data Source Indicator */}
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Badge 
+                      variant="outline" 
+                      className={`font-mono text-xs gap-1 ${
+                        dataSource === 'live' 
+                          ? 'border-success/50 text-success' 
+                          : dataSource === 'runtime'
+                          ? 'border-primary/50 text-primary'
+                          : 'border-muted-foreground/30 text-muted-foreground'
+                      }`}
+                    >
+                      {dataSource === 'live' ? (
+                        <>
+                          <Radio className="h-3 w-3 animate-pulse" />
+                          LIVE
+                        </>
+                      ) : dataSource === 'runtime' ? (
+                        <>
+                          <Wifi className="h-3 w-3" />
+                          RUNTIME
+                        </>
+                      ) : (
+                        <>
+                          <Database className="h-3 w-3" />
+                          DB
+                        </>
+                      )}
+                    </Badge>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" className="font-mono text-xs">
+                    {dataSource === 'live' && (
+                      <p>Metrics from live trading session</p>
+                    )}
+                    {dataSource === 'runtime' && (
+                      <p>Metrics from runtime status API</p>
+                    )}
+                    {dataSource === 'fallback' && (
+                      <p>Metrics from Supabase (historical)</p>
+                    )}
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
             </div>
             
             {/* Right: Controls */}
