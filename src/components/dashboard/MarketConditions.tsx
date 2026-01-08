@@ -19,20 +19,20 @@ export const MarketConditions = () => {
   const confidence = (primarySymbol?.confidence || 0.5) * 100;
 
   const getRegimeBadge = () => {
-    switch (regime) {
-      case 'trend':
-      case 'strong_trend':
-        return <Badge className="bg-success/20 text-success border-success/40">TRENDING</Badge>;
-      case 'weak_trend':
-        return <Badge className="bg-warning/20 text-warning border-warning/40">WEAK TREND</Badge>;
-      case 'ranging':
-        return <Badge className="bg-primary/20 text-primary border-primary/40">RANGING</Badge>;
-      case 'choppy':
-      case 'chop':
-        return <Badge className="bg-muted text-muted-foreground border-muted">CHOPPY</Badge>;
-      default:
-        return <Badge className="bg-muted text-muted-foreground">UNKNOWN</Badge>;
+    const regimeStr = String(regime);
+    if (regimeStr === 'trend' || regimeStr === 'strong_trend') {
+      return <Badge className="bg-success/20 text-success border-success/40">TRENDING</Badge>;
     }
+    if (regimeStr === 'weak_trend') {
+      return <Badge className="bg-warning/20 text-warning border-warning/40">WEAK TREND</Badge>;
+    }
+    if (regimeStr === 'ranging') {
+      return <Badge className="bg-primary/20 text-primary border-primary/40">RANGING</Badge>;
+    }
+    if (regimeStr === 'choppy' || regimeStr === 'chop') {
+      return <Badge className="bg-muted text-muted-foreground border-muted">CHOPPY</Badge>;
+    }
+    return <Badge className="bg-muted text-muted-foreground">UNKNOWN</Badge>;
   };
 
   return (
