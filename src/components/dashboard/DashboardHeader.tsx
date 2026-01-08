@@ -1,6 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Power, Pause, Play, AlertTriangle, Ban, Square, PlayCircle, Database, Radio, Wifi, WifiOff } from "lucide-react";
+import { Power, Pause, Play, AlertTriangle, Ban, Square, PlayCircle, Database, Radio, Wifi, WifiOff, RefreshCw, Plug, PlugZap } from "lucide-react";
 import { useSessionStats } from "@/hooks/useSessionStats";
 import {
   AlertDialog,
@@ -28,6 +28,7 @@ import {
 } from "@/components/ui/tooltip";
 import { runtimeClient } from "@/services/runtimeClient";
 import { useRuntimeStatus, useRuntimeHealth } from "@/hooks/useRuntimeStatus";
+import { useWebSocketEvents } from "@/hooks/useWebSocketEvents";
 import { useToast } from "@/hooks/use-toast";
 import { useState } from "react";
 import { Input } from "@/components/ui/input";
@@ -47,6 +48,12 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   const { data: runtimeStatus } = useRuntimeStatus();
   const { data: runtimeHealthy } = useRuntimeHealth();
   const { data: sessionStats } = useSessionStats();
+  
+  // WebSocket connection state
+  const { isConnected: wsConnected, connectionError: wsError, connect: wsReconnect } = useWebSocketEvents({ 
+    autoConnect: false, // Already connected via provider, just read state
+    showNotifications: false 
+  });
 
   // Determine data source: live backend vs Supabase fallback
   const dataSource = sessionStats ? 'live' : (runtimeStatus?.engineRunning ? 'runtime' : 'fallback');
@@ -292,6 +299,57 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
                   </TooltipProvider>
                 </div>
               )}
+
+              {/* WebSocket Connection Status */}
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <div className="flex items-center gap-1">
+                      <Badge 
+                        variant="outline" 
+                        className={`font-mono text-xs gap-1 cursor-default ${
+                          wsConnected 
+                            ? 'border-success/50 text-success' 
+                            : 'border-destructive/50 text-destructive'
+                        }`}
+                      >
+                        {wsConnected ? (
+                          <>
+                            <PlugZap className="h-3 w-3" />
+                            <span className="hidden sm:inline">WS</span>
+                          </>
+                        ) : (
+                          <>
+                            <Plug className="h-3 w-3" />
+                            <span className="hidden sm:inline">WS</span>
+                          </>
+                        )}
+                      </Badge>
+                      {!wsConnected && (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-6 w-6"
+                          onClick={() => wsReconnect()}
+                        >
+                          <RefreshCw className="h-3 w-3" />
+                        </Button>
+                      )}
+                    </div>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" className="font-mono text-xs max-w-xs">
+                    {wsConnected ? (
+                      <p>WebSocket connected — receiving live events</p>
+                    ) : (
+                      <div>
+                        <p className="font-semibold text-destructive">WebSocket disconnected</p>
+                        {wsError && <p className="text-muted-foreground">{wsError}</p>}
+                        <p className="text-muted-foreground mt-1">Click refresh to reconnect</p>
+                      </div>
+                    )}
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
             </div>
             
             {/* Right: Controls */}
