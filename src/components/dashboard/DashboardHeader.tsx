@@ -241,6 +241,57 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
                   </TooltipContent>
                 </Tooltip>
               </TooltipProvider>
+
+              {/* Latency Indicators - only show when backend is connected */}
+              {runtimeStatus && (
+                <div className="flex items-center gap-2">
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Badge 
+                          variant="outline" 
+                          className={`font-mono text-xs gap-1 ${
+                            (runtimeStatus.wsLatencyMs ?? 0) > 200 
+                              ? 'border-destructive/50 text-destructive' 
+                              : (runtimeStatus.wsLatencyMs ?? 0) > 100
+                              ? 'border-warning/50 text-warning'
+                              : 'border-success/50 text-success'
+                          }`}
+                        >
+                          <span className="text-muted-foreground">WS</span>
+                          {runtimeStatus.wsLatencyMs ?? '--'}ms
+                        </Badge>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom" className="font-mono text-xs">
+                        WebSocket latency to exchange
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Badge 
+                          variant="outline" 
+                          className={`font-mono text-xs gap-1 ${
+                            (runtimeStatus.restLatencyMs ?? 0) > 500 
+                              ? 'border-destructive/50 text-destructive' 
+                              : (runtimeStatus.restLatencyMs ?? 0) > 200
+                              ? 'border-warning/50 text-warning'
+                              : 'border-success/50 text-success'
+                          }`}
+                        >
+                          <span className="text-muted-foreground">REST</span>
+                          {runtimeStatus.restLatencyMs ?? '--'}ms
+                        </Badge>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom" className="font-mono text-xs">
+                        REST API latency to exchange
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+              )}
             </div>
             
             {/* Right: Controls */}
