@@ -44,10 +44,11 @@ export interface RegimeFilterStats {
   compatibilityMatrix: Record<string, Record<string, number>>;
 }
 
-const API_BASE = 'http://localhost:3001';
+const API_BASE = import.meta.env.VITE_RUNTIME_API_URL || 'http://localhost:3001';
 
 async function fetchRegimeStates(): Promise<RegimeStatesResponse> {
-  const response = await fetch(`${API_BASE}/api/regime/status`);
+  // Backend provides the full shape (`states`, `summary`) at /api/regime/state
+  const response = await fetch(`${API_BASE}/api/regime/state`);
   if (!response.ok) {
     throw new Error('Failed to fetch regime states');
   }

@@ -96,7 +96,7 @@ export class SecretManager {
           api_passphrase_iv: encryptedPassphrase?.iv,
           api_passphrase_tag: encryptedPassphrase?.tag,
           updated_at: new Date().toISOString()
-        });
+        }, { onConflict: 'exchange,environment' });
 
       if (error) {
         throw error;

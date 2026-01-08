@@ -9,9 +9,9 @@
     "build:dev": "vite build --mode development",
     "lint": "eslint .",
     "preview": "vite preview",
-    "start": "node start.cjs",
-    "start:unix": "./start.sh",
-    "start:windows": "start.bat",
+    "start": "node start.js",
+    "start:unix": "node start.js",
+    "start:windows": "node start.js",
     "backend": "cd atlas/apps/core-node && pnpm api",
     "backend:build": "cd atlas/apps/core-node && pnpm build",
     "install:all": "pnpm install && cd atlas/apps/core-node && pnpm install"
