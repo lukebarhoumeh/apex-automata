@@ -28,7 +28,7 @@ import {
 } from "@/components/ui/tooltip";
 import { runtimeClient } from "@/services/runtimeClient";
 import { useRuntimeStatus, useRuntimeHealth } from "@/hooks/useRuntimeStatus";
-import { useWebSocketEvents } from "@/hooks/useWebSocketEvents";
+import { useWebSocket } from "@/hooks/useWebSocketEvents";
 import { useToast } from "@/hooks/use-toast";
 import { useState } from "react";
 import { Input } from "@/components/ui/input";
@@ -49,11 +49,8 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   const { data: runtimeHealthy } = useRuntimeHealth();
   const { data: sessionStats } = useSessionStats();
   
-  // WebSocket connection state
-  const { isConnected: wsConnected, connectionError: wsError, connect: wsReconnect } = useWebSocketEvents({ 
-    autoConnect: false, // Already connected via provider, just read state
-    showNotifications: false 
-  });
+  // WebSocket connection state (from context provider)
+  const { isConnected: wsConnected, connectionError: wsError } = useWebSocket();
 
   // Determine data source: live backend vs Supabase fallback
   const dataSource = sessionStats ? 'live' : (runtimeStatus?.engineRunning ? 'runtime' : 'fallback');
@@ -325,16 +322,6 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
                           </>
                         )}
                       </Badge>
-                      {!wsConnected && (
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-6 w-6"
-                          onClick={() => wsReconnect()}
-                        >
-                          <RefreshCw className="h-3 w-3" />
-                        </Button>
-                      )}
                     </div>
                   </TooltipTrigger>
                   <TooltipContent side="bottom" className="font-mono text-xs max-w-xs">
@@ -344,7 +331,7 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
                       <div>
                         <p className="font-semibold text-destructive">WebSocket disconnected</p>
                         {wsError && <p className="text-muted-foreground">{wsError}</p>}
-                        <p className="text-muted-foreground mt-1">Click refresh to reconnect</p>
+                        <p className="text-muted-foreground mt-1">Auto-reconnecting...</p>
                       </div>
                     )}
                   </TooltipContent>
