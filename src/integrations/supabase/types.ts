@@ -149,6 +149,60 @@ export type Database = {
         }
         Relationships: []
       }
+      exchange_credentials: {
+        Row: {
+          api_key_encrypted: string | null
+          api_key_iv: string | null
+          api_key_tag: string | null
+          api_passphrase_encrypted: string | null
+          api_passphrase_iv: string | null
+          api_passphrase_tag: string | null
+          api_secret_encrypted: string | null
+          api_secret_iv: string | null
+          api_secret_tag: string | null
+          created_at: string | null
+          environment: string
+          exchange: string
+          id: string
+          updated_at: string | null
+          user_id: string
+        }
+        Insert: {
+          api_key_encrypted?: string | null
+          api_key_iv?: string | null
+          api_key_tag?: string | null
+          api_passphrase_encrypted?: string | null
+          api_passphrase_iv?: string | null
+          api_passphrase_tag?: string | null
+          api_secret_encrypted?: string | null
+          api_secret_iv?: string | null
+          api_secret_tag?: string | null
+          created_at?: string | null
+          environment?: string
+          exchange: string
+          id?: string
+          updated_at?: string | null
+          user_id: string
+        }
+        Update: {
+          api_key_encrypted?: string | null
+          api_key_iv?: string | null
+          api_key_tag?: string | null
+          api_passphrase_encrypted?: string | null
+          api_passphrase_iv?: string | null
+          api_passphrase_tag?: string | null
+          api_secret_encrypted?: string | null
+          api_secret_iv?: string | null
+          api_secret_tag?: string | null
+          created_at?: string | null
+          environment?: string
+          exchange?: string
+          id?: string
+          updated_at?: string | null
+          user_id?: string
+        }
+        Relationships: []
+      }
       fills: {
         Row: {
           fee_amount: number | null
@@ -849,6 +903,48 @@ export type Database = {
           quote_asset?: string
           symbol?: string
           tick_size?: number
+        }
+        Relationships: []
+      }
+      trading_sessions: {
+        Row: {
+          created_at: string | null
+          ended_at: string | null
+          final_equity: number | null
+          initial_equity: number | null
+          mode: string
+          session_id: string
+          started_at: string | null
+          total_pnl: number | null
+          total_trades: number | null
+          updated_at: string | null
+          user_id: string
+        }
+        Insert: {
+          created_at?: string | null
+          ended_at?: string | null
+          final_equity?: number | null
+          initial_equity?: number | null
+          mode: string
+          session_id: string
+          started_at?: string | null
+          total_pnl?: number | null
+          total_trades?: number | null
+          updated_at?: string | null
+          user_id: string
+        }
+        Update: {
+          created_at?: string | null
+          ended_at?: string | null
+          final_equity?: number | null
+          initial_equity?: number | null
+          mode?: string
+          session_id?: string
+          started_at?: string | null
+          total_pnl?: number | null
+          total_trades?: number | null
+          updated_at?: string | null
+          user_id?: string
         }
         Relationships: []
       }
