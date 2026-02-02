@@ -906,6 +906,135 @@ export type Database = {
         }
         Relationships: []
       }
+      trade_outcomes: {
+        Row: {
+          adx: number | null
+          atr_percent: number | null
+          bb_width: number | null
+          choppiness: number | null
+          cold_streak_active: boolean | null
+          created_at: string | null
+          entry_price: number
+          entry_time: string
+          exit_price: number | null
+          exit_reason: string | null
+          exit_time: string | null
+          fees: number | null
+          hold_duration_seconds: number | null
+          id: string
+          indicators_snapshot: Json
+          initial_risk: number | null
+          max_adverse_excursion: number | null
+          max_favorable_excursion: number | null
+          meta_filter_score: number | null
+          mtf_alignment: number | null
+          outcome_label: string | null
+          outcome_score: number | null
+          pnl_percent: number | null
+          position_multiplier: number | null
+          position_size: number | null
+          r_multiple: number | null
+          realized_pnl: number | null
+          regime: string
+          regime_confidence: number | null
+          session_id: string | null
+          signal_direction: string
+          signal_id: string
+          signal_metadata: Json | null
+          signal_strength: number
+          slippage_bps: number | null
+          strategy: string
+          symbol: string
+          trend_direction: string | null
+          updated_at: string | null
+          volume_ratio: number | null
+        }
+        Insert: {
+          adx?: number | null
+          atr_percent?: number | null
+          bb_width?: number | null
+          choppiness?: number | null
+          cold_streak_active?: boolean | null
+          created_at?: string | null
+          entry_price: number
+          entry_time: string
+          exit_price?: number | null
+          exit_reason?: string | null
+          exit_time?: string | null
+          fees?: number | null
+          hold_duration_seconds?: number | null
+          id?: string
+          indicators_snapshot?: Json
+          initial_risk?: number | null
+          max_adverse_excursion?: number | null
+          max_favorable_excursion?: number | null
+          meta_filter_score?: number | null
+          mtf_alignment?: number | null
+          outcome_label?: string | null
+          outcome_score?: number | null
+          pnl_percent?: number | null
+          position_multiplier?: number | null
+          position_size?: number | null
+          r_multiple?: number | null
+          realized_pnl?: number | null
+          regime: string
+          regime_confidence?: number | null
+          session_id?: string | null
+          signal_direction: string
+          signal_id: string
+          signal_metadata?: Json | null
+          signal_strength: number
+          slippage_bps?: number | null
+          strategy: string
+          symbol: string
+          trend_direction?: string | null
+          updated_at?: string | null
+          volume_ratio?: number | null
+        }
+        Update: {
+          adx?: number | null
+          atr_percent?: number | null
+          bb_width?: number | null
+          choppiness?: number | null
+          cold_streak_active?: boolean | null
+          created_at?: string | null
+          entry_price?: number
+          entry_time?: string
+          exit_price?: number | null
+          exit_reason?: string | null
+          exit_time?: string | null
+          fees?: number | null
+          hold_duration_seconds?: number | null
+          id?: string
+          indicators_snapshot?: Json
+          initial_risk?: number | null
+          max_adverse_excursion?: number | null
+          max_favorable_excursion?: number | null
+          meta_filter_score?: number | null
+          mtf_alignment?: number | null
+          outcome_label?: string | null
+          outcome_score?: number | null
+          pnl_percent?: number | null
+          position_multiplier?: number | null
+          position_size?: number | null
+          r_multiple?: number | null
+          realized_pnl?: number | null
+          regime?: string
+          regime_confidence?: number | null
+          session_id?: string | null
+          signal_direction?: string
+          signal_id?: string
+          signal_metadata?: Json | null
+          signal_strength?: number
+          slippage_bps?: number | null
+          strategy?: string
+          symbol?: string
+          trend_direction?: string | null
+          updated_at?: string | null
+          volume_ratio?: number | null
+        }
+        Relationships: []
+      }
       trading_sessions: {
         Row: {
           created_at: string | null
@@ -971,6 +1100,130 @@ export type Database = {
       }
     }
     Views: {
+      ml_training_data: {
+        Row: {
+          adx: number | null
+          atr_percent: number | null
+          bb_lower: number | null
+          bb_upper: number | null
+          bb_width: number | null
+          choppiness: number | null
+          cold_streak_encoded: number | null
+          ema21: number | null
+          ema9: number | null
+          entry_time: string | null
+          hold_duration_seconds: number | null
+          id: string | null
+          macd: number | null
+          macd_histogram: number | null
+          macd_signal: number | null
+          meta_filter_score: number | null
+          mtf_alignment: number | null
+          outcome_label: string | null
+          outcome_score: number | null
+          pnl_percent: number | null
+          position_multiplier: number | null
+          profitable_binary: number | null
+          r_multiple: number | null
+          regime: string | null
+          regime_confidence: number | null
+          rsi: number | null
+          signal_direction: string | null
+          signal_strength: number | null
+          strategy: string | null
+          symbol: string | null
+          trend_direction_encoded: number | null
+          volume_ratio: number | null
+          vwap: number | null
+        }
+        Insert: {
+          adx?: number | null
+          atr_percent?: number | null
+          bb_lower?: never
+          bb_upper?: never
+          bb_width?: number | null
+          choppiness?: number | null
+          cold_streak_encoded?: never
+          ema21?: never
+          ema9?: never
+          entry_time?: string | null
+          hold_duration_seconds?: number | null
+          id?: string | null
+          macd?: never
+          macd_histogram?: never
+          macd_signal?: never
+          meta_filter_score?: number | null
+          mtf_alignment?: number | null
+          outcome_label?: string | null
+          outcome_score?: number | null
+          pnl_percent?: number | null
+          position_multiplier?: number | null
+          profitable_binary?: never
+          r_multiple?: number | null
+          regime?: string | null
+          regime_confidence?: number | null
+          rsi?: never
+          signal_direction?: string | null
+          signal_strength?: number | null
+          strategy?: string | null
+          symbol?: string | null
+          trend_direction_encoded?: never
+          volume_ratio?: number | null
+          vwap?: never
+        }
+        Update: {
+          adx?: number | null
+          atr_percent?: number | null
+          bb_lower?: never
+          bb_upper?: never
+          bb_width?: number | null
+          choppiness?: number | null
+          cold_streak_encoded?: never
+          ema21?: never
+          ema9?: never
+          entry_time?: string | null
+          hold_duration_seconds?: number | null
+          id?: string | null
+          macd?: never
+          macd_histogram?: never
+          macd_signal?: never
+          meta_filter_score?: number | null
+          mtf_alignment?: number | null
+          outcome_label?: string | null
+          outcome_score?: number | null
+          pnl_percent?: number | null
+          position_multiplier?: number | null
+          profitable_binary?: never
+          r_multiple?: number | null
+          regime?: string | null
+          regime_confidence?: number | null
+          rsi?: never
+          signal_direction?: string | null
+          signal_strength?: number | null
+          strategy?: string | null
+          symbol?: string | null
+          trend_direction_encoded?: never
+          volume_ratio?: number | null
+          vwap?: never
+        }
+        Relationships: []
+      }
+      strategy_regime_performance: {
+        Row: {
+          avg_hold_seconds: number | null
+          avg_meta_score: number | null
+          avg_pnl_percent: number | null
+          avg_r_multiple: number | null
+          avg_signal_strength: number | null
+          losses: number | null
+          regime: string | null
+          strategy: string | null
+          total_trades: number | null
+          win_rate: number | null
+          wins: number | null
+        }
+        Relationships: []
+      }
       v_daily_r: {
         Row: {
           daily_r: number | null
