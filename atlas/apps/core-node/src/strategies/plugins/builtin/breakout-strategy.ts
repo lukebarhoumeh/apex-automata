@@ -222,4 +222,3 @@ export class BreakoutStrategy extends BaseStrategy {
     return signals;
   }
 }
-

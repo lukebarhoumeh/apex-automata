@@ -136,9 +136,6 @@ export class VWAPMeanReversionStrategy extends BaseStrategy {
     const signals: StrategySignal[] = [];
     const { symbol } = context;
     
-    // EARLY DEBUG
-    console.log(`[VWAP_MR_START ${symbol}] entering generateSignals`);
-
     // Get config (with per-symbol overrides) - AGGRESSIVE defaults
     const deviationEntry = this.getConfig<number>('deviationEntry', 0.15, symbol);  // Ultra aggressive
     const minVolume = this.getConfig<number>('minVolume', 0, symbol);
@@ -147,8 +144,6 @@ export class VWAPMeanReversionStrategy extends BaseStrategy {
     const useBollinger = this.getConfig<boolean>('useBollinger', false, symbol);
 
     const { latestCandle, candles, indicators } = context;
-
-    console.log(`[VWAP_MR ${symbol}] useBollinger=${useBollinger} deviationEntry=${deviationEntry}`);
 
     // Volume filter - skip for testing
     // if (latestCandle.volume < minVolume) {
@@ -175,9 +170,7 @@ export class VWAPMeanReversionStrategy extends BaseStrategy {
     } else {
       // Use VWAP
       const vwap = indicators.vwap;
-      console.log(`[VWAP_MR ${symbol}] vwap exists=${!!vwap} length=${vwap?.length || 0}`);
       if (!vwap || vwap.length < 20) {
-        console.log(`[VWAP_MR ${symbol}] EXITING: insufficient vwap data`);
         return signals;
       }
 
@@ -190,9 +183,6 @@ export class VWAPMeanReversionStrategy extends BaseStrategy {
 
       deviation = (latestCandle.close - currentMean) / stdDev;
     }
-
-    // AGGRESSIVE DEBUG: Log every evaluation
-    console.log(`[VWAP_MR ${symbol}] price=${latestCandle.close.toFixed(2)} vwap=${currentMean.toFixed(2)} deviation=${deviation.toFixed(3)} threshold=${deviationEntry}`);
 
     // Check if deviation is too extreme (overextended)
     if (Math.abs(deviation) > maxDeviation) {

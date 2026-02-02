@@ -36,8 +36,8 @@ per_symbol:
         deviationEntry: 0.1       # ULTRA AGGRESSIVE - any small deviation
       momentum:
         atrMultiplier: 2.0
-        rsiOversold: 48           # Very close to neutral
-        rsiOverbought: 52
+        rsiOversold: 45           # Near neutral (must be <= 45)
+        rsiOverbought: 55         # Near neutral (must be >= 55)
   ETH-USD:
     max_notional_usd: 50000  # TESTING: Very high limit
     max_daily_loss_usd: 5000
@@ -50,8 +50,8 @@ per_symbol:
         deviationEntry: 0.1       # ULTRA AGGRESSIVE
       momentum:
         atrMultiplier: 2.0
-        rsiOversold: 48
-        rsiOverbought: 52
+        rsiOversold: 45
+        rsiOverbought: 55
   SOL-USD:
     max_notional_usd: 50000  # TESTING: Very high limit
     max_daily_loss_usd: 5000
@@ -65,8 +65,8 @@ per_symbol:
         maxDeviation: 10.0
       momentum:
         atrMultiplier: 2.5
-        rsiOversold: 48
-        rsiOverbought: 52
+        rsiOversold: 45
+        rsiOverbought: 55
 
 strategy:
   mode: momentum_futures

@@ -121,8 +121,10 @@ export class TradeOutcomeCollector extends EventEmitter {
   private logger: Logger;
   private supabase: SupabaseClient | null = null;
   
-  // Store pending signal contexts (keyed by symbol for now, could be signalId)
+  // Store pending signal contexts keyed by signalId (to avoid symbol collisions).
   private pendingSignals: Map<string, SignalContext> = new Map();
+  // Index pending signalIds by symbol for lookup/debugging.
+  private pendingSignalIdsBySymbol: Map<string, Set<string>> = new Map();
   
   // Statistics
   private stats = {
@@ -213,8 +215,11 @@ export class TradeOutcomeCollector extends EventEmitter {
       metadata: signal.metadata,
     };
 
-    // Store by symbol (overwrite if new signal for same symbol)
-    this.pendingSignals.set(signal.symbol, context);
+    // Store by signalId to avoid overwriting contexts for the same symbol.
+    this.pendingSignals.set(signal.id, context);
+    const symbolSet = this.pendingSignalIdsBySymbol.get(signal.symbol) ?? new Set<string>();
+    symbolSet.add(signal.id);
+    this.pendingSignalIdsBySymbol.set(signal.symbol, symbolSet);
     this.stats.signalsCaptured++;
 
     this.logger.debug('[TradeOutcomeCollector] Signal context captured', {
@@ -232,19 +237,20 @@ export class TradeOutcomeCollector extends EventEmitter {
   public async recordOutcome(position: Position, exitReason?: string): Promise<void> {
     if (!this.config.enabled) return;
 
-    const context = this.pendingSignals.get(position.symbol);
+    const context = this.getContextForPosition(position);
     
     if (!context) {
       this.logger.debug('[TradeOutcomeCollector] No signal context found for closed position', {
         symbol: position.symbol,
         positionId: position.id,
+        signalId: position.signalId,
       });
       return;
     }
 
     // Calculate outcome metrics
-    const holdDuration = position.closeTime 
-      ? Math.floor((position.closeTime.getTime() - context.timestamp.getTime()) / 1000)
+    const holdDuration = position.closedAt 
+      ? Math.floor((position.closedAt.getTime() - context.timestamp.getTime()) / 1000)
       : undefined;
     
     const realizedPnl = position.realizedPnL;
@@ -279,13 +285,19 @@ export class TradeOutcomeCollector extends EventEmitter {
     // Calculate fees
     const fees = position.trades?.reduce((sum, t) => sum + (t.fee || 0), 0) || 0;
 
+    const metadataMfe = position.metadata?.maxFavorableExcursion;
+    const maxFavorableExcursion = typeof metadataMfe === 'number' && Number.isFinite(metadataMfe)
+      ? metadataMfe
+      : undefined;
+    const maxAdverseExcursion = Number.isFinite(position.maxDrawdown) ? position.maxDrawdown : undefined;
+
     // Build record
     const record: TradeOutcomeRecord = {
       signal_id: context.signalId,
       session_id: this.config.sessionId,
       symbol: position.symbol,
       entry_time: context.timestamp.toISOString(),
-      exit_time: position.closeTime?.toISOString(),
+      exit_time: position.closedAt?.toISOString(),
       hold_duration_seconds: holdDuration,
       strategy: context.strategy,
       signal_direction: context.direction,
@@ -309,8 +321,8 @@ export class TradeOutcomeCollector extends EventEmitter {
       exit_reason: exitReason || this.inferExitReason(position, context),
       realized_pnl: realizedPnl,
       pnl_percent: pnlPercent,
-      max_favorable_excursion: position.maxUnrealizedPnL,
-      max_adverse_excursion: position.maxDrawdown,
+      max_favorable_excursion: maxFavorableExcursion,
+      max_adverse_excursion: maxAdverseExcursion,
       outcome_label: outcomeLabel,
       outcome_score: outcomeScore,
       r_multiple: rMultiple,
@@ -324,7 +336,7 @@ export class TradeOutcomeCollector extends EventEmitter {
     await this.writeOutcome(record);
     
     // Remove pending context
-    this.pendingSignals.delete(position.symbol);
+    this.removePendingContext(context.signalId);
     
     this.emit('outcome:recorded', record);
   }
@@ -351,8 +363,13 @@ export class TradeOutcomeCollector extends EventEmitter {
       return 'take_profit';
     }
     
+    const metadataMfe = position.metadata?.maxFavorableExcursion;
+    const maxFavorableExcursion = typeof metadataMfe === 'number' && Number.isFinite(metadataMfe)
+      ? metadataMfe
+      : undefined;
+
     // Check for trailing stop (if we have MFE data)
-    if (position.maxUnrealizedPnL && position.maxUnrealizedPnL > 0 && position.realizedPnL < position.maxUnrealizedPnL * 0.5) {
+    if (Number.isFinite(maxFavorableExcursion) && maxFavorableExcursion > 0 && position.realizedPnL < maxFavorableExcursion * 0.5) {
       return 'trailing_stop';
     }
     
@@ -408,22 +425,22 @@ export class TradeOutcomeCollector extends EventEmitter {
    */
   private cleanupExpiredContexts(): void {
     const now = Date.now();
-    const expiredSymbols: string[] = [];
+    const expiredSignalIds: string[] = [];
 
-    for (const [symbol, context] of this.pendingSignals) {
+    for (const [signalId, context] of this.pendingSignals) {
       if (now - context.timestamp.getTime() > this.config.contextTtlMs) {
-        expiredSymbols.push(symbol);
+        expiredSignalIds.push(signalId);
       }
     }
 
-    for (const symbol of expiredSymbols) {
-      this.pendingSignals.delete(symbol);
+    for (const signalId of expiredSignalIds) {
+      this.removePendingContext(signalId);
       this.stats.signalsExpired++;
     }
 
-    if (expiredSymbols.length > 0) {
+    if (expiredSignalIds.length > 0) {
       this.logger.debug('[TradeOutcomeCollector] Cleaned up expired contexts', {
-        count: expiredSymbols.length,
+        count: expiredSignalIds.length,
       });
     }
   }
@@ -452,7 +469,63 @@ export class TradeOutcomeCollector extends EventEmitter {
    * Get pending signal context for a symbol (for debugging).
    */
   public getPendingContext(symbol: string): SignalContext | undefined {
-    return this.pendingSignals.get(symbol);
+    const ids = this.pendingSignalIdsBySymbol.get(symbol);
+    if (!ids || ids.size === 0) {
+      return undefined;
+    }
+    if (ids.size === 1) {
+      const [onlyId] = ids;
+      return this.pendingSignals.get(onlyId);
+    }
+    // If multiple pending contexts exist for this symbol, return the most recent one.
+    let latest: SignalContext | undefined;
+    for (const id of ids) {
+      const context = this.pendingSignals.get(id);
+      if (!context) continue;
+      if (!latest || context.timestamp > latest.timestamp) {
+        latest = context;
+      }
+    }
+    return latest;
+  }
+
+  private getContextForPosition(position: Position): SignalContext | undefined {
+    if (position.signalId) {
+      return this.pendingSignals.get(position.signalId);
+    }
+
+    const ids = this.pendingSignalIdsBySymbol.get(position.symbol);
+    if (!ids || ids.size === 0) {
+      return undefined;
+    }
+
+    if (ids.size > 1) {
+      this.logger.warn('[TradeOutcomeCollector] Multiple pending contexts for symbol without signalId', {
+        symbol: position.symbol,
+        count: ids.size,
+      });
+      return undefined;
+    }
+
+    const [onlyId] = ids;
+    return this.pendingSignals.get(onlyId);
+  }
+
+  private removePendingContext(signalId: string): void {
+    const context = this.pendingSignals.get(signalId);
+    if (!context) {
+      return;
+    }
+
+    this.pendingSignals.delete(signalId);
+
+    const symbolSet = this.pendingSignalIdsBySymbol.get(context.symbol);
+    if (symbolSet) {
+      symbolSet.delete(signalId);
+      if (symbolSet.size === 0) {
+        this.pendingSignalIdsBySymbol.delete(context.symbol);
+      }
+    }
   }
 
   /**
