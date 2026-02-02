@@ -16,6 +16,7 @@ import { OrderRequest } from '../exchanges/coinbase';
 import { MetricsTracker } from '../trading/metrics-tracker';
 import { SecretManager } from '../config/secrets';
 import { CoinbaseExchange } from '../exchanges/coinbase';
+import { TradeOutcomeCollector } from '../ml/trade-outcome-collector';
 
 const app = express();
 const server = createServer(app);
@@ -139,6 +140,7 @@ const supabase = createClient(
 // Trading engine instance
 let tradingEngine: TradingEngine | null = null;
 let signalProcessor: SignalProcessor | null = null;
+let tradeOutcomeCollector: TradeOutcomeCollector | null = null;
 
 // WebSocket clients
 const wsClients = new Set<any>();
@@ -496,6 +498,18 @@ app.post('/api/engine/start', async (req, res) => {
     tradingEngine.on('position:update', async (position) => {
       broadcast({ type: 'PositionUpdate', payload: position });
       await syncPositionToSupabase(position);
+      
+      // Record outcome for ML training when position is closed
+      if (position.side === 'flat' && tradeOutcomeCollector?.isEnabled()) {
+        try {
+          await tradeOutcomeCollector.recordOutcome(position);
+        } catch (error) {
+          logger.error('Failed to record trade outcome', {
+            positionId: position.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
     });
 
     tradingEngine.on('risk:alert', async (alert) => {
@@ -596,6 +610,27 @@ app.post('/api/engine/start', async (req, res) => {
       }
     });
     
+    // Load per-symbol strategy overrides from guardrails
+    if (guardrails.per_symbol) {
+      signalProcessor.loadPerSymbolOverridesFromGuardrails(guardrails.per_symbol);
+      logger.info('Loaded per-symbol strategy overrides', {
+        symbols: Object.keys(guardrails.per_symbol),
+      });
+    }
+
+    // Initialize trade outcome collector for ML training data
+    tradeOutcomeCollector = new TradeOutcomeCollector({
+      supabaseUrl: env.SUPABASE_URL || '',
+      supabaseKey: env.SUPABASE_SERVICE_KEY || '',
+      sessionId: `session_${Date.now()}`,
+      enabled: true,
+      profitThreshold: 0,
+    }, logger);
+    
+    logger.info('Trade outcome collector initialized', {
+      enabled: tradeOutcomeCollector.isEnabled(),
+    });
+    
     // Listen for warmup events
     signalProcessor.on('warmup:complete', (symbol: string) => {
       logger.info(`Warmup complete for ${symbol}`);
@@ -692,6 +727,45 @@ app.post('/api/engine/start', async (req, res) => {
     signalProcessor.on('signal:generated', async (signal) => {
       logger.info('Signal generated', signal);
       broadcast({ type: 'Signal', payload: signal });
+
+      // Capture signal context for ML training
+      if (tradeOutcomeCollector?.isEnabled()) {
+        const regimeState = signalProcessor!.getRegimeState(signal.symbol);
+        const indicators = signal.metadata?.indicators as Record<string, number> || {};
+        
+        tradeOutcomeCollector.captureSignalContext(
+          {
+            id: signal.id,
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            direction: signal.direction,
+            strength: signal.strength,
+            price: signal.price,
+            stopLoss: signal.stopLoss,
+            takeProfit: signal.takeProfit,
+            timestamp: signal.timestamp,
+            metadata: signal.metadata || {},
+          },
+          regimeState || {
+            regime: 'ranging',
+            confidence: 0.5,
+            adx: 0,
+            atrPercent: 0,
+            bbWidth: 0,
+            choppiness: 0,
+            trendDirection: 'neutral',
+            mtfAlignment: 0,
+            lastUpdate: new Date(),
+          },
+          indicators,
+          {
+            volumeRatio: indicators.volumeRatio,
+            metaFilterScore: signal.metadata?.metaQualityScore as number,
+            coldStreakActive: signal.metadata?.coldStreakActive as boolean,
+            positionMultiplier: signal.metadata?.positionMultiplier as number,
+          }
+        );
+      }
       
       // Store signal in Supabase
       await syncSignalToSupabase(signal);
@@ -880,8 +954,13 @@ app.post('/api/engine/start', async (req, res) => {
     });
 
   } catch (error) {
-    logger.error('Failed to start trading engine:', error);
-    res.status(500).json({ error: 'Failed to start trading engine' });
+    const errorDetails = {
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      name: error instanceof Error ? error.name : typeof error,
+    };
+    logger.error('Failed to start trading engine:', errorDetails);
+    res.status(500).json({ error: 'Failed to start trading engine', details: errorDetails });
   }
 });
 
@@ -1158,13 +1237,13 @@ app.post('/api/config/signals', (req, res) => {
 
 // Get session statistics
 app.get('/api/analytics/session', (req, res) => {
-  if (!tradingEngine) {
+  if (!tradingEngine || !tradingEngine.engineRunning) {
     return res.status(400).json({ error: 'Trading engine not running' });
   }
   
   const stats = tradingEngine.getSessionStats();
   if (!stats) {
-    return res.status(500).json({ error: 'Analytics not available' });
+    return res.status(400).json({ error: 'Analytics not available' });
   }
   
   // Return stats without equity curve (large payload)
@@ -1792,6 +1871,211 @@ app.post('/api/strategies/plugin-mode', (req, res) => {
     success: true, 
     message: `Plugin strategy mode ${enabled ? 'enabled' : 'disabled'}`,
     pluginModeEnabled: signalProcessor.isPluginStrategiesEnabled(),
+  });
+});
+
+// ============ ML Trade Outcome Collector Endpoints ============
+
+// Get outcome collector status and stats
+app.get('/api/ml/outcomes/status', (req, res) => {
+  if (!tradeOutcomeCollector) {
+    return res.status(400).json({ error: 'Trade outcome collector not initialized' });
+  }
+
+  res.json({
+    enabled: tradeOutcomeCollector.isEnabled(),
+    stats: tradeOutcomeCollector.getStats(),
+  });
+});
+
+// Get pending signal contexts (for debugging)
+app.get('/api/ml/outcomes/pending/:symbol', (req, res) => {
+  if (!tradeOutcomeCollector) {
+    return res.status(400).json({ error: 'Trade outcome collector not initialized' });
+  }
+
+  const { symbol } = req.params;
+  const context = tradeOutcomeCollector.getPendingContext(symbol);
+
+  if (!context) {
+    return res.status(404).json({ error: `No pending context for ${symbol}` });
+  }
+
+  res.json({ symbol, context });
+});
+
+// ============ Signal Arbiter Endpoints ============
+
+// Get arbiter status and stats
+app.get('/api/arbiter/status', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const arbiter = signalProcessor.getSignalArbiter();
+  
+  res.json({
+    enabled: signalProcessor.isArbiterEnabled(),
+    config: arbiter.getConfig(),
+    stats: arbiter.getStats(),
+    symbolStates: arbiter.getAllSymbolStates(),
+  });
+});
+
+// Enable/disable arbiter
+app.post('/api/arbiter/toggle', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { enabled } = req.body;
+  
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+
+  signalProcessor.setArbiterEnabled(enabled);
+  
+  res.json({
+    success: true,
+    enabled: signalProcessor.isArbiterEnabled(),
+  });
+});
+
+// Update arbiter configuration
+app.post('/api/arbiter/config', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const config = req.body;
+  
+  if (!config || typeof config !== 'object') {
+    return res.status(400).json({ error: 'Request body must be a config object' });
+  }
+
+  signalProcessor.updateArbiterConfig(config);
+  
+  const arbiter = signalProcessor.getSignalArbiter();
+  res.json({
+    success: true,
+    config: arbiter.getConfig(),
+  });
+});
+
+// Reset cooldown for a symbol
+app.post('/api/arbiter/reset-cooldown/:symbol', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { symbol } = req.params;
+  signalProcessor.resetArbiterCooldown(symbol);
+  
+  res.json({
+    success: true,
+    message: `Cooldown reset for ${symbol}`,
+  });
+});
+
+// Clear all arbiter state
+app.post('/api/arbiter/clear', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  signalProcessor.clearArbiterState();
+  
+  res.json({
+    success: true,
+    message: 'All arbiter state cleared',
+  });
+});
+
+// ============ Per-Symbol Strategy Override Endpoints ============
+
+// Get all per-symbol overrides for all strategies
+app.get('/api/strategies/symbol-overrides', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const overrides = signalProcessor.getAllSymbolOverrides();
+  res.json({ overrides });
+});
+
+// Get effective config for a strategy on a specific symbol
+app.get('/api/strategies/:strategyId/effective-config/:symbol', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { strategyId, symbol } = req.params;
+  const effectiveConfig = signalProcessor.getEffectiveStrategyConfig(strategyId, symbol);
+
+  if (!effectiveConfig) {
+    return res.status(404).json({ error: `Strategy ${strategyId} not found` });
+  }
+
+  res.json({
+    strategyId,
+    symbol,
+    effectiveConfig,
+  });
+});
+
+// Set per-symbol overrides for a specific strategy
+app.post('/api/strategies/:strategyId/symbol-overrides/:symbol', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { strategyId, symbol } = req.params;
+  const overrides = req.body;
+
+  if (!overrides || typeof overrides !== 'object') {
+    return res.status(400).json({ error: 'Request body must be an object with parameter overrides' });
+  }
+
+  const success = signalProcessor.setStrategySymbolOverrides(strategyId, symbol, overrides);
+
+  if (!success) {
+    return res.status(404).json({ error: `Strategy ${strategyId} not found or not a BaseStrategy` });
+  }
+
+  // Get the new effective config to return
+  const effectiveConfig = signalProcessor.getEffectiveStrategyConfig(strategyId, symbol);
+
+  res.json({
+    success: true,
+    message: `Updated overrides for ${strategyId} on ${symbol}`,
+    strategyId,
+    symbol,
+    appliedOverrides: overrides,
+    effectiveConfig,
+  });
+});
+
+// Bulk update per-symbol overrides for multiple strategies/symbols
+app.post('/api/strategies/symbol-overrides/bulk', (req, res) => {
+  if (!signalProcessor) {
+    return res.status(400).json({ error: 'Signal processor not running' });
+  }
+
+  const { overrides } = req.body;
+
+  if (!overrides || typeof overrides !== 'object') {
+    return res.status(400).json({ 
+      error: 'Request body must have "overrides" object with format: { symbol: { strategyId: { params } } }' 
+    });
+  }
+
+  signalProcessor.loadPerSymbolOverrides(overrides);
+
+  res.json({
+    success: true,
+    message: 'Bulk updated per-symbol strategy overrides',
+    symbols: Object.keys(overrides),
   });
 });
 

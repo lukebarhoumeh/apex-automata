@@ -49,8 +49,9 @@ const STARTUP_GRACE_PERIOD_MS = 60_000; // 60 seconds
 
 // Environment-specific data gap thresholds (in seconds)
 const DATA_GAP_THRESHOLDS: Record<string, number> = {
-  sandbox: 30,    // More lenient for sandbox/dev
-  production: 2,  // Strict for live trading
+  sandbox: 60,    // Very lenient for sandbox/dev
+  paper: 30,      // Lenient for paper trading (brief gaps are normal)
+  production: 10, // Strict for live trading, but allow brief jitter
 };
 
 export class TradingEngine extends EventEmitter {
@@ -217,7 +218,6 @@ export class TradingEngine extends EventEmitter {
       
       if (this.tradeAnalytics) {
         await this.tradeAnalytics.stop();
-        this.tradeAnalytics = null;
       }
 
       if (this.dataGapMonitor) {
@@ -381,7 +381,9 @@ export class TradingEngine extends EventEmitter {
     const guardrails = this.config.guardrails;
     const accountEquity = guardrails.account.equity_usd;
     const maxPositionSizeUsd = accountEquity * guardrails.risk.max_position_exposure_pct;
-    const maxTotalExposureUsd = accountEquity * guardrails.account.max_account_leverage;
+    const maxTotalExposureUsd = this.config.mode === 'paper'
+      ? accountEquity
+      : accountEquity * guardrails.account.max_account_leverage;
     const maxDailyLossUsd = Math.abs(guardrails.risk.daily_loss_limit) * accountEquity;
     const maxDrawdownPercent = Math.abs(guardrails.risk.max_drawdown_limit) * 100;
     const minOrderUsd = accountEquity * guardrails.account.risk_per_trade * guardrails.account.min_notional_buffer;
@@ -404,6 +406,7 @@ export class TradingEngine extends EventEmitter {
       supabaseUrl: this.config.supabase.url,
       supabaseKey: this.config.supabase.serviceKey,
       userId: this.config.supabase.userId,
+      ignorePersistedKillSwitch: this.config.mode === 'paper',
       limits: {
         maxPositionSize: maxPositionSizeUsd,
         maxTotalExposure: maxTotalExposureUsd,
@@ -412,13 +415,13 @@ export class TradingEngine extends EventEmitter {
         maxOrderSize: maxPositionSizeUsd,
         minOrderSize: minOrderUsd,
         maxOpenOrders: guardrails.account.max_open_positions,
-        maxLeverage: guardrails.account.max_account_leverage
+        maxLeverage: this.config.mode === 'paper' ? 1 : guardrails.account.max_account_leverage
       },
       killSwitches: {
         enabled: true,
         dailyLossLimit: maxDailyLossUsd,
         consecutiveLossLimit: 5,     // 5 losses in a row
-        errorRateLimit: 20,          // 20% error rate
+        errorRateLimit: this.config.mode === 'paper' ? 101 : 20, // Effectively disabled in paper mode
         latencyLimit: guardrails.circuit_breakers.data_gap_sec * 1000
       },
       riskPerTrade: guardrails.account.risk_per_trade * 100,
@@ -839,6 +842,8 @@ export class TradingEngine extends EventEmitter {
       if (this.config.mode === 'paper' && this.paperSimulator) {
         this.logger.info('Paper trading mode - simulating order execution');
         
+        let managedOrder: ManagedOrder | null = null;
+
         try {
           if (!this.orderManager) {
             throw new Error('OrderManager not initialized');
@@ -847,7 +852,7 @@ export class TradingEngine extends EventEmitter {
           // Create/track the order BEFORE simulating execution so immediate fills can be matched
           const clientOrderId = uuidv4();
           const parsedSize = request.size ? parseFloat(request.size) : 0;
-          const managedOrder: ManagedOrder = {
+          managedOrder = {
             id: clientOrderId,
             clientOrderId,
             exchangeOrderId: undefined,
@@ -905,7 +910,36 @@ export class TradingEngine extends EventEmitter {
           
           return managedOrder;
         } catch (error) {
-          this.logger.error('Paper order failed:', error);
+          const reason = error instanceof Error ? error.message : String(error);
+          const normalized = reason.toLowerCase();
+          const isValidationError =
+            normalized.includes('insufficient') ||
+            normalized.includes('order size must be greater than zero') ||
+            normalized.includes('invalid order size');
+
+          if (managedOrder) {
+            managedOrder.status = 'rejected';
+            managedOrder.updatedAt = new Date();
+          }
+
+          if (this.orderManager) {
+            const activeOrders = this.orderManager.getActiveOrders();
+            this.riskEngine!.updateOpenOrderCount(activeOrders.length);
+          }
+
+          if (isValidationError) {
+            this.logger.warn('Paper order rejected', {
+              reason,
+              productId: request.product_id,
+              side: request.side,
+              size: request.size,
+              price: request.price ?? null,
+            });
+            return null;
+          }
+
+          const errorDetails = error instanceof Error ? { message: error.message, stack: error.stack } : error;
+          this.logger.error('Paper order failed:', errorDetails);
           throw error;
         }
       }

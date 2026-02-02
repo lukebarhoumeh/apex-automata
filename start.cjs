@@ -24,6 +24,8 @@ const colors = {
 const isWindows = os.platform() === 'win32';
 const npmCmd = isWindows ? 'npm.cmd' : 'npm';
 const pnpmCmd = isWindows ? 'pnpm.cmd' : 'pnpm';
+const frontendPort = Number(process.env.FRONTEND_PORT || process.env.VITE_PORT || 8080);
+const frontendUrl = `http://localhost:${frontendPort}`;
 
 // Process tracking
 let backendProcess = null;
@@ -226,7 +228,7 @@ function cleanup() {
   // Kill processes on ports
   Promise.all([
     killPort(3001),
-    killPort(5173),
+    killPort(frontendPort),
   ]).then(() => {
     log.success('AtlasBot stopped');
     process.exit(0);
@@ -260,7 +262,7 @@ async function start() {
     // Free ports
     log.info('Checking ports...');
     await killPort(3001);
-    await killPort(5173);
+    await killPort(frontendPort);
     
     // Start backend
     log.info('Starting backend API...');
@@ -278,13 +280,13 @@ async function start() {
     frontendProcess = startProcess(pnpmCmd, ['dev'], __dirname, 'frontend.log');
     
     // Wait for frontend
-    await waitForService('http://localhost:5173', 'Frontend');
+    await waitForService(frontendUrl, 'Frontend');
     
     // Success!
     console.log('\n' + colors.green + '═'.repeat(60) + colors.reset);
     console.log(colors.green + '  🎉 AtlasBot v2 is running!' + colors.reset);
     console.log(colors.green + '═'.repeat(60) + colors.reset);
-    console.log('\n  📊 Frontend:   http://localhost:5173');
+    console.log(`\n  📊 Frontend:   ${frontendUrl}`);
     console.log('  🔧 Backend:    http://localhost:3001');
     console.log('  📝 API Health: http://localhost:3001/health');
     console.log('  📈 Status:     http://localhost:3001/api/status');

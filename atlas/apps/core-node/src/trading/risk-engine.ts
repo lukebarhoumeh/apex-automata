@@ -26,6 +26,11 @@ export interface RiskEngineConfig {
   supabaseUrl: string;
   supabaseKey: string;
   userId?: string;
+  /**
+   * If true, ignore any persisted kill switch state on startup.
+   * Useful for paper mode where sessions should start clean.
+   */
+  ignorePersistedKillSwitch?: boolean;
   limits: {
     maxPositionSize: number;        // Max USD value per position
     maxTotalExposure: number;       // Max total USD exposure
@@ -315,6 +320,15 @@ export class RiskEngine extends EventEmitter {
             consecutiveLosses: this.metrics.consecutiveLosses,
             killSwitchActive: this.killSwitchActive,
           });
+        }
+
+        if (this.config.ignorePersistedKillSwitch) {
+          if (this.metrics.killSwitchActive) {
+            this.logger.warn('Ignoring persisted kill switch state for current session');
+          }
+          this.metrics.killSwitchActive = false;
+          this.killSwitchActive = false;
+          this.metrics.errorRate = 0;
         }
       }
       
@@ -802,9 +816,10 @@ export class RiskEngine extends EventEmitter {
       return 0;
     }
 
-    // Cap by max exposure
+    // Cap by max exposure (with 2% safety margin to avoid rounding issues)
     const exposureCapUsd = soft ? this.scaleUsd(this.maxPositionExposureUsd, soft.maxPositionSizeMultiplier) : this.maxPositionExposureUsd;
-    const maxSizeByExposure = exposureCapUsd / entryPrice;
+    const safeExposureCapUsd = exposureCapUsd * 0.98;  // 2% safety margin
+    const maxSizeByExposure = safeExposureCapUsd / entryPrice;
     if (Number.isFinite(maxSizeByExposure)) {
       size = Math.min(size, maxSizeByExposure);
     }
