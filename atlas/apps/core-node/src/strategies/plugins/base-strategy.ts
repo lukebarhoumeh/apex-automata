@@ -17,6 +17,7 @@ import {
   ConfigParameter,
   RegimeCompatibility,
   IndicatorRequirement,
+  PerSymbolOverrides,
 } from './types';
 import { MarketRegime } from '../regime-detector';
 
@@ -36,6 +37,9 @@ export abstract class BaseStrategy implements StrategyPlugin {
   // ============ State ============
   enabled: boolean = true;
   config: Record<string, unknown> = {};
+  
+  // Per-symbol parameter overrides (e.g., BTC-USD gets different ATR multiplier than SOL-USD)
+  protected perSymbolOverrides: PerSymbolOverrides = {};
   
   // Statistics
   protected stats = {
@@ -136,10 +140,26 @@ export abstract class BaseStrategy implements StrategyPlugin {
   }
 
   /**
-   * Get a typed config value.
+   * Get a typed config value, with optional per-symbol override.
+   * 
+   * Priority order:
+   * 1. Per-symbol override (if symbol provided and override exists)
+   * 2. Global config value
+   * 3. Default value
+   * 
+   * @param key - Configuration parameter key
+   * @param defaultValue - Fallback value if not configured
+   * @param symbol - Optional symbol for per-symbol overrides (e.g., 'BTC-USD')
    */
-  protected getConfig<T>(key: string, defaultValue: T): T {
+  protected getConfig<T>(key: string, defaultValue: T, symbol?: string): T {
     this.ensureInitialized();
+    
+    // Check per-symbol override first
+    if (symbol && this.perSymbolOverrides[symbol]?.[key] !== undefined) {
+      return this.perSymbolOverrides[symbol][key] as T;
+    }
+    
+    // Fall back to global config
     const value = this.config[key];
     return value !== undefined ? (value as T) : defaultValue;
   }
@@ -284,6 +304,84 @@ export abstract class BaseStrategy implements StrategyPlugin {
 
   onConfigUpdate?(newConfig: Record<string, unknown>): void;
 
+  // ============ Per-Symbol Override Management ============
+
+  /**
+   * Set per-symbol parameter overrides.
+   * These take priority over global config when generating signals for that symbol.
+   * 
+   * @param symbol - Trading pair (e.g., 'BTC-USD')
+   * @param overrides - Parameter overrides for this symbol
+   */
+  public setSymbolOverrides(symbol: string, overrides: Record<string, unknown>): void {
+    // Validate each override against schema
+    const validatedOverrides: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(overrides)) {
+      const param = this.configSchema.parameters.find(p => p.key === key);
+      if (param && this.validateParam(param, value)) {
+        validatedOverrides[key] = value;
+      }
+    }
+    
+    this.perSymbolOverrides[symbol] = {
+      ...this.perSymbolOverrides[symbol],
+      ...validatedOverrides,
+    };
+  }
+
+  /**
+   * Get per-symbol overrides for a specific symbol.
+   */
+  public getSymbolOverrides(symbol: string): Record<string, unknown> | undefined {
+    return this.perSymbolOverrides[symbol];
+  }
+
+  /**
+   * Get all per-symbol overrides.
+   */
+  public getAllSymbolOverrides(): PerSymbolOverrides {
+    return { ...this.perSymbolOverrides };
+  }
+
+  /**
+   * Clear per-symbol overrides for a specific symbol.
+   */
+  public clearSymbolOverrides(symbol: string): void {
+    delete this.perSymbolOverrides[symbol];
+  }
+
+  /**
+   * Clear all per-symbol overrides.
+   */
+  public clearAllSymbolOverrides(): void {
+    this.perSymbolOverrides = {};
+  }
+
+  /**
+   * Load per-symbol overrides from configuration object.
+   * Typically called during initialization with guardrails config.
+   */
+  public loadSymbolOverrides(overrides: PerSymbolOverrides): void {
+    for (const [symbol, symbolOverrides] of Object.entries(overrides)) {
+      this.setSymbolOverrides(symbol, symbolOverrides);
+    }
+  }
+
+  /**
+   * Get effective config for a specific symbol (merged global + overrides).
+   * Useful for debugging and UI display.
+   */
+  public getEffectiveConfig(symbol: string): Record<string, unknown> {
+    this.ensureInitialized();
+    const effective: Record<string, unknown> = { ...this.config };
+    
+    if (this.perSymbolOverrides[symbol]) {
+      Object.assign(effective, this.perSymbolOverrides[symbol]);
+    }
+    
+    return effective;
+  }
+
   // ============ Introspection ============
 
   getState(): Record<string, unknown> {
@@ -291,6 +389,7 @@ export abstract class BaseStrategy implements StrategyPlugin {
       id: this.id,
       enabled: this.enabled,
       config: { ...this.config },
+      perSymbolOverrides: { ...this.perSymbolOverrides },
     };
   }
 

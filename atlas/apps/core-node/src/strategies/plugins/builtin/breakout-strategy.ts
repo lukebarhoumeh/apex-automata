@@ -43,7 +43,7 @@ export class BreakoutStrategy extends BaseStrategy {
         name: 'Donchian Period',
         description: 'Lookback period for Donchian channel highs/lows',
         type: 'number',
-        default: 20,
+        default: 10,  // AGGRESSIVE: Shortened from 20 to catch more breakouts
         min: 5,
         max: 100,
       },
@@ -71,8 +71,8 @@ export class BreakoutStrategy extends BaseStrategy {
         name: 'Volume Threshold',
         description: 'Minimum volume ratio (vs 20-period average) required for breakout',
         type: 'number',
-        default: 1.1,
-        min: 0.5,
+        default: 0.5,  // AGGRESSIVE: Lowered from 1.1 to allow breakouts without volume confirm
+        min: 0.1,
         max: 3.0,
         step: 0.1,
       },
@@ -91,7 +91,7 @@ export class BreakoutStrategy extends BaseStrategy {
         name: 'Confirm With Close',
         description: 'Require candle to close beyond channel (vs just breaking intrabar)',
         type: 'boolean',
-        default: true,
+        default: false,  // AGGRESSIVE: Don't require close confirmation
       },
     ],
   };
@@ -124,20 +124,21 @@ export class BreakoutStrategy extends BaseStrategy {
     },
     { 
       regime: 'choppy', 
-      compatibility: 'incompatible', 
-      positionMultiplier: 0.0,
-      notes: 'Avoid breakouts in choppy markets - too many fakeouts',
+      compatibility: 'neutral',  // Changed from incompatible to allow signals with reduced size
+      positionMultiplier: 0.25,
+      notes: 'High fakeout risk in choppy markets - use minimal size',
     },
   ];
 
   generateSignals(context: MarketContext): StrategySignal[] {
     const signals: StrategySignal[] = [];
+    const { symbol } = context;
     
-    // Get config values
-    const volumeThreshold = this.getConfig<number>('volumeThreshold', 1.1);
-    const atrMultiplier = this.getConfig<number>('atrMultiplier', 2.0);
-    const targetMultiplier = this.getConfig<number>('targetMultiplier', 2.0);
-    const period = this.getConfig<number>('period', 20);
+    // Get config values (with per-symbol overrides) - AGGRESSIVE defaults
+    const volumeThreshold = this.getConfig<number>('volumeThreshold', 0.5, symbol);  // Very low
+    const atrMultiplier = this.getConfig<number>('atrMultiplier', 2.0, symbol);
+    const targetMultiplier = this.getConfig<number>('targetMultiplier', 2.0, symbol);
+    const period = this.getConfig<number>('period', 10, symbol);  // Shorter period
 
     // Get indicator values
     const donchianUpper = context.indicators.donchianUpper;
@@ -162,15 +163,16 @@ export class BreakoutStrategy extends BaseStrategy {
 
     const { latestCandle } = context;
 
-    // Volume filter
-    const volumeRatio = latestCandle.volume / avgVolume;
-    if (!Number.isFinite(volumeRatio) || volumeRatio < volumeThreshold) {
-      return signals; // No signal if volume too low
-    }
-
+    // Volume filter - AGGRESSIVE: Skip volume check entirely for testing
+    const volumeRatio = latestCandle.volume / (avgVolume || 1);
+    // REMOVED: Volume threshold check to allow ALL breakouts
+    
     // Calculate stop/target distances
     const stopDistance = currentATR * atrMultiplier;
     const targetDistance = stopDistance * targetMultiplier;
+
+    // AGGRESSIVE DEBUG: Log every evaluation
+    console.log(`[BREAKOUT ${symbol}] close=${latestCandle.close.toFixed(2)} upper=${prevUpper.toFixed(2)} lower=${prevLower.toFixed(2)} gap_up=${(latestCandle.close - prevUpper).toFixed(2)} gap_down=${(prevLower - latestCandle.close).toFixed(2)}`);
 
     // Check for bullish breakout (price closes above previous high)
     if (latestCandle.close > prevUpper) {

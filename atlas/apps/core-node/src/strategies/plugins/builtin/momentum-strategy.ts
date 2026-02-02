@@ -53,8 +53,8 @@ export class MomentumStrategy extends BaseStrategy {
         name: 'RSI Overbought',
         description: 'RSI level considered overbought (sell signal)',
         type: 'number',
-        default: 70,
-        min: 60,
+        default: 60,  // AGGRESSIVE: Lowered from 70 to trigger more sell signals
+        min: 55,
         max: 90,
       },
       {
@@ -62,9 +62,9 @@ export class MomentumStrategy extends BaseStrategy {
         name: 'RSI Oversold',
         description: 'RSI level considered oversold (buy signal)',
         type: 'number',
-        default: 30,
+        default: 40,  // AGGRESSIVE: Raised from 30 to trigger more buy signals
         min: 10,
-        max: 40,
+        max: 45,
       },
       {
         key: 'macdFast',
@@ -98,7 +98,7 @@ export class MomentumStrategy extends BaseStrategy {
         name: 'Require MACD Confirmation',
         description: 'Require MACD histogram to confirm direction',
         type: 'boolean',
-        default: true,
+        default: false,  // AGGRESSIVE: Disabled to allow more signals
       },
       {
         key: 'requireMacdCrossover',
@@ -167,14 +167,15 @@ export class MomentumStrategy extends BaseStrategy {
 
   generateSignals(context: MarketContext): StrategySignal[] {
     const signals: StrategySignal[] = [];
+    const { symbol } = context;
 
-    // Get config
-    const rsiOversold = this.getConfig<number>('rsiOversold', 30);
-    const rsiOverbought = this.getConfig<number>('rsiOverbought', 70);
-    const requireMacdConfirm = this.getConfig<boolean>('requireMacdConfirm', true);
-    const requireMacdCrossover = this.getConfig<boolean>('requireMacdCrossover', false);
-    const atrMultiplier = this.getConfig<number>('atrMultiplier', 2.0);
-    const targetMultiplier = this.getConfig<number>('targetMultiplier', 2.0);
+    // Get config (with per-symbol overrides) - AGGRESSIVE defaults
+    const rsiOversold = this.getConfig<number>('rsiOversold', 45, symbol);  // Raised from 30
+    const rsiOverbought = this.getConfig<number>('rsiOverbought', 55, symbol);  // Lowered from 70
+    const requireMacdConfirm = this.getConfig<boolean>('requireMacdConfirm', false, symbol);  // Disabled
+    const requireMacdCrossover = this.getConfig<boolean>('requireMacdCrossover', false, symbol);
+    const atrMultiplier = this.getConfig<number>('atrMultiplier', 2.0, symbol);
+    const targetMultiplier = this.getConfig<number>('targetMultiplier', 2.0, symbol);
 
     const { indicators } = context;
 

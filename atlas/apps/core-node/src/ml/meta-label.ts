@@ -84,9 +84,19 @@ export class MetaLabel {
     this.logger = logger;
     
     if (config.enabled) {
-      this.loadModel().catch(err => {
-        this.logger.error('Failed to load meta-label model:', err);
-      });
+      if (!config.modelPath) {
+        this.logger.warn(
+          '⚠️  ML Meta-Label enabled but no modelPath configured. ' +
+          'ML filtering will be DISABLED (signals pass through with neutral score 0.5). ' +
+          'To enable: train a model and set metaLabeling.modelPath in config.'
+        );
+      } else {
+        this.loadModel().catch(err => {
+          this.logger.error('Failed to load meta-label model:', err);
+        });
+      }
+    } else {
+      this.logger.info('ML Meta-Label filtering is disabled (rule-based MetaFilter is still active)');
     }
   }
 
@@ -102,7 +112,13 @@ export class MetaLabel {
     const fullPath = path.resolve(this.config.modelPath);
     
     if (!fs.existsSync(fullPath)) {
-      this.logger.warn(`Meta-label model not found at ${fullPath}`);
+      this.logger.warn(
+        `⚠️  Meta-label ONNX model not found at: ${fullPath}\n` +
+        '   ML signal filtering will be DISABLED. To enable:\n' +
+        '   1. Collect trade outcomes via the trade_outcomes table\n' +
+        '   2. Train a classifier (see docs/ml-training.md)\n' +
+        '   3. Export to ONNX and place at the configured path'
+      );
       return;
     }
 

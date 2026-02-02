@@ -44,10 +44,10 @@ export class VWAPMeanReversionStrategy extends BaseStrategy {
         name: 'Entry Deviation',
         description: 'Number of standard deviations from VWAP required for entry',
         type: 'number',
-        default: 2.0,
-        min: 1.0,
+        default: 0.15,  // ULTRA AGGRESSIVE: Trigger on any small deviation
+        min: 0.1,
         max: 4.0,
-        step: 0.1,
+        step: 0.05,
       },
       {
         key: 'deviationExit',
@@ -99,8 +99,9 @@ export class VWAPMeanReversionStrategy extends BaseStrategy {
 
   readonly requiredIndicators: IndicatorRequirement[] = [
     { name: 'vwap', required: true, description: 'Volume-Weighted Average Price' },
-    { name: 'bbUpper', required: false, description: 'Bollinger Band upper (optional)' },
-    { name: 'bbLower', required: false, description: 'Bollinger Band lower (optional)' },
+    { name: 'bbUpper', required: false, description: 'Bollinger Band upper (optional, used when useBollinger=true)' },
+    { name: 'bbMiddle', required: false, description: 'Bollinger Band middle/SMA (optional, used when useBollinger=true)' },
+    { name: 'bbLower', required: false, description: 'Bollinger Band lower (optional, used when useBollinger=true)' },
     { name: 'atr', required: true, description: 'ATR for stop calculation' },
   ];
 
@@ -133,20 +134,26 @@ export class VWAPMeanReversionStrategy extends BaseStrategy {
 
   generateSignals(context: MarketContext): StrategySignal[] {
     const signals: StrategySignal[] = [];
+    const { symbol } = context;
+    
+    // EARLY DEBUG
+    console.log(`[VWAP_MR_START ${symbol}] entering generateSignals`);
 
-    // Get config
-    const deviationEntry = this.getConfig<number>('deviationEntry', 2.0);
-    const minVolume = this.getConfig<number>('minVolume', 0);
-    const stopMultiplier = this.getConfig<number>('stopMultiplier', 1.0);
-    const maxDeviation = this.getConfig<number>('maxDeviation', 4.0);
-    const useBollinger = this.getConfig<boolean>('useBollinger', false);
+    // Get config (with per-symbol overrides) - AGGRESSIVE defaults
+    const deviationEntry = this.getConfig<number>('deviationEntry', 0.15, symbol);  // Ultra aggressive
+    const minVolume = this.getConfig<number>('minVolume', 0, symbol);
+    const stopMultiplier = this.getConfig<number>('stopMultiplier', 1.0, symbol);
+    const maxDeviation = this.getConfig<number>('maxDeviation', 4.0, symbol);
+    const useBollinger = this.getConfig<boolean>('useBollinger', false, symbol);
 
     const { latestCandle, candles, indicators } = context;
 
-    // Volume filter
-    if (latestCandle.volume < minVolume) {
-      return signals;
-    }
+    console.log(`[VWAP_MR ${symbol}] useBollinger=${useBollinger} deviationEntry=${deviationEntry}`);
+
+    // Volume filter - skip for testing
+    // if (latestCandle.volume < minVolume) {
+    //   return signals;
+    // }
 
     let deviation: number;
     let currentMean: number;
@@ -168,7 +175,9 @@ export class VWAPMeanReversionStrategy extends BaseStrategy {
     } else {
       // Use VWAP
       const vwap = indicators.vwap;
+      console.log(`[VWAP_MR ${symbol}] vwap exists=${!!vwap} length=${vwap?.length || 0}`);
       if (!vwap || vwap.length < 20) {
+        console.log(`[VWAP_MR ${symbol}] EXITING: insufficient vwap data`);
         return signals;
       }
 
@@ -181,6 +190,9 @@ export class VWAPMeanReversionStrategy extends BaseStrategy {
 
       deviation = (latestCandle.close - currentMean) / stdDev;
     }
+
+    // AGGRESSIVE DEBUG: Log every evaluation
+    console.log(`[VWAP_MR ${symbol}] price=${latestCandle.close.toFixed(2)} vwap=${currentMean.toFixed(2)} deviation=${deviation.toFixed(3)} threshold=${deviationEntry}`);
 
     // Check if deviation is too extreme (overextended)
     if (Math.abs(deviation) > maxDeviation) {

@@ -46,13 +46,16 @@ const positionSizeMultiplierGauge = new Gauge({
 });
 
 // Strategy type classification
-export type StrategyType = 'trend_following' | 'mean_reversion' | 'neutral';
+export type StrategyType = 'trend_following' | 'mean_reversion' | 'oscillator' | 'neutral';
 
 // Map strategies to their types
+// Note: 'momentum' uses RSI/MACD oscillators to catch reversals, NOT trend-following
 const STRATEGY_TYPES: Record<string, StrategyType> = {
   'breakout': 'trend_following',
-  'momentum': 'trend_following',
   'trend': 'trend_following',
+  'trend_follow': 'trend_following',  // Higher-timeframe EMA crossover strategy
+  'ema_trend': 'trend_following',
+  'momentum': 'oscillator',           // RSI/MACD reversal strategy
   'vwap_mr': 'mean_reversion',
   'mean_reversion': 'mean_reversion',
   'scalp': 'neutral',
@@ -60,25 +63,30 @@ const STRATEGY_TYPES: Record<string, StrategyType> = {
 };
 
 // Regime-strategy compatibility matrix
+// oscillator = RSI/MACD reversal strategies (works in ranges and weak trends, cautious in strong trends)
 const REGIME_STRATEGY_COMPAT: Record<MarketRegime, Record<StrategyType, number>> = {
   'strong_trend': {
     'trend_following': 1.0,   // Full green light
     'mean_reversion': 0.0,    // Block completely
+    'oscillator': 0.5,        // Cautious - RSI can stay overbought/oversold in trends
     'neutral': 0.7,
   },
   'weak_trend': {
     'trend_following': 0.8,   // Proceed with reduced size
     'mean_reversion': 0.3,    // Very cautious
+    'oscillator': 1.0,        // Optimal - oscillators work great in mild trends
     'neutral': 0.6,
   },
   'ranging': {
     'trend_following': 0.3,   // Very cautious - many false breakouts
     'mean_reversion': 1.0,    // Full green light
+    'oscillator': 0.9,        // Near optimal - RSI bounces work well in ranges
     'neutral': 0.7,
   },
   'choppy': {
     'trend_following': 0.0,   // Block - whipsaw city
     'mean_reversion': 0.7,    // Good but be careful
+    'oscillator': 0.4,        // Reduced - false signals in chop
     'neutral': 0.5,
   },
 };
@@ -109,13 +117,13 @@ export interface RegimeFilterConfig {
 
 const DEFAULT_CONFIG: RegimeFilterConfig = {
   enabled: true,
-  minCompatibilityScore: 0.3,
-  counterRegimeStrengthBoost: 0.2,
+  minCompatibilityScore: 0.1,   // AGGRESSIVE: Very low
+  counterRegimeStrengthBoost: 0,  // AGGRESSIVE: No boost required
   maxPositionMultiplier: 1.0,
-  minPositionMultiplier: 0.25,
-  minRegimeConfidence: 0.4,
-  alwaysAllowStrategies: [],
-  requireMTFAlignment: true,
+  minPositionMultiplier: 0.1,   // AGGRESSIVE: Allow smaller positions
+  minRegimeConfidence: 0.1,     // AGGRESSIVE: Low confidence ok
+  alwaysAllowStrategies: ['vwap_mr', 'breakout', 'momentum', 'trend_follow'],  // AGGRESSIVE: Always allow all
+  requireMTFAlignment: false,   // AGGRESSIVE: No MTF required
   mtfAlignmentThreshold: 0.3,
 };
 

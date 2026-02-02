@@ -3,13 +3,22 @@ import path from 'node:path';
 import YAML from 'yaml';
 import { z } from 'zod';
 
-// Per-symbol risk limit configuration
+// Per-strategy parameter overrides (e.g., different ATR multiplier for BTC vs SOL)
+const StrategyOverridesSchema = z.record(
+  z.string(), // strategy id (e.g., 'breakout', 'vwap_mr', 'momentum')
+  z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])) // param key -> value
+).optional();
+
+// Per-symbol risk limit configuration with optional strategy overrides
 const PerSymbolLimitSchema = z.object({
   max_notional_usd: z.number().nonnegative(),
   max_daily_loss_usd: z.number().nonnegative(),
+  // Optional per-symbol strategy parameter overrides
+  strategy_overrides: StrategyOverridesSchema,
 });
 
 export type PerSymbolLimit = z.infer<typeof PerSymbolLimitSchema>;
+export type StrategyOverrides = z.infer<typeof StrategyOverridesSchema>;
 
 const GuardrailsSchema = z.object({
   account: z.object({

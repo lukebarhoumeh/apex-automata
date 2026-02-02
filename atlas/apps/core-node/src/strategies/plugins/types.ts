@@ -242,6 +242,26 @@ export interface StrategyRegistration {
 }
 
 /**
+ * Per-symbol strategy parameter overrides.
+ * Allows different parameter values for different trading pairs.
+ * 
+ * Example:
+ * {
+ *   'BTC-USD': { atrMultiplier: 1.8, volumeThreshold: 1.0 },
+ *   'SOL-USD': { atrMultiplier: 2.5, volumeThreshold: 1.3 }
+ * }
+ */
+export type PerSymbolOverrides = Record<string, Record<string, unknown>>;
+
+/**
+ * Extended strategy configuration with per-symbol support.
+ */
+export interface StrategyConfigWithOverrides extends Record<string, unknown> {
+  /** Per-symbol parameter overrides */
+  perSymbolOverrides?: PerSymbolOverrides;
+}
+
+/**
  * Strategy registry events.
  */
 export interface StrategyRegistryEvents {

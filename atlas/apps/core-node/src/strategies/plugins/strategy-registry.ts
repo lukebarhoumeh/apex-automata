@@ -300,6 +300,13 @@ export class StrategyRegistry extends EventEmitter {
 
       // Generate signals
       const signals = strategy.generateSignals(context);
+      
+      // AGGRESSIVE DEBUG: Log every strategy execution
+      if (signals.length > 0) {
+        this.logger.info(`Strategy ${strategy.id} generated ${signals.length} signal(s)`, { symbol: context.symbol, regime: context.regime.regime });
+      } else {
+        this.logger.debug(`Strategy ${strategy.id} returned 0 signals`, { symbol: context.symbol, regime: context.regime.regime });
+      }
 
       // Record execution time
       const duration = Number(process.hrtime.bigint() - startTime) / 1e9;

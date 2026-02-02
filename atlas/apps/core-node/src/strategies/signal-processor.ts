@@ -13,7 +13,11 @@ import {
   StrategySignal,
   MarketContext,
   createBuiltinStrategies,
+  PerSymbolStrategyOverrides,
+  BaseStrategy,
+  PerSymbolOverrides,
 } from './plugins';
+import { SignalArbiter, SignalArbiterConfig, ArbiterResult } from './signal-arbiter';
 
 export interface SignalProcessorConfig {
   supabaseUrl: string;
@@ -37,6 +41,10 @@ export interface SignalProcessorConfig {
   strategyRegistry?: Partial<StrategyRegistryConfig>;
   // Whether to use the new plugin-based strategy system
   usePluginStrategies?: boolean;
+  // Signal arbiter configuration for deconfliction
+  signalArbiter?: Partial<SignalArbiterConfig>;
+  // Whether to enable signal arbitration (default: true)
+  enableArbiter?: boolean;
 }
 
 export interface BreakoutConfig {
@@ -143,6 +151,10 @@ export class SignalProcessor extends EventEmitter {
   // Strategy plugin registry
   private strategyRegistry: StrategyRegistry;
   private usePluginStrategies: boolean;
+  
+  // Signal arbiter for deconfliction
+  private signalArbiter: SignalArbiter;
+  private enableArbiter: boolean;
 
   constructor(config: SignalProcessorConfig, logger: Logger) {
     super();
@@ -197,6 +209,16 @@ export class SignalProcessor extends EventEmitter {
     });
     this.strategyRegistry.on('strategy:error', (strategyId: string, error: Error) => {
       this.logger.error(`Strategy plugin error (${strategyId}):`, error);
+    });
+
+    // Initialize signal arbiter for deconfliction
+    this.enableArbiter = config.enableArbiter ?? true;
+    this.signalArbiter = new SignalArbiter(config.signalArbiter || {}, logger);
+    
+    // Forward arbiter events
+    this.signalArbiter.on('flip', ({ symbol, from, to }) => {
+      this.logger.info(`[Arbiter] Position flip detected for ${symbol}: ${from} -> ${to}`);
+      this.emit('arbiter:flip', symbol, from, to);
     });
   }
 
@@ -459,7 +481,9 @@ export class SignalProcessor extends EventEmitter {
     const atrPeriod = breakoutCfg?.atrPeriod ?? 14;
     indicators.sma20 = TechnicalIndicators.SMA(closes, 20);
     indicators.sma50 = TechnicalIndicators.SMA(closes, 50);
+    indicators.ema9 = TechnicalIndicators.EMA(closes, 9);   // For trend-follow strategy
     indicators.ema12 = TechnicalIndicators.EMA(closes, 12);
+    indicators.ema21 = TechnicalIndicators.EMA(closes, 21); // For trend-follow strategy
     indicators.ema26 = TechnicalIndicators.EMA(closes, 26);
     indicators.rsi = TechnicalIndicators.RSI(closes, 14);
     
@@ -583,8 +607,35 @@ export class SignalProcessor extends EventEmitter {
     // Generate signals from all enabled strategies
     const signals = this.strategyRegistry.generateSignals(context);
 
-    // Process each generated signal through filters
-    for (const pluginSignal of signals) {
+    // Apply signal arbitration if enabled (deconflict multiple strategies)
+    let signalsToProcess: StrategySignal[] = signals;
+    
+    if (this.enableArbiter && signals.length > 1) {
+      const arbiterResult = this.signalArbiter.arbitrate(signals, regimeState);
+      signalsToProcess = arbiterResult.signals;
+      
+      // Emit event for filtered signals
+      if (arbiterResult.filteredSignals.length > 0) {
+        this.emit('arbiter:filtered', {
+          symbol,
+          reason: arbiterResult.reason,
+          filteredCount: arbiterResult.filteredSignals.length,
+          passedCount: arbiterResult.signals.length,
+          consensusScore: arbiterResult.consensusScore,
+          cooldownActive: arbiterResult.cooldownActive,
+        });
+        
+        this.logger.debug(`[Arbiter] Deconfliction for ${symbol}`, {
+          totalSignals: signals.length,
+          passed: arbiterResult.signals.length,
+          filtered: arbiterResult.filteredSignals.length,
+          reason: arbiterResult.reason,
+        });
+      }
+    }
+
+    // Process each selected signal through filters
+    for (const pluginSignal of signalsToProcess) {
       // Convert plugin signal to processor signal format
       const signal: Signal = {
         id: pluginSignal.id,
@@ -599,6 +650,7 @@ export class SignalProcessor extends EventEmitter {
         metadata: {
           ...pluginSignal.metadata,
           source: 'plugin',
+          arbiterApproved: this.enableArbiter,
         },
       };
 
@@ -1383,5 +1435,178 @@ export class SignalProcessor extends EventEmitter {
   public setPluginStrategiesEnabled(enabled: boolean): void {
     this.usePluginStrategies = enabled;
     this.logger.info(`Plugin strategies ${enabled ? 'enabled' : 'disabled'}`);
+  }
+
+  // ============ Signal Arbiter Public API ============
+
+  /**
+   * Get the signal arbiter instance.
+   */
+  public getSignalArbiter(): SignalArbiter {
+    return this.signalArbiter;
+  }
+
+  /**
+   * Check if signal arbitration is enabled.
+   */
+  public isArbiterEnabled(): boolean {
+    return this.enableArbiter;
+  }
+
+  /**
+   * Enable or disable signal arbitration.
+   */
+  public setArbiterEnabled(enabled: boolean): void {
+    this.enableArbiter = enabled;
+    this.logger.info(`Signal arbiter ${enabled ? 'enabled' : 'disabled'}`);
+  }
+
+  /**
+   * Update arbiter configuration at runtime.
+   */
+  public updateArbiterConfig(config: Partial<SignalArbiterConfig>): void {
+    this.signalArbiter.updateConfig(config);
+  }
+
+  /**
+   * Get arbiter statistics.
+   */
+  public getArbiterStats() {
+    return this.signalArbiter.getStats();
+  }
+
+  /**
+   * Reset arbiter cooldown for a specific symbol.
+   */
+  public resetArbiterCooldown(symbol: string): void {
+    this.signalArbiter.resetCooldown(symbol);
+  }
+
+  /**
+   * Clear all arbiter state.
+   */
+  public clearArbiterState(): void {
+    this.signalArbiter.clearState();
+  }
+
+  // ============ Per-Symbol Override Management ============
+
+  /**
+   * Load per-symbol strategy overrides from guardrails config.
+   * Call this after loading guardrails to apply per-symbol parameter calibration.
+   * 
+   * Expected format from guardrails:
+   * per_symbol:
+   *   BTC-USD:
+   *     strategy_overrides:
+   *       breakout: { atrMultiplier: 1.8 }
+   *       momentum: { atrMultiplier: 1.8 }
+   */
+  public loadPerSymbolOverridesFromGuardrails(
+    perSymbolConfig: Record<string, { strategy_overrides?: Record<string, Record<string, unknown>> }>
+  ): void {
+    const overridesBySymbol: PerSymbolStrategyOverrides = {};
+    
+    for (const [symbol, config] of Object.entries(perSymbolConfig)) {
+      if (config.strategy_overrides) {
+        overridesBySymbol[symbol] = config.strategy_overrides;
+      }
+    }
+    
+    this.loadPerSymbolOverrides(overridesBySymbol);
+  }
+
+  /**
+   * Load per-symbol overrides directly.
+   * Format: { symbol: { strategyId: { param: value } } }
+   */
+  public loadPerSymbolOverrides(overrides: PerSymbolStrategyOverrides): void {
+    const strategies = this.strategyRegistry.getAll();
+    
+    for (const strategy of strategies) {
+      if (strategy instanceof BaseStrategy) {
+        const strategyOverrides: PerSymbolOverrides = {};
+        
+        for (const [symbol, strategyConfigs] of Object.entries(overrides)) {
+          if (strategyConfigs[strategy.id]) {
+            strategyOverrides[symbol] = strategyConfigs[strategy.id];
+          }
+        }
+        
+        if (Object.keys(strategyOverrides).length > 0) {
+          strategy.loadSymbolOverrides(strategyOverrides);
+          this.logger.debug(`Loaded per-symbol overrides for strategy ${strategy.id}`, {
+            symbols: Object.keys(strategyOverrides),
+          });
+        }
+      }
+    }
+    
+    this.logger.info('Loaded per-symbol strategy overrides', {
+      symbols: Object.keys(overrides),
+      strategies: strategies.map(s => s.id),
+    });
+  }
+
+  /**
+   * Set per-symbol overrides for a specific strategy at runtime.
+   * This allows UI/API to update parameters without restart.
+   */
+  public setStrategySymbolOverrides(
+    strategyId: string,
+    symbol: string,
+    overrides: Record<string, unknown>
+  ): boolean {
+    const strategy = this.strategyRegistry.get(strategyId);
+    
+    if (!strategy) {
+      this.logger.warn(`Cannot set symbol overrides: strategy ${strategyId} not found`);
+      return false;
+    }
+    
+    if (!(strategy instanceof BaseStrategy)) {
+      this.logger.warn(`Cannot set symbol overrides: strategy ${strategyId} is not a BaseStrategy`);
+      return false;
+    }
+    
+    strategy.setSymbolOverrides(symbol, overrides);
+    this.logger.info(`Updated symbol overrides for ${strategyId} on ${symbol}`, { overrides });
+    return true;
+  }
+
+  /**
+   * Get effective config for a strategy on a specific symbol.
+   * Returns merged global + per-symbol config.
+   */
+  public getEffectiveStrategyConfig(strategyId: string, symbol: string): Record<string, unknown> | null {
+    const strategy = this.strategyRegistry.get(strategyId);
+    
+    if (!strategy) {
+      return null;
+    }
+    
+    if (strategy instanceof BaseStrategy) {
+      return strategy.getEffectiveConfig(symbol);
+    }
+    
+    return { ...strategy.config };
+  }
+
+  /**
+   * Get all per-symbol overrides for all strategies.
+   */
+  public getAllSymbolOverrides(): Record<string, PerSymbolOverrides> {
+    const result: Record<string, PerSymbolOverrides> = {};
+    
+    for (const strategy of this.strategyRegistry.getAll()) {
+      if (strategy instanceof BaseStrategy) {
+        const overrides = strategy.getAllSymbolOverrides();
+        if (Object.keys(overrides).length > 0) {
+          result[strategy.id] = overrides;
+        }
+      }
+    }
+    
+    return result;
   }
 }

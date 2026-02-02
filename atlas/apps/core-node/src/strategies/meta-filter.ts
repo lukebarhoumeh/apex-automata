@@ -181,16 +181,16 @@ const DEFAULT_CONFIG: MetaFilterConfig = {
   enabled: true,
   
   coldStreakEnabled: true,
-  coldStreakThreshold: 3,
-  coldStreakCooldownMs: 30 * 60 * 1000, // 30 minutes
+  coldStreakThreshold: 10,  // AGGRESSIVE: Higher threshold
+  coldStreakCooldownMs: 5 * 60 * 1000, // AGGRESSIVE: Only 5 min cooldown
   coldStreakRecoveryWins: 1,
-  
-  strengthFilterEnabled: true,
-  minStrengthPercentile: 0.25,
-  minAbsoluteStrength: 0.3,
-  
-  volumeConfirmEnabled: true,
-  minVolumeRatio: 1.2,
+
+  strengthFilterEnabled: false,  // AGGRESSIVE: Disabled
+  minStrengthPercentile: 0.0,
+  minAbsoluteStrength: 0.0,
+
+  volumeConfirmEnabled: false,  // AGGRESSIVE: Disabled
+  minVolumeRatio: 0.1,
   volumeRatioBonus: 0.1,
   
   timeFilterEnabled: true,

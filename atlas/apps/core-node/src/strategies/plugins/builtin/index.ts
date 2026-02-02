@@ -5,15 +5,18 @@
  * for creating instances with configuration.
  */
 
-import { StrategyPlugin } from '../types';
+import { StrategyPlugin, PerSymbolOverrides } from '../types';
+import { BaseStrategy } from '../base-strategy';
 import { BreakoutStrategy } from './breakout-strategy';
 import { VWAPMeanReversionStrategy } from './vwap-mr-strategy';
 import { MomentumStrategy } from './momentum-strategy';
+import { TrendFollowStrategy } from './trend-follow-strategy';
 
 // Export individual strategies
 export { BreakoutStrategy } from './breakout-strategy';
 export { VWAPMeanReversionStrategy } from './vwap-mr-strategy';
 export { MomentumStrategy } from './momentum-strategy';
+export { TrendFollowStrategy } from './trend-follow-strategy';
 
 /**
  * Registry of all built-in strategies.
@@ -22,6 +25,7 @@ export const BUILTIN_STRATEGIES = {
   breakout: BreakoutStrategy,
   vwap_mr: VWAPMeanReversionStrategy,
   momentum: MomentumStrategy,
+  trend_follow: TrendFollowStrategy,
 } as const;
 
 /**
@@ -32,14 +36,48 @@ export function getBuiltinStrategyIds(): string[] {
 }
 
 /**
+ * Per-symbol strategy overrides configuration.
+ * Keyed by symbol, then by strategy ID, then by parameter.
+ * 
+ * Example:
+ * {
+ *   'BTC-USD': { breakout: { atrMultiplier: 1.8 }, momentum: { atrMultiplier: 1.8 } },
+ *   'SOL-USD': { breakout: { atrMultiplier: 2.5 } }
+ * }
+ */
+export type PerSymbolStrategyOverrides = Record<string, Record<string, Record<string, unknown>>>;
+
+/**
  * Create all built-in strategy instances.
+ * 
+ * @param configs - Optional global configs per strategy
+ * @param perSymbolOverrides - Optional per-symbol parameter overrides
  */
 export function createBuiltinStrategies(
-  configs?: Record<string, Record<string, unknown>>
+  configs?: Record<string, Record<string, unknown>>,
+  perSymbolOverrides?: PerSymbolStrategyOverrides
 ): StrategyPlugin[] {
   return Object.entries(BUILTIN_STRATEGIES).map(([id, StrategyClass]) => {
     const config = configs?.[id];
-    return new StrategyClass(config);
+    const strategy = new StrategyClass(config);
+    
+    // Load per-symbol overrides if provided
+    if (perSymbolOverrides && strategy instanceof BaseStrategy) {
+      const strategyOverrides: PerSymbolOverrides = {};
+      
+      // Transform from { symbol: { strategy: { params } } } to { symbol: { params } }
+      for (const [symbol, strategyConfigs] of Object.entries(perSymbolOverrides)) {
+        if (strategyConfigs[id]) {
+          strategyOverrides[symbol] = strategyConfigs[id];
+        }
+      }
+      
+      if (Object.keys(strategyOverrides).length > 0) {
+        strategy.loadSymbolOverrides(strategyOverrides);
+      }
+    }
+    
+    return strategy;
   });
 }
 
