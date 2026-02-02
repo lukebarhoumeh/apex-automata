@@ -906,6 +906,87 @@ export type Database = {
         }
         Relationships: []
       }
+      trade_log: {
+        Row: {
+          created_at: string | null
+          duration_seconds: number | null
+          entry_order_id: string | null
+          entry_price: number
+          entry_time: string
+          exit_order_id: string | null
+          exit_price: number | null
+          exit_reason: string | null
+          exit_time: string | null
+          fees: number | null
+          id: string
+          max_adverse_excursion: number | null
+          max_favorable_excursion: number | null
+          outcome: string | null
+          realized_pnl: number | null
+          reason_code: string | null
+          session_id: string
+          side: string
+          signal_id: string | null
+          size: number
+          slippage_bps: number | null
+          strategy: string | null
+          symbol: string
+          user_id: string
+        }
+        Insert: {
+          created_at?: string | null
+          duration_seconds?: number | null
+          entry_order_id?: string | null
+          entry_price: number
+          entry_time: string
+          exit_order_id?: string | null
+          exit_price?: number | null
+          exit_reason?: string | null
+          exit_time?: string | null
+          fees?: number | null
+          id?: string
+          max_adverse_excursion?: number | null
+          max_favorable_excursion?: number | null
+          outcome?: string | null
+          realized_pnl?: number | null
+          reason_code?: string | null
+          session_id: string
+          side: string
+          signal_id?: string | null
+          size: number
+          slippage_bps?: number | null
+          strategy?: string | null
+          symbol: string
+          user_id: string
+        }
+        Update: {
+          created_at?: string | null
+          duration_seconds?: number | null
+          entry_order_id?: string | null
+          entry_price?: number
+          entry_time?: string
+          exit_order_id?: string | null
+          exit_price?: number | null
+          exit_reason?: string | null
+          exit_time?: string | null
+          fees?: number | null
+          id?: string
+          max_adverse_excursion?: number | null
+          max_favorable_excursion?: number | null
+          outcome?: string | null
+          realized_pnl?: number | null
+          reason_code?: string | null
+          session_id?: string
+          side?: string
+          signal_id?: string | null
+          size?: number
+          slippage_bps?: number | null
+          strategy?: string | null
+          symbol?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
       trade_outcomes: {
         Row: {
           adx: number | null
@@ -1100,6 +1181,24 @@ export type Database = {
       }
     }
     Views: {
+      daily_trade_summary: {
+        Row: {
+          avg_duration_seconds: number | null
+          avg_slippage_bps: number | null
+          breakeven: number | null
+          gross_loss: number | null
+          gross_profit: number | null
+          losses: number | null
+          profit_factor: number | null
+          total_pnl: number | null
+          total_trades: number | null
+          trade_date: string | null
+          user_id: string | null
+          win_rate: number | null
+          wins: number | null
+        }
+        Relationships: []
+      }
       ml_training_data: {
         Row: {
           adx: number | null
