@@ -31,6 +31,21 @@ const frontendUrl = `http://localhost:${frontendPort}`;
 let backendProcess = null;
 let frontendProcess = null;
 
+// Auto-restart configuration for backend
+const BACKEND_RESTART_CONFIG = {
+  enabled: true,
+  maxRestarts: 10,          // Max restarts in window
+  restartWindowMs: 300000,  // 5 minute window
+  initialDelayMs: 1000,     // Initial restart delay
+  maxDelayMs: 30000,        // Max restart delay (30 seconds)
+  backoffMultiplier: 2,     // Exponential backoff
+};
+
+// Backend restart tracking
+let backendRestarts = [];
+let backendRestartDelay = BACKEND_RESTART_CONFIG.initialDelayMs;
+let isShuttingDown = false;
+
 // Logging
 const log = {
   info: (msg) => console.log(`${colors.cyan}ℹ${colors.reset}  ${msg}`),
@@ -101,8 +116,8 @@ function waitForService(url, serviceName, maxAttempts = 30) {
 }
 
 // Start a process
-function startProcess(command, args, cwd, logFile) {
-  const logStream = fs.createWriteStream(path.join(logsDir, logFile));
+function startProcess(command, args, cwd, logFile, onExit = null) {
+  const logStream = fs.createWriteStream(path.join(logsDir, logFile), { flags: 'a' });
   
   const proc = spawn(command, args, {
     cwd,
@@ -117,7 +132,73 @@ function startProcess(command, args, cwd, logFile) {
     log.error(`Process error: ${err.message}`);
   });
   
+  if (onExit) {
+    proc.on('exit', onExit);
+  }
+  
   return proc;
+}
+
+// Start backend with auto-restart capability
+function startBackendWithRestart(backendPath) {
+  const now = Date.now();
+  
+  // Clean up old restarts outside the window
+  backendRestarts = backendRestarts.filter(
+    ts => (now - ts) < BACKEND_RESTART_CONFIG.restartWindowMs
+  );
+  
+  // Check if we've exceeded max restarts
+  if (backendRestarts.length >= BACKEND_RESTART_CONFIG.maxRestarts) {
+    log.error(`Backend exceeded max restarts (${BACKEND_RESTART_CONFIG.maxRestarts}) in ${BACKEND_RESTART_CONFIG.restartWindowMs / 1000}s window`);
+    log.error('Manual intervention required. Check logs/backend.log for errors.');
+    return null;
+  }
+  
+  log.info('Starting backend API...');
+  
+  backendProcess = startProcess(pnpmCmd, ['api'], backendPath, 'backend.log', (code, signal) => {
+    if (isShuttingDown) {
+      return; // Don't restart during intentional shutdown
+    }
+    
+    const exitInfo = signal ? `signal ${signal}` : `code ${code}`;
+    
+    if (code !== 0) {
+      log.warning(`Backend exited unexpectedly (${exitInfo})`);
+      
+      // Track restart
+      backendRestarts.push(Date.now());
+      
+      // Calculate delay with backoff
+      const delay = Math.min(
+        backendRestartDelay,
+        BACKEND_RESTART_CONFIG.maxDelayMs
+      );
+      
+      log.info(`Restarting backend in ${delay}ms (restart ${backendRestarts.length}/${BACKEND_RESTART_CONFIG.maxRestarts})`);
+      
+      setTimeout(() => {
+        backendProcess = startBackendWithRestart(backendPath);
+        if (backendProcess) {
+          // Reset delay on successful start
+          setTimeout(() => {
+            backendRestartDelay = BACKEND_RESTART_CONFIG.initialDelayMs;
+          }, 5000);
+        }
+      }, delay);
+      
+      // Increase delay for next restart (exponential backoff)
+      backendRestartDelay = Math.min(
+        backendRestartDelay * BACKEND_RESTART_CONFIG.backoffMultiplier,
+        BACKEND_RESTART_CONFIG.maxDelayMs
+      );
+    } else {
+      log.info(`Backend exited normally (${exitInfo})`);
+    }
+  });
+  
+  return backendProcess;
 }
 
 // Install dependencies if needed
@@ -217,6 +298,9 @@ function cleanup() {
   console.log('\n');
   log.warning('Shutting down AtlasBot...');
   
+  // Set flag to prevent auto-restart
+  isShuttingDown = true;
+  
   if (frontendProcess) {
     frontendProcess.kill();
   }
@@ -264,10 +348,9 @@ async function start() {
     await killPort(3001);
     await killPort(frontendPort);
     
-    // Start backend
-    log.info('Starting backend API...');
+    // Start backend with auto-restart
     const backendPath = path.join(__dirname, 'atlas', 'apps', 'core-node');
-    backendProcess = startProcess(pnpmCmd, ['api'], backendPath, 'backend.log');
+    backendProcess = startBackendWithRestart(backendPath);
     
     // Wait for backend
     await waitForService('http://localhost:3001/health', 'Backend API');

@@ -5,6 +5,21 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { OrderRequest } from '../exchanges/coinbase';
 import { Position, PositionTracker } from './position-tracker';
 import { GuardrailConfig } from '../config/loadGuardrails';
+import {
+  RiskStateMachine,
+  RiskHaltReasonCode,
+  TradingState,
+  createDailyStopHalt,
+  createConsecutiveLossesHalt,
+  createMaxDrawdownHalt,
+  isDailyHaltReason,
+} from './risk-state';
+import {
+  RiskMath,
+  RiskSnapshot,
+  validatePerTradeRisk,
+  computeDailyStopThresholdR,
+} from './risk-math';
 
 // Prometheus metrics for risk engine reliability
 const riskMetricsWriteFailures = new Counter({
@@ -136,6 +151,11 @@ export class RiskEngine extends EventEmitter {
   // Per-symbol tracking
   private dailyLossPerSymbol: Map<string, number> = new Map();
   private blockedSymbols: Set<string> = new Set();
+  
+  // Step 5: Unified risk state machine and risk math
+  private riskStateMachine: RiskStateMachine;
+  private riskMath: RiskMath;
+  private dailyStopThresholdR: number;
 
   constructor(
     config: RiskEngineConfig,
@@ -170,6 +190,53 @@ export class RiskEngine extends EventEmitter {
     this.weeklyStartTimestamp = Date.now();
 
     this.metrics = this.initializeMetrics();
+    
+    // Step 5: Initialize unified risk state machine
+    this.riskStateMachine = new RiskStateMachine({
+      logger,
+      supabaseUrl: config.supabaseUrl,
+      supabaseKey: config.supabaseKey,
+      userId: config.userId,
+    });
+    
+    // Forward state machine events
+    this.riskStateMachine.on('risk:state_changed', (event) => {
+      this.emit('risk:state_changed', event);
+    });
+    this.riskStateMachine.on('risk:killswitch:triggered', (event) => {
+      this.emit('risk:killswitch:triggered', event);
+    });
+    this.riskStateMachine.on('risk:killswitch:deactivated', (event) => {
+      this.emit('risk:killswitch:deactivated', event);
+    });
+    this.riskStateMachine.on('risk:day_rollover', (event) => {
+      this.emit('risk:day_rollover', event);
+      this.handleDayRollover();
+    });
+    
+    // Step 5: Initialize canonical risk math
+    const perTradeRiskFraction = validatePerTradeRisk(
+      accountCfg.risk_per_trade,
+      'guardrails.account.risk_per_trade',
+      logger
+    );
+    
+    this.riskMath = new RiskMath({
+      accountEquityUsd: this.accountEquity,
+      perTradeRiskFraction,
+      logger,
+    });
+    
+    // Compute daily stop threshold in R
+    this.dailyStopThresholdR = computeDailyStopThresholdR(
+      Math.abs(riskCfg.daily_loss_limit),
+      perTradeRiskFraction
+    );
+    
+    this.logger.info('Risk thresholds computed', {
+      dailyStopThresholdR: this.dailyStopThresholdR,
+      riskUnitUsd: this.riskMath.computeRiskUnit(),
+    });
     
     // Trade outcome hooks (drives consecutive loss + per-symbol loss tracking)
     this.positionTracker.on('position:closed', (position: Position) => {
@@ -849,7 +916,10 @@ export class RiskEngine extends EventEmitter {
     const soft = this.getSoftLaunch();
     const dailyLimitUsd = soft ? this.scaleUsd(this.dailyLossLimitUsd, soft.maxDailyLossMultiplier) : this.dailyLossLimitUsd;
     if (!this.killSwitchActive && dailyLoss >= dailyLimitUsd) {
-      this.triggerKillSwitch(`Daily loss guardrail tripped: -$${dailyLoss.toFixed(2)}`);
+      this.triggerKillSwitch(
+        `Daily loss guardrail tripped: -$${dailyLoss.toFixed(2)}`,
+        'daily_stop'
+      );
       return;
     }
 
@@ -861,14 +931,20 @@ export class RiskEngine extends EventEmitter {
 
     const weeklyLoss = this.weeklyStartEquity - currentEquity;
     if (!this.killSwitchActive && weeklyLoss >= this.weeklyLossLimitUsd) {
-      this.triggerKillSwitch(`Weekly loss guardrail tripped: -$${weeklyLoss.toFixed(2)}`);
+      this.triggerKillSwitch(
+        `Weekly loss guardrail tripped: -$${weeklyLoss.toFixed(2)}`,
+        'weekly_stop'
+      );
       return;
     }
 
     const absoluteDrawdown = this.accountEquity - currentEquity;
+    const drawdownPct = this.accountEquity > 0 ? absoluteDrawdown / this.accountEquity : 0;
     const drawdownLimitUsd = soft ? this.scaleUsd(this.maxDrawdownUsd, soft.maxDailyLossMultiplier) : this.maxDrawdownUsd;
+    const drawdownLimitPct = this.accountEquity > 0 ? drawdownLimitUsd / this.accountEquity : 0.05;
     if (!this.killSwitchActive && absoluteDrawdown >= drawdownLimitUsd) {
-      this.triggerKillSwitch(`Max drawdown exceeded: -$${absoluteDrawdown.toFixed(2)}`);
+      const halt = createMaxDrawdownHalt(drawdownPct, drawdownLimitPct, absoluteDrawdown);
+      this.triggerKillSwitch(halt.reasonText, halt.reasonCode);
       return;
     }
 
@@ -880,7 +956,10 @@ export class RiskEngine extends EventEmitter {
       const drop = maxEquityWindow - currentEquity;
       const rapidLimitUsd = soft ? this.scaleUsd(this.rapidLossThresholdUsd, soft.maxDailyLossMultiplier) : this.rapidLossThresholdUsd;
       if (!this.killSwitchActive && drop >= rapidLimitUsd) {
-        this.triggerKillSwitch(`Rapid loss guardrail tripped: -$${drop.toFixed(2)} in <10m`);
+        this.triggerKillSwitch(
+          `Rapid loss guardrail tripped: -$${drop.toFixed(2)} in <10m`,
+          'rapid_loss'
+        );
       }
     }
   }
@@ -906,6 +985,15 @@ export class RiskEngine extends EventEmitter {
       ? ((this.dailyHighEquity - currentEquity) / this.dailyHighEquity) * 100
       : 0;
     this.metrics.maxDrawdown = Math.max(this.metrics.maxDrawdown, currentDrawdownPct);
+    
+    // Step 5: Update canonical risk math snapshot
+    const portfolioSummary = this.positionTracker.getPortfolioSummary();
+    const realizedPnl = portfolioSummary.realizedPnL || 0;
+    const unrealizedPnl = portfolioSummary.unrealizedPnL || portfolioSummary.totalPnL || 0;
+    this.riskMath.computeSnapshot(realizedPnl, unrealizedPnl);
+    
+    // Check for day rollover
+    this.riskStateMachine.checkDayRollover();
 
     // Update error rate
     const recentOrders = this.orderHistory.filter(
@@ -942,29 +1030,58 @@ export class RiskEngine extends EventEmitter {
       return;
     }
 
-    // Check daily loss kill switch
+    // Check daily loss kill switch (use R-based threshold from risk math)
+    const snapshot = this.riskMath.getSnapshot();
+    if (snapshot && this.riskMath.isDailyStopTriggered(this.dailyStopThresholdR)) {
+      const halt = createDailyStopHalt(
+        snapshot.dailyPnlUsd,
+        snapshot.dailyPnlR,
+        this.dailyStopThresholdR
+      );
+      this.triggerKillSwitch(halt.reasonText, halt.reasonCode);
+      return;
+    }
+
+    // Fallback: Check daily loss in USD
     const dailyLossLimit = this.getEffectiveKillSwitchDailyLossUsd();
     if (this.metrics.dailyPnL <= -dailyLossLimit) {
-      this.triggerKillSwitch(`Daily loss limit exceeded: -$${Math.abs(this.metrics.dailyPnL).toFixed(2)}`);
+      this.triggerKillSwitch(
+        `Daily loss limit exceeded: -$${Math.abs(this.metrics.dailyPnL).toFixed(2)}`,
+        'daily_stop'
+      );
+      return;
     }
 
     // Check consecutive losses
     if (this.metrics.consecutiveLosses >= this.config.killSwitches.consecutiveLossLimit) {
-      this.triggerKillSwitch(`Consecutive losses exceeded: ${this.metrics.consecutiveLosses}`);
+      const halt = createConsecutiveLossesHalt(
+        this.metrics.consecutiveLosses,
+        this.config.killSwitches.consecutiveLossLimit
+      );
+      this.triggerKillSwitch(halt.reasonText, halt.reasonCode);
+      return;
     }
 
     // Check error rate
     if (this.metrics.errorRate >= this.config.killSwitches.errorRateLimit) {
-      this.triggerKillSwitch(`Error rate too high: ${this.metrics.errorRate.toFixed(2)}%`);
+      this.triggerKillSwitch(
+        `Error rate too high: ${this.metrics.errorRate.toFixed(2)}%`,
+        'error_rate'
+      );
+      return;
     }
 
     // Check latency
     if (this.metrics.averageLatency >= this.config.killSwitches.latencyLimit) {
-      this.triggerKillSwitch(`Latency too high: ${this.metrics.averageLatency.toFixed(0)}ms`);
+      this.triggerKillSwitch(
+        `Latency too high: ${this.metrics.averageLatency.toFixed(0)}ms`,
+        'latency'
+      );
+      return;
     }
   }
 
-  private triggerKillSwitch(reason: string): void {
+  private triggerKillSwitch(reason: string, reasonCode: RiskHaltReasonCode = 'unknown'): void {
     if (this.killSwitchActive) {
       return; // Already triggered
     }
@@ -973,12 +1090,66 @@ export class RiskEngine extends EventEmitter {
     this.killSwitchActive = true;
     this.metrics.killSwitchActive = true;
     
+    // Use the risk state machine for structured halt
+    const snapshot = this.riskMath.getSnapshot();
+    const daily = isDailyHaltReason(reasonCode);
+    
+    this.riskStateMachine.halt(reasonCode, reason, daily, {
+      dailyPnlUsd: snapshot?.dailyPnlUsd,
+      dailyPnlR: snapshot?.dailyPnlR,
+      thresholdR: this.dailyStopThresholdR,
+      consecutiveLosses: this.metrics.consecutiveLosses,
+      errorRate: this.metrics.errorRate,
+    });
+    
+    // Emit legacy event for backward compatibility
     this.emit('risk:killswitch:triggered', reason);
 
-    // Close all positions
-    this.positionTracker.closeAllPositions().catch(error => {
-      this.logger.error('Failed to close positions during kill switch:', error);
+    // Note: Position flattening is now optional and config-driven.
+    // The state machine halts trading but does NOT automatically close positions.
+    // Position monitor will still execute reduce-only exits (stop/TP/trailing).
+  }
+  
+  /**
+   * Trigger halt with structured reason (Step 5)
+   */
+  private haltTrading(
+    reasonCode: RiskHaltReasonCode,
+    reasonText: string,
+    daily: boolean,
+    context?: Record<string, any>
+  ): void {
+    if (this.riskStateMachine.isHalted()) {
+      return; // Already halted
+    }
+    
+    this.killSwitchActive = true;
+    this.metrics.killSwitchActive = true;
+    
+    this.riskStateMachine.halt(reasonCode, reasonText, daily, context);
+  }
+  
+  /**
+   * Handle day rollover from state machine
+   */
+  private handleDayRollover(): void {
+    this.logger.info('Risk day rollover triggered');
+    
+    // Reset daily tracking
+    this.resetDailyMetrics().catch(e => {
+      this.logger.error('Failed to reset daily metrics on rollover', { error: e.message });
     });
+    
+    // Update risk math for new day
+    const currentEquity = this.dailyStartEquity + this.metrics.dailyPnL;
+    this.riskMath.resetForNewDay(currentEquity);
+  }
+  
+  /**
+   * Check for day rollover (call on each tick)
+   */
+  public checkDayRollover(): boolean {
+    return this.riskStateMachine.checkDayRollover();
   }
 
   // Calculate position size based on Kelly criterion
@@ -1083,6 +1254,71 @@ export class RiskEngine extends EventEmitter {
   public getMetrics(): RiskMetrics {
     return { ...this.metrics };
   }
+  
+  /**
+   * Get risk state for API (Step 5)
+   */
+  public getRiskState(): TradingState {
+    return this.riskStateMachine.getState();
+  }
+  
+  /**
+   * Get comprehensive risk status for API (Step 5)
+   */
+  public getRiskStatus(): {
+    tradingState: 'RUNNING' | 'PAUSED' | 'HALTED';
+    reasonCode?: RiskHaltReasonCode;
+    reasonText?: string;
+    since?: number;
+    daily?: boolean;
+    dayStartEquityUsd: number;
+    riskUnitUsd: number;
+    perTradeRiskPct: number;
+    dailyPnlUsd: number;
+    dailyPnlR: number;
+    realizedPnlUsd: number;
+    unrealizedPnlUsd: number;
+    drawdownPct: number;
+    thresholds: {
+      dailyStopR: number;
+      maxHeat: number;
+      perTradeRisk: number;
+    };
+  } {
+    const stateStatus = this.riskStateMachine.getStatus();
+    const mathStatus = this.riskMath.getStatus();
+    
+    return {
+      ...stateStatus,
+      ...mathStatus,
+      thresholds: {
+        dailyStopR: this.dailyStopThresholdR,
+        maxHeat: this.config.limits.maxTotalExposure / this.accountEquity,
+        perTradeRisk: mathStatus.perTradeRiskPct / 100,
+      },
+    };
+  }
+  
+  /**
+   * Get risk math snapshot (Step 5)
+   */
+  public getRiskSnapshot(): RiskSnapshot | null {
+    return this.riskMath.getSnapshot();
+  }
+  
+  /**
+   * Check if entries are allowed (Step 5)
+   */
+  public canEnterTrades(): boolean {
+    return this.riskStateMachine.canEnterTrades() && !this.killSwitchActive;
+  }
+  
+  /**
+   * Check if exits are allowed (always true) (Step 5)
+   */
+  public canExitTrades(): boolean {
+    return this.riskStateMachine.canExitTrades();
+  }
 
   // Reset daily metrics (call at start of trading day)
   public async resetDailyMetrics(): Promise<void> {
@@ -1105,10 +1341,16 @@ export class RiskEngine extends EventEmitter {
     this.triggerKillSwitch(`Manual activation: ${reason}`);
   }
 
-  public deactivateKillSwitch(): void {
-    this.killSwitchActive = false;
-    this.metrics.killSwitchActive = false;
-    this.logger.info('Kill switch deactivated');
+  public deactivateKillSwitch(force: boolean = true): boolean {
+    const resumed = this.riskStateMachine.resume(force);
+    if (resumed) {
+      this.killSwitchActive = false;
+      this.metrics.killSwitchActive = false;
+      this.logger.info('Kill switch deactivated');
+    } else {
+      this.logger.warn('Failed to deactivate kill switch (requires force=true for non-daily halts)');
+    }
+    return resumed;
   }
 
   // Cleanup

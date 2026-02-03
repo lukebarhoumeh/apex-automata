@@ -11,6 +11,17 @@ import { PositionMonitor, PositionMonitorConfig } from './position-monitor';
 import { TradeAnalytics, TradeAnalyticsConfig, SessionStats, TradeRecord } from './trade-analytics';
 import { GuardrailConfig } from '../config/loadGuardrails';
 import { v4 as uuidv4 } from 'uuid';
+import { 
+  IExecutionAdapter, 
+  BrokerOrderEvent,
+  getMarketDataUrls,
+} from './execution';
+import {
+  createAdapters,
+  RuntimeConfig,
+  buildRuntimeConfig,
+} from './execution/adapter-factory';
+import { IAccountProvider } from './account';
 
 export interface TradingEngineConfig {
   mode: 'paper' | 'live';
@@ -29,12 +40,28 @@ export interface TradingEngineConfig {
     encryptionKey: string;
   };
   guardrails: GuardrailConfig;
+  
+  /**
+   * New unified environment config (Step 4)
+   * When provided, overrides the legacy mode/environment settings
+   */
+  runtime?: {
+    /** Market data environment: production or sandbox (default: production) */
+    marketDataEnv?: 'production' | 'sandbox';
+    /** Execution environment for live mode (default: production) */
+    executionEnv?: 'production' | 'sandbox';
+    /** Initial equity for paper mode in USD */
+    paperInitialEquityUsd?: number;
+  };
 }
 
 export interface TradingEngineEvents {
   'engine:started': () => void;
   'engine:stopped': () => void;
   'engine:error': (error: Error) => void;
+  'engine:heartbeat': (timestamp: number) => void;
+  'engine:state_changed': (state: EngineState, reason: string) => void;
+  'engine:fatal': (error: Error, context: string) => void;
   'market:ticker': (ticker: Ticker) => void;
   'market:orderbook': (orderbook: OrderBook) => void;
   'order:created': (order: ManagedOrder) => void;
@@ -44,8 +71,21 @@ export interface TradingEngineEvents {
   'signal:generated': (signal: any) => void;
 }
 
+/**
+ * Engine runtime states
+ * - stopped: Engine is not running
+ * - starting: Engine is initializing
+ * - running: Engine is running and trading is active
+ * - stopping: Engine is shutting down
+ * - halted: Engine is running but trading halted due to kill switch
+ */
+export type EngineState = 'stopped' | 'starting' | 'running' | 'stopping' | 'halted';
+
 // Startup grace period before data gap checks begin (ms)
 const STARTUP_GRACE_PERIOD_MS = 60_000; // 60 seconds
+
+// Heartbeat interval (ms)
+const ENGINE_HEARTBEAT_INTERVAL_MS = 2000;
 
 // Environment-specific data gap thresholds (in seconds)
 const DATA_GAP_THRESHOLDS: Record<string, number> = {
@@ -69,6 +109,11 @@ export class TradingEngine extends EventEmitter {
   private marketPrices: Map<string, number> = new Map();
   private guardrails: GuardrailConfig;
   
+  // Step 4: Unified execution adapter and account provider
+  private executionAdapter: IExecutionAdapter | null = null;
+  private accountProvider: IAccountProvider | null = null;
+  private runtimeConfig: RuntimeConfig;
+  
   // Order timing for latency tracking
   private orderTimestamps: Map<string, number> = new Map();
   
@@ -80,11 +125,36 @@ export class TradingEngine extends EventEmitter {
   // Active symbols that are actually subscribed (may differ from config if some aren't available)
   private activeSymbols: string[] = [];
 
+  // Engine state tracking for 24/7 resilience
+  private engineState: EngineState = 'stopped';
+  private heartbeatInterval: NodeJS.Timeout | null = null;
+  private lastHeartbeatAt: number = 0;
+  private startCount: number = 0;
+  private stopCount: number = 0;
+  private lastStartReason: string = '';
+  private lastStopReason: string = '';
+
   constructor(config: TradingEngineConfig, logger: Logger) {
     super();
     this.config = config;
     this.logger = logger;
     this.guardrails = config.guardrails;
+
+    // Build unified runtime config (Step 4)
+    // This decouples market data env from execution mode
+    this.runtimeConfig = buildRuntimeConfig({
+      executionMode: config.mode,
+      // Default to production market data unless explicitly set
+      marketDataEnv: config.runtime?.marketDataEnv || 'production',
+      executionEnv: config.runtime?.executionEnv || config.exchange.environment,
+      paperInitialEquityUsd: config.runtime?.paperInitialEquityUsd || config.guardrails.account.equity_usd,
+    });
+
+    this.logger.info('Runtime config initialized', {
+      executionMode: this.runtimeConfig.executionMode,
+      marketDataEnv: this.runtimeConfig.marketDataEnv,
+      executionEnv: this.runtimeConfig.executionEnv,
+    });
 
     // Initialize secret manager
     this.secretManager = new SecretManager(
@@ -105,14 +175,25 @@ export class TradingEngine extends EventEmitter {
     return this.isRunning;
   }
 
-  public async start(): Promise<void> {
-    if (this.isRunning) {
-      this.logger.warn('Trading engine already running');
+  public async start(reason: string = 'manual'): Promise<void> {
+    // Idempotency check - prevent double-start
+    if (this.isRunning || this.engineState === 'starting') {
+      this.logger.warn('Trading engine already running or starting', {
+        isRunning: this.isRunning,
+        engineState: this.engineState,
+      });
       return;
     }
 
+    this.setEngineState('starting', reason);
+    this.startCount++;
+    this.lastStartReason = reason;
+
     try {
-      this.logger.info(`Starting trading engine in ${this.config.mode} mode`);
+      this.logger.info(`Starting trading engine in ${this.config.mode} mode`, {
+        reason,
+        startCount: this.startCount,
+      });
 
       // Initialize paper trading simulator if in paper mode
       if (this.config.mode === 'paper') {
@@ -150,36 +231,161 @@ export class TradingEngine extends EventEmitter {
       }
       
       this.startDataGapMonitor();
+      
+      // Start heartbeat for supervisor monitoring
+      this.startHeartbeat();
 
       this.isRunning = true;
+      this.setEngineState('running', 'start_complete');
       this.emit('engine:started');
       
       this.logger.info('Trading engine started successfully', {
         mode: this.config.mode,
         activeSymbols: this.activeSymbols,
         gracePeriodMs: STARTUP_GRACE_PERIOD_MS,
+        startCount: this.startCount,
       });
     } catch (error) {
+      this.setEngineState('stopped', 'start_failed');
       this.logger.error('Failed to start trading engine:', error);
       this.emit('engine:error', error as Error);
       throw error;
     }
   }
 
-  public async stop(): Promise<void> {
-    if (!this.isRunning) {
-      this.logger.warn('Trading engine not running');
+  /**
+   * Start the engine heartbeat for supervisor monitoring
+   */
+  private startHeartbeat(): void {
+    // Clear any existing heartbeat first (idempotency)
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+    }
+
+    this.heartbeatInterval = setInterval(() => {
+      try {
+        this.lastHeartbeatAt = Date.now();
+        this.emit('engine:heartbeat', this.lastHeartbeatAt);
+      } catch (error) {
+        this.logger.error('Error in heartbeat interval', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }, ENGINE_HEARTBEAT_INTERVAL_MS);
+
+    // Emit initial heartbeat
+    this.lastHeartbeatAt = Date.now();
+    this.emit('engine:heartbeat', this.lastHeartbeatAt);
+  }
+
+  /**
+   * Stop the engine heartbeat
+   */
+  private stopHeartbeat(): void {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+  }
+
+  /**
+   * Set engine state and emit event
+   */
+  private setEngineState(state: EngineState, reason: string): void {
+    const oldState = this.engineState;
+    this.engineState = state;
+    
+    if (oldState !== state) {
+      this.logger.info('Engine state changed', {
+        from: oldState,
+        to: state,
+        reason,
+      });
+      this.emit('engine:state_changed', state, reason);
+    }
+  }
+
+  /**
+   * Get current engine state
+   */
+  public getEngineState(): EngineState {
+    return this.engineState;
+  }
+
+  /**
+   * Get last heartbeat timestamp
+   */
+  public getLastHeartbeatAt(): number {
+    return this.lastHeartbeatAt;
+  }
+
+  /**
+   * Handle fatal error from engine components
+   * Routes to supervisor for recovery decision
+   */
+  public handleFatal(error: Error, context: string): void {
+    this.logger.error('Fatal engine error', {
+      context,
+      error: error.message,
+      stack: error.stack,
+    });
+
+    // Don't try to recover if kill switch is active
+    if (this.riskEngine?.getMetrics().killSwitchActive) {
+      this.logger.warn('Kill switch active, not attempting recovery');
+      this.setEngineState('halted', `fatal_error_killswitch: ${context}`);
       return;
     }
 
+    // Emit fatal event for supervisor to handle
+    this.emit('engine:fatal', error, context);
+  }
+
+  public async stop(reason: string = 'manual'): Promise<void> {
+    // Idempotency check - prevent double-stop
+    if (!this.isRunning && this.engineState === 'stopped') {
+      this.logger.warn('Trading engine already stopped');
+      return;
+    }
+
+    // Prevent stop during start
+    if (this.engineState === 'starting') {
+      this.logger.warn('Cannot stop engine while starting, waiting...');
+      // Wait a bit for start to complete
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+
+    // Prevent double-stop
+    if (this.engineState === 'stopping') {
+      this.logger.warn('Trading engine already stopping');
+      return;
+    }
+
+    this.setEngineState('stopping', reason);
+    this.stopCount++;
+    this.lastStopReason = reason;
+
     try {
-      this.logger.info('Stopping trading engine');
+      this.logger.info('Stopping trading engine', {
+        reason,
+        stopCount: this.stopCount,
+      });
+
+      // Stop heartbeat first
+      this.stopHeartbeat();
 
       // Cancel all open orders
       if (this.orderManager) {
         const activeOrders = this.orderManager.getActiveOrders();
         for (const order of activeOrders) {
-          await this.cancelOrder(order.id);
+          try {
+            await this.cancelOrder(order.id);
+          } catch (err) {
+            this.logger.warn('Failed to cancel order during stop', {
+              orderId: order.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
         }
       }
       
@@ -190,7 +396,7 @@ export class TradingEngine extends EventEmitter {
             await this.positionTracker.closeAllPositions();
           }
           
-          // Best-effort wait for closes to be processed (paper fills are immediate; live fills rely on polling/WS).
+          // Best-effort wait for closes to be processed
           const timeoutMs = Math.max(5000, (this.guardrails.execution.order_timeout_sec || 5) * 1000 * 3);
           await this.waitForPositionsToClose(timeoutMs);
         } catch (err) {
@@ -226,13 +432,52 @@ export class TradingEngine extends EventEmitter {
       }
 
       this.isRunning = false;
+      this.setEngineState('stopped', 'stop_complete');
       this.emit('engine:stopped');
       
-      this.logger.info('Trading engine stopped');
+      this.logger.info('Trading engine stopped', {
+        reason,
+        stopCount: this.stopCount,
+      });
     } catch (error) {
       this.logger.error('Error stopping trading engine:', error);
+      this.setEngineState('stopped', 'stop_error');
       this.emit('engine:error', error as Error);
     }
+  }
+
+  /**
+   * Get exchange instance for supervisor access (reconnection)
+   */
+  public getExchange(): CoinbaseExchange | null {
+    return this.exchange;
+  }
+
+  /**
+   * Get engine health info for supervisor
+   */
+  public getHealthInfo(): {
+    engineState: EngineState;
+    isRunning: boolean;
+    lastHeartbeatAt: number;
+    startCount: number;
+    stopCount: number;
+    lastStartReason: string;
+    lastStopReason: string;
+    activeSymbols: string[];
+    wsHealth: any;
+  } {
+    return {
+      engineState: this.engineState,
+      isRunning: this.isRunning,
+      lastHeartbeatAt: this.lastHeartbeatAt,
+      startCount: this.startCount,
+      stopCount: this.stopCount,
+      lastStartReason: this.lastStartReason,
+      lastStopReason: this.lastStopReason,
+      activeSymbols: this.activeSymbols,
+      wsHealth: this.exchange ? (this.exchange as any).ws?.getHealth?.() : null,
+    };
   }
 
   private async waitForPositionsToClose(timeoutMs: number): Promise<void> {
@@ -381,14 +626,41 @@ export class TradingEngine extends EventEmitter {
     const guardrails = this.config.guardrails;
     const accountEquity = guardrails.account.equity_usd;
     const maxPositionSizeUsd = accountEquity * guardrails.risk.max_position_exposure_pct;
-    const maxTotalExposureUsd = this.config.mode === 'paper'
-      ? accountEquity
-      : accountEquity * guardrails.account.max_account_leverage;
     const maxDailyLossUsd = Math.abs(guardrails.risk.daily_loss_limit) * accountEquity;
     const maxDrawdownPercent = Math.abs(guardrails.risk.max_drawdown_limit) * 100;
     const minOrderUsd = accountEquity * guardrails.account.risk_per_trade * guardrails.account.min_notional_buffer;
     
-    const softLaunch = this.config.mode === 'live'
+    // Step 6: Paper/Live Parity - Use explicit config flags with parity defaults
+    // All flags default to FALSE (parity behavior)
+    const paperOverrides = {
+      resetRiskStateOnStart: process.env.PAPER_RESET_RISK_STATE_ON_START === 'true',
+      disableErrorRateLimit: process.env.PAPER_DISABLE_ERROR_RATE_LIMIT === 'true',
+      disableLatencyLimit: process.env.PAPER_DISABLE_LATENCY_LIMIT === 'true',
+      disableDataGapLimit: process.env.PAPER_DISABLE_DATA_GAP_LIMIT === 'true',
+      disableSoftLaunch: process.env.PAPER_DISABLE_SOFT_LAUNCH === 'true',
+    };
+    
+    const isPaper = this.config.mode === 'paper';
+    
+    // Log active overrides if any (transparency)
+    if (isPaper) {
+      const activeOverrides = Object.entries(paperOverrides)
+        .filter(([, v]) => v)
+        .map(([k]) => k);
+      if (activeOverrides.length > 0) {
+        this.logger.warn('Paper mode overrides active (divergence from live)', { activeOverrides });
+      } else {
+        this.logger.info('Paper mode running with full parity to live (no overrides)');
+      }
+    }
+    
+    // Step 6: Exposure and leverage are now the SAME in paper and live (parity)
+    // Unless explicitly overridden, paper uses same leverage as live
+    const maxTotalExposureUsd = accountEquity * guardrails.account.max_account_leverage;
+    
+    // Step 6: Soft launch applies to BOTH paper and live unless explicitly disabled in paper
+    const enableSoftLaunch = isPaper ? !paperOverrides.disableSoftLaunch : true;
+    const softLaunch = enableSoftLaunch
       ? {
           enabled: true,
           maxEntryTrades: 10,
@@ -402,11 +674,18 @@ export class TradingEngine extends EventEmitter {
         }
       : undefined;
 
+    // Step 6: ignorePersistedKillSwitch is now controlled by explicit flag, not mode
+    const ignorePersistedKillSwitch = isPaper && paperOverrides.resetRiskStateOnStart;
+    
+    // Step 6: errorRateLimit is now the SAME in paper and live (parity)
+    // Unless explicitly disabled via PAPER_DISABLE_ERROR_RATE_LIMIT
+    const errorRateLimit = (isPaper && paperOverrides.disableErrorRateLimit) ? 101 : 20;
+
     const config: RiskEngineConfig = {
       supabaseUrl: this.config.supabase.url,
       supabaseKey: this.config.supabase.serviceKey,
       userId: this.config.supabase.userId,
-      ignorePersistedKillSwitch: this.config.mode === 'paper',
+      ignorePersistedKillSwitch,
       limits: {
         maxPositionSize: maxPositionSizeUsd,
         maxTotalExposure: maxTotalExposureUsd,
@@ -415,13 +694,13 @@ export class TradingEngine extends EventEmitter {
         maxOrderSize: maxPositionSizeUsd,
         minOrderSize: minOrderUsd,
         maxOpenOrders: guardrails.account.max_open_positions,
-        maxLeverage: this.config.mode === 'paper' ? 1 : guardrails.account.max_account_leverage
+        maxLeverage: guardrails.account.max_account_leverage  // Step 6: Same in paper and live
       },
       killSwitches: {
         enabled: true,
         dailyLossLimit: maxDailyLossUsd,
         consecutiveLossLimit: 5,     // 5 losses in a row
-        errorRateLimit: this.config.mode === 'paper' ? 101 : 20, // Effectively disabled in paper mode
+        errorRateLimit,              // Step 6: Parity by default
         latencyLimit: guardrails.circuit_breakers.data_gap_sec * 1000
       },
       riskPerTrade: guardrails.account.risk_per_trade * 100,
@@ -616,7 +895,11 @@ export class TradingEngine extends EventEmitter {
     this.riskEngine!.on('risk:alert', (symbol, alert) => this.emit('risk:alert', { symbol, alert }));
     this.riskEngine!.on('risk:killswitch:triggered', async (reason) => {
       this.logger.error(`Kill switch triggered: ${reason}`);
-      await this.stop();
+      // IMPORTANT: Do NOT stop the engine on kill switch
+      // Instead, transition to halted state - runtime stays alive, trading stops
+      this.setEngineState('halted', `kill_switch: ${reason}`);
+      // Emit event for UI to show clear indication
+      this.emit('risk:alert', { type: 'kill_switch', reasons: [reason], message: reason });
     });
     this.riskEngine!.on('risk:metrics:update', (metrics) => this.emit('risk:metrics', metrics));
   }

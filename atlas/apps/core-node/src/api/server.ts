@@ -3,7 +3,7 @@ import cors from 'cors';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { createLogger } from '../core/logger';
-import { TradingEngine, TradingEngineConfig } from '../trading/trading-engine';
+import { TradingEngine, TradingEngineConfig, EngineState } from '../trading/trading-engine';
 import { SignalProcessor } from '../strategies/signal-processor';
 import { createClient } from '@supabase/supabase-js';
 import path from 'path';
@@ -17,6 +17,7 @@ import { MetricsTracker } from '../trading/metrics-tracker';
 import { SecretManager } from '../config/secrets';
 import { CoinbaseExchange } from '../exchanges/coinbase';
 import { TradeOutcomeCollector } from '../ml/trade-outcome-collector';
+import { EngineSupervisor, SupervisorState, RestartReason } from '../runtime/engine-supervisor';
 
 const app = express();
 const server = createServer(app);
@@ -102,6 +103,15 @@ const runtimeState = {
   // Warmup state (C1-6)
   warmupComplete: false,
   candlesBuffered: {} as Record<string, number>,
+  // 24/7 Resilience fields
+  runtimeAlive: true,
+  engineState: 'stopped' as EngineState,
+  engineDesiredState: 'stopped' as EngineState,
+  lastMarketDataAt: 0,
+  lastEngineHeartbeatAt: 0,
+  restartCount: 0,
+  lastRestartReason: null as string | null,
+  lastRestartAt: null as number | null,
 };
 
 // In-memory configs (will be persisted/hot-reloaded later)
@@ -141,6 +151,74 @@ const supabase = createClient(
 let tradingEngine: TradingEngine | null = null;
 let signalProcessor: SignalProcessor | null = null;
 let tradeOutcomeCollector: TradeOutcomeCollector | null = null;
+
+// Engine Supervisor for 24/7 resilience
+const supervisor = new EngineSupervisor({}, logger);
+
+// Set up supervisor callbacks
+supervisor.setRestartEngineCallback(async (reason: RestartReason): Promise<boolean> => {
+  logger.info('Supervisor requested engine restart', { reason });
+  
+  if (!tradingEngine) {
+    logger.warn('No trading engine to restart');
+    return false;
+  }
+  
+  try {
+    const config = tradingEngine.getConfig();
+    const mode = config.mode;
+    
+    // Stop current engine
+    await tradingEngine.stop(`supervisor_restart: ${reason}`);
+    
+    // Wait a moment before restarting
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    // Restart engine
+    await tradingEngine.start(`supervisor_restart: ${reason}`);
+    
+    return true;
+  } catch (error) {
+    logger.error('Failed to restart engine via supervisor', {
+      reason,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+});
+
+supervisor.setReconnectExchangeCallback(async (): Promise<boolean> => {
+  logger.info('Supervisor requested exchange reconnect');
+  
+  if (!tradingEngine) {
+    logger.warn('No trading engine for exchange reconnect');
+    return false;
+  }
+  
+  try {
+    const exchange = tradingEngine.getExchange();
+    if (exchange && typeof (exchange as any).forceWsReconnect === 'function') {
+      (exchange as any).forceWsReconnect();
+      return true;
+    } else if (exchange) {
+      // Fallback to direct WS client access
+      const wsClient = (exchange as any).getWsClient?.();
+      if (wsClient && typeof wsClient.forceReconnect === 'function') {
+        wsClient.forceReconnect();
+        return true;
+      }
+    }
+    return false;
+  } catch (error) {
+    logger.error('Failed to reconnect exchange via supervisor', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+});
+
+// Start the supervisor
+supervisor.start();
 
 // WebSocket clients
 const wsClients = new Set<any>();
@@ -249,7 +327,7 @@ if (tradingEngine?.engineRunning) {
   }
 }, 5 * 60 * 1000);
 
-// Periodic StatusUpdate broadcast for frontend
+// Periodic StatusUpdate broadcast for frontend with supervisor state
 setInterval(() => {
   if (wsClients.size === 0) return;
   
@@ -260,6 +338,21 @@ setInterval(() => {
     runtimeState.restLatencyMs = realMetrics.restLatencyMs;
     runtimeState.spreadPctile = realMetrics.spreadPctile;
     runtimeState.regime = realMetrics.regime;
+  }
+  
+  // Get supervisor state for enhanced runtime visibility
+  const supervisorState = supervisor.getState();
+  runtimeState.runtimeAlive = supervisorState.runtimeAlive;
+  runtimeState.engineState = tradingEngine?.getEngineState() || 'stopped';
+  runtimeState.lastMarketDataAt = supervisorState.lastMarketDataAt;
+  runtimeState.lastEngineHeartbeatAt = supervisorState.lastEngineHeartbeatAt;
+  runtimeState.restartCount = supervisorState.restartCount;
+  runtimeState.lastRestartReason = supervisorState.lastRestartReason;
+  runtimeState.lastRestartAt = supervisorState.lastRestartAt;
+  
+  // Sync kill switch state from supervisor
+  if (supervisorState.killSwitch.active && !runtimeState.killSwitch.active) {
+    runtimeState.killSwitch = supervisorState.killSwitch;
   }
   
   const isEngineRunning = tradingEngine !== null && tradingEngine.engineRunning;
@@ -279,6 +372,16 @@ setInterval(() => {
       activeSymbols: tradingEngine?.getActiveSymbols() || [],
       warmupComplete: runtimeState.warmupComplete,
       candlesBuffered: runtimeState.candlesBuffered,
+      // 24/7 Resilience fields
+      runtimeAlive: runtimeState.runtimeAlive,
+      engineState: runtimeState.engineState,
+      engineDesiredState: supervisorState.engineDesiredState,
+      lastMarketDataAt: runtimeState.lastMarketDataAt,
+      lastEngineHeartbeatAt: runtimeState.lastEngineHeartbeatAt,
+      restartCount: runtimeState.restartCount,
+      lastRestartReason: runtimeState.lastRestartReason,
+      lastRestartAt: runtimeState.lastRestartAt,
+      timestamp: Date.now(), // Explicit timestamp for staleness detection
     }
   });
 }, 1500);
@@ -342,16 +445,24 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true, timestamp: Date.now() });
 });
 
-// Get trading engine status (UI contract)
+// Get trading engine status (UI contract) with 24/7 resilience fields
 app.get('/api/status', (req, res) => {
   const isEngineRunning = tradingEngine !== null && tradingEngine.engineRunning;
+  const supervisorState = supervisor.getState();
+  
+  // Get comprehensive exchange health if available
+  const exchange = tradingEngine?.getExchange();
+  const wsHealth = exchange ? (exchange as any).getWsHealth?.() : null;
+  const exchangeHealth = exchange ? (exchange as any).getExchangeHealth?.() : null;
+  const restHealth = exchange ? (exchange as any).getRestHealth?.() : null;
+  const reconcilerState = exchange ? (exchange as any).getReconcilerState?.() : null;
   
   res.json({
     engineRunning: isEngineRunning,
     mode: isEngineRunning ? tradingEngine!.getConfig().mode : null,
     paused: runtimeState.paused,
     dailyStopHit: runtimeState.dailyStopHit,
-    killSwitch: runtimeState.killSwitch,
+    killSwitch: supervisorState.killSwitch.active ? supervisorState.killSwitch : runtimeState.killSwitch,
     wsLatencyMs: runtimeState.wsLatencyMs,
     restLatencyMs: runtimeState.restLatencyMs,
     spreadPctile: runtimeState.spreadPctile,
@@ -360,7 +471,176 @@ app.get('/api/status', (req, res) => {
     activeSymbols: tradingEngine?.getActiveSymbols() || [],
     warmupComplete: runtimeState.warmupComplete ?? false,
     candlesBuffered: runtimeState.candlesBuffered ?? {},
+    // 24/7 Resilience fields - ALWAYS present for UI staleness detection
+    runtimeAlive: true,
+    engineState: tradingEngine?.getEngineState() || 'stopped',
+    engineDesiredState: supervisorState.engineDesiredState,
+    lastMarketDataAt: supervisorState.lastMarketDataAt,
+    lastEngineHeartbeatAt: supervisorState.lastEngineHeartbeatAt,
+    restartCount: supervisorState.restartCount,
+    lastRestartReason: supervisorState.lastRestartReason,
+    lastRestartAt: supervisorState.lastRestartAt,
+    timestamp: Date.now(), // Explicit timestamp for UI staleness detection
+    // WebSocket health - single source of truth
+    ws: wsHealth ? {
+      connected: wsHealth.connected,
+      reconnecting: wsHealth.reconnecting,
+      reconnectAttempts: wsHealth.reconnectAttempts,
+      lastMessageAt: wsHealth.lastMessageAt,
+      messageAgeMs: wsHealth.messageAgeMs,
+      isStalled: wsHealth.isStalled,
+      subscriptionCount: wsHealth.subscriptions?.length ?? 0,
+    } : null,
+    // REST health
+    rest: restHealth ? {
+      circuitOpen: restHealth.circuitOpen,
+      rateLimited: restHealth.rateLimited,
+      consecutiveFailures: restHealth.consecutiveFailures,
+      degraded: restHealth.degraded,
+      degradedReasons: restHealth.degradedReasons,
+    } : null,
+    // Comprehensive exchange health
+    exchangeHealth: exchangeHealth ? {
+      degraded: exchangeHealth.degraded,
+      degradedReasons: exchangeHealth.degradedReasons,
+      allowsEntries: exchange ? (exchange as any).allowsNewEntries?.() : true,
+      allowsExits: exchange ? (exchange as any).allowsExits?.() : true,
+    } : null,
+    // Reconciler state
+    reconciler: reconcilerState ? {
+      running: reconcilerState.running,
+      lastOrderReconcileAt: reconcilerState.lastOrderReconcileAt,
+      lastFillReconcileAt: reconcilerState.lastFillReconcileAt,
+      degraded: reconcilerState.degraded,
+      degradedReason: reconcilerState.degradedReason,
+    } : null,
   });
+});
+
+// Get supervisor status for advanced monitoring
+app.get('/api/supervisor/status', (req, res) => {
+  const supervisorState = supervisor.getState();
+  const engineHealth = tradingEngine?.getHealthInfo();
+  
+  res.json({
+    supervisor: supervisorState,
+    engine: engineHealth || null,
+    config: supervisor.getConfig(),
+  });
+});
+
+// Get comprehensive exchange health status
+app.get('/api/exchange/health', (req, res) => {
+  const exchange = tradingEngine?.getExchange();
+  
+  if (!exchange) {
+    return res.json({
+      available: false,
+      message: 'Exchange not initialized (engine not running)',
+    });
+  }
+
+  const exchangeHealth = (exchange as any).getExchangeHealth?.() ?? null;
+  const wsHealth = (exchange as any).getWsHealth?.() ?? null;
+  const restHealth = (exchange as any).getRestHealth?.() ?? null;
+  const reconcilerState = (exchange as any).getReconcilerState?.() ?? null;
+  const gapFillerStatus = (exchange as any).getGapFillerStatus?.() ?? [];
+
+  res.json({
+    available: true,
+    health: exchangeHealth,
+    ws: wsHealth,
+    rest: restHealth,
+    reconciler: reconcilerState,
+    gapFiller: {
+      trackedSymbols: gapFillerStatus,
+      hasStaleData: gapFillerStatus.some((s: any) => s.isStale),
+    },
+    allowsEntries: (exchange as any).allowsNewEntries?.() ?? true,
+    allowsExits: (exchange as any).allowsExits?.() ?? true,
+  });
+});
+
+// Force exchange REST circuit breaker reset
+app.post('/api/exchange/reset-circuit', (req, res) => {
+  const exchange = tradingEngine?.getExchange();
+  
+  if (!exchange) {
+    return res.status(400).json({ error: 'Exchange not available' });
+  }
+
+  try {
+    (exchange as any).forceCloseRestCircuit?.();
+    logger.info('Exchange REST circuit breaker force reset via API');
+    res.json({ success: true, message: 'Circuit breaker reset' });
+  } catch (error) {
+    logger.error('Failed to reset circuit breaker:', error);
+    res.status(500).json({ error: 'Failed to reset circuit breaker' });
+  }
+});
+
+// Trigger immediate reconciliation
+app.post('/api/exchange/reconcile', async (req, res) => {
+  const exchange = tradingEngine?.getExchange();
+  
+  if (!exchange) {
+    return res.status(400).json({ error: 'Exchange not available' });
+  }
+
+  try {
+    await (exchange as any).triggerReconciliation?.();
+    logger.info('Reconciliation triggered via API');
+    res.json({ success: true, message: 'Reconciliation triggered' });
+  } catch (error) {
+    logger.error('Failed to trigger reconciliation:', error);
+    res.status(500).json({ error: 'Failed to trigger reconciliation' });
+  }
+});
+
+// Reset supervisor restart tracking (for manual intervention)
+app.post('/api/supervisor/reset-restarts', (req, res) => {
+  supervisor.resetRestartTracking();
+  logger.info('Supervisor restart tracking reset via API');
+  res.json({ success: true, message: 'Restart tracking reset' });
+});
+
+// Deactivate kill switch (resume trading)
+app.post('/api/killswitch/deactivate', async (req, res) => {
+  const { confirm } = req.body;
+  
+  if (confirm !== 'RESUME TRADING') {
+    return res.status(400).json({ 
+      error: "Confirmation phrase 'RESUME TRADING' required to deactivate kill switch" 
+    });
+  }
+  
+  try {
+    supervisor.deactivateKillSwitch();
+    
+    if (tradingEngine) {
+      tradingEngine.getRiskEngineInstance()?.deactivateKillSwitch();
+    }
+    
+    runtimeState.killSwitch.active = false;
+    runtimeState.killSwitch.reasons = [];
+    runtimeState.killSwitch.since = null;
+    
+    killSwitchActiveGauge.set(0);
+    
+    // Broadcast kill switch deactivated
+    broadcast({
+      type: 'KillSwitchDeactivated',
+      payload: {
+        timestamp: Date.now(),
+      }
+    });
+    
+    logger.info('Kill switch deactivated via API');
+    res.json({ success: true, message: 'Kill switch deactivated - trading can resume' });
+  } catch (error) {
+    logger.error('Failed to deactivate kill switch:', error);
+    res.status(500).json({ error: 'Failed to deactivate kill switch' });
+  }
 });
 
 // Start trading engine
@@ -407,11 +687,16 @@ app.post('/api/engine/start', async (req, res) => {
       }
     }
 
+    // Step 4: Unified environment config
+    // Paper mode now uses production market data by default
+    const resolvedMarketDataEnv = requestedMarketEnv === 'sandbox' ? 'sandbox' : 'production';
+    
     const engineConfig: TradingEngineConfig = {
       mode: mode as 'paper' | 'live',
       exchange: {
         name: 'coinbase',
-        environment: mode === 'live' ? 'production' : requestedMarketEnv
+        // For market data connectivity (used by WS/REST for price data)
+        environment: resolvedMarketDataEnv
       },
       products: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
       supabase: {
@@ -423,11 +708,18 @@ app.post('/api/engine/start', async (req, res) => {
       security: {
         encryptionKey: env.ENCRYPTION_KEY || ''
       },
-      guardrails: engineGuardrails
+      guardrails: engineGuardrails,
+      // New unified runtime config
+      runtime: {
+        marketDataEnv: resolvedMarketDataEnv,
+        executionEnv: mode === 'live' ? 'production' : 'production', // Paper ignores this
+        paperInitialEquityUsd: engineGuardrails.account.equity_usd,
+      }
     };
 
     logger.info(`Starting trading engine in ${mode} mode`, {
-      marketDataEnv: engineConfig.exchange.environment
+      marketDataEnv: resolvedMarketDataEnv,
+      executionMode: mode,
     });
 
     // Create trading engine
@@ -436,8 +728,41 @@ app.post('/api/engine/start', async (req, res) => {
     // Update metrics
     engineRunningGauge.set(1);
 
+    // Connect engine to supervisor for 24/7 monitoring
+    tradingEngine.on('engine:heartbeat', (timestamp) => {
+      supervisor.recordEngineHeartbeat();
+    });
+
+    tradingEngine.on('engine:state_changed', (state, reason) => {
+      supervisor.setActualState(state as any, reason);
+      
+      // Broadcast state change to UI
+      broadcast({
+        type: 'EngineStateChanged',
+        payload: {
+          state,
+          reason,
+          timestamp: Date.now(),
+        }
+      });
+    });
+
+    tradingEngine.on('engine:fatal', (error, context) => {
+      logger.error('Engine fatal error received', { context, error: error.message });
+      broadcast({
+        type: 'EngineError',
+        payload: {
+          context,
+          error: error.message,
+          timestamp: Date.now(),
+        }
+      });
+    });
+
     // Set up event listeners to update frontend
     tradingEngine.on('market:ticker', (ticker) => {
+      // Record market data for supervisor monitoring
+      supervisor.recordMarketData();
       const toNumber = (value: unknown, fallback: number): number => {
         const parsed = typeof value === 'number' ? value : parseFloat(String(value ?? ''));
         return Number.isFinite(parsed) ? parsed : fallback;
@@ -929,7 +1254,11 @@ app.post('/api/engine/start', async (req, res) => {
     });
 
     // Start the engine
-    await tradingEngine.start();
+    await tradingEngine.start('api_request');
+    
+    // Update supervisor state
+    supervisor.setDesiredState('running', mode as any);
+    supervisor.setActualState('running', 'engine_started');
     
     // Load historical data for warmup (don't await - do in background)
     const activeSymbols = tradingEngine.getActiveSymbols();
@@ -1111,9 +1440,15 @@ app.post('/api/engine/stop', async (req, res) => {
       return res.status(400).json({ error: 'Trading engine not running' });
     }
 
-    await tradingEngine.stop();
+    // Update supervisor state first
+    supervisor.setDesiredState('stopped');
+    
+    await tradingEngine.stop('api_request');
     tradingEngine = null;
     signalProcessor = null;
+    
+    // Update supervisor actual state
+    supervisor.setActualState('stopped', 'api_stop_request');
     
     // Update metrics
     engineRunningGauge.set(0);
@@ -1129,17 +1464,21 @@ app.post('/api/engine/stop', async (req, res) => {
 // Emergency kill switch
 app.post('/api/engine/kill', async (req, res) => {
   try {
+    const reason = 'User activated kill switch';
+    
+    // Activate kill switch via supervisor (this halts trading but keeps runtime alive)
+    supervisor.activateKillSwitch([reason]);
+    
     if (tradingEngine) {
-      await tradingEngine.emergencyStop('User activated kill switch');
-      tradingEngine = null;
-      signalProcessor = null;
-      engineRunningGauge.set(0);
+      // Do NOT stop the engine - just halt trading
+      // The engine stays alive for market data and status updates
+      tradingEngine.getRiskEngineInstance()?.activateKillSwitch(reason);
     }
     
     // Update metrics
     killSwitchActiveGauge.set(1);
     runtimeState.killSwitch.active = true;
-    runtimeState.killSwitch.reasons = ['User activated kill switch'];
+    runtimeState.killSwitch.reasons = [reason];
     runtimeState.killSwitch.since = Date.now();
 
     // Update risk events in Supabase
@@ -1148,12 +1487,27 @@ app.post('/api/engine/kill', async (req, res) => {
       .insert({
         user_id: USER_ID,
         event_type: 'kill_switch',
-        details: { reason: 'User activated kill switch' },
+        details: { reason },
         active: true,
         triggered_at: new Date().toISOString()
       });
 
-    res.json({ success: true, message: 'Kill switch activated' });
+    // Broadcast kill switch event
+    broadcast({
+      type: 'KillSwitchTriggered',
+      payload: {
+        active: true,
+        reasons: [reason],
+        since: runtimeState.killSwitch.since,
+        timestamp: Date.now(),
+      }
+    });
+
+    res.json({ 
+      success: true, 
+      message: 'Kill switch activated - trading halted, runtime still active',
+      engineStillAlive: tradingEngine !== null,
+    });
 
   } catch (error) {
     logger.error('Failed to activate kill switch:', error);
@@ -2774,49 +3128,83 @@ initializeAccountMetrics().catch(err => {
   logger.error('Failed to initialize account metrics on startup:', err);
 });
 
-// Global error handlers for stability
+// Global error handlers for stability - 24/7 resilience
 process.on('uncaughtException', (error) => {
-  logger.error('Uncaught Exception - keeping server alive:', error);
+  logger.error('Uncaught Exception - keeping server alive:', {
+    error: error.message,
+    stack: error.stack,
+  });
+  
+  // Notify supervisor of error (for potential recovery)
+  if (tradingEngine && !supervisor.isKillSwitchActive()) {
+    tradingEngine.handleFatal(error, 'uncaughtException');
+  }
+  
+  // Broadcast error to UI
+  broadcast({
+    type: 'SystemError',
+    payload: {
+      type: 'uncaughtException',
+      message: error.message,
+      timestamp: Date.now(),
+    }
+  });
+  
   // Don't exit - try to keep running
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  const message = reason instanceof Error ? reason.message : String(reason);
+  logger.error('Unhandled Rejection:', {
+    reason: message,
+    stack: reason instanceof Error ? reason.stack : undefined,
+  });
+  
+  // Broadcast error to UI
+  broadcast({
+    type: 'SystemError',
+    payload: {
+      type: 'unhandledRejection',
+      message,
+      timestamp: Date.now(),
+    }
+  });
+  
   // Don't exit - try to keep running
 });
 
 // Graceful shutdown handler
-process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, shutting down gracefully...');
+async function gracefulShutdown(signal: string) {
+  logger.info(`${signal} received, shutting down gracefully...`);
+  
   try {
+    // Stop supervisor first
+    supervisor.stop();
+    
+    // Stop trading engine
     if (tradingEngine) {
-      await tradingEngine.stop();
+      await tradingEngine.stop(`${signal}_shutdown`);
     }
+    
+    // Close server
     server.close(() => {
       logger.info('Server closed');
       process.exit(0);
     });
+    
+    // Force exit after 10 seconds if graceful shutdown hangs
+    setTimeout(() => {
+      logger.error('Graceful shutdown timed out, forcing exit');
+      process.exit(1);
+    }, 10000);
   } catch (error) {
     logger.error('Error during shutdown:', error);
     process.exit(1);
   }
-});
+}
 
-process.on('SIGINT', async () => {
-  logger.info('SIGINT received, shutting down gracefully...');
-  try {
-    if (tradingEngine) {
-      await tradingEngine.stop();
-    }
-    server.close(() => {
-      logger.info('Server closed');
-      process.exit(0);
-    });
-  } catch (error) {
-    logger.error('Error during shutdown:', error);
-    process.exit(1);
-  }
-});
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // Start server
 const PORT = process.env.PORT || 3001;

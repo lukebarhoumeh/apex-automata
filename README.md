@@ -32,6 +32,7 @@ Key features:
 - Risk management (position sizing, daily stop, kill-switch)
 - Orders, fills, positions, alerts syncing to Supabase
 - Real-time WebSocket updates to the UI
+- **24/7 Runtime Resilience** - Automatic recovery, infinite reconnection, watchdog monitoring
 
 ---
 
@@ -46,6 +47,219 @@ Runtime flow:
 2) RiskEngine gates entries; OrderManager simulates fills (paper)
 3) PositionTracker updates positions/PnL; data synced to Supabase
 4) UI consumes Supabase tables + runtime WebSocket events
+
+---
+
+## 24/7 Runtime Resilience
+
+The system is designed for continuous 24/7 operation with automatic recovery:
+
+### Engine States
+
+| State | Description |
+|-------|-------------|
+| `stopped` | Engine not running |
+| `starting` | Engine initializing |
+| `running` | Engine running, trading active |
+| `stopping` | Engine shutting down |
+| `halted` | **Trading halted** (kill switch), but runtime stays alive |
+
+### Key Behaviors
+
+1. **Kill Switch ≠ Shutdown**: When the kill switch triggers (daily loss, etc.), trading halts but the runtime stays alive. WebSocket connections remain open, market data keeps flowing, and the UI shows the halted state with reasons.
+
+2. **Infinite Reconnection**: Coinbase WebSocket never gives up reconnecting. Uses exponential backoff with jitter, capped at 60 seconds. Automatic resubscription after reconnect.
+
+3. **Engine Supervisor (Watchdog)**: Monitors engine heartbeat and market data freshness. Triggers automatic recovery when components become stale (configurable thresholds).
+
+4. **Idempotent Lifecycle**: `start()` and `stop()` are idempotent - calling them multiple times is safe and won't create duplicate intervals or listeners.
+
+5. **Single WebSocket Client**: The system uses exactly ONE WebSocket client for Coinbase (`CoinbaseWebSocket`). Subscriptions are idempotent - subscribing twice is a no-op. All subscriptions are automatically restored on reconnect via `SubscriptionManager`.
+
+6. **Risk State Machine**: Trading state is managed explicitly (`RUNNING`/`PAUSED`/`HALTED`). Kill switch halts trading but keeps runtime alive. Reduce-only exits always work.
+
+### Risk System
+
+The risk system uses a unified state machine and canonical R-unit math:
+
+| Component | Purpose |
+|-----------|---------|
+| `RiskStateMachine` | Manages trading state (`RUNNING`/`PAUSED`/`HALTED`) |
+| `RiskMath` | Canonical P&L and R-unit calculations |
+| `RiskEngine` | Integration with trading engine |
+
+**Key Concepts:**
+- **1R** = per_trade_risk × day_start_equity (e.g., 1% × $50,000 = $500)
+- **Daily Stop** = threshold in R units (e.g., -2R = -$1,000)
+- **Daily halts** auto-clear on day rollover
+- **Non-daily halts** require manual reset
+
+See [docs/risk.md](docs/risk.md) for complete documentation.
+
+### WebSocket Health Surface
+
+The status API (`GET /api/status`) includes WebSocket health:
+
+```json
+{
+  "ws": {
+    "connected": true,
+    "reconnecting": false,
+    "reconnectAttempts": 0,
+    "lastMessageAt": 1706832000000,
+    "messageAgeMs": 150,
+    "isStalled": false,
+    "subscriptionCount": 2
+  }
+}
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENGINE_HEARTBEAT_STALE_MS` | 15000 | Max time without engine heartbeat before recovery |
+| `MARKETDATA_STALE_MS` | 10000 | Max time without market data before WS reconnect |
+| `STATUS_HEARTBEAT_MS` | 1500 | Interval for status broadcasts to UI |
+| `RESTART_COOLDOWN_MS` | 30000 | Minimum time between restart attempts |
+| `MAX_CONSECUTIVE_RESTARTS` | 5 | Max restarts before giving up |
+
+### Supervisor Endpoints
+
+- `GET /api/supervisor/status` - Detailed supervisor state and engine health
+- `POST /api/supervisor/reset-restarts` - Reset restart tracking for manual recovery
+- `POST /api/killswitch/deactivate` - Resume trading after kill switch (requires confirmation)
+
+### Recovery Behavior
+
+- **Stale Engine Heartbeat**: Supervisor triggers engine restart (respects cooldown)
+- **Stale Market Data**: Supervisor triggers WebSocket reconnect
+- **Uncaught Exceptions**: Logged and reported to UI, but process stays alive
+- **Process Crash**: `start.cjs` auto-restarts backend with exponential backoff
+
+---
+
+## Coinbase Connectivity Model
+
+The system uses a resilient connectivity layer for Coinbase that ensures 24/7 operation:
+
+### REST API Resilience
+
+```
+Request → Rate Limiter → Retry with Backoff → Circuit Breaker → Response
+```
+
+| Feature | Implementation |
+|---------|---------------|
+| **Timeout** | 10s hard timeout with AbortController |
+| **Retry Policy** | 3 retries with exponential backoff (1s → 2s → 4s), max 30s |
+| **Rate Limiting** | Token bucket (15/s global, 5/s orders) |
+| **Circuit Breaker** | Opens after 5 failures, 30s cooldown |
+
+### Error Classification
+
+| Kind | HTTP Status | Retryable | Examples |
+|------|-------------|-----------|----------|
+| `timeout` | - | Yes | Request timed out |
+| `network` | - | Yes | DNS, connection refused |
+| `rate_limit` | 429 | Yes | Rate limited |
+| `server` | 5xx | Yes | Internal server error |
+| `auth` | 401/403 | No | Invalid API key |
+| `post_only` | 400 | No | Post-only would cross |
+| `insufficient_funds` | 400 | No | Not enough balance |
+
+### WebSocket + REST Reconciliation
+
+Even when WebSocket is healthy, the reconciler runs to ensure no missed events:
+
+1. **Order Reconciliation** (every 5s): Compares local orders vs Coinbase open orders
+2. **Fill Reconciliation** (every 5s): Fetches recent fills, dedupes by trade_id
+3. **Triggered Reconciliation**: Runs immediately on WS reconnect or order actions
+
+### Market Data Gap Filling
+
+When WebSocket market data goes stale:
+
+1. Gap filler detects no candles for >30s
+2. Fetches missing candles via REST
+3. Dedupes and backfills candle buffer
+4. Indicators resume without gaps
+
+### Degraded Mode Rules
+
+| Condition | Allow Entries | Allow Exits | Monitor |
+|-----------|---------------|-------------|---------|
+| WS disconnected only | ✅ | ✅ | ✅ |
+| REST circuit open | ❌ | ⚠️ | ✅ |
+| WS down + reconciler degraded | ❌ | ⚠️ | ✅ |
+| Rate limited | ⚠️ | ⚠️ | ✅ |
+
+### API Endpoints
+
+- `GET /api/exchange/health` - Comprehensive exchange health status
+- `POST /api/exchange/reset-circuit` - Force reset REST circuit breaker
+- `POST /api/exchange/reconcile` - Trigger immediate reconciliation
+
+---
+
+## Paper vs Live Mode
+
+The system uses a unified execution model where paper and live modes share identical code paths. Only the execution adapter differs.
+
+### Environment Configuration
+
+| Variable | Values | Default | Description |
+|----------|--------|---------|-------------|
+| `EXECUTION_MODE` | `paper` \| `live` | `paper` | Whether orders are simulated or real |
+| `MARKETDATA_ENV` | `production` \| `sandbox` | `production` | Source of market data |
+| `EXECUTION_ENV` | `production` \| `sandbox` | `production` | Target for live orders (ignored in paper) |
+
+### Key Design: Paper Uses Real Market Data
+
+By default, **paper mode uses production Coinbase market data**. This ensures:
+- Realistic price movements
+- Accurate signal testing  
+- Valid performance metrics
+
+### Execution Adapter Interface
+
+Both modes emit identical `BrokerOrderEvent` streams:
+
+```typescript
+type BrokerOrderEvent = 
+  | OrderAcceptedEvent   // Order acknowledged
+  | OrderRejectedEvent   // Order rejected with reason
+  | OrderCanceledEvent   // Order canceled
+  | FillEvent;           // Partial or complete fill
+```
+
+### Paper Adapter Features
+
+| Feature | Implementation |
+|---------|---------------|
+| **Latency** | 50-150ms simulated delay |
+| **Slippage** | Base 0.05% + depth-aware impact |
+| **Fees** | Maker 0.4%, Taker 0.6% |
+| **Post-only** | Rejects if would cross spread |
+| **Validation** | Respects tick size, lot size, min notional |
+
+### Configuration Examples
+
+**Paper Trading (Default)**:
+```bash
+EXECUTION_MODE=paper
+MARKETDATA_ENV=production  # Real prices!
+```
+
+**Live Trading**:
+```bash
+EXECUTION_MODE=live
+MARKETDATA_ENV=production
+EXECUTION_ENV=production
+CONFIRM_LIVE=YES  # Safety gate required
+```
+
+See [docs/modes.md](docs/modes.md) for complete documentation.
 
 ---
 

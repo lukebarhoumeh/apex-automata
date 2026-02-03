@@ -1,9 +1,34 @@
+/**
+ * @deprecated DEPRECATED - DO NOT USE
+ * 
+ * This WebSocket implementation is DEPRECATED and should NOT be used in production.
+ * 
+ * The canonical WebSocket client for Coinbase is:
+ * - CoinbaseWebSocket in `exchanges/coinbase/websocket.ts`
+ * 
+ * This file exists only for the unused MultiExchangeConnector experimental code.
+ * It will be removed in a future version.
+ * 
+ * Reasons for deprecation:
+ * 1. Does not implement the unified ICoinbaseWsClient interface
+ * 2. Lacks subscription persistence for reconnect
+ * 3. Uses different event names than the standard
+ * 4. Not integrated with the main trading runtime
+ * 5. Connection pooling adds complexity without benefit for our use case
+ * 
+ * @see exchanges/coinbase/websocket.ts for the production implementation
+ * @see exchanges/coinbase/ws/coinbase-ws.interface.ts for the interface contract
+ */
+
 import WebSocket from 'ws';
 import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
 import * as net from 'net';
 import * as tls from 'tls';
 
+/**
+ * @deprecated Use CoinbaseWebSocket instead
+ */
 export interface UltraFastWebSocketConfig {
   url: string;
   // Performance optimizations
@@ -34,7 +59,13 @@ export interface MarketDataUpdate {
   latency?: number;
 }
 
-// Ultra-optimized WebSocket client for minimum latency
+/**
+ * @deprecated DO NOT USE - Use CoinbaseWebSocket from exchanges/coinbase/websocket.ts instead
+ * 
+ * This class is deprecated and will be removed in a future version.
+ * It is not integrated with the main trading runtime and lacks features
+ * required for 24/7 operation (subscription persistence, interface compliance).
+ */
 export class UltraFastWebSocket extends EventEmitter {
   private config: UltraFastWebSocketConfig;
   private logger: Logger;
