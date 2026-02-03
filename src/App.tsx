@@ -2,7 +2,8 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/AppSidebar";
 import { AuthProvider } from "@/contexts/AuthContext";
-import { WebSocketProvider } from "@/hooks/useWebSocketEvents";
+import { RuntimeWsProvider } from "@/runtime/ws";
+import { WsDebugPanel } from "@/components/debug/WsDebugPanel";
 import Index from "./pages/Index";
 import Orders from "./pages/Orders";
 import Signals from "./pages/Signals";
@@ -18,7 +19,7 @@ const App = () => {
   return (
     <BrowserRouter>
       <AuthProvider>
-        <WebSocketProvider>
+        <RuntimeWsProvider showNotifications={true}>
           <SidebarProvider>
             <div className="flex min-h-screen w-full">
               <AppSidebar />
@@ -45,8 +46,11 @@ const App = () => {
                 </main>
               </div>
             </div>
+            
+            {/* Debug Panel - only visible when VITE_DEBUG_WS=1 */}
+            <WsDebugPanel />
           </SidebarProvider>
-        </WebSocketProvider>
+        </RuntimeWsProvider>
       </AuthProvider>
     </BrowserRouter>
   );

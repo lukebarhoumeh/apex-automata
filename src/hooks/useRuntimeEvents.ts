@@ -1,9 +1,18 @@
-// WebSocket hook for real-time runtime events from the Node backend
-import { useEffect, useRef, useState, useCallback } from 'react';
+/**
+ * @deprecated Use useRuntimeWs from @/runtime/ws instead.
+ * 
+ * This file is kept for backward compatibility only.
+ */
 
-// Backend WebSocket is on root path, not /events
-const WS_URL = import.meta.env.VITE_RUNTIME_WS_URL || 'ws://localhost:3001';
+import { useEffect, useState } from 'react';
+import { useRuntimeWs, useRuntimeWsState } from '@/runtime/ws';
+import type { 
+  TickerPayload, 
+  CandlePayload,
+  RuntimeEventEnvelope 
+} from '@/runtime/ws/types';
 
+// Re-export types for backward compatibility
 export type EventType = 
   | 'StatusUpdate'
   | 'TickerUpdate'
@@ -15,25 +24,8 @@ export type EventType =
   | 'Alert'
   | 'CandleUpdate';
 
-export interface TickerUpdate {
-  symbol: string;
-  price: number;
-  bid: number;
-  ask: number;
-  volume: number;
-  timestamp: number;
-}
-
-export interface CandleUpdate {
-  symbol: string;
-  timeframe: string;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-  timestamp: number;
-}
+export interface TickerUpdate extends TickerPayload {}
+export interface CandleUpdate extends CandlePayload {}
 
 export interface RuntimeEvent<T = unknown> {
   type: EventType;
@@ -42,8 +34,8 @@ export interface RuntimeEvent<T = unknown> {
 }
 
 interface UseRuntimeEventsOptions {
-  onTicker?: (data: TickerUpdate) => void;
-  onCandle?: (data: CandleUpdate) => void;
+  onTicker?: (data: TickerPayload) => void;
+  onCandle?: (data: CandlePayload) => void;
   onSignal?: (data: unknown) => void;
   onOrderUpdate?: (data: unknown) => void;
   onFill?: (data: unknown) => void;
@@ -55,135 +47,103 @@ interface UseRuntimeEventsOptions {
   reconnectInterval?: number;
 }
 
+/**
+ * @deprecated Use useRuntimeWs() and subscribe to specific events instead
+ */
 export function useRuntimeEvents(options: UseRuntimeEventsOptions = {}) {
-  const {
-    onTicker,
-    onCandle,
-    onSignal,
-    onOrderUpdate,
-    onFill,
-    onPositionUpdate,
-    onRiskEvent,
-    onAlert,
-    onStatusUpdate,
-    autoReconnect = true,
-    reconnectInterval = 3000,
-  } = options;
-
-  const [isConnected, setIsConnected] = useState(false);
-  const [lastMessage, setLastMessage] = useState<RuntimeEvent | null>(null);
-  const [connectionError, setConnectionError] = useState<string | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<number | null>(null);
-  const mountedRef = useRef(true);
-
-  const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
-
-    try {
-      const ws = new WebSocket(WS_URL);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        if (!mountedRef.current) return;
-        setIsConnected(true);
-        setConnectionError(null);
-        console.log('[WS] Connected to runtime events');
-      };
-
-      ws.onmessage = (event) => {
-        if (!mountedRef.current) return;
-        try {
-          const data: RuntimeEvent = JSON.parse(event.data);
-          setLastMessage(data);
-
-          // Route to appropriate handler
-          switch (data.type) {
-            case 'TickerUpdate':
-              onTicker?.(data.payload as TickerUpdate);
-              break;
-            case 'CandleUpdate':
-              onCandle?.(data.payload as CandleUpdate);
-              break;
-            case 'Signal':
-              onSignal?.(data.payload);
-              break;
-            case 'OrderUpdate':
-              onOrderUpdate?.(data.payload);
-              break;
-            case 'Fill':
-              onFill?.(data.payload);
-              break;
-            case 'PositionUpdate':
-              onPositionUpdate?.(data.payload);
-              break;
-            case 'RiskEvent':
-              onRiskEvent?.(data.payload);
-              break;
-            case 'Alert':
-              onAlert?.(data.payload);
-              break;
-            case 'StatusUpdate':
-              onStatusUpdate?.(data.payload);
-              break;
-          }
-        } catch (err) {
-          console.error('[WS] Failed to parse message:', err);
-        }
-      };
-
-      ws.onclose = () => {
-        if (!mountedRef.current) return;
-        setIsConnected(false);
-        console.log('[WS] Disconnected from runtime events');
-
-        // Auto reconnect
-        if (autoReconnect && mountedRef.current) {
-          reconnectTimeoutRef.current = window.setTimeout(() => {
-            if (mountedRef.current) {
-              connect();
-            }
-          }, reconnectInterval);
-        }
-      };
-
-      ws.onerror = (error) => {
-        if (!mountedRef.current) return;
-        console.error('[WS] WebSocket error:', error);
-        setConnectionError('WebSocket connection failed');
-      };
-    } catch (err) {
-      console.error('[WS] Failed to create WebSocket:', err);
-      setConnectionError('Failed to create WebSocket connection');
-    }
-  }, [onTicker, onCandle, onSignal, onOrderUpdate, onFill, onPositionUpdate, onRiskEvent, onAlert, onStatusUpdate, autoReconnect, reconnectInterval]);
-
-  const disconnect = useCallback(() => {
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-  }, []);
+  const wsState = useRuntimeWsState();
+  const { on, getRecentEvents } = useRuntimeWs();
+  const [lastMessage, setLastMessage] = useState<RuntimeEventEnvelope | null>(null);
 
   useEffect(() => {
-    mountedRef.current = true;
-    connect();
+    const unsubscribers: (() => void)[] = [];
+
+    if (options.onTicker) {
+      unsubscribers.push(on('market:ticker', (e) => {
+        setLastMessage(e);
+        options.onTicker?.(e.payload as TickerPayload);
+      }));
+    }
+
+    if (options.onCandle) {
+      unsubscribers.push(on('market:candle', (e) => {
+        setLastMessage(e);
+        options.onCandle?.(e.payload as CandlePayload);
+      }));
+    }
+
+    if (options.onSignal) {
+      unsubscribers.push(on('signal', (e) => {
+        setLastMessage(e);
+        options.onSignal?.(e.payload);
+      }));
+    }
+
+    if (options.onOrderUpdate) {
+      unsubscribers.push(on('order:updated', (e) => {
+        setLastMessage(e);
+        options.onOrderUpdate?.(e.payload);
+      }));
+      unsubscribers.push(on('order:created', (e) => {
+        setLastMessage(e);
+        options.onOrderUpdate?.(e.payload);
+      }));
+      unsubscribers.push(on('order:filled', (e) => {
+        setLastMessage(e);
+        options.onOrderUpdate?.(e.payload);
+      }));
+    }
+
+    if (options.onFill) {
+      unsubscribers.push(on('fill', (e) => {
+        setLastMessage(e);
+        options.onFill?.(e.payload);
+      }));
+    }
+
+    if (options.onPositionUpdate) {
+      unsubscribers.push(on('position:opened', (e) => {
+        setLastMessage(e);
+        options.onPositionUpdate?.(e.payload);
+      }));
+      unsubscribers.push(on('position:updated', (e) => {
+        setLastMessage(e);
+        options.onPositionUpdate?.(e.payload);
+      }));
+      unsubscribers.push(on('position:closed', (e) => {
+        setLastMessage(e);
+        options.onPositionUpdate?.(e.payload);
+      }));
+    }
+
+    if (options.onRiskEvent) {
+      unsubscribers.push(on('risk:event', (e) => {
+        setLastMessage(e);
+        options.onRiskEvent?.(e.payload);
+      }));
+      unsubscribers.push(on('risk:metrics', (e) => {
+        setLastMessage(e);
+        options.onRiskEvent?.(e.payload);
+      }));
+    }
+
+    if (options.onStatusUpdate) {
+      unsubscribers.push(on('status', (e) => {
+        setLastMessage(e);
+        options.onStatusUpdate?.(e.payload);
+      }));
+    }
 
     return () => {
-      mountedRef.current = false;
-      disconnect();
+      unsubscribers.forEach(unsub => unsub());
     };
-  }, [connect, disconnect]);
+  }, [on, options]);
 
   return {
-    isConnected,
+    isConnected: wsState.connected,
     lastMessage,
-    connectionError,
-    reconnect: connect,
-    disconnect,
+    connectionError: wsState.error,
+    reconnect: () => {}, // No-op, managed by provider
+    disconnect: () => {}, // No-op, managed by provider
   };
 }

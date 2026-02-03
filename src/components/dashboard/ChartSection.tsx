@@ -23,15 +23,12 @@ export const ChartSection = ({ symbol = "BTC-USD" }: ChartSectionProps) => {
   const [showDonchian, setShowDonchian] = useState(true);
   
   // Prefer WebSocket live data, fallback to useTradingEngine polling
-  const livePrice = primaryTicker?.price || lastTicker?.price || lastTicker?.last;
-  const vwap = lastTicker?.vwap;
-  const atr = lastTicker?.atr;
+  // lastTicker is now typed as TickerPayload which has 'price', not 'last'
+  const livePrice = primaryTicker?.price || lastTicker?.price;
   const spread = primaryTicker ? ((primaryTicker.ask - primaryTicker.bid) / primaryTicker.price * 100).toFixed(3) : null;
   
   // Fallback to mock data if no live data
   const displayPrice = livePrice ? Number(livePrice).toFixed(2) : "—";
-  const displayVwap = vwap ? Number(vwap).toFixed(2) : "—";
-  const displayAtr = atr ? Number(atr).toFixed(0) : "—";
 
   return (
     <Card className="card-glow border-primary/20">
@@ -69,14 +66,6 @@ export const ChartSection = ({ symbol = "BTC-USD" }: ChartSectionProps) => {
             >
               <span className="text-muted-foreground">Last:</span>
               <span className="ml-1 font-mono font-semibold">${displayPrice}</span>
-            </Badge>
-            <Badge variant="outline" className="text-xs bg-card">
-              <span className="text-muted-foreground">VWAP:</span>
-              <span className="ml-1 font-mono">${displayVwap}</span>
-            </Badge>
-            <Badge variant="outline" className="text-xs bg-card">
-              <span className="text-muted-foreground">ATR(14):</span>
-              <span className="ml-1 font-mono">${displayAtr}</span>
             </Badge>
             <div className="flex gap-1">
               <Popover>

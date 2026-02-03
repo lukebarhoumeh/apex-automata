@@ -1,18 +1,26 @@
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { WifiOff, Loader2 } from "lucide-react";
+import { useRuntimeWsState } from "@/runtime/ws";
 import { useRuntimeHealth } from "@/hooks/useRuntimeStatus";
 
 interface ConnectionStatusBannerProps {
-  isConnected: boolean;
+  isConnected?: boolean;
   isReconnecting?: boolean;
 }
 
 export const ConnectionStatusBanner = ({ 
-  isConnected, 
-  isReconnecting = false 
+  isConnected: propIsConnected, 
+  isReconnecting: propIsReconnecting 
 }: ConnectionStatusBannerProps) => {
+  // Use the unified WS state from RuntimeWsProvider
+  const wsState = useRuntimeWsState();
+  
   // Also check if backend health endpoint is reachable
   const { data: backendHealthy } = useRuntimeHealth();
+  
+  // Use props if provided, otherwise use WS state
+  const isConnected = propIsConnected ?? wsState.connected;
+  const isReconnecting = propIsReconnecting ?? (wsState.reconnectAttempts > 0 && !wsState.connected);
   
   // Consider connected if either WebSocket is connected OR backend API is healthy
   const actuallyConnected = isConnected || backendHealthy;
@@ -30,7 +38,9 @@ export const ConnectionStatusBanner = ({
       </div>
       <AlertDescription>
         {isReconnecting ? (
-          <span>Reconnecting to trading engine...</span>
+          <span>
+            Reconnecting to trading engine... (attempt {wsState.reconnectAttempts})
+          </span>
         ) : (
           <span>Disconnected from trading engine. Showing historical data only.</span>
         )}
