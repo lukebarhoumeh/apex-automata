@@ -1,8 +1,18 @@
-import { useQuery } from "@tanstack/react-query";
+/**
+ * Calculated Metrics Hook (Event-Driven)
+ * 
+ * Derives metrics from pnl:snapshot events when connected,
+ * falls back to REST + Supabase when disconnected.
+ */
+
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { FIXED_USER_ID } from "@/contexts/AuthContext";
 import { useSessionStats } from "./useSessionStats";
 import { useRuntimeStatus } from "./useRuntimeStatus";
+import { useConnectivityBooleans } from "@/runtime/connectivity";
+import { getEventBus } from "@/runtime/event-bus";
 import type { Tables } from "@/integrations/supabase/types";
 
 type Position = Tables<"positions">;
@@ -13,11 +23,29 @@ const API_URL = import.meta.env.VITE_RUNTIME_API_URL || 'http://localhost:3001';
 const INITIAL_BALANCE = 50000;
 const RISK_PER_TRADE = 0.01;
 
+// Fallback poll interval when disconnected
+const FALLBACK_POLL_INTERVAL = 10000;
+
 export const useCalculatedMetrics = () => {
+  const { isConnected } = useConnectivityBooleans();
+  const queryClient = useQueryClient();
+  
   // Priority 1: Live session stats from backend /api/analytics/session
   const { data: sessionStats } = useSessionStats();
   // Priority 2: Runtime status from backend /api/status (for mode, engineRunning, risk data)
   const { data: runtimeStatus } = useRuntimeStatus();
+  
+  // Listen to pnl:snapshot for immediate updates
+  useEffect(() => {
+    const bus = getEventBus();
+    
+    const unsubscribe = bus.on('pnl:snapshot', () => {
+      // pnl:snapshot triggers recalculation via cache invalidation
+      // This is handled by applyEventToCache, but we can add extra logic here
+    });
+    
+    return unsubscribe;
+  }, [queryClient]);
   
   return useQuery({
     queryKey: ["calculated-metrics", sessionStats?.sessionId, runtimeStatus?.engineRunning],
@@ -135,7 +163,9 @@ export const useCalculatedMetrics = () => {
         daily_stop_hit: false,
       };
     },
-    refetchInterval: 2000, // Fast refresh for real-time data
+    // Only poll when disconnected - events handle updates when connected
+    refetchInterval: isConnected ? false : FALLBACK_POLL_INTERVAL,
     enabled: true,
+    staleTime: isConnected ? 30000 : 1000,
   });
 };

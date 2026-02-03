@@ -1,8 +1,17 @@
+/**
+ * Signals Hook (Event-Driven)
+ * 
+ * Uses event bus for real-time updates, fallback polling when disconnected.
+ */
+
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { FIXED_USER_ID } from "@/contexts/AuthContext";
-import { useEffect, useState, useCallback } from "react";
+import { useConnectivityBooleans } from "@/runtime/connectivity";
 import type { Tables } from "@/integrations/supabase/types";
+
+// Fallback poll interval when disconnected
+const FALLBACK_POLL_INTERVAL = 10000;
 
 export type Signal = Tables<"signals">;
 
@@ -15,6 +24,8 @@ export interface SignalFilters {
 }
 
 export const useSignals = (filters?: SignalFilters) => {
+  const { isConnected } = useConnectivityBooleans();
+  
   return useQuery({
     queryKey: ["signals", FIXED_USER_ID, filters],
     queryFn: async () => {
@@ -45,11 +56,15 @@ export const useSignals = (filters?: SignalFilters) => {
       if (error) throw error;
       return data as Signal[];
     },
-    refetchInterval: 5000,
+    // Only poll when disconnected - event bus handles real-time updates
+    refetchInterval: isConnected ? false : FALLBACK_POLL_INTERVAL,
+    staleTime: isConnected ? 60000 : 2000,
   });
 };
 
 export const useRecentSignals = (limit = 10) => {
+  const { isConnected } = useConnectivityBooleans();
+  
   return useQuery({
     queryKey: ["recent-signals", FIXED_USER_ID, limit],
     queryFn: async () => {
@@ -63,36 +78,11 @@ export const useRecentSignals = (limit = 10) => {
       if (error) throw error;
       return data as Signal[];
     },
-    refetchInterval: 3000,
+    refetchInterval: isConnected ? false : FALLBACK_POLL_INTERVAL,
+    staleTime: isConnected ? 30000 : 1000,
   });
 };
 
-export const useRealtimeSignals = (onNewSignal: (signal: Signal) => void) => {
-  useEffect(() => {
-    const channel = supabase
-      .channel("signals-realtime")
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "signals",
-        },
-        (payload) => {
-          if (payload.new) {
-            onNewSignal(payload.new as Signal);
-          }
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [onNewSignal]);
-};
-
-// Get related orders/positions for a signal
 export const useSignalDetails = (signalId: string | null) => {
   return useQuery({
     queryKey: ["signal-details", signalId],

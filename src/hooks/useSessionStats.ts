@@ -1,6 +1,19 @@
-import { useQuery } from "@tanstack/react-query";
+/**
+ * Session Stats Hook (Event-Driven)
+ * 
+ * Derives from pnl:snapshot events when connected,
+ * falls back to REST polling when disconnected.
+ */
+
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
+import { useConnectivityBooleans } from "@/runtime/connectivity";
+import { getEventBus } from "@/runtime/event-bus";
 
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || 'http://localhost:3001';
+
+// Fallback poll interval when disconnected
+const FALLBACK_POLL_INTERVAL = 5000;
 
 export interface SessionStats {
   sessionId: string;
@@ -47,6 +60,22 @@ export interface SessionStats {
 }
 
 export const useSessionStats = () => {
+  const { isConnected } = useConnectivityBooleans();
+  const queryClient = useQueryClient();
+  
+  // Listen to pnl:snapshot events to update session stats
+  useEffect(() => {
+    const bus = getEventBus();
+    
+    const unsubscribe = bus.on('pnl:snapshot', (event) => {
+      // pnl:snapshot contains session info that maps to session stats
+      // The applyEventToCache already invalidates session-stats
+      // This is just for additional real-time updates if needed
+    });
+    
+    return unsubscribe;
+  }, [queryClient]);
+  
   return useQuery({
     queryKey: ["session-stats"],
     queryFn: async (): Promise<SessionStats | null> => {
@@ -65,8 +94,8 @@ export const useSessionStats = () => {
         return null;
       }
     },
-    refetchInterval: 2000,
-    staleTime: 1000,
+    // Only poll when disconnected - pnl:snapshot events handle updates when connected
+    refetchInterval: isConnected ? false : FALLBACK_POLL_INTERVAL,
+    staleTime: isConnected ? 30000 : 1000,
   });
 };
-
