@@ -28,7 +28,7 @@ import {
 } from "@/components/ui/tooltip";
 import { runtimeClient } from "@/services/runtimeClient";
 import { useRuntimeStatus, useRuntimeHealth } from "@/hooks/useRuntimeStatus";
-import { useWebSocket } from "@/hooks/useWebSocketEvents";
+import { useRuntimeWsState } from "@/runtime/ws";
 import { useToast } from "@/hooks/use-toast";
 import { useState } from "react";
 import { Input } from "@/components/ui/input";
@@ -49,8 +49,10 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   const { data: runtimeHealthy } = useRuntimeHealth();
   const { data: sessionStats } = useSessionStats();
   
-  // WebSocket connection state (from context provider)
-  const { isConnected: wsConnected, connectionError: wsError } = useWebSocket();
+  // WebSocket connection state (from unified runtime WS pipeline)
+  const wsState = useRuntimeWsState();
+  const wsConnected = wsState.connected;
+  const wsError = wsState.error;
 
   // Determine data source: live backend vs Supabase fallback
   const dataSource = sessionStats ? 'live' : (runtimeStatus?.engineRunning ? 'runtime' : 'fallback');
