@@ -63,6 +63,11 @@ const TYPE_MAP: Record<string, CanonicalEventType> = {
   'SupervisorHealth': 'supervisor:health',
   'HealthUpdate': 'supervisor:health',
   
+  // Heartbeat events
+  'Heartbeat': 'runtime:heartbeat',
+  'Ping': 'runtime:heartbeat',
+  'SupervisorHeartbeat': 'runtime:heartbeat',
+  
   // Already canonical types (passthrough)
   'status': 'status',
   'pnl:snapshot': 'pnl:snapshot',
@@ -85,6 +90,7 @@ const TYPE_MAP: Record<string, CanonicalEventType> = {
   'regime:changed': 'regime:changed',
   'regime:change': 'regime:changed',
   'supervisor:health': 'supervisor:health',
+  'runtime:heartbeat': 'runtime:heartbeat',
   
   // Candle alias
   'candle': 'market:candle',
@@ -493,6 +499,10 @@ export function normalizeRuntimeEvent(raw: unknown): RuntimeEventEnvelope | null
       break;
     case 'supervisor:health':
       payload = normalizeSupervisorHealthPayload(rawPayload);
+      break;
+    case 'runtime:heartbeat':
+      // Heartbeat has minimal payload - just normalize keys
+      payload = normalizeKeys(rawPayload);
       break;
     default:
       payload = normalizeKeys(rawPayload);

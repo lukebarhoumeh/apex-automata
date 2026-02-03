@@ -29,6 +29,7 @@ import {
 import { runtimeClient } from "@/services/runtimeClient";
 import { useRuntimeStatus, useRuntimeHealth } from "@/hooks/useRuntimeStatus";
 import { useRuntimeWsState } from "@/runtime/ws";
+import { useConnectivity, getConnectivityDisplayInfo } from "@/runtime/connectivity";
 import { useToast } from "@/hooks/use-toast";
 import { useState } from "react";
 import { Input } from "@/components/ui/input";
@@ -51,8 +52,10 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   
   // WebSocket connection state (from unified runtime WS pipeline)
   const wsState = useRuntimeWsState();
-  const wsConnected = wsState.connected;
-  const wsError = wsState.error;
+  
+  // Connectivity state (accurate truth model - no false positives)
+  const connectivity = useConnectivity();
+  const connectivityInfo = getConnectivityDisplayInfo(connectivity);
 
   // Determine data source: live backend vs Supabase fallback
   const dataSource = sessionStats ? 'live' : (runtimeStatus?.engineRunning ? 'runtime' : 'fallback');
@@ -299,7 +302,7 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
                 </div>
               )}
 
-              {/* WebSocket Connection Status */}
+              {/* Realtime Connection Status - Uses accurate connectivity model */}
               <TooltipProvider>
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -307,34 +310,44 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
                       <Badge 
                         variant="outline" 
                         className={`font-mono text-xs gap-1 cursor-default ${
-                          wsConnected 
+                          connectivityInfo.variant === 'success' 
                             ? 'border-success/50 text-success' 
+                            : connectivityInfo.variant === 'warning'
+                            ? 'border-warning/50 text-warning'
                             : 'border-destructive/50 text-destructive'
                         }`}
                       >
-                        {wsConnected ? (
+                        {connectivity.state === 'CONNECTED' ? (
                           <>
                             <PlugZap className="h-3 w-3" />
-                            <span className="hidden sm:inline">WS</span>
+                            <span className="hidden sm:inline">Realtime</span>
+                          </>
+                        ) : connectivity.state === 'STALE' ? (
+                          <>
+                            <RefreshCw className="h-3 w-3" />
+                            <span className="hidden sm:inline">Stale</span>
                           </>
                         ) : (
                           <>
                             <Plug className="h-3 w-3" />
-                            <span className="hidden sm:inline">WS</span>
+                            <span className="hidden sm:inline">{connectivityInfo.label}</span>
                           </>
                         )}
                       </Badge>
                     </div>
                   </TooltipTrigger>
                   <TooltipContent side="bottom" className="font-mono text-xs max-w-xs">
-                    {wsConnected ? (
-                      <p>WebSocket connected — receiving live events</p>
-                    ) : (
-                      <div>
-                        <p className="font-semibold text-destructive">WebSocket disconnected</p>
-                        {wsError && <p className="text-muted-foreground">{wsError}</p>}
-                        <p className="text-muted-foreground mt-1">Auto-reconnecting...</p>
-                      </div>
+                    <p className={`font-semibold ${
+                      connectivityInfo.variant === 'success' ? 'text-success' :
+                      connectivityInfo.variant === 'warning' ? 'text-warning' : 'text-destructive'
+                    }`}>
+                      {connectivityInfo.label}
+                    </p>
+                    <p className="text-muted-foreground">{connectivityInfo.description}</p>
+                    {wsState.reconnectAttempts > 0 && connectivity.state === 'DISCONNECTED' && (
+                      <p className="text-muted-foreground mt-1">
+                        Reconnecting... (attempt {wsState.reconnectAttempts})
+                      </p>
                     )}
                   </TooltipContent>
                 </Tooltip>

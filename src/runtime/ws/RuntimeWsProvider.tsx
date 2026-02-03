@@ -3,11 +3,14 @@
  * 
  * Provides a single WS connection to all components.
  * Handles React Query cache invalidation on events.
+ * Also wires REST health polling to the connectivity service.
  */
 
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { getRuntimeWsClient, RuntimeWsClient } from './RuntimeWsClient';
+import { getConnectivityService } from '../connectivity/RuntimeConnectivityService';
+import { runtimeClient } from '@/services/runtimeClient';
 import { useToast } from '@/hooks/use-toast';
 import type { 
   CanonicalEventType, 
@@ -19,6 +22,7 @@ import type {
   RegimePayload,
   PnLSnapshotPayload,
 } from './types';
+import { REST_PROBE_INTERVAL_MS } from '../connectivity/types';
 
 // ============ Context Types ============
 
@@ -60,6 +64,7 @@ export function RuntimeWsProvider({
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const clientRef = useRef<RuntimeWsClient | null>(null);
+  const restProbeIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   
   const [state, setState] = useState<RuntimeWsConnectionState>({
     connected: false,
@@ -93,6 +98,36 @@ export function RuntimeWsProvider({
       unsubEvents();
     };
   }, [queryClient, showNotifications]);
+  
+  // REST health probing for connectivity fallback
+  useEffect(() => {
+    const connectivity = getConnectivityService();
+    
+    const probe = async () => {
+      try {
+        const healthy = await runtimeClient.checkHealth();
+        if (healthy) {
+          connectivity.ingestRestOk();
+        } else {
+          connectivity.ingestRestFail();
+        }
+      } catch {
+        connectivity.ingestRestFail();
+      }
+    };
+    
+    // Initial probe
+    probe();
+    
+    // Setup interval
+    restProbeIntervalRef.current = setInterval(probe, REST_PROBE_INTERVAL_MS);
+    
+    return () => {
+      if (restProbeIntervalRef.current) {
+        clearInterval(restProbeIntervalRef.current);
+      }
+    };
+  }, []);
   
   // ============ Cache Invalidation ============
   

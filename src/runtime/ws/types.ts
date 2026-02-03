@@ -27,6 +27,7 @@ export const CANONICAL_EVENT_TYPES = [
   'regime:update',
   'regime:changed',
   'supervisor:health',
+  'runtime:heartbeat',
 ] as const;
 
 export type CanonicalEventType = typeof CANONICAL_EVENT_TYPES[number];
@@ -256,6 +257,15 @@ export interface SupervisorHealthPayload {
   degradedMode?: boolean;
 }
 
+// ============ Heartbeat Payload ============
+
+export interface HeartbeatPayload {
+  ts?: number;
+  engineRunning?: boolean;
+  sessionId?: string;
+  mode?: 'paper' | 'live';
+}
+
 // ============ Type-safe Event Creators ============
 
 export type StatusEvent = RuntimeEventEnvelope<'status', StatusPayload>;
@@ -277,6 +287,7 @@ export type WarmupEvent = RuntimeEventEnvelope<'warmup', WarmupPayload>;
 export type RegimeUpdateEvent = RuntimeEventEnvelope<'regime:update', RegimePayload>;
 export type RegimeChangedEvent = RuntimeEventEnvelope<'regime:changed', RegimePayload>;
 export type SupervisorHealthEvent = RuntimeEventEnvelope<'supervisor:health', SupervisorHealthPayload>;
+export type HeartbeatEvent = RuntimeEventEnvelope<'runtime:heartbeat', HeartbeatPayload>;
 
 export type AnyRuntimeEvent =
   | StatusEvent
@@ -297,7 +308,8 @@ export type AnyRuntimeEvent =
   | WarmupEvent
   | RegimeUpdateEvent
   | RegimeChangedEvent
-  | SupervisorHealthEvent;
+  | SupervisorHealthEvent
+  | HeartbeatEvent;
 
 // ============ Connection State ============
 

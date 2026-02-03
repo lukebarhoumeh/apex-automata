@@ -3,14 +3,17 @@
  * 
  * SINGLE WebSocket connection to the runtime backend.
  * All WS events flow through here, get normalized, and dispatched to subscribers.
+ * Also wires events to the Connectivity Service for accurate connection status.
  */
 
 import { normalizeRuntimeEvent, getUnknownTypes, getUnknownTypesCount } from './normalizeEvent';
+import { getConnectivityService } from '../connectivity/RuntimeConnectivityService';
 import type { 
   CanonicalEventType, 
   RuntimeEventEnvelope, 
   RuntimeWsConnectionState,
   AnyRuntimeEvent,
+  StatusPayload,
 } from './types';
 
 const WS_URL = import.meta.env.VITE_RUNTIME_WS_URL || 'ws://localhost:3001';
@@ -29,6 +32,14 @@ interface SubscriberEntry {
   types: CanonicalEventType[] | '*';
   handler: EventHandler;
 }
+
+// Heartbeat-like event types (used to determine "alive" status)
+const HEARTBEAT_EVENT_TYPES: CanonicalEventType[] = [
+  'status',
+  'pnl:snapshot',
+  'runtime:heartbeat',
+  'supervisor:health',
+];
 
 // ============ Runtime WS Client ============
 
@@ -184,6 +195,9 @@ export class RuntimeWsClient {
       error: null,
       reconnectAttempts: 0,
     });
+    
+    // Notify connectivity service
+    getConnectivityService().ingestWsOpen();
   }
   
   private handleMessage(event: MessageEvent): void {
@@ -197,6 +211,9 @@ export class RuntimeWsClient {
       if (normalized) {
         this.updateState({ lastEventAt: now });
         this.dispatchEvent(normalized);
+        
+        // Feed heartbeat-like events to connectivity service
+        this.ingestToConnectivity(normalized, now);
         
         // Add to debug buffer
         this.eventBuffer.push(normalized);
@@ -213,6 +230,33 @@ export class RuntimeWsClient {
     }
   }
   
+  /**
+   * Feed events to the connectivity service for accurate status tracking
+   */
+  private ingestToConnectivity(event: RuntimeEventEnvelope, ts: number): void {
+    const connectivity = getConnectivityService();
+    
+    // Status events carry engine state - special handling
+    if (event.type === 'status') {
+      const statusPayload = event.payload as StatusPayload;
+      connectivity.ingestStatus({
+        engineRunning: statusPayload.engineRunning,
+        mode: statusPayload.mode,
+        paused: statusPayload.paused,
+        tradingState: statusPayload.tradingState,
+        haltReasonCode: statusPayload.haltReasonCode,
+        dailyStopHit: statusPayload.dailyStopHit,
+        killSwitch: statusPayload.killSwitch,
+      }, ts);
+      return;
+    }
+    
+    // All heartbeat-like events count as heartbeat
+    if (HEARTBEAT_EVENT_TYPES.includes(event.type)) {
+      connectivity.ingestHeartbeat(ts);
+    }
+  }
+  
   private handleError(event: Event): void {
     console.error('[RuntimeWS] WebSocket error:', event);
     this.updateState({ error: 'WebSocket error' });
@@ -225,6 +269,10 @@ export class RuntimeWsClient {
     
     this.ws = null;
     this.updateState({ connected: false });
+    
+    // Notify connectivity service
+    getConnectivityService().ingestWsClose(event.reason || 'Connection closed');
+    
     this.scheduleReconnect();
   }
   
