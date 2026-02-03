@@ -154,13 +154,12 @@ export function applyEventToCache(
       queryClient.invalidateQueries({ queryKey: ['runtime-status'] });
       return false;
       
-    // ============ PnL Snapshot (most important) ============
+    // ============ PnL Snapshot (CANONICAL - Sprint 1.4) ============
     case 'pnl:snapshot':
-      // Store the snapshot directly
+      // Store the snapshot directly - this is THE source of truth for P&L
       queryClient.setQueryData(['pnl-snapshot'], payload);
-      // Invalidate calculated metrics to recompute from snapshot
-      queryClient.invalidateQueries({ queryKey: ['calculated-metrics'] });
-      queryClient.invalidateQueries({ queryKey: ['session-stats'] });
+      // Do NOT invalidate calculated-metrics here - it derives from snapshot
+      // The usePnLSnapshot hook will trigger re-renders automatically
       return true;
       
     // ============ Status/Health ============

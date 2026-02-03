@@ -1,10 +1,16 @@
+/**
+ * Account Metrics Hook (Sprint 1.4 - Deprecated for P&L)
+ * 
+ * This hook now exists ONLY for backward compatibility with
+ * Supabase account_metrics table queries.
+ * 
+ * For P&L display, use usePnLSnapshot() or useCalculatedMetrics().
+ * This hook should NOT be used for equity/P&L in the main dashboard.
+ */
+
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { FIXED_USER_ID } from "@/contexts/AuthContext";
-
-// Configuration
-const INITIAL_BALANCE = 50000; // Starting balance for paper trading
-const RISK_PER_TRADE = 0.01; // 1% risk per trade
 
 export interface AccountMetrics {
   total_equity: number;
@@ -18,6 +24,10 @@ export interface AccountMetrics {
   date: string;
 }
 
+/**
+ * @deprecated Use usePnLSnapshot() for P&L display.
+ * This hook is for Supabase account_metrics table only.
+ */
 export const useAccountMetrics = () => {
   return useQuery({
     queryKey: ["account-metrics"],
@@ -33,32 +43,14 @@ export const useAccountMetrics = () => {
 
       if (error) {
         console.error('Error fetching account metrics:', error);
-        // Return default metrics if no data exists
-        return {
-          total_equity: INITIAL_BALANCE,
-          daily_pnl: 0,
-          daily_pnl_r: 0,
-          risk_heat: 0,
-          spread_percentile: 0,
-          open_positions_count: 0,
-          wins_today: 0,
-          losses_today: 0,
-          date: today
-        } as AccountMetrics;
+        // Return null - let consumers handle missing data
+        return null;
       }
       
-      return data as AccountMetrics || {
-        total_equity: 52450.00,
-        daily_pnl: 0,
-        daily_pnl_r: 0,
-        risk_heat: 0,
-        spread_percentile: 0,
-        open_positions_count: 0,
-        wins_today: 0,
-        losses_today: 0,
-        date: today
-      } as AccountMetrics;
+      return data as AccountMetrics | null;
     },
-    refetchInterval: 3000,
+    // Low priority - not used for live P&L display
+    refetchInterval: 30000,
+    staleTime: 10000,
   });
 };

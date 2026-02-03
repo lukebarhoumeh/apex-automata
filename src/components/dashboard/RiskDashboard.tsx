@@ -1,24 +1,42 @@
+/**
+ * RiskDashboard - Risk Panel (Sprint 1.4)
+ * 
+ * Uses the canonical pnl:snapshot for P&L/equity display.
+ * Uses runtime status for kill switch and engine state.
+ */
+
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Progress } from "@/components/ui/progress";
 import { Shield, TrendingDown, DollarSign, AlertTriangle, Activity } from "lucide-react";
 import { useRuntimeStatus } from "@/hooks/useRuntimeStatus";
-import { useAccountMetrics } from "@/hooks/useAccountMetrics";
+import { usePnLSnapshot } from "@/hooks/usePnLSnapshot";
 
 export const RiskDashboard = () => {
   const { data: status } = useRuntimeStatus();
-  const { data: metrics } = useAccountMetrics();
+  const { snapshot, isStale, source } = usePnLSnapshot();
 
-  // Get risk data from runtime status (real-time from backend)
-  const riskData = status?.risk;
+  // Runtime state (not P&L)
   const killSwitchActive = status?.killSwitch?.active ?? false;
   const dailyStopHit = status?.dailyStopHit ?? false;
 
-  // Fallback to account metrics if runtime risk not available
-  const dailyPnL = riskData?.dailyPnLUsd ?? metrics?.daily_pnl ?? 0;
-  const exposureUsd = riskData?.exposureUsd ?? 0;
-  const maxDrawdownPct = riskData?.maxDrawdownPct ?? 0;
-  const riskHeat = metrics?.risk_heat ?? 0;
+  // P&L from canonical snapshot - NOT from runtime status
+  const dailyPnL = snapshot?.dailyPnlUsd ?? 0;
+  const dailyPnLR = snapshot?.dailyPnlR ?? 0;
+  const exposureUsd = snapshot?.exposureUsd ?? 0;
+  const totalEquity = snapshot?.totalEquityUsd ?? 0;
+  const unrealizedPnl = snapshot?.unrealizedPnlUsd ?? 0;
+  const realizedPnl = snapshot?.realizedPnlUsd ?? 0;
+  
+  // Risk heat from snapshot (exposure / equity)
+  const riskHeat = totalEquity > 0 ? (exposureUsd / totalEquity) * 100 : 0;
+  
+  // Max drawdown would come from session stats or separate tracking
+  // For now, derive from daily P&L if negative
+  const maxDrawdownPct = dailyPnL < 0 && totalEquity > 0
+    ? Math.abs(dailyPnL / totalEquity) * 100
+    : 0;
+
+  const hasData = snapshot !== null && source !== 'none';
 
   const formatCurrency = (val: number) =>
     new Intl.NumberFormat("en-US", {
@@ -29,12 +47,14 @@ export const RiskDashboard = () => {
     }).format(val);
 
   const getPnLColor = (pnl: number) => {
+    if (!hasData) return "text-muted-foreground";
     if (pnl > 0) return "text-success";
     if (pnl < 0) return "text-destructive";
     return "text-foreground";
   };
 
   const getDrawdownColor = (dd: number) => {
+    if (!hasData) return "text-muted-foreground";
     if (dd < 2) return "text-success";
     if (dd < 5) return "text-warning";
     return "text-destructive";
@@ -53,6 +73,11 @@ export const RiskDashboard = () => {
           <div className="flex items-center gap-2">
             <Shield className="h-5 w-5 text-primary" />
             Risk Dashboard
+            {isStale && (
+              <Badge variant="outline" className="text-xs text-warning border-warning/50">
+                STALE
+              </Badge>
+            )}
           </div>
           {killSwitchActive && (
             <Badge variant="destructive" className="animate-pulse">
@@ -68,7 +93,7 @@ export const RiskDashboard = () => {
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
-        {/* Daily P&L */}
+        {/* Daily P&L - from pnl:snapshot */}
         <div className="flex items-center justify-between p-3 rounded-lg bg-muted/30">
           <div className="flex items-center gap-2">
             <DollarSign className="h-4 w-4 text-muted-foreground" />
@@ -76,14 +101,34 @@ export const RiskDashboard = () => {
           </div>
           <div className="text-right">
             <span className={`text-lg font-bold font-mono tabular-nums ${getPnLColor(dailyPnL)}`}>
-              {dailyPnL >= 0 ? "+" : ""}
-              {formatCurrency(dailyPnL)}
+              {hasData ? (
+                <>
+                  {dailyPnL >= 0 ? "+" : ""}
+                  {formatCurrency(dailyPnL)}
+                </>
+              ) : "---"}
             </span>
-            {metrics?.daily_pnl_r !== undefined && (
-              <span className={`text-xs ml-2 ${getPnLColor(metrics.daily_pnl_r)}`}>
-                ({metrics.daily_pnl_r >= 0 ? "+" : ""}{metrics.daily_pnl_r.toFixed(2)}R)
+            {hasData && (
+              <span className={`text-xs ml-2 ${getPnLColor(dailyPnLR)}`}>
+                ({dailyPnLR >= 0 ? "+" : ""}{dailyPnLR.toFixed(2)}R)
               </span>
             )}
+          </div>
+        </div>
+
+        {/* Realized vs Unrealized breakdown */}
+        <div className="grid grid-cols-2 gap-3">
+          <div className="p-2 rounded-lg bg-muted/20">
+            <div className="text-xs text-muted-foreground">Realized</div>
+            <div className={`text-sm font-bold font-mono ${getPnLColor(realizedPnl)}`}>
+              {hasData ? formatCurrency(realizedPnl) : "---"}
+            </div>
+          </div>
+          <div className="p-2 rounded-lg bg-muted/20">
+            <div className="text-xs text-muted-foreground">Unrealized</div>
+            <div className={`text-sm font-bold font-mono ${getPnLColor(unrealizedPnl)}`}>
+              {hasData ? formatCurrency(unrealizedPnl) : "---"}
+            </div>
           </div>
         </div>
 
@@ -94,7 +139,7 @@ export const RiskDashboard = () => {
             <span className="text-sm font-medium">Total Exposure</span>
           </div>
           <span className="text-lg font-bold font-mono tabular-nums">
-            {formatCurrency(exposureUsd)}
+            {hasData ? formatCurrency(exposureUsd) : "---"}
           </span>
         </div>
 
@@ -102,10 +147,10 @@ export const RiskDashboard = () => {
         <div className="flex items-center justify-between p-3 rounded-lg bg-muted/30">
           <div className="flex items-center gap-2">
             <TrendingDown className="h-4 w-4 text-muted-foreground" />
-            <span className="text-sm font-medium">Max Drawdown</span>
+            <span className="text-sm font-medium">Session Drawdown</span>
           </div>
           <span className={`text-lg font-bold font-mono tabular-nums ${getDrawdownColor(maxDrawdownPct)}`}>
-            -{maxDrawdownPct.toFixed(2)}%
+            {hasData ? `-${maxDrawdownPct.toFixed(2)}%` : "---"}
           </span>
         </div>
 
@@ -116,20 +161,22 @@ export const RiskDashboard = () => {
             <Badge
               variant="outline"
               className={`font-mono ${
-                riskHeat > 75
+                !hasData 
+                  ? "border-muted-foreground/30 text-muted-foreground"
+                  : riskHeat > 75
                   ? "border-destructive text-destructive"
                   : riskHeat > 50
                   ? "border-warning text-warning"
                   : "border-success text-success"
               }`}
             >
-              {riskHeat.toFixed(0)}%
+              {hasData ? `${riskHeat.toFixed(0)}%` : "---"}
             </Badge>
           </div>
           <div className="relative h-2 rounded-full bg-muted overflow-hidden">
             <div
-              className={`h-full transition-all duration-500 ${getHeatColor(riskHeat)}`}
-              style={{ width: `${Math.min(riskHeat, 100)}%` }}
+              className={`h-full transition-all duration-500 ${hasData ? getHeatColor(riskHeat) : 'bg-muted-foreground/30'}`}
+              style={{ width: hasData ? `${Math.min(riskHeat, 100)}%` : '0%' }}
             />
           </div>
           <div className="flex justify-between text-xs text-muted-foreground">
@@ -138,24 +185,6 @@ export const RiskDashboard = () => {
             <span>100%</span>
           </div>
         </div>
-
-        {/* Win/Loss Today */}
-        {metrics && (
-          <div className="grid grid-cols-2 gap-3 pt-2">
-            <div className="text-center p-2 rounded-lg bg-success/10 border border-success/20">
-              <div className="text-xs text-muted-foreground">Wins Today</div>
-              <div className="text-xl font-bold text-success font-mono">
-                {metrics.wins_today ?? 0}
-              </div>
-            </div>
-            <div className="text-center p-2 rounded-lg bg-destructive/10 border border-destructive/20">
-              <div className="text-xs text-muted-foreground">Losses Today</div>
-              <div className="text-xl font-bold text-destructive font-mono">
-                {metrics.losses_today ?? 0}
-              </div>
-            </div>
-          </div>
-        )}
       </CardContent>
     </Card>
   );

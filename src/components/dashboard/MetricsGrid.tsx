@@ -1,3 +1,10 @@
+/**
+ * MetricsGrid - Dashboard KPI Cards (Sprint 1.4)
+ * 
+ * Displays P&L metrics from the canonical pnl:snapshot source.
+ * Shows "---" for unknown values rather than fake zeros.
+ */
+
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { TrendingUp, DollarSign, Activity, AlertCircle, Percent, Zap, ArrowUp, ArrowDown } from "lucide-react";
 import { cn, formatUsd, formatR, formatPercent } from "@/lib/utils";
@@ -9,7 +16,7 @@ interface MetricCardProps {
   change?: string;
   icon: React.ReactNode;
   trend?: "up" | "down" | "neutral";
-  variant?: "default" | "success" | "destructive" | "warning";
+  variant?: "default" | "success" | "destructive" | "warning" | "unknown";
   animate?: boolean;
 }
 
@@ -31,6 +38,8 @@ const MetricCard = ({
         return "border-destructive/30 bg-gradient-to-br from-destructive/5 to-transparent";
       case "warning":
         return "border-warning/30 bg-gradient-to-br from-warning/5 to-transparent";
+      case "unknown":
+        return "border-muted/30 bg-gradient-to-br from-muted/5 to-transparent opacity-60";
       default:
         return "border-border/50 bg-gradient-to-br from-card to-card/50";
     }
@@ -44,6 +53,8 @@ const MetricCard = ({
         return "text-destructive loss-glow";
       case "warning":
         return "text-warning";
+      case "unknown":
+        return "text-muted-foreground";
       default:
         return "text-foreground";
     }
@@ -57,6 +68,8 @@ const MetricCard = ({
         return "text-destructive";
       case "warning":
         return "text-warning";
+      case "unknown":
+        return "text-muted-foreground/50";
       default:
         return "text-muted-foreground";
     }
@@ -109,75 +122,92 @@ interface MetricsGridProps {
     total_equity: number;
     daily_pnl: number;
     daily_pnl_r: number;
+    total_realized_pnl?: number;
+    total_unrealized_pnl?: number;
     risk_heat: number;
     spread_percentile: number;
     open_positions_count: number;
     wins_today: number;
     losses_today: number;
+    isStale?: boolean;
+    source?: string;
   };
 }
 
 export const MetricsGrid = ({ metrics }: MetricsGridProps) => {
-  // Use actual values only - no fake defaults
-  const equity = metrics?.total_equity ?? 50000; // Initial balance if no data
+  // If no metrics, show unknown state - don't fake data
+  const hasData = metrics && metrics.total_equity !== 0;
+  
+  const equity = metrics?.total_equity ?? 0;
   const dailyPnl = metrics?.daily_pnl ?? 0;
   const dailyPnlR = metrics?.daily_pnl_r ?? 0;
+  const realizedPnl = metrics?.total_realized_pnl ?? dailyPnl;
+  const unrealizedPnl = metrics?.total_unrealized_pnl ?? 0;
   const riskHeat = metrics?.risk_heat ?? 0;
-  const spreadPercentile = metrics?.spread_percentile ?? 50;
+  const spreadPercentile = metrics?.spread_percentile ?? 0;
   const openPositions = metrics?.open_positions_count ?? 0;
   const wins = metrics?.wins_today ?? 0;
   const losses = metrics?.losses_today ?? 0;
+  const isStale = metrics?.isStale ?? false;
 
-  const dailyPnlVariant = dailyPnl > 0 ? "success" : dailyPnl < 0 ? "destructive" : "default";
+  // Determine P&L variant based on value
+  const getPnlVariant = (pnl: number) => {
+    if (!hasData) return "unknown";
+    if (pnl > 0) return "success";
+    if (pnl < 0) return "destructive";
+    return "default";
+  };
+
+  const dailyPnlVariant = getPnlVariant(dailyPnl);
   const dailyPnlTrend = dailyPnl > 0 ? "up" : dailyPnl < 0 ? "down" : "neutral";
 
   return (
     <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 animate-slide-up">
       <MetricCard
         title="Total Equity"
-        value={formatUsd(equity)}
-        change={dailyPnl !== 0 ? formatPercent(dailyPnl / (equity - dailyPnl)) : undefined}
+        value={hasData ? formatUsd(equity) : "---"}
+        change={hasData && dailyPnl !== 0 ? formatPercent(dailyPnl / Math.max(equity - dailyPnl, 1)) : undefined}
         trend={dailyPnl > 0 ? "up" : dailyPnl < 0 ? "down" : "neutral"}
-        subtitle={dailyPnl > 0 ? "All-time high" : "Session equity"}
+        subtitle={isStale ? "Data stale" : hasData ? "Session equity" : "Waiting for data"}
         icon={<DollarSign className="h-4 w-4" />}
-        variant={dailyPnl > 0 ? "success" : dailyPnl < 0 ? "destructive" : "default"}
+        variant={!hasData ? "unknown" : dailyPnl > 0 ? "success" : dailyPnl < 0 ? "destructive" : "default"}
       />
       <MetricCard
         title="Daily P&L"
-        value={formatR(dailyPnlR)}
-        change={formatUsd(dailyPnl)}
+        value={hasData ? formatR(dailyPnlR) : "---"}
+        change={hasData ? formatUsd(dailyPnl) : undefined}
         trend={dailyPnlTrend}
-        subtitle={`${wins}W / ${losses}L`}
+        subtitle={hasData ? `${wins}W / ${losses}L` : "No trades"}
         icon={<TrendingUp className="h-4 w-4" />}
         variant={dailyPnlVariant}
       />
       <MetricCard
-        title="Risk Heat"
-        value={formatPercent(riskHeat / 100)}
-        subtitle="of 3% max limit"
+        title="Unrealized"
+        value={hasData ? formatUsd(unrealizedPnl) : "---"}
+        subtitle={hasData ? `${openPositions} open position${openPositions !== 1 ? 's' : ''}` : "No positions"}
         icon={<Activity className="h-4 w-4" />}
-        variant={riskHeat > 2.5 ? "warning" : "default"}
+        variant={getPnlVariant(unrealizedPnl)}
       />
       <MetricCard
-        title="Spread %tile"
-        value={`${spreadPercentile}%`}
-        subtitle={spreadPercentile > 80 ? "High volatility" : "Normal"}
+        title="Risk Heat"
+        value={hasData ? formatPercent(riskHeat / 100) : "---"}
+        subtitle={hasData ? "of 3% max limit" : "Unknown"}
         icon={<Percent className="h-4 w-4" />}
-        variant={spreadPercentile > 90 ? "warning" : "default"}
+        variant={!hasData ? "unknown" : riskHeat > 2.5 ? "warning" : "default"}
       />
       <MetricCard
-        title="Open Positions"
-        value={openPositions.toString()}
-        subtitle={openPositions > 0 ? "Active trades" : "No positions"}
+        title="Spread %ile"
+        value={hasData ? `${spreadPercentile}%` : "---"}
+        subtitle={hasData ? (spreadPercentile > 80 ? "High volatility" : "Normal") : "Unknown"}
         icon={<Zap className="h-4 w-4" />}
-        variant="default"
+        variant={!hasData ? "unknown" : spreadPercentile > 90 ? "warning" : "default"}
       />
       <MetricCard
         title="Daily Stop"
-        value={dailyPnlR < 0 ? formatR(dailyPnlR) : formatR(-2)}
-        subtitle={dailyPnlR <= -2 ? "TRIGGERED" : "Remaining"}
+        value={hasData ? (dailyPnlR < 0 ? formatR(dailyPnlR) : formatR(-2)) : "---"}
+        subtitle={hasData ? (dailyPnlR <= -2 ? "TRIGGERED" : "Remaining") : "Unknown"}
         icon={<AlertCircle className="h-4 w-4" />}
-        variant={dailyPnlR <= -2 ? "destructive" : "default"}
+        variant={!hasData ? "unknown" : dailyPnlR <= -2 ? "destructive" : "default"}
       />
     </div>
   );

@@ -1,7 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Power, Pause, Play, AlertTriangle, Ban, Square, PlayCircle, Database, Radio, Wifi, WifiOff, RefreshCw, Plug, PlugZap } from "lucide-react";
-import { useSessionStats } from "@/hooks/useSessionStats";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -34,7 +33,7 @@ import { useConnectivity, getConnectivityDisplayInfo } from "@/runtime/connectiv
 import { useToast } from "@/hooks/use-toast";
 import { useState } from "react";
 import { Input } from "@/components/ui/input";
-import { useCalculatedMetrics } from "@/hooks/useCalculatedMetrics";
+import { usePnLSnapshot } from "@/hooks/usePnLSnapshot";
 
 interface DashboardHeaderProps {
   botState: "paper" | "live" | "paused";
@@ -46,10 +45,11 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   const [isLoading, setIsLoading] = useState(false);
   const [startMode, setStartMode] = useState<'paper' | 'live'>('paper');
   const [liveConfirmText, setLiveConfirmText] = useState('');
-  const { data: metrics } = useCalculatedMetrics();
+  
+  // P&L from canonical snapshot (Sprint 1.4)
+  const { snapshot, isStale: pnlIsStale, source: pnlSource } = usePnLSnapshot();
   const { data: runtimeStatus } = useRuntimeStatus();
   const { data: runtimeHealthy } = useRuntimeHealth();
-  const { data: sessionStats } = useSessionStats();
   
   // WebSocket connection state (from unified runtime WS pipeline)
   const wsState = useRuntimeWsState();
@@ -58,8 +58,11 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
   const connectivity = useConnectivity();
   const connectivityInfo = getConnectivityDisplayInfo(connectivity);
 
-  // Determine data source: live backend vs Supabase fallback
-  const dataSource = sessionStats ? 'live' : (runtimeStatus?.engineRunning ? 'runtime' : 'fallback');
+  // Determine data source based on P&L source
+  const dataSource = pnlSource === 'ws' ? 'live' : pnlSource === 'rest' ? 'runtime' : 'fallback';
+  
+  // Check if we have valid P&L data
+  const hasPnLData = snapshot !== null && pnlSource !== 'none';
 
   const formatCurrency = (val: number) => 
     new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0 }).format(val);
@@ -525,13 +528,16 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
             </div>
           </div>
 
-          {/* Bottom Row: Key Performance Indicators */}
+          {/* Bottom Row: Key Performance Indicators - from pnl:snapshot */}
           <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
             {/* Equity */}
             <div className="space-y-1">
-              <div className="text-xs text-muted-foreground font-mono">Equity</div>
+              <div className="text-xs text-muted-foreground font-mono">
+                Equity
+                {pnlIsStale && <span className="text-warning ml-1">(stale)</span>}
+              </div>
               <div className="text-lg font-bold font-mono tabular-nums">
-                {formatCurrency(metrics?.total_equity || 0)}
+                {hasPnLData ? formatCurrency(snapshot?.totalEquityUsd ?? 0) : '---'}
               </div>
             </div>
 
@@ -539,22 +545,35 @@ export const DashboardHeader = ({ botState, onStateChange }: DashboardHeaderProp
             <div className="space-y-1">
               <div className="text-xs text-muted-foreground font-mono">Daily P&L</div>
               <div className={`text-lg font-bold font-mono tabular-nums ${
-                (metrics?.daily_pnl || 0) >= 0 ? 'text-success profit-glow' : 'text-destructive loss-glow'
+                !hasPnLData ? 'text-muted-foreground' :
+                (snapshot?.dailyPnlUsd ?? 0) >= 0 ? 'text-success profit-glow' : 'text-destructive loss-glow'
               }`}>
-                {formatCurrency(metrics?.daily_pnl || 0)}
-                <span className="text-xs ml-1">({(metrics?.daily_pnl_r || 0).toFixed(2)}R)</span>
+                {hasPnLData ? (
+                  <>
+                    {formatCurrency(snapshot?.dailyPnlUsd ?? 0)}
+                    <span className="text-xs ml-1">({(snapshot?.dailyPnlR ?? 0).toFixed(2)}R)</span>
+                  </>
+                ) : '---'}
               </div>
             </div>
 
-            {/* Risk Heat */}
+            {/* Risk Heat - calculated from snapshot exposure/equity */}
             <div className="space-y-1">
               <div className="text-xs text-muted-foreground font-mono">Risk Heat</div>
-              <div className={`text-lg font-bold font-mono tabular-nums ${
-                (metrics?.risk_heat || 0) > 70 ? 'text-destructive' : 
-                (metrics?.risk_heat || 0) > 50 ? 'text-warning' : 'text-success'
-              }`}>
-                {(metrics?.risk_heat || 0).toFixed(0)}%
-              </div>
+              {(() => {
+                const equity = snapshot?.totalEquityUsd ?? 0;
+                const exposure = snapshot?.exposureUsd ?? 0;
+                const heat = equity > 0 ? (exposure / equity) * 100 : 0;
+                return (
+                  <div className={`text-lg font-bold font-mono tabular-nums ${
+                    !hasPnLData ? 'text-muted-foreground' :
+                    heat > 70 ? 'text-destructive' : 
+                    heat > 50 ? 'text-warning' : 'text-success'
+                  }`}>
+                    {hasPnLData ? `${heat.toFixed(0)}%` : '---'}
+                  </div>
+                );
+              })()}
             </div>
 
             {/* Spread Percentile */}

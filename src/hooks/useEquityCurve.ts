@@ -1,15 +1,19 @@
 /**
- * Equity Curve Hook (Event-Driven)
+ * Equity Curve Hook (Event-Driven, Sprint 1.4)
  * 
  * Builds equity curve from pnl:snapshot events when connected.
- * Only fetches historical data on initial load or reconnect.
+ * Historical data fetched on initial load or reconnect.
+ * 
+ * The live series is built from the same pnl:snapshot that drives
+ * the header/metrics, ensuring chart and KPIs never drift.
  */
 
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useEffect, useRef, useCallback, useState } from "react";
 import { useConnectivityBooleans } from "@/runtime/connectivity";
 import { getEventBus } from "@/runtime/event-bus";
 import type { BusEvent } from "@/runtime/event-bus/types";
+import type { PnLSnapshot } from "@/runtime/pnl/types";
 
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || 'http://localhost:3001';
 
@@ -21,8 +25,8 @@ const FALLBACK_POLL_INTERVAL = 30000;
 
 export interface EquityPoint {
   timestamp: number;
-  equity: number;
-  pnl: number;
+  equity: number;  // totalEquityUsd from snapshot
+  pnl: number;     // realized + unrealized
   tradeId?: string;
 }
 
@@ -44,10 +48,14 @@ export const useLiveEquitySeries = () => {
     const bus = getEventBus();
     
     const unsubscribe = bus.on('pnl:snapshot', (event: BusEvent<'pnl:snapshot'>) => {
-      const payload = event.payload as {
+      // Type the payload as PnLSnapshot
+      const payload = event.payload as Partial<PnLSnapshot> & {
         totalEquityUsd?: number;
+        total_equity_usd?: number;
         realizedPnlUsd?: number;
+        realized_pnl_usd?: number;
         unrealizedPnlUsd?: number;
+        unrealized_pnl_usd?: number;
         ts?: number;
       };
       
@@ -57,10 +65,15 @@ export const useLiveEquitySeries = () => {
       }
       lastTsRef.current = event.ts;
       
+      // Normalize field names (handle both camelCase and snake_case)
+      const equity = payload.totalEquityUsd ?? payload.total_equity_usd ?? 0;
+      const realized = payload.realizedPnlUsd ?? payload.realized_pnl_usd ?? 0;
+      const unrealized = payload.unrealizedPnlUsd ?? payload.unrealized_pnl_usd ?? 0;
+      
       const point: EquityPoint = {
         timestamp: event.ts,
-        equity: payload.totalEquityUsd || 0,
-        pnl: (payload.realizedPnlUsd || 0) + (payload.unrealizedPnlUsd || 0),
+        equity: equity,
+        pnl: realized + unrealized,
       };
       
       setSeries(prev => {
