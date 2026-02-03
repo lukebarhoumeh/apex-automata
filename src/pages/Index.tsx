@@ -65,10 +65,7 @@ const Index = () => {
       
       <main className="container mx-auto px-4 lg:px-6 py-4 lg:py-6 space-y-4 relative z-10">
         {/* Connection & Status Banners */}
-        <ConnectionStatusBanner 
-          isConnected={tradingEngine.isConnected} 
-          isReconnecting={tradingEngine.isReconnecting}
-        />
+        <ConnectionStatusBanner />
         
         <StaleDataWarning 
           lastUpdate={tradingEngine.lastUpdate}
