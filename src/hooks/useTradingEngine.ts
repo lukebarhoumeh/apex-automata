@@ -1,215 +1,189 @@
-import { useEffect, useState, useRef, useCallback } from 'react';
-import { tradingApi } from '@/services/tradingApi';
-import { useToast } from '@/components/ui/use-toast';
+/**
+ * Trading Engine Hook
+ * 
+ * Provides connection state and engine status using the unified RuntimeWs pipeline.
+ */
+
+import { useEffect, useState, useCallback } from 'react';
+import { useRuntimeWs, useRuntimeWsState } from '@/runtime/ws';
+import { runtimeClient } from '@/services/runtimeClient';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import type { 
+  StatusPayload, 
+  TickerPayload, 
+  SignalPayload, 
+  OrderPayload, 
+  PositionPayload 
+} from '@/runtime/ws/types';
 
 export interface TradingEngineState {
   isConnected: boolean;
   engineRunning: boolean;
   mode: 'paper' | 'live' | null;
-  lastTicker: any;
-  lastSignal: any;
-  lastOrder: any;
-  lastPosition: any;
-  lastAlert: any;
+  paused: boolean;
+  dailyStopHit: boolean;
+  killSwitch: {
+    active: boolean;
+    reasons: string[];
+  };
+  tradingState?: 'RUNNING' | 'PAUSED' | 'HALTED';
+  lastTicker: TickerPayload | null;
+  lastSignal: SignalPayload | null;
+  lastOrder: OrderPayload | null;
+  lastPosition: PositionPayload | null;
   backendAvailable: boolean;
   lastUpdate: Date | null;
   isReconnecting: boolean;
 }
 
 export const useTradingEngine = () => {
-  const { toast } = useToast();
+  const queryClient = useQueryClient();
+  const wsState = useRuntimeWsState();
+  const { on } = useRuntimeWs();
+  
   const [state, setState] = useState<TradingEngineState>({
     isConnected: false,
     engineRunning: false,
     mode: null,
+    paused: false,
+    dailyStopHit: false,
+    killSwitch: { active: false, reasons: [] },
+    tradingState: undefined,
     lastTicker: null,
     lastSignal: null,
     lastOrder: null,
     lastPosition: null,
-    lastAlert: null,
     backendAvailable: false,
     lastUpdate: null,
     isReconnecting: false,
   });
 
-  const tickerDebounceRef = useRef<NodeJS.Timeout>();
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
-  const backendCheckIntervalRef = useRef<NodeJS.Timeout>();
+  // Check backend availability via REST (fallback for when WS is down)
+  const { data: runtimeStatus } = useQuery({
+    queryKey: ['runtime-status'],
+    queryFn: () => runtimeClient.getStatus(),
+    refetchInterval: 5000,
+    retry: 1,
+    staleTime: 2000,
+  });
 
-  // Debounced ticker update to avoid excessive re-renders
-  const updateTicker = useCallback((ticker: any) => {
-    if (tickerDebounceRef.current) {
-      clearTimeout(tickerDebounceRef.current);
-    }
-    tickerDebounceRef.current = setTimeout(() => {
-      setState(prev => ({ 
-        ...prev, 
-        lastTicker: ticker,
-        lastUpdate: new Date()
-      }));
-    }, 150);
-  }, []);
-
-  // Check backend availability on mount and periodically
+  // Sync WS connection state
   useEffect(() => {
-    const checkBackend = async () => {
-      try {
-        const status = await tradingApi.getStatus();
-        setState(prev => ({ 
-          ...prev, 
-          backendAvailable: true,
-          engineRunning: status.engineRunning,
-          mode: status.mode,
-        }));
-      } catch (error) {
-        setState(prev => ({ ...prev, backendAvailable: false }));
-      }
-    };
-    
-    // Initial check
-    checkBackend();
-    
-    // Periodic check every 5 seconds
-    backendCheckIntervalRef.current = setInterval(checkBackend, 5000);
-    
-    return () => {
-      if (backendCheckIntervalRef.current) {
-        clearInterval(backendCheckIntervalRef.current);
-      }
-    };
-  }, []);
+    setState(prev => ({
+      ...prev,
+      isConnected: wsState.connected,
+      isReconnecting: wsState.reconnectAttempts > 0 && !wsState.connected,
+      lastUpdate: wsState.lastEventAt ? new Date(wsState.lastEventAt) : prev.lastUpdate,
+    }));
+  }, [wsState.connected, wsState.reconnectAttempts, wsState.lastEventAt]);
 
+  // Sync REST status (for backend availability and initial state)
+  useEffect(() => {
+    if (runtimeStatus) {
+      setState(prev => ({
+        ...prev,
+        backendAvailable: true,
+        engineRunning: runtimeStatus.engineRunning,
+        mode: runtimeStatus.mode,
+        paused: runtimeStatus.paused ?? false,
+        dailyStopHit: runtimeStatus.dailyStopHit ?? false,
+        killSwitch: runtimeStatus.killSwitch ?? { active: false, reasons: [] },
+        tradingState: runtimeStatus.tradingState,
+      }));
+    }
+  }, [runtimeStatus]);
+
+  // Subscribe to WS events for real-time updates
   useEffect(() => {
     const unsubscribers: (() => void)[] = [];
 
-    // Connection status
+    // Status updates
     unsubscribers.push(
-      tradingApi.on('connected', () => {
-        if (reconnectTimeoutRef.current) {
-          clearTimeout(reconnectTimeoutRef.current);
-        }
-        setState(prev => ({ 
-          ...prev, 
-          isConnected: true, 
-          backendAvailable: true,
-          isReconnecting: false,
-          lastUpdate: new Date()
-        }));
-        if (state.backendAvailable) {
-          toast({
-            title: "Connected to Trading Engine",
-            description: "Real-time data stream established",
-          });
-        }
-      })
-    );
-
-    unsubscribers.push(
-      tradingApi.on('disconnected', () => {
-        setState(prev => ({ ...prev, isConnected: false, isReconnecting: true }));
-        if (state.backendAvailable) {
-          toast({
-            title: "Disconnected from Trading Engine",
-            description: "Attempting to reconnect...",
-            variant: "destructive",
-          });
-        }
-        
-        // Set reconnecting flag with timeout
-        reconnectTimeoutRef.current = setTimeout(() => {
-          setState(prev => ({ ...prev, isReconnecting: false }));
-        }, 10000);
-      })
-    );
-
-    // Engine status - backend sends StatusUpdate
-    unsubscribers.push(
-      tradingApi.on('StatusUpdate', (status: any) => {
-        console.log('Received StatusUpdate:', status);
+      on('status', (event) => {
+        const status = event.payload as StatusPayload;
         setState(prev => ({
           ...prev,
-          engineRunning: status.mode !== null && !status.paused,
-          mode: status.mode || null,
+          engineRunning: status.engineRunning,
+          mode: status.mode,
+          paused: status.paused,
+          dailyStopHit: status.dailyStopHit,
+          killSwitch: status.killSwitch,
+          tradingState: status.tradingState,
+          lastUpdate: new Date(),
+        }));
+        // Invalidate status query to keep REST in sync
+        queryClient.invalidateQueries({ queryKey: ['runtime-status'] });
+      })
+    );
+
+    // Ticker updates (debounced internally by WS client)
+    unsubscribers.push(
+      on('market:ticker', (event) => {
+        setState(prev => ({
+          ...prev,
+          lastTicker: event.payload as TickerPayload,
+          lastUpdate: new Date(),
         }));
       })
     );
 
-    // Market data - backend sends TickerUpdate
+    // Signal updates
     unsubscribers.push(
-      tradingApi.on('TickerUpdate', (ticker: any) => {
-        console.log('Received TickerUpdate:', ticker);
-        updateTicker(ticker);
+      on('signal', (event) => {
+        setState(prev => ({
+          ...prev,
+          lastSignal: event.payload as SignalPayload,
+          lastUpdate: new Date(),
+        }));
       })
     );
 
-    // Trading signals - backend sends Signal
+    // Order updates
     unsubscribers.push(
-      tradingApi.on('Signal', (signal: any) => {
-        console.log('Received Signal:', signal);
-        setState(prev => ({ ...prev, lastSignal: signal }));
-        toast({
-          title: `${signal.strategy} Signal`,
-          description: `${signal.direction.toUpperCase()} ${signal.symbol} @ ${signal.price}`,
-        });
+      on('order:created', (event) => {
+        setState(prev => ({
+          ...prev,
+          lastOrder: event.payload as OrderPayload,
+          lastUpdate: new Date(),
+        }));
       })
     );
 
-    // Orders - backend sends OrderUpdate
     unsubscribers.push(
-      tradingApi.on('OrderUpdate', (order: any) => {
-        console.log('Received OrderUpdate:', order);
-        setState(prev => ({ ...prev, lastOrder: order }));
-        toast({
-          title: "Order Placed",
-          description: `${order.side} ${order.size} ${order.product} @ ${order.price || 'Market'}`,
-        });
+      on('order:updated', (event) => {
+        setState(prev => ({
+          ...prev,
+          lastOrder: event.payload as OrderPayload,
+          lastUpdate: new Date(),
+        }));
       })
     );
 
-    // Fills - backend sends Fill
+    // Position updates
     unsubscribers.push(
-      tradingApi.on('Fill', (fill: any) => {
-        console.log('Received Fill:', fill);
-        toast({
-          title: "Order Filled",
-          description: `Filled ${fill.quantity} @ ${fill.price}`,
-          variant: "default",
-        });
+      on('position:opened', (event) => {
+        setState(prev => ({
+          ...prev,
+          lastPosition: event.payload as PositionPayload,
+          lastUpdate: new Date(),
+        }));
       })
     );
 
-    // Positions - backend sends PositionUpdate
     unsubscribers.push(
-      tradingApi.on('PositionUpdate', (position: any) => {
-        console.log('Received PositionUpdate:', position);
-        setState(prev => ({ ...prev, lastPosition: position }));
+      on('position:closed', (event) => {
+        setState(prev => ({
+          ...prev,
+          lastPosition: event.payload as PositionPayload,
+          lastUpdate: new Date(),
+        }));
       })
     );
 
-    // Risk alerts - backend sends RiskEvent
-    unsubscribers.push(
-      tradingApi.on('RiskEvent', (alert: any) => {
-        console.log('Received RiskEvent:', alert);
-        setState(prev => ({ ...prev, lastAlert: alert }));
-        toast({
-          title: "Risk Alert",
-          description: alert.message || JSON.stringify(alert),
-          variant: "destructive",
-        });
-      })
-    );
-
-    // Cleanup
     return () => {
       unsubscribers.forEach(unsub => unsub());
-      if (tickerDebounceRef.current) {
-        clearTimeout(tickerDebounceRef.current);
-      }
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-      }
     };
-  }, [toast, updateTicker]);
+  }, [on, queryClient]);
 
   return state;
 };

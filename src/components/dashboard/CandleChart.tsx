@@ -60,7 +60,7 @@ export const CandleChart = ({
     if (liveCandles.length > 0) return; // Skip if WS provides candles
     if (!lastTicker?.price) return;
     
-    const price = parseFloat(lastTicker.price);
+    const price = typeof lastTicker.price === 'string' ? parseFloat(lastTicker.price) : lastTicker.price;
     const now = Date.now();
     const candleTime = Math.floor(now / tfMs) * tfMs;
 

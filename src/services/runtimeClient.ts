@@ -15,6 +15,8 @@ export interface RuntimeStatus {
     reasons: string[];
     since?: number | null;
   };
+  tradingState?: 'RUNNING' | 'PAUSED' | 'HALTED';
+  haltReasonCode?: string;
   wsLatencyMs: number;
   restLatencyMs: number;
   spreadPctile: number;

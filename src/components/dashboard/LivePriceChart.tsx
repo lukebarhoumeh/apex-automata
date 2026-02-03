@@ -19,10 +19,10 @@ export const LivePriceChart = ({ symbol, height = 450 }: LivePriceChartProps) =>
 
   // Add new price data when ticker updates
   useEffect(() => {
-    if (lastTicker?.price && lastTicker?.product_id === symbol) {
+    if (lastTicker?.price && lastTicker?.symbol === symbol) {
       const newPoint: PricePoint = {
         time: Date.now(),
-        price: parseFloat(lastTicker.price)
+        price: typeof lastTicker.price === 'string' ? parseFloat(lastTicker.price) : lastTicker.price
       };
       
       setPriceHistory(prev => {
