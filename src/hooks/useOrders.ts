@@ -1,13 +1,24 @@
+/**
+ * Orders Hook (Event-Driven)
+ * 
+ * Uses event bus for real-time updates, fallback polling when disconnected.
+ */
+
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { FIXED_USER_ID } from "@/contexts/AuthContext";
-import { useEffect } from "react";
+import { useConnectivityBooleans } from "@/runtime/connectivity";
 import type { Tables } from "@/integrations/supabase/types";
+
+// Fallback poll interval when disconnected
+const FALLBACK_POLL_INTERVAL = 10000;
 
 export type Order = Tables<"orders">;
 export type Fill = Tables<"fills">;
 
 export const useOrders = (limit = 50) => {
+  const { isConnected } = useConnectivityBooleans();
+  
   return useQuery({
     queryKey: ["orders", FIXED_USER_ID, limit],
     queryFn: async () => {
@@ -21,11 +32,15 @@ export const useOrders = (limit = 50) => {
       if (error) throw error;
       return data as Order[];
     },
-    refetchInterval: 5000,
+    // Only poll when disconnected - event bus handles real-time updates
+    refetchInterval: isConnected ? false : FALLBACK_POLL_INTERVAL,
+    staleTime: isConnected ? 60000 : 2000,
   });
 };
 
 export const useFills = (orderId?: string) => {
+  const { isConnected } = useConnectivityBooleans();
+  
   return useQuery({
     queryKey: ["fills", FIXED_USER_ID, orderId],
     queryFn: async () => {
@@ -45,56 +60,7 @@ export const useFills = (orderId?: string) => {
       if (error) throw error;
       return data as Fill[];
     },
-    refetchInterval: 5000,
+    refetchInterval: isConnected ? false : FALLBACK_POLL_INTERVAL,
+    staleTime: isConnected ? 60000 : 2000,
   });
-};
-
-export const useRealtimeOrders = (onUpdate: (order: Order) => void) => {
-  useEffect(() => {
-    const channel = supabase
-      .channel("orders-realtime")
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "orders",
-        },
-        (payload) => {
-          if (payload.new) {
-            onUpdate(payload.new as Order);
-          }
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [onUpdate]);
-};
-
-export const useRealtimeFills = (onFill: (fill: Fill) => void) => {
-  useEffect(() => {
-    const channel = supabase
-      .channel("fills-realtime")
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "fills",
-        },
-        (payload) => {
-          if (payload.new) {
-            onFill(payload.new as Fill);
-          }
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [onFill]);
 };

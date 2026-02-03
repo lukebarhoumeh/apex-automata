@@ -1,6 +1,16 @@
+/**
+ * Positions Hook (Event-Driven)
+ * 
+ * Uses event bus for real-time updates, fallback polling when disconnected.
+ */
+
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { FIXED_USER_ID } from "@/contexts/AuthContext";
+import { useConnectivityBooleans } from "@/runtime/connectivity";
+
+// Fallback poll interval when disconnected
+const FALLBACK_POLL_INTERVAL = 10000;
 
 export interface Position {
   id: string;
@@ -22,6 +32,8 @@ export interface Position {
 }
 
 export const usePositions = () => {
+  const { isConnected } = useConnectivityBooleans();
+  
   return useQuery({
     queryKey: ["positions", FIXED_USER_ID],
     queryFn: async () => {
@@ -35,30 +47,30 @@ export const usePositions = () => {
       if (error) throw error;
       return data;
     },
-    refetchInterval: 5000,
+    // Only poll when disconnected - Supabase realtime + WS events handle updates
+    refetchInterval: isConnected ? false : FALLBACK_POLL_INTERVAL,
+    staleTime: isConnected ? 60000 : 2000,
   });
 };
 
-export const useRealtimePositions = (onUpdate: (position: Position) => void) => {
-  const channel = supabase
-    .channel("positions-changes")
-    .on(
-      "postgres_changes",
-      {
-        event: "*",
-        schema: "public",
-        table: "positions",
-      },
-      (payload) => {
-        console.log("Position update:", payload);
-        if (payload.new) {
-          onUpdate(payload.new as Position);
-        }
-      }
-    )
-    .subscribe();
+export const useClosedPositions = (limit = 50) => {
+  const { isConnected } = useConnectivityBooleans();
+  
+  return useQuery({
+    queryKey: ["closed-positions", FIXED_USER_ID, limit],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("positions")
+        .select("*")
+        .eq("user_id", FIXED_USER_ID)
+        .not("closed_at", "is", null)
+        .order("closed_at", { ascending: false })
+        .limit(limit);
 
-  return () => {
-    supabase.removeChannel(channel);
-  };
+      if (error) throw error;
+      return data as Position[];
+    },
+    refetchInterval: isConnected ? false : FALLBACK_POLL_INTERVAL,
+    staleTime: isConnected ? 60000 : 5000,
+  });
 };

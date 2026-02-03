@@ -1,12 +1,23 @@
+/**
+ * Risk Events Hook (Event-Driven)
+ * 
+ * Uses event bus for real-time updates, fallback polling when disconnected.
+ */
+
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { FIXED_USER_ID } from "@/contexts/AuthContext";
-import { useEffect, useState } from "react";
+import { useConnectivityBooleans } from "@/runtime/connectivity";
 import type { Tables } from "@/integrations/supabase/types";
+
+// Fallback poll interval when disconnected
+const FALLBACK_POLL_INTERVAL = 10000;
 
 export type RiskEvent = Tables<"risk_events">;
 
 export const useRiskEvents = () => {
+  const { isConnected } = useConnectivityBooleans();
+  
   return useQuery({
     queryKey: ["risk-events", FIXED_USER_ID],
     queryFn: async () => {
@@ -20,11 +31,15 @@ export const useRiskEvents = () => {
       if (error) throw error;
       return data as RiskEvent[];
     },
-    refetchInterval: 5000,
+    // Only poll when disconnected - event bus handles real-time updates
+    refetchInterval: isConnected ? false : FALLBACK_POLL_INTERVAL,
+    staleTime: isConnected ? 60000 : 2000,
   });
 };
 
 export const useActiveRiskEvents = () => {
+  const { isConnected } = useConnectivityBooleans();
+  
   return useQuery({
     queryKey: ["active-risk-events", FIXED_USER_ID],
     queryFn: async () => {
@@ -38,31 +53,7 @@ export const useActiveRiskEvents = () => {
       if (error) throw error;
       return data as RiskEvent[];
     },
-    refetchInterval: 3000,
+    refetchInterval: isConnected ? false : FALLBACK_POLL_INTERVAL,
+    staleTime: isConnected ? 30000 : 1000,
   });
-};
-
-export const useRealtimeRiskEvents = (onNewEvent: (event: RiskEvent) => void) => {
-  useEffect(() => {
-    const channel = supabase
-      .channel("risk-events-realtime")
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "risk_events",
-        },
-        (payload) => {
-          if (payload.new) {
-            onNewEvent(payload.new as RiskEvent);
-          }
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [onNewEvent]);
 };

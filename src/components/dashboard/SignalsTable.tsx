@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -6,7 +6,8 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { useSignals, useRealtimeSignals, useSignalDetails, type Signal, type SignalFilters } from "@/hooks/useSignals";
+import { useSignals, useSignalDetails, type Signal, type SignalFilters } from "@/hooks/useSignals";
+import { getEventBus } from "@/runtime/event-bus";
 import { formatDistanceToNow } from "date-fns";
 import { Activity, TrendingUp, TrendingDown, Filter, ExternalLink, Zap, X, CheckCircle2, XCircle } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -21,14 +22,21 @@ export const SignalsTable = () => {
   const { data: signals, isLoading, refetch } = useSignals(filters);
   const { data: signalDetails } = useSignalDetails(selectedSignalId);
 
-  // Real-time updates
-  useRealtimeSignals(useCallback((signal) => {
-    toast({
-      title: `New ${signal.strategy} Signal`,
-      description: `${signal.side.toUpperCase()} ${signal.symbol} - ${signal.allowed ? "ALLOWED" : "REJECTED"}`,
+  // Real-time updates via event bus
+  useEffect(() => {
+    const bus = getEventBus();
+    
+    const unsubscribe = bus.on('signal', (event) => {
+      const signal = event.payload as Signal;
+      toast({
+        title: `New ${signal.strategy} Signal`,
+        description: `${signal.side.toUpperCase()} ${signal.symbol} - ${signal.allowed ? "ALLOWED" : "REJECTED"}`,
+      });
+      refetch();
     });
-    refetch();
-  }, [toast, refetch]));
+    
+    return unsubscribe;
+  }, [toast, refetch]);
 
   const getStrategyColor = (strategy: string) => {
     switch (strategy) {

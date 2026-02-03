@@ -27,7 +27,8 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { runtimeClient } from "@/services/runtimeClient";
-import { useRuntimeStatus, useRuntimeHealth } from "@/hooks/useRuntimeStatus";
+import { useRuntimeStatus } from "@/hooks/useRuntimeStatus";
+import { useRuntimeHealth } from "@/hooks/useRuntimeHealth";
 import { useRuntimeWsState } from "@/runtime/ws";
 import { useConnectivity, getConnectivityDisplayInfo } from "@/runtime/connectivity";
 import { useToast } from "@/hooks/use-toast";

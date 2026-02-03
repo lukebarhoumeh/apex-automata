@@ -1,16 +1,19 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Activity, Database, Wifi, WifiOff, Server, Coins } from "lucide-react";
-import { useRuntimeStatus, useRuntimeHealth } from "@/hooks/useRuntimeStatus";
+import { useRuntimeStatus } from "@/hooks/useRuntimeStatus";
+import { useRuntimeHealth } from "@/hooks/useRuntimeHealth";
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { WarmupIndicator, EngineStateIndicator } from "./WarmupIndicator";
 import { Separator } from "@/components/ui/separator";
+import { useConnectivityBooleans } from "@/runtime/connectivity";
 
 export const SystemHealthPanel = () => {
   const { data: runtimeStatus, isError: runtimeError } = useRuntimeStatus();
   const { data: runtimeHealthy } = useRuntimeHealth();
-
+  const { isConnected } = useConnectivityBooleans();
+  
   // Check Supabase connectivity
   const { data: dbHealthy, isError: dbError } = useQuery({
     queryKey: ["db-health"],
@@ -18,8 +21,9 @@ export const SystemHealthPanel = () => {
       const { error } = await supabase.from("symbols").select("id").limit(1);
       return !error;
     },
-    refetchInterval: 10000,
+    refetchInterval: isConnected ? false : 10000,
     retry: 1,
+    staleTime: isConnected ? 60000 : 5000,
   });
 
   const formatLatency = (ms: number) => {
