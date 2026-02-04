@@ -23,9 +23,11 @@ import { RegimePanel } from "@/components/dashboard/RegimePanel";
 import { MetaFilterPanel } from "@/components/dashboard/MetaFilterPanel";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useTradingEngine } from "@/hooks/useTradingEngine";
+import { useTradingState } from "@/hooks/useTradingState";
 import { Badge } from "@/components/ui/badge";
 import { StaleDataWarning } from "@/components/dashboard/StaleDataWarning";
 import { ConnectionStatusBanner } from "@/components/dashboard/ConnectionStatusBanner";
+import { TradingStatePill, KillSwitchBanner, AlertModal } from "@/components/status";
 import { 
   LayoutDashboard, 
   LineChart, 
@@ -40,6 +42,9 @@ const Index = () => {
   const [botState, setBotState] = useState<"paper" | "live" | "paused">("paper");
   const [activeView, setActiveView] = useState<"overview" | "trading" | "risk" | "settings">("overview");
   const tradingEngine = useTradingEngine();
+  
+  // Sprint 1.6: Unified trading state with alert handling
+  const { tradingState, pendingAlert, dismissAlert } = useTradingState();
 
   const handleViewDetails = (id: string) => {
     console.log("View details for:", id);
@@ -52,7 +57,13 @@ const Index = () => {
            style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.1) 1px, transparent 1px)', backgroundSize: '20px 20px' }} 
       />
       
+      {/* Alert Modal for critical events */}
+      <AlertModal alert={pendingAlert} onClose={dismissAlert} />
+      
       <DashboardHeader botState={botState} onStateChange={setBotState} />
+      
+      {/* Kill Switch Banner - persistent when active */}
+      <KillSwitchBanner state={tradingState} />
       
       <main className="container mx-auto px-4 lg:px-6 py-4 lg:py-6 space-y-4 relative z-10">
         {/* Connection & Status Banners */}
@@ -85,16 +96,21 @@ const Index = () => {
               </TabsTrigger>
             </TabsList>
             
-            <Badge 
-              variant={tradingEngine.backendAvailable ? "default" : "secondary"}
-              className={tradingEngine.backendAvailable 
-                ? "bg-emerald-600/20 text-emerald-400 border border-emerald-600/30" 
-                : "bg-slate-700/50 text-slate-400"
-              }
-            >
-              <Activity className="h-3 w-3 mr-1" />
-              {tradingEngine.backendAvailable ? "Engine Connected" : "Offline"}
-            </Badge>
+            {/* Trading State Pill - Sprint 1.6 */}
+            <div className="flex items-center gap-3">
+              <TradingStatePill state={tradingState} />
+              
+              <Badge 
+                variant={tradingEngine.backendAvailable ? "default" : "secondary"}
+                className={tradingEngine.backendAvailable 
+                  ? "bg-emerald-600/20 text-emerald-400 border border-emerald-600/30" 
+                  : "bg-slate-700/50 text-slate-400"
+                }
+              >
+                <Activity className="h-3 w-3 mr-1" />
+                {tradingEngine.backendAvailable ? "Engine Connected" : "Offline"}
+              </Badge>
+            </div>
           </div>
 
           {/* Overview Tab - Key Metrics at a Glance */}
