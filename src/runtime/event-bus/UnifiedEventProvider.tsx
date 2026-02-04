@@ -11,13 +11,15 @@ import React, { createContext, useContext, useEffect, useRef, useCallback, useSt
 import { useQueryClient } from '@tanstack/react-query';
 import { getRuntimeWsClient } from '../ws/RuntimeWsClient';
 import { getEventBus } from '../event-bus/EventBus';
-import { startRealtimeBridge, stopRealtimeBridge } from '../realtime/supabaseRealtimeBridge';
-import { useConnectivity, useConnectivityBooleans, getConnectivityService } from '../connectivity';
+import { startRealtimeManager, stopRealtimeManager, getRealtimeManager } from '../realtime/SupabaseRealtimeManager';
+import { performCatchUp, prepareCatchUp } from '../realtime/catchUp';
+import { useConnectivity, useConnectivityBooleans } from '../connectivity';
 import { runtimeClient } from '@/services/runtimeClient';
 import { FIXED_USER_ID } from '@/contexts/AuthContext';
 import type { BusEvent, EventBusStats } from '../event-bus/types';
 import type { RuntimeEventEnvelope } from '../ws/types';
 import type { RuntimeConnectivity } from '../connectivity/types';
+import type { RealtimeLatencyStats } from '../realtime/types';
 
 // Debug mode
 const DEBUG = import.meta.env.VITE_DEBUG_EVENT_BUS === '1';
@@ -30,6 +32,9 @@ const FALLBACK_POLL_INTERVAL_MS = 5000;
 /** Resync delay after reconnection */
 const RESYNC_DELAY_MS = 500;
 
+/** Time to wait before doing catch-up (let realtime settle) */
+const CATCH_UP_DELAY_MS = 1000;
+
 // ============ Context Types ============
 
 interface UnifiedEventContextValue {
@@ -39,8 +44,12 @@ interface UnifiedEventContextValue {
   isFallbackPolling: boolean;
   /** Event bus stats */
   stats: EventBusStats;
+  /** Supabase realtime latency stats */
+  realtimeStats: RealtimeLatencyStats;
   /** Force a resync (one-shot fetch) */
   forceResync: () => void;
+  /** Force a catch-up from Supabase */
+  forceCatchUp: () => Promise<void>;
 }
 
 const UnifiedEventContext = createContext<UnifiedEventContextValue | null>(null);
@@ -74,10 +83,12 @@ export function UnifiedEventProvider({ children }: UnifiedEventProviderProps) {
   const { isConnected, isStale, isDisconnected, isBackendDown } = useConnectivityBooleans();
   
   const [stats, setStats] = useState<EventBusStats>(() => getEventBus().getStats());
+  const [realtimeStats, setRealtimeStats] = useState<RealtimeLatencyStats>(() => getRealtimeManager().getLatencyStats());
   const [isFallbackPolling, setIsFallbackPolling] = useState(false);
   
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastResyncRef = useRef<number>(0);
+  const wasDisconnectedRef = useRef<boolean>(false);
   
   // ============ Wire WS events to Bus ============
   
@@ -114,18 +125,19 @@ export function UnifiedEventProvider({ children }: UnifiedEventProviderProps) {
       
       // Update stats
       setStats(bus.getStats());
+      setRealtimeStats(getRealtimeManager().getLatencyStats());
     });
     
     return unsubscribe;
   }, [queryClient]);
   
-  // ============ Start Supabase Realtime Bridge ============
+  // ============ Start Supabase Realtime Manager ============
   
   useEffect(() => {
-    startRealtimeBridge(FIXED_USER_ID);
+    startRealtimeManager(FIXED_USER_ID);
     
     return () => {
-      stopRealtimeBridge();
+      stopRealtimeManager();
     };
   }, []);
   
@@ -182,24 +194,28 @@ export function UnifiedEventProvider({ children }: UnifiedEventProviderProps) {
     };
   }, [isStale, isDisconnected, isBackendDown]);
   
-  // ============ Resync after reconnection ============
+  // ============ Catch-up on reconnection ============
   
   useEffect(() => {
-    // When transitioning from disconnected to connected, do a one-shot resync
-    if (isConnected && lastResyncRef.current > 0) {
-      const timeSinceLastResync = Date.now() - lastResyncRef.current;
-      
-      if (timeSinceLastResync > 30000) { // Only resync if been disconnected > 30s
-        setTimeout(() => {
-          forceResync();
-        }, RESYNC_DELAY_MS);
-      }
+    // Track disconnection state
+    if (isDisconnected || isStale) {
+      wasDisconnectedRef.current = true;
     }
     
-    if (!isConnected) {
-      lastResyncRef.current = Date.now();
+    // When transitioning from disconnected to connected, do catch-up
+    if (isConnected && wasDisconnectedRef.current) {
+      const timeSinceLastResync = Date.now() - lastResyncRef.current;
+      
+      // Only resync if been disconnected long enough
+      if (timeSinceLastResync > 10000) {
+        setTimeout(() => {
+          forceCatchUp();
+        }, CATCH_UP_DELAY_MS);
+      }
+      
+      wasDisconnectedRef.current = false;
     }
-  }, [isConnected]);
+  }, [isConnected, isDisconnected, isStale]);
   
   // ============ Force Resync ============
   
@@ -210,7 +226,7 @@ export function UnifiedEventProvider({ children }: UnifiedEventProviderProps) {
     
     // Clear old dedupe entries to allow re-fetched data
     const bus = getEventBus();
-    bus.clearDedupeOlderThan(Date.now() - 60000); // Clear entries older than 1 min
+    bus.clearDedupeOlderThan(Date.now() - 60000);
     
     // Invalidate all critical queries to trigger refetch
     await Promise.all([
@@ -220,10 +236,33 @@ export function UnifiedEventProvider({ children }: UnifiedEventProviderProps) {
       queryClient.invalidateQueries({ queryKey: ['runtime-status'] }),
       queryClient.invalidateQueries({ queryKey: ['session-stats'] }),
       queryClient.invalidateQueries({ queryKey: ['equity-curve'] }),
+      queryClient.invalidateQueries({ queryKey: ['pnl-snapshot'] }),
     ]);
     
     lastResyncRef.current = Date.now();
   }, [queryClient]);
+  
+  // ============ Force Catch-Up from Supabase ============
+  
+  const forceCatchUp = useCallback(async () => {
+    if (DEBUG) {
+      console.log('[UnifiedEventProvider] Force catch-up triggered');
+    }
+    
+    prepareCatchUp();
+    await performCatchUp(FIXED_USER_ID);
+    lastResyncRef.current = Date.now();
+  }, []);
+  
+  // ============ Periodic stats refresh ============
+  
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setRealtimeStats(getRealtimeManager().getLatencyStats());
+    }, 1000);
+    
+    return () => clearInterval(interval);
+  }, []);
   
   // ============ Context Value ============
   
@@ -231,7 +270,9 @@ export function UnifiedEventProvider({ children }: UnifiedEventProviderProps) {
     connectivity,
     isFallbackPolling,
     stats,
+    realtimeStats,
     forceResync,
+    forceCatchUp,
   };
   
   return (
