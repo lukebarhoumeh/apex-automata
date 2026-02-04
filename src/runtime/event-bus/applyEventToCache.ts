@@ -189,6 +189,16 @@ export function applyEventToCache(
       queryClient.invalidateQueries({ queryKey: ['calculated-metrics'] });
       return false;
       
+    case 'db:risk_metrics':
+      queryClient.invalidateQueries({ queryKey: ['runtime-status'] });
+      queryClient.invalidateQueries({ queryKey: ['risk-metrics'] });
+      return false;
+      
+    case 'db:trading_sessions':
+      queryClient.invalidateQueries({ queryKey: ['session-stats'] });
+      queryClient.invalidateQueries({ queryKey: ['trading-sessions'] });
+      return false;
+      
     case 'db:alerts':
     case 'alert:new':
       queryClient.invalidateQueries({ queryKey: ['alerts'] });

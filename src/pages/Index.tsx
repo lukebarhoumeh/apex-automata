@@ -23,8 +23,6 @@ import { RegimePanel } from "@/components/dashboard/RegimePanel";
 import { MetaFilterPanel } from "@/components/dashboard/MetaFilterPanel";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useTradingEngine } from "@/hooks/useTradingEngine";
-import { useRealtimeSubscription } from "@/hooks/useRealtimeSubscription";
-import { useUserId } from "@/contexts/AuthContext";
 import { Badge } from "@/components/ui/badge";
 import { StaleDataWarning } from "@/components/dashboard/StaleDataWarning";
 import { ConnectionStatusBanner } from "@/components/dashboard/ConnectionStatusBanner";
@@ -42,13 +40,6 @@ const Index = () => {
   const [botState, setBotState] = useState<"paper" | "live" | "paused">("paper");
   const [activeView, setActiveView] = useState<"overview" | "trading" | "risk" | "settings">("overview");
   const tradingEngine = useTradingEngine();
-  const userId = useUserId();
-  
-  // Subscribe to Supabase Realtime for instant updates
-  useRealtimeSubscription({
-    tables: ['positions', 'orders', 'fills', 'signals', 'risk_events', 'alerts'],
-    userId,
-  });
 
   const handleViewDetails = (id: string) => {
     console.log("View details for:", id);

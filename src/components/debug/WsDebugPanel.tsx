@@ -9,11 +9,13 @@ import { useState, useEffect } from 'react';
 import { useRuntimeWs, useRuntimeWsState } from '@/runtime/ws';
 import { getEventBus } from '@/runtime/event-bus';
 import { useConnectivity, getConnectivityDisplayInfo } from '@/runtime/connectivity';
+import { useUnifiedEvents } from '@/runtime/event-bus/UnifiedEventProvider';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { SupabaseDebugTab } from './SupabaseDebugTab';
 import { 
   ChevronDown, 
   ChevronUp, 
@@ -30,6 +32,7 @@ import type { BusEvent, EventBusStats } from '@/runtime/event-bus/types';
 
 const DEBUG_WS = import.meta.env.VITE_DEBUG_WS === '1' || import.meta.env.VITE_DEBUG_WS === 'true';
 const DEBUG_BUS = import.meta.env.VITE_DEBUG_EVENT_BUS === '1' || import.meta.env.VITE_DEBUG_EVENT_BUS === 'true';
+const DEBUG_REALTIME = import.meta.env.VITE_DEBUG_REALTIME === '1' || import.meta.env.VITE_DEBUG_REALTIME === 'true';
 
 export function WsDebugPanel() {
   const [isExpanded, setIsExpanded] = useState(false);
@@ -39,6 +42,15 @@ export function WsDebugPanel() {
   const { state, getRecentEvents, getUnknownTypesInfo, reconnect, subscribe } = useRuntimeWs();
   const connectivity = useConnectivity();
   const connectivityInfo = getConnectivityDisplayInfo(connectivity);
+  
+  // Get unified events context (includes realtime stats)
+  let realtimeStats = null;
+  try {
+    const unified = useUnifiedEvents();
+    realtimeStats = unified.realtimeStats;
+  } catch {
+    // Not within provider, use default
+  }
   
   // Refresh WS events periodically and on new events
   useEffect(() => {
@@ -74,7 +86,7 @@ export function WsDebugPanel() {
     };
   }, []);
   
-  if (!DEBUG_WS && !DEBUG_BUS) {
+  if (!DEBUG_WS && !DEBUG_BUS && !DEBUG_REALTIME) {
     return null;
   }
   
@@ -119,8 +131,9 @@ export function WsDebugPanel() {
         {isExpanded && (
           <CardContent className="py-2 px-4 space-y-4">
             <Tabs defaultValue="connectivity" className="w-full">
-              <TabsList className="w-full grid grid-cols-3">
-                <TabsTrigger value="connectivity" className="text-xs">Connectivity</TabsTrigger>
+              <TabsList className="w-full grid grid-cols-4">
+                <TabsTrigger value="connectivity" className="text-xs">WS</TabsTrigger>
+                <TabsTrigger value="supabase" className="text-xs">Supabase</TabsTrigger>
                 <TabsTrigger value="bus" className="text-xs">Event Bus</TabsTrigger>
                 <TabsTrigger value="events" className="text-xs">Events</TabsTrigger>
               </TabsList>
@@ -180,6 +193,17 @@ export function WsDebugPanel() {
                     Reconnect
                   </Button>
                 </div>
+              </TabsContent>
+              
+              {/* Supabase Tab */}
+              <TabsContent value="supabase" className="space-y-3">
+                {realtimeStats ? (
+                  <SupabaseDebugTab stats={realtimeStats} />
+                ) : (
+                  <div className="text-xs text-muted-foreground text-center py-4">
+                    Supabase realtime stats not available
+                  </div>
+                )}
               </TabsContent>
               
               {/* Event Bus Tab */}

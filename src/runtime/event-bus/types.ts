@@ -60,6 +60,8 @@ export type BusEventType =
   // Supabase-specific (for tables that don't map to WS events)
   | 'db:account_metrics'
   | 'db:alerts'
+  | 'db:risk_metrics'
+  | 'db:trading_sessions'
   | 'alert:new';
 
 // ============ Handler Types ============
