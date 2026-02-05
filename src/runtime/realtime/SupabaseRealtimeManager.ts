@@ -364,6 +364,7 @@ export async function startRealtimeManager(userId: string): Promise<void> {
     tables: [
       'positions',
       'orders',
+      'order_legs',
       'fills',
       'signals',
       'risk_events',

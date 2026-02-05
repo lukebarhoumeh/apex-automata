@@ -4,6 +4,7 @@
  * Shows Supabase realtime connection status and latency metrics.
  */
 
+import { useEffect, useState } from 'react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { useUnifiedEvents } from '@/runtime/event-bus/UnifiedEventProvider';
@@ -16,6 +17,13 @@ interface SupabaseDebugTabProps {
 
 export function SupabaseDebugTab({ stats }: SupabaseDebugTabProps) {
   const { forceCatchUp } = useUnifiedEvents();
+  const [health, setHealth] = useState<{ ok: boolean; dbOk: boolean; ts: string; error?: string } | null>(null);
+  const [healthError, setHealthError] = useState<string | null>(null);
+  const [healthLoading, setHealthLoading] = useState(false);
+  const [healthCheckedAt, setHealthCheckedAt] = useState<number | null>(null);
+  const functionUrl = import.meta.env.VITE_SUPABASE_URL
+    ? `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/runtime-health`
+    : null;
   
   const formatLatency = (ms: number | null): string => {
     if (ms === null) return '---';
@@ -55,6 +63,35 @@ export function SupabaseDebugTab({ stats }: SupabaseDebugTabProps) {
     .sort((a, b) => b[1] - a[1]) as [RealtimeTableName, number][];
   
   const totalEvents = Object.values(stats.eventCounts).reduce((a, b) => a + b, 0);
+
+  const refreshHealth = async () => {
+    if (!functionUrl) {
+      setHealthError('Missing VITE_SUPABASE_URL');
+      return;
+    }
+
+    setHealthLoading(true);
+    try {
+      const res = await fetch(functionUrl, { cache: 'no-store' });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error || res.statusText);
+      }
+      setHealth(data);
+      setHealthError(null);
+    } catch (error) {
+      setHealthError(error instanceof Error ? error.message : 'Unknown error');
+    } finally {
+      setHealthLoading(false);
+      setHealthCheckedAt(Date.now());
+    }
+  };
+
+  useEffect(() => {
+    refreshHealth();
+    const interval = setInterval(refreshHealth, 15000);
+    return () => clearInterval(interval);
+  }, [functionUrl]);
   
   return (
     <div className="space-y-3">
@@ -128,6 +165,43 @@ export function SupabaseDebugTab({ stats }: SupabaseDebugTabProps) {
           <RefreshCw className="h-3 w-3 mr-1" />
           Force Catch-Up
         </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => refreshHealth()}
+          disabled={healthLoading}
+        >
+          <RefreshCw className={`h-3 w-3 mr-1 ${healthLoading ? 'animate-spin' : ''}`} />
+          Refresh Health
+        </Button>
+      </div>
+
+      {/* Function Health */}
+      <div className="text-xs">
+        <div className="text-muted-foreground mb-1">Function Health:</div>
+        <div className="flex items-center gap-2">
+          {healthLoading ? (
+            <span className="text-muted-foreground">Checking...</span>
+          ) : healthError ? (
+            <span className="text-destructive">{healthError}</span>
+          ) : health ? (
+            <>
+              <Badge variant="outline" className={health.dbOk ? 'text-success' : 'text-warning'}>
+                {health.dbOk ? 'DB OK' : 'DB ERROR'}
+              </Badge>
+              <span className="text-muted-foreground">
+                {health.ts}
+              </span>
+            </>
+          ) : (
+            <span className="text-muted-foreground">No data</span>
+          )}
+          {healthCheckedAt && (
+            <span className="text-muted-foreground">
+              · checked {formatFreshness(healthCheckedAt)}
+            </span>
+          )}
+        </div>
       </div>
     </div>
   );

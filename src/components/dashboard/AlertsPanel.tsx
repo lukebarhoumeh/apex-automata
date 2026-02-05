@@ -6,6 +6,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { supabase } from '@/integrations/supabase/client';
 import { AlertTriangle, Info, AlertCircle, Check } from 'lucide-react';
 import { format } from 'date-fns';
+import { invokeFunction } from '@/services/supabaseFunctions';
 
 interface Alert {
   id: string;
@@ -63,12 +64,7 @@ export const AlertsPanel = () => {
 
   const acknowledgeAlert = async (id: string) => {
     try {
-      const { error } = await supabase
-        .from('alerts')
-        .update({ acked_at: new Date().toISOString() })
-        .eq('id', id);
-
-      if (error) throw error;
+      await invokeFunction<{ id: string }, { ok: boolean; id: string }>('alerts-ack', { id });
       fetchAlerts();
     } catch (error) {
       console.error('Failed to acknowledge alert:', error);

@@ -1,6 +1,8 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "@/hooks/use-toast";
+import { useUserId } from "@/contexts/AuthContext";
+import { invokeFunction } from "@/services/supabaseFunctions";
 
 export interface RiskSettings {
   id: string;
@@ -13,15 +15,18 @@ export interface RiskSettings {
 }
 
 export const useRiskSettings = () => {
+  const userId = useUserId();
+
   return useQuery({
-    queryKey: ["risk-settings"],
+    queryKey: ["risk-settings", userId],
     queryFn: async () => {
       const { data, error } = await supabase
         .from("risk_settings")
         .select("*")
-        .single();
+        .eq("user_id", userId)
+        .maybeSingle();
 
-      if (error && error.code !== 'PGRST116') throw error;
+      if (error) throw error;
       return data as RiskSettings | null;
     },
   });
@@ -29,24 +34,19 @@ export const useRiskSettings = () => {
 
 export const useUpdateRiskSettings = () => {
   const queryClient = useQueryClient();
+  const userId = useUserId();
 
   return useMutation({
     mutationFn: async (settings: Partial<RiskSettings>) => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) throw new Error("Not authenticated");
+      const result = await invokeFunction<
+        Partial<RiskSettings> & { user_id: string },
+        { ok: boolean; id: string }
+      >("risk-settings-update", { user_id: userId, ...settings });
 
-      const { data, error } = await supabase
-        .from("risk_settings")
-        .update(settings)
-        .eq("user_id", user.id)
-        .select()
-        .single();
-
-      if (error) throw error;
-      return data;
+      return result;
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["risk-settings"] });
+      queryClient.invalidateQueries({ queryKey: ["risk-settings", userId] });
       toast({
         title: "Settings Updated",
         description: "Risk management settings have been saved.",

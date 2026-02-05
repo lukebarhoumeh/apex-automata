@@ -7,6 +7,7 @@ import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { useEffect, useState } from "react";
 import { useToast } from "@/hooks/use-toast";
+import { invokeFunction } from "@/services/supabaseFunctions";
 
 interface Alert {
   id: string;
@@ -73,14 +74,15 @@ const Alerts = () => {
 
   const handleAcknowledge = async (alertId: string) => {
     try {
-      await supabase
-        .from("alerts")
-        .update({ acked_at: new Date().toISOString() })
-        .eq("id", alertId);
+      const ackedAt = new Date().toISOString();
+      await invokeFunction<{ id: string; acked_at?: string }, { ok: boolean; id: string }>(
+        "alerts-ack",
+        { id: alertId, acked_at: ackedAt }
+      );
 
       setAlerts((prev) =>
         prev.map((a) =>
-          a.id === alertId ? { ...a, acked_at: new Date().toISOString() } : a
+          a.id === alertId ? { ...a, acked_at: ackedAt } : a
         )
       );
     } catch (error) {

@@ -1,6 +1,8 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "@/hooks/use-toast";
+import { useUserId } from "@/contexts/AuthContext";
+import { invokeFunction } from "@/services/supabaseFunctions";
 
 export interface Model {
   id: string;
@@ -87,6 +89,7 @@ export const useSignalAcceptanceStats = () => {
 
 export const useUpdateModelThreshold = () => {
   const queryClient = useQueryClient();
+  const userId = useUserId();
 
   return useMutation({
     mutationFn: async (threshold: number) => {
@@ -100,25 +103,14 @@ export const useUpdateModelThreshold = () => {
         },
       });
 
-      // Also update in strategy_signals table
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        const { data: existing } = await supabase
-          .from("strategy_signals")
-          .select("id, params")
-          .eq("name", "meta")
-          .maybeSingle();
-
-        if (existing) {
-          const currentParams = (existing.params as Record<string, any>) || {};
-          await supabase
-            .from("strategy_signals")
-            .update({
-              params: { ...currentParams, threshold },
-            })
-            .eq("id", existing.id);
-        }
-      }
+      await invokeFunction<
+        { user_id: string; name: string; params: Record<string, unknown> },
+        { ok: boolean; id: string }
+      >("strategy-signal-upsert", {
+        user_id: userId,
+        name: "meta",
+        params: { threshold },
+      });
 
       return { threshold };
     },

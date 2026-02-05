@@ -6,6 +6,7 @@ import { Badge } from '@/components/ui/badge';
 import { supabase } from '@/integrations/supabase/client';
 import { useToast } from '@/components/ui/use-toast';
 import { TrendingUp, Activity, BarChart3 } from 'lucide-react';
+import { invokeFunction } from '@/services/supabaseFunctions';
 
 interface Strategy {
   id: string;
@@ -42,12 +43,10 @@ export const StrategiesPanel = () => {
 
   const toggleStrategy = async (id: string, enabled: boolean) => {
     try {
-      const { error } = await supabase
-        .from('strategies')
-        .update({ enabled })
-        .eq('id', id);
-
-      if (error) throw error;
+      await invokeFunction<{ id: string; enabled: boolean }, { ok: boolean; id: string }>(
+        'strategy-toggle',
+        { id, enabled }
+      );
       
       setStrategies(prev => 
         prev.map(s => s.id === id ? { ...s, enabled } : s)

@@ -2,6 +2,8 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "@/hooks/use-toast";
 import { z } from "zod";
+import { FIXED_USER_ID, useUserId } from "@/contexts/AuthContext";
+import { invokeFunction } from "@/services/supabaseFunctions";
 
 export const journalEntrySchema = z.object({
   title: z.string().trim().min(1, "Title is required").max(200, "Title must be less than 200 characters"),
@@ -32,13 +34,15 @@ export const useJournalEntries = (filters?: {
   dateFrom?: string;
   dateTo?: string;
 }) => {
+  const userId = useUserId();
+
   return useQuery({
-    queryKey: ["journal-entries", filters],
+    queryKey: ["journal-entries", userId, filters],
     queryFn: async () => {
       let query = supabase
         .from("journal_entries")
         .select("*")
-        .eq("user_id", "b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f") // Fixed USER_ID
+        .eq("user_id", userId)
         .order("created_at", { ascending: false });
 
       if (filters?.search) {
@@ -67,29 +71,35 @@ export const useJournalEntries = (filters?: {
 
 export const useCreateJournalEntry = () => {
   const queryClient = useQueryClient();
+  const userId = useUserId();
 
   return useMutation({
     mutationFn: async (input: JournalEntryInput) => {
       // Validate input
       const validated = journalEntrySchema.parse(input);
 
-      // Use fixed USER_ID for single-user MVP
-      const user = { id: 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f' };
+      const result = await invokeFunction<
+        {
+          action: "create";
+          user_id: string;
+          title: string;
+          note?: string;
+          position_id?: string;
+          order_id?: string;
+          signal_id?: string;
+          attachments?: string[];
+        },
+        { ok: boolean; id: string }
+      >("journal-entry", {
+        action: "create",
+        user_id: FIXED_USER_ID,
+        ...validated,
+      });
 
-      const { data, error } = await supabase
-        .from("journal_entries")
-        .insert({
-          user_id: user.id,
-          ...validated,
-        })
-        .select()
-        .single();
-
-      if (error) throw error;
-      return data;
+      return result;
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["journal-entries"] });
+      queryClient.invalidateQueries({ queryKey: ["journal-entries", userId] });
       toast({
         title: "Entry Created",
         description: "Journal entry has been saved",
@@ -107,24 +117,37 @@ export const useCreateJournalEntry = () => {
 
 export const useUpdateJournalEntry = () => {
   const queryClient = useQueryClient();
+  const userId = useUserId();
 
   return useMutation({
     mutationFn: async ({ id, input }: { id: string; input: Partial<JournalEntryInput> }) => {
       // Validate input
       const validated = journalEntrySchema.partial().parse(input);
 
-      const { data, error } = await supabase
-        .from("journal_entries")
-        .update(validated)
-        .eq("id", id)
-        .select()
-        .single();
+      const result = await invokeFunction<
+        {
+          action: "update";
+          id: string;
+          user_id: string;
+          title?: string;
+          note?: string | null;
+          position_id?: string;
+          order_id?: string;
+          signal_id?: string;
+          attachments?: string[];
+        },
+        { ok: boolean; id: string }
+      >("journal-entry", {
+        action: "update",
+        id,
+        user_id: FIXED_USER_ID,
+        ...validated,
+      });
 
-      if (error) throw error;
-      return data;
+      return result;
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["journal-entries"] });
+      queryClient.invalidateQueries({ queryKey: ["journal-entries", userId] });
       toast({
         title: "Entry Updated",
         description: "Journal entry has been saved",
@@ -142,15 +165,21 @@ export const useUpdateJournalEntry = () => {
 
 export const useDeleteJournalEntry = () => {
   const queryClient = useQueryClient();
+  const userId = useUserId();
 
   return useMutation({
     mutationFn: async (id: string) => {
-      const { error } = await supabase.from("journal_entries").delete().eq("id", id);
-
-      if (error) throw error;
+      await invokeFunction<
+        { action: "delete"; id: string; user_id: string },
+        { ok: boolean; id: string }
+      >("journal-entry", {
+        action: "delete",
+        id,
+        user_id: FIXED_USER_ID,
+      });
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["journal-entries"] });
+      queryClient.invalidateQueries({ queryKey: ["journal-entries", userId] });
       toast({
         title: "Entry Deleted",
         description: "Journal entry has been removed",

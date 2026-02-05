@@ -8,7 +8,7 @@
 import { supabase } from '@/integrations/supabase/client';
 import { getEventBus } from '../event-bus/EventBus';
 import type { BusEvent } from '../event-bus/types';
-import type { CatchUpResult } from './types';
+import type { CatchUpResult, RealtimeTableName } from './types';
 
 const DEBUG = import.meta.env.VITE_DEBUG_REALTIME === '1' || import.meta.env.VITE_DEBUG_EVENT_BUS === '1';
 
@@ -36,6 +36,38 @@ function snakeToCamel(obj: Record<string, unknown>): Record<string, unknown> {
   }
   
   return result;
+}
+
+/**
+ * Generate a dedupe key aligned with realtime events.
+ */
+function generateDedupeKey(table: RealtimeTableName, record: Record<string, unknown>): string {
+  const id = record.id as string;
+
+  switch (table) {
+    case 'orders':
+      return `order:${id}:${record.updated_at || record.created_at}`;
+    case 'order_legs':
+      return `leg:${id}:${record.updated_at}`;
+    case 'positions':
+      return `pos:${id}:${record.updated_at || record.closed_at || record.opened_at}`;
+    case 'fills':
+      return `fill:${id || record.trade_id || `${record.order_id}:${record.filled_at}`}`;
+    case 'signals':
+      return `sig:${id}:${record.created_at}`;
+    case 'risk_events':
+      return `riske:${id}:${record.updated_at || record.triggered_at}`;
+    case 'risk_metrics':
+      return `riskm:${record.user_id}:${record.updated_at}`;
+    case 'alerts':
+      return `alert:${id}:${record.created_at}`;
+    case 'account_metrics':
+      return `acct:${record.user_id}:${record.updated_at}`;
+    case 'trading_sessions':
+      return `session:${record.session_id}:${record.updated_at}`;
+    default:
+      return `${table}:${id}:${Date.now()}`;
+  }
 }
 
 /**
@@ -132,7 +164,7 @@ export async function performCatchUp(userId: string): Promise<CatchUpResult> {
           payload: snakeToCamel(pos as Record<string, unknown>),
           ts: Date.now(),
           source: 'rest', // Mark as REST since it's a fetch, not realtime
-          dedupeKey: `catchup:pos:${pos.id}`,
+          dedupeKey: generateDedupeKey('positions', pos as Record<string, unknown>),
         };
         bus.publish(event);
       }
@@ -147,7 +179,7 @@ export async function performCatchUp(userId: string): Promise<CatchUpResult> {
           payload: snakeToCamel(order as Record<string, unknown>),
           ts: Date.now(),
           source: 'rest',
-          dedupeKey: `catchup:order:${order.id}`,
+          dedupeKey: generateDedupeKey('orders', order as Record<string, unknown>),
         };
         bus.publish(event);
       }
@@ -162,7 +194,7 @@ export async function performCatchUp(userId: string): Promise<CatchUpResult> {
           payload: snakeToCamel(fill as Record<string, unknown>),
           ts: Date.now(),
           source: 'rest',
-          dedupeKey: `catchup:fill:${fill.id}`,
+          dedupeKey: generateDedupeKey('fills', fill as Record<string, unknown>),
         };
         bus.publish(event);
       }
@@ -177,7 +209,7 @@ export async function performCatchUp(userId: string): Promise<CatchUpResult> {
           payload: snakeToCamel(signal as Record<string, unknown>),
           ts: Date.now(),
           source: 'rest',
-          dedupeKey: `catchup:sig:${signal.id}`,
+          dedupeKey: generateDedupeKey('signals', signal as Record<string, unknown>),
         };
         bus.publish(event);
       }
@@ -192,7 +224,7 @@ export async function performCatchUp(userId: string): Promise<CatchUpResult> {
           payload: snakeToCamel(riskEvent as Record<string, unknown>),
           ts: Date.now(),
           source: 'rest',
-          dedupeKey: `catchup:risk:${riskEvent.id}`,
+          dedupeKey: generateDedupeKey('risk_events', riskEvent as Record<string, unknown>),
         };
         bus.publish(event);
       }
@@ -207,7 +239,7 @@ export async function performCatchUp(userId: string): Promise<CatchUpResult> {
         payload: snakeToCamel(metrics as Record<string, unknown>),
         ts: Date.now(),
         source: 'rest',
-        dedupeKey: `catchup:metrics:${metrics.id}`,
+        dedupeKey: generateDedupeKey('account_metrics', metrics as Record<string, unknown>),
       };
       bus.publish(event);
     }
