@@ -8,6 +8,7 @@
  * - Reconciler idempotency
  */
 
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { 
   TokenBucketRateLimiter, 
   CoinbaseRateLimiter 
@@ -31,10 +32,10 @@ import { Logger } from '../core/logger';
 
 // Mock logger
 const mockLogger: Logger = {
-  info: jest.fn(),
-  warn: jest.fn(),
-  error: jest.fn(),
-  debug: jest.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
 } as any;
 
 describe('CoinbaseApiError', () => {
@@ -125,7 +126,7 @@ describe('TokenBucketRateLimiter', () => {
   let limiter: TokenBucketRateLimiter;
 
   beforeEach(() => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
     limiter = new TokenBucketRateLimiter({
       maxTokens: 5,
       refillRate: 1, // 1 token per second
@@ -135,7 +136,7 @@ describe('TokenBucketRateLimiter', () => {
   });
 
   afterEach(() => {
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   it('should allow immediate requests when tokens available', async () => {
@@ -158,7 +159,7 @@ describe('TokenBucketRateLimiter', () => {
     const acquirePromise = limiter.acquire();
     
     // Advance time to allow token refill
-    jest.advanceTimersByTime(1000);
+    vi.advanceTimersByTime(1000);
     
     await acquirePromise;
     expect(limiter.getState().tokens).toBeLessThan(5);
@@ -176,7 +177,7 @@ describe('TokenBucketRateLimiter', () => {
     limiter.forceWait(100);
     
     const acquirePromise = limiter.acquire();
-    jest.advanceTimersByTime(100);
+    vi.advanceTimersByTime(100);
     await acquirePromise;
     
     const state = limiter.getState();
@@ -236,7 +237,7 @@ describe('ResilientHttpClient', () => {
   let client: ResilientHttpClient;
 
   beforeEach(() => {
-    jest.useFakeTimers({ advanceTimers: true });
+    vi.useFakeTimers({ advanceTimers: true });
     
     client = new ResilientHttpClient({
       ...DEFAULT_COINBASE_HTTP_CONFIG,
@@ -251,7 +252,7 @@ describe('ResilientHttpClient', () => {
   });
 
   afterEach(() => {
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   describe('Circuit Breaker', () => {
@@ -329,17 +330,17 @@ describe('CoinbaseReconciler', () => {
   let mockOrderManager: any;
 
   beforeEach(() => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
     
     mockRestClient = {
-      getOrders: jest.fn().mockResolvedValue([]),
-      getOrder: jest.fn().mockResolvedValue({ id: 'order-1', status: 'done' }),
-      getFills: jest.fn().mockResolvedValue([]),
+      getOrders: vi.fn().mockResolvedValue([]),
+      getOrder: vi.fn().mockResolvedValue({ id: 'order-1', status: 'done' }),
+      getFills: vi.fn().mockResolvedValue([]),
     };
 
     mockOrderManager = {
-      getActiveOrders: jest.fn().mockReturnValue([]),
-      getOrderByExchangeOrderId: jest.fn().mockReturnValue(undefined),
+      getActiveOrders: vi.fn().mockReturnValue([]),
+      getOrderByExchangeOrderId: vi.fn().mockReturnValue(undefined),
     };
 
     reconciler = new CoinbaseReconciler(
@@ -352,7 +353,7 @@ describe('CoinbaseReconciler', () => {
 
   afterEach(() => {
     reconciler.stop();
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   describe('Fill Deduplication', () => {
@@ -417,7 +418,7 @@ describe('CoinbaseReconciler', () => {
 
       mockRestClient.getFills.mockResolvedValue([fill]);
 
-      const fillHandler = jest.fn();
+      const fillHandler = vi.fn();
       reconciler.on('fill:ingested', fillHandler);
       reconciler.start();
 
@@ -445,7 +446,7 @@ describe('CoinbaseReconciler', () => {
       mockRestClient.getOrders.mockResolvedValue([]); // Order no longer open
       mockRestClient.getOrder.mockResolvedValue({ id: 'exchange-1', status: 'done' });
 
-      const stateChangeHandler = jest.fn();
+      const stateChangeHandler = vi.fn();
       reconciler.on('order:state_changed', stateChangeHandler);
       reconciler.start();
 
@@ -469,7 +470,7 @@ describe('CoinbaseReconciler', () => {
       mockOrderManager.getActiveOrders.mockReturnValue([localOrder]);
       mockRestClient.getOrders.mockResolvedValue([{ id: 'exchange-1', status: 'open' }]);
 
-      const stateChangeHandler = jest.fn();
+      const stateChangeHandler = vi.fn();
       reconciler.on('order:state_changed', stateChangeHandler);
       reconciler.start();
 
@@ -484,7 +485,7 @@ describe('CoinbaseReconciler', () => {
     it('should enter degraded mode after consecutive errors', async () => {
       mockRestClient.getOrders.mockRejectedValue(new Error('API Error'));
 
-      const degradedHandler = jest.fn();
+      const degradedHandler = vi.fn();
       reconciler.on('degraded', degradedHandler);
       reconciler.start();
 
@@ -521,7 +522,7 @@ describe('CoinbaseReconciler', () => {
       mockRestClient.getOrders.mockResolvedValue([]);
       mockRestClient.getFills.mockResolvedValue([]);
 
-      const recoveredHandler = jest.fn();
+      const recoveredHandler = vi.fn();
       reconciler.on('recovered', recoveredHandler);
 
       await reconciler.reconcileOrders();
