@@ -48,7 +48,7 @@ export class RuntimeWsClient {
   private subscribers: Set<SubscriberEntry> = new Set();
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 20;
+  private maxReconnectAttempts = Infinity; // Never give up - 24/7 operation
   private baseReconnectDelay = 1000;
   private maxReconnectDelay = 30000;
   
