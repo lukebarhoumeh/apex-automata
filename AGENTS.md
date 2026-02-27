@@ -40,7 +40,7 @@ The backend uses `tsx` to run TypeScript directly (no compilation step needed fo
 
 3. **Backend env loading**: `atlas/apps/core-node/src/core/env.ts` loads `.env` from `path.resolve(cwd, '../../../.env')` relative to core-node — this maps to `/workspace/.env` when CWD is core-node.
 
-4. **Supabase service key**: Without a real `SUPABASE_SERVICE_KEY`, the backend starts but Supabase operations (DB reads/writes) will fail with fetch errors. The API endpoints and trading engine still function for paper mode.
+4. **Supabase service key**: Without a real `SUPABASE_SERVICE_KEY`, the backend starts but Supabase operations (DB reads/writes) will fail with fetch errors. The API endpoints and trading engine still function for paper mode. Note: the Cloud Agent VM cannot resolve external DNS (e.g. `gdrdaajvutmewgxbjurk.supabase.co`), so even with a valid key, Supabase calls will fail with "fetch failed" errors in this environment. This does not affect local engine/API functionality.
 
 5. **Backend tests**: Run with `cd atlas/apps/core-node && pnpm test`. Some tests use Jest APIs (`jest.fn()`, `jest.mock()`) but the test runner is Vitest — these tests fail at import time. 232/245 tests pass; 13 fail due to pre-existing issues.
 
