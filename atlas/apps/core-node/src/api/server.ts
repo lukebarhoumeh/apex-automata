@@ -1080,7 +1080,7 @@ app.post('/api/engine/start', async (req, res) => {
             choppiness: 0,
             trendDirection: 'neutral',
             mtfAlignment: 0,
-            lastUpdate: new Date(),
+            lastUpdated: new Date(),
           },
           indicators,
           {
@@ -2478,7 +2478,7 @@ app.get('/api/risk/analytics', (req, res) => {
   
   res.json({
     session: {
-      trades: summary?.trades || 0,
+      trades: summary?.positionCount || 0,
       wins: 0, // Would need TradeAnalytics
       losses: 0,
       winRate: 0,
