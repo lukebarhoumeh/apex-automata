@@ -727,7 +727,7 @@ export class TradingEngine extends EventEmitter {
       killSwitches: {
         enabled: true,
         dailyLossLimit: maxDailyLossUsd,
-        consecutiveLossLimit: 5,     // 5 losses in a row
+        consecutiveLossLimit: 10,    // 10 losses in a row (allows learning in ranging markets)
         errorRateLimit,              // Step 6: Parity by default
         latencyLimit: guardrails.circuit_breakers.data_gap_sec * 1000
       },
