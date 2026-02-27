@@ -173,6 +173,9 @@ export class EngineSupervisor extends EventEmitter {
   private restartHistory: Array<{ timestamp: number; reason: RestartReason }> = [];
   private isRestarting: boolean = false;
 
+  // Auto-reset: after 10 minutes of stable running (no restarts), reset tracking
+  private static readonly STABLE_PERIOD_MS = 10 * 60 * 1000;
+
   // Callbacks for recovery actions
   private restartEngineCallback: ((reason: RestartReason) => Promise<boolean>) | null = null;
   private reconnectExchangeCallback: (() => Promise<boolean>) | null = null;
@@ -287,6 +290,18 @@ export class EngineSupervisor extends EventEmitter {
     if (this.killSwitchActive) {
       this.checkMarketDataHealth(now);
     }
+
+    // Auto-reset restart tracking after a stable period without restarts
+    if (this.restartHistory.length > 0 && this.lastRestartAt) {
+      const timeSinceLastRestart = now - this.lastRestartAt;
+      if (timeSinceLastRestart >= EngineSupervisor.STABLE_PERIOD_MS) {
+        this.logger.info('Stable period reached, auto-resetting restart tracking', {
+          stablePeriodMs: EngineSupervisor.STABLE_PERIOD_MS,
+          timeSinceLastRestartMs: timeSinceLastRestart,
+        });
+        this.resetRestartTracking();
+      }
+    }
   }
 
   /**
@@ -374,8 +389,13 @@ export class EngineSupervisor extends EventEmitter {
     this.emit('supervisor:restart_triggered', reason);
     supervisorRestartCounter.inc({ reason });
 
+    const RESTART_TIMEOUT_MS = 30000;
+
     try {
-      const success = await this.restartEngineCallback(reason);
+      const timeoutPromise = new Promise<boolean>((_, reject) =>
+        setTimeout(() => reject(new Error('Engine restart timed out')), RESTART_TIMEOUT_MS)
+      );
+      const success = await Promise.race([this.restartEngineCallback(reason), timeoutPromise]);
 
       this.restartCount++;
       this.lastRestartReason = reason;
@@ -610,10 +630,11 @@ export class EngineSupervisor extends EventEmitter {
   }
 
   /**
-   * Reset restart tracking (for manual recovery)
+   * Reset restart tracking (for manual recovery or auto-reset after stable period)
    */
   public resetRestartTracking(): void {
+    this.restartCount = 0;
     this.restartHistory = [];
-    this.logger.info('Restart tracking reset');
+    this.logger.info('Supervisor restart tracking reset');
   }
 }
