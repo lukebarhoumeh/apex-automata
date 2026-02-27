@@ -116,6 +116,10 @@ const runtimeState = {
 
 let engineOperationInProgress = false;
 
+// Interval references for cleanup on shutdown
+let metricsInterval: NodeJS.Timeout | null = null;
+let statusBroadcastInterval: NodeJS.Timeout | null = null;
+
 // In-memory configs (will be persisted/hot-reloaded later)
 let riskConfig: any = null;
 let signalsConfig: any = null;
@@ -323,7 +327,7 @@ function processTickerForCandles(ticker: { product_id: string; price: string; la
 }
 
 // Periodic update for account metrics (every 5 minutes)
-setInterval(async () => {
+metricsInterval = setInterval(async () => {
   try {
     if (tradingEngine?.engineRunning) {
       await updateAccountMetrics();
@@ -334,7 +338,7 @@ setInterval(async () => {
 }, 5 * 60 * 1000);
 
 // Periodic StatusUpdate broadcast for frontend with supervisor state
-setInterval(() => {
+statusBroadcastInterval = setInterval(() => {
   if (wsClients.size === 0) return;
   
   // Use real metrics from tracker
@@ -3226,6 +3230,10 @@ async function gracefulShutdown(signal: string) {
   logger.info(`${signal} received, shutting down gracefully...`);
   
   try {
+    // Clear periodic intervals
+    if (metricsInterval) { clearInterval(metricsInterval); metricsInterval = null; }
+    if (statusBroadcastInterval) { clearInterval(statusBroadcastInterval); statusBroadcastInterval = null; }
+
     // Stop supervisor first
     supervisor.stop();
     

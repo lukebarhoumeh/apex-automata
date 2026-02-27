@@ -445,6 +445,14 @@ export class TradingEngine extends EventEmitter {
         this.orderTimestampsCleanupInterval = null;
       }
 
+      // Remove event listeners to prevent handler accumulation on restart
+      this.exchange?.removeAllListeners();
+      this.orderManager?.removeAllListeners();
+      this.positionTracker?.removeAllListeners();
+      this.riskEngine?.removeAllListeners();
+      this.positionMonitor?.removeAllListeners();
+      this.paperSimulator?.removeAllListeners();
+
       this.isRunning = false;
       this.setEngineState('stopped', 'stop_complete');
       this.emit('engine:stopped');
