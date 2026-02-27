@@ -4,7 +4,7 @@
  * Tests for idempotent start/stop, heartbeat, and kill switch behavior
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { TradingEngine, TradingEngineConfig, EngineState } from '../trading/trading-engine';
 import { Logger } from '../core/logger';
 

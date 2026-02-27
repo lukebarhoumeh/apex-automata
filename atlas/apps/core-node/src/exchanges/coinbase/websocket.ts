@@ -414,7 +414,12 @@ export class CoinbaseWebSocket extends EventEmitter implements ICoinbaseWsClient
 
     this.reconnectTimeout = setTimeout(() => {
       this.reconnectTimeout = null;
-      this.connect();
+      try {
+        this.connect();
+      } catch (err) {
+        this.logger.error('Reconnect attempt failed, scheduling another', { error: String(err) });
+        this.scheduleReconnect();
+      }
     }, delay);
   }
 
@@ -619,14 +624,21 @@ export class CoinbaseWebSocket extends EventEmitter implements ICoinbaseWsClient
 
     // Send subscription messages for each channel
     for (const spec of desired) {
-      const message: WebSocketChannelMessage = {
-        type: 'subscribe',
-        product_ids: spec.product_ids,
-        channels: [spec.channel]
-      };
+      try {
+        const message: WebSocketChannelMessage = {
+          type: 'subscribe',
+          product_ids: spec.product_ids,
+          channels: [spec.channel]
+        };
 
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify(message));
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify(message));
+        }
+      } catch (err) {
+        this.logger.error('Failed to send resubscribe message', {
+          channel: spec.channel,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
 

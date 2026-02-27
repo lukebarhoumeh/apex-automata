@@ -8,7 +8,7 @@
  * - Reconciler idempotency
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { 
   TokenBucketRateLimiter, 
   CoinbaseRateLimiter 

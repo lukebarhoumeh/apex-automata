@@ -103,6 +103,7 @@ export class TradingEngine extends EventEmitter {
   private riskEngine: RiskEngine | null = null;
   private positionMonitor: PositionMonitor | null = null;
   private tradeAnalytics: TradeAnalytics | null = null;
+  private signalProcessor: any = null;
   private secretManager: SecretManager;
   private paperSimulator: PaperTradingSimulator | null = null;
   private isRunning = false;
@@ -116,6 +117,7 @@ export class TradingEngine extends EventEmitter {
   
   // Order timing for latency tracking
   private orderTimestamps: Map<string, number> = new Map();
+  private orderTimestampsCleanupInterval: NodeJS.Timeout | null = null;
   
   // Per-symbol market data timestamp tracking for data gap detection
   private lastMarketDataPerSymbol: Map<string, number> = new Map();
@@ -169,6 +171,10 @@ export class TradingEngine extends EventEmitter {
 
   public getConfig(): TradingEngineConfig {
     return this.config;
+  }
+
+  public setSignalProcessor(sp: any): void {
+    this.signalProcessor = sp;
   }
 
   public get engineRunning(): boolean {
@@ -234,6 +240,9 @@ export class TradingEngine extends EventEmitter {
       
       // Start heartbeat for supervisor monitoring
       this.startHeartbeat();
+
+      // Periodic cleanup of stale order timestamps (every 5 minutes)
+      this.orderTimestampsCleanupInterval = setInterval(() => this.cleanupOrderTimestamps(), 5 * 60 * 1000);
 
       this.isRunning = true;
       this.setEngineState('running', 'start_complete');
@@ -430,6 +439,19 @@ export class TradingEngine extends EventEmitter {
         clearInterval(this.dataGapMonitor);
         this.dataGapMonitor = null;
       }
+
+      if (this.orderTimestampsCleanupInterval) {
+        clearInterval(this.orderTimestampsCleanupInterval);
+        this.orderTimestampsCleanupInterval = null;
+      }
+
+      // Remove event listeners to prevent handler accumulation on restart
+      this.exchange?.removeAllListeners();
+      this.orderManager?.removeAllListeners();
+      this.positionTracker?.removeAllListeners();
+      this.riskEngine?.removeAllListeners();
+      this.positionMonitor?.removeAllListeners();
+      this.paperSimulator?.removeAllListeners();
 
       this.isRunning = false;
       this.setEngineState('stopped', 'stop_complete');
@@ -821,7 +843,7 @@ export class TradingEngine extends EventEmitter {
           direction: position.side === 'long' ? 'buy' : 'sell',
           signalStrength: position.metadata?.signalStrength || 0.5,
           entryTime: position.openTime,
-          exitTime: position.closeTime || new Date(),
+          exitTime: position.closedAt || new Date(),
           pnl: position.realizedPnL,
           outcome,
           regime: position.metadata?.regime,
@@ -1046,6 +1068,15 @@ export class TradingEngine extends EventEmitter {
       this.lastMarketDataPerSymbol.set(symbol, now);
     }
     this.logger.info('Data gap tracking reset after reconnection');
+  }
+
+  private cleanupOrderTimestamps(): void {
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    for (const [orderId, timestamp] of this.orderTimestamps) {
+      if (timestamp < oneHourAgo) {
+        this.orderTimestamps.delete(orderId);
+      }
+    }
   }
 
   private handleTicker(ticker: Ticker): void {

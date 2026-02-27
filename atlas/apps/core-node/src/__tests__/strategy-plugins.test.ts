@@ -150,7 +150,6 @@ describe('StrategyPlugin System', () => {
     });
 
     it('should initialize with default config', () => {
-      // AGGRESSIVE defaults: shorter period, lower volume threshold
       expect(strategy.config.period).toBe(10);
       expect(strategy.config.volumeThreshold).toBe(0.5);
       expect(strategy.config.atrMultiplier).toBe(2.0);
@@ -218,7 +217,6 @@ describe('StrategyPlugin System', () => {
 
     it('should have RSI/MACD config parameters', () => {
       expect(strategy.config.rsiPeriod).toBe(14);
-      // AGGRESSIVE defaults: wider trigger zones
       expect(strategy.config.rsiOversold).toBe(40);
       expect(strategy.config.rsiOverbought).toBe(60);
       expect(strategy.config.macdFast).toBe(12);
@@ -346,11 +344,10 @@ describe('StrategyPlugin System', () => {
       
       const stats = registry.getStats();
       
-      // 4 built-in strategies: breakout, vwap_mr, momentum, trend_follow
       expect(stats.total).toBe(4);
       expect(stats.enabled).toBe(3);
       expect(stats.strategies.length).toBe(4);
-      expect(stats.byCategory['trend']).toBe(2); // breakout + trend_follow
+      expect(stats.byCategory['trend']).toBe(2);
       expect(stats.byCategory['mean-reversion']).toBe(1);
       expect(stats.byCategory['momentum']).toBe(1);
     });
@@ -360,7 +357,6 @@ describe('StrategyPlugin System', () => {
     it('should create all built-in strategies', () => {
       const strategies = createBuiltinStrategies();
       
-      // 4 built-in strategies: breakout, vwap_mr, momentum, trend_follow
       expect(strategies.length).toBe(4);
       expect(strategies.find(s => s.id === 'breakout')).toBeDefined();
       expect(strategies.find(s => s.id === 'vwap_mr')).toBeDefined();

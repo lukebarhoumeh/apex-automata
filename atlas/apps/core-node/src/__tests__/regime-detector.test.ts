@@ -319,7 +319,7 @@ describe('RegimeFilter', () => {
       }
     });
 
-    it('should return low position multiplier for mean-reversion in strong trend', () => {
+    it('should allow mean-reversion signal in strong trend when strategy is always-allowed', () => {
       // Set up strong trending market
       const candles = generateCandles(100, 50000, {
         trend: 'up',
@@ -331,14 +331,8 @@ describe('RegimeFilter', () => {
       const signal = createMockSignal('BTC-USD', 'vwap_mr', 'sell', 0.3);
       const result = regimeFilter.filter(signal);
 
-      // AGGRESSIVE config: alwaysAllowStrategies includes vwap_mr, so signals pass
-      // but position multiplier should reflect low compatibility
-      const state = regimeDetector.getState('BTC-USD');
-      if (state && state.regime === 'strong_trend') {
-        // With aggressive config, signals are allowed but may have reduced multiplier
-        expect(result.positionMultiplier).toBeGreaterThanOrEqual(0);
-        expect(result.positionMultiplier).toBeLessThanOrEqual(1);
-      }
+      // vwap_mr is in alwaysAllowStrategies, so it passes regardless of regime
+      expect(result.allowed).toBe(true);
     });
 
     it('should adjust position multiplier based on compatibility', () => {
@@ -358,22 +352,17 @@ describe('RegimeFilter', () => {
       expect(result.positionMultiplier).toBeLessThanOrEqual(1);
     });
 
-    it('should add regime metadata to adjusted signal', () => {
+    it('should return adjusted signal when strategy is always-allowed', () => {
       const candles = generateCandles(100, 50000);
       regimeDetector.update('BTC-USD', candles);
 
       const signal = createMockSignal('BTC-USD', 'momentum', 'buy', 0.8);
       const result = regimeFilter.filter(signal);
 
-      // FilterResult should always have regimeState and positionMultiplier
-      expect(result.regimeState).toBeDefined();
-      expect(typeof result.positionMultiplier).toBe('number');
-      expect(result.compatibilityScore).toBeGreaterThanOrEqual(0);
-      
-      // Adjusted signal is only present when allowed
-      if (result.allowed && result.adjustedSignal) {
-        expect(result.adjustedSignal).toBeDefined();
-      }
+      // momentum is in alwaysAllowStrategies, so it's allowed with original signal
+      expect(result.allowed).toBe(true);
+      expect(result.adjustedSignal).toBeDefined();
+      expect(result.positionMultiplier).toBe(1.0);
     });
   });
 
@@ -417,7 +406,11 @@ describe('RegimeFilter', () => {
   });
 
   describe('events', () => {
-    it('should provide consistent filter results', () => {
+    it('should not emit signal:filtered for always-allowed strategies', () => {
+      const filteredHandler = vi.fn();
+      regimeFilter.on('signal:filtered', filteredHandler);
+
+      // Set up strong trend
       const candles = generateCandles(100, 50000, {
         trend: 'up',
         volatility: 'high',
@@ -425,15 +418,30 @@ describe('RegimeFilter', () => {
       });
       regimeDetector.update('BTC-USD', candles);
 
-      // Filter a signal and verify the result structure
+      // vwap_mr is in alwaysAllowStrategies, so it won't be filtered
+      const signal = createMockSignal('BTC-USD', 'vwap_mr', 'sell', 0.3);
+      regimeFilter.filter(signal);
+
+      expect(filteredHandler).not.toHaveBeenCalled();
+    });
+
+    it('should allow signal without emitting passed event for always-allowed strategies', () => {
+      const passedHandler = vi.fn();
+      regimeFilter.on('signal:passed', passedHandler);
+
+      const candles = generateCandles(100, 50000, {
+        trend: 'up',
+        volatility: 'high',
+        consistency: 0.9,
+      });
+      regimeDetector.update('BTC-USD', candles);
+
+      // breakout is in alwaysAllowStrategies, returns early without emitting
       const signal = createMockSignal('BTC-USD', 'breakout', 'buy', 0.8);
       const result = regimeFilter.filter(signal);
 
-      // AGGRESSIVE config: alwaysAllowStrategies includes breakout, so it should pass
       expect(result.allowed).toBe(true);
-      expect(result.positionMultiplier).toBeGreaterThan(0);
-      expect(result.regimeState).toBeDefined();
-      expect(result.reason).toBeDefined();
+      expect(passedHandler).not.toHaveBeenCalled();
     });
   });
 });

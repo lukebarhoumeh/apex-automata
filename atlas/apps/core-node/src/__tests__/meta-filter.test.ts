@@ -84,7 +84,6 @@ describe('MetaFilter', () => {
       const stats = filter.getStats();
       
       expect(stats.enabled).toBe(true);
-      // AGGRESSIVE config: higher threshold to allow more trades
       expect(stats.config.coldStreakThreshold).toBe(10);
       expect(stats.config.minQualityScore).toBe(0.5);
     });
@@ -184,12 +183,11 @@ describe('MetaFilter', () => {
   });
 
   describe('signal strength filtering', () => {
-    it('should pass signals regardless of strength when minAbsoluteStrength is 0', () => {
-      // AGGRESSIVE config: minAbsoluteStrength is 0.0, so all signals pass strength check
+    it('should pass signals when absolute minimum strength is zero', () => {
       const signal = createMockSignal('breakout', 0.2);
       const result = metaFilter.filter(signal);
 
-      // With minAbsoluteStrength=0, the strength rule should pass
+      // With minAbsoluteStrength defaulting to 0, all non-negative strengths pass
       const strengthRule = result.rulesEvaluated.find(r => r.rule.includes('strength'));
       expect(strengthRule?.passed).toBe(true);
     });

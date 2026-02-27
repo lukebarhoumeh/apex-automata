@@ -338,7 +338,7 @@ export class CoinbaseReconciler extends EventEmitter {
       let newFillsIngested = 0;
 
       for (const fill of fills) {
-        const fillId = fill.trade_id || `${fill.order_id}-${fill.created_at}`;
+        const fillId = String(fill.trade_id) || `${fill.order_id}-${String(fill.created_at)}`;
         const isNew = !this.seenFillIds.has(fillId);
 
         if (isNew) {
@@ -362,7 +362,7 @@ export class CoinbaseReconciler extends EventEmitter {
 
       // Update cursor for next reconciliation
       if (fills.length > 0) {
-        this.lastFillCursor = fills[0].trade_id || fills[0].created_at;
+        this.lastFillCursor = String(fills[0].trade_id) || String(fills[0].created_at);
       }
 
       // Limit the size of seen fills set

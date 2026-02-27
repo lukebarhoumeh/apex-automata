@@ -9,7 +9,7 @@
  * 5. Stall detection
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi, MockedClass } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { SubscriptionManager, CoinbaseChannelSpec } from '../exchanges/coinbase/ws/coinbase-ws.interface';
 import { CoinbaseWebSocket } from '../exchanges/coinbase/websocket';
 import { CoinbaseExchange } from '../exchanges/coinbase';
@@ -18,7 +18,7 @@ import WebSocket from 'ws';
 
 // Mock ws module
 vi.mock('ws');
-const MockWebSocket = WebSocket as MockedClass<typeof WebSocket>;
+const MockWebSocket = WebSocket as any;
 
 // Mock logger
 const mockLogger: Logger = {

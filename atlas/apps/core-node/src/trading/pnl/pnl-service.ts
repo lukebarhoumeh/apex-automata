@@ -218,12 +218,12 @@ export class PnLService extends EventEmitter {
     }
 
     for (const position of positions) {
-      const markPrice = this.lastMarkPrices.get(position.symbol) || position.marketPrice || position.entryPrice;
+      const markPrice = this.lastMarkPrices.get(position.symbol) || position.marketPrice || position.averagePrice;
       
       // Seed entry price to mark so unrealized starts at 0
       this.logger.info('Importing existing position at mark', {
         symbol: position.symbol,
-        originalEntry: position.entryPrice,
+        originalEntry: position.averagePrice,
         markPrice,
         side: position.side,
         size: position.size,
@@ -280,9 +280,9 @@ export class PnLService extends EventEmitter {
     let unrealized = 0;
 
     for (const pos of positions) {
-      const markPrice = this.lastMarkPrices.get(pos.symbol) || pos.marketPrice || pos.entryPrice;
+      const markPrice = this.lastMarkPrices.get(pos.symbol) || pos.marketPrice || pos.averagePrice;
       const direction = pos.side === 'long' ? 1 : -1;
-      const pnl = (markPrice - pos.entryPrice) * pos.size * direction;
+      const pnl = (markPrice - pos.averagePrice) * pos.size * direction;
       unrealized += pnl;
     }
 
@@ -291,7 +291,7 @@ export class PnLService extends EventEmitter {
 
   private calculateExposure(positions: Position[]): number {
     return positions.reduce((total, pos) => {
-      const markPrice = this.lastMarkPrices.get(pos.symbol) || pos.marketPrice || pos.entryPrice;
+      const markPrice = this.lastMarkPrices.get(pos.symbol) || pos.marketPrice || pos.averagePrice;
       return total + Math.abs(pos.size * markPrice);
     }, 0);
   }
@@ -300,15 +300,15 @@ export class PnLService extends EventEmitter {
     const result: Record<string, PositionSnapshot> = {};
 
     for (const pos of positions) {
-      const markPrice = this.lastMarkPrices.get(pos.symbol) || pos.marketPrice || pos.entryPrice;
+      const markPrice = this.lastMarkPrices.get(pos.symbol) || pos.marketPrice || pos.averagePrice;
       const direction = pos.side === 'long' ? 1 : -1;
-      const unrealizedPnl = (markPrice - pos.entryPrice) * pos.size * direction;
+      const unrealizedPnl = (markPrice - pos.averagePrice) * pos.size * direction;
 
       result[pos.symbol] = {
         symbol: pos.symbol,
         side: pos.side === 'long' ? 'long' : 'short',
         quantity: pos.size,
-        entryPrice: pos.entryPrice,
+        entryPrice: pos.averagePrice,
         markPrice,
         unrealizedPnl,
         notional: Math.abs(pos.size * markPrice),

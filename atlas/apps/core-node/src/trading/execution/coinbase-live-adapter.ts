@@ -306,7 +306,7 @@ export class CoinbaseLiveExecutionAdapter extends EventEmitter implements IExecu
         side: order.side as 'buy' | 'sell',
         type: order.type as 'market' | 'limit' | 'stop',
         price: order.price ? parseFloat(order.price) : undefined,
-        quantity: parseFloat(order.size),
+        quantity: parseFloat(order.size || '0'),
         filledQuantity: parseFloat(order.filled_size || '0'),
         status: order.status,
         createdAt: new Date(order.created_at).getTime(),
@@ -395,9 +395,9 @@ export class CoinbaseLiveExecutionAdapter extends EventEmitter implements IExecu
     }
 
     // Handle terminal states
-    if (order.status === 'done' || order.status === 'settled') {
+    if (order.status === 'done' || order.settled) {
       this.pendingOrders.delete(clientOrderId);
-    } else if (order.status === 'canceled' || order.status === 'cancelled') {
+    } else if (order.status === 'canceled') {
       this.emitEvent({
         type: 'order_canceled',
         clientOrderId,

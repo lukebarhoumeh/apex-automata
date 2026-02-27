@@ -114,6 +114,12 @@ const runtimeState = {
   lastRestartAt: null as number | null,
 };
 
+let engineOperationInProgress = false;
+
+// Interval references for cleanup on shutdown
+let metricsInterval: NodeJS.Timeout | null = null;
+let statusBroadcastInterval: NodeJS.Timeout | null = null;
+
 // In-memory configs (will be persisted/hot-reloaded later)
 let riskConfig: any = null;
 let signalsConfig: any = null;
@@ -321,14 +327,18 @@ function processTickerForCandles(ticker: { product_id: string; price: string; la
 }
 
 // Periodic update for account metrics (every 5 minutes)
-setInterval(async () => {
-if (tradingEngine?.engineRunning) {
-    await updateAccountMetrics();
+metricsInterval = setInterval(async () => {
+  try {
+    if (tradingEngine?.engineRunning) {
+      await updateAccountMetrics();
+    }
+  } catch (err) {
+    logger.error('Failed to handle periodic updateAccountMetrics', { error: String(err) });
   }
 }, 5 * 60 * 1000);
 
 // Periodic StatusUpdate broadcast for frontend with supervisor state
-setInterval(() => {
+statusBroadcastInterval = setInterval(() => {
   if (wsClients.size === 0) return;
   
   // Use real metrics from tracker
@@ -645,6 +655,10 @@ app.post('/api/killswitch/deactivate', async (req, res) => {
 
 // Start trading engine
 app.post('/api/engine/start', async (req, res) => {
+  if (engineOperationInProgress) {
+    return res.status(409).json({ error: 'Engine operation already in progress' });
+  }
+  engineOperationInProgress = true;
   try {
     const { mode = 'paper', marketDataEnv, confirm } = req.body || {};
     const requestedMarketEnv = marketDataEnv === 'sandbox' ? 'sandbox' : 'production';
@@ -804,48 +818,64 @@ app.post('/api/engine/start', async (req, res) => {
     });
 
     tradingEngine.on('order:created', async (order) => {
-      ordersCreatedCounter.inc();
-      broadcast({ type: 'OrderUpdate', payload: order });
-      await syncOrderToSupabase(order);
+      try {
+        ordersCreatedCounter.inc();
+        broadcast({ type: 'OrderUpdate', payload: order });
+        await syncOrderToSupabase(order);
+      } catch (err) {
+        logger.error('Failed to handle order:created', { error: String(err) });
+      }
     });
 
     tradingEngine.on('order:filled', async (order, fill) => {
-      ordersFilledCounter.inc();
-      // Broadcast order status update + fill
-      broadcast({ type: 'OrderUpdate', payload: order });
-      broadcast({ type: 'Fill', payload: fill });
-      await syncOrderToSupabase(order);
-      await syncFillToSupabase(fill);
-      // Update account metrics after fills
-      await updateAccountMetrics();
+      try {
+        ordersFilledCounter.inc();
+        // Broadcast order status update + fill
+        broadcast({ type: 'OrderUpdate', payload: order });
+        broadcast({ type: 'Fill', payload: fill });
+        await syncOrderToSupabase(order);
+        await syncFillToSupabase(fill);
+        // Update account metrics after fills
+        await updateAccountMetrics();
+      } catch (err) {
+        logger.error('Failed to handle order:filled', { error: String(err) });
+      }
     });
 
     tradingEngine.on('position:update', async (position) => {
-      broadcast({ type: 'PositionUpdate', payload: position });
-      await syncPositionToSupabase(position);
-      
-      // Record outcome for ML training when position is closed
-      if (position.side === 'flat' && tradeOutcomeCollector?.isEnabled()) {
-        try {
-          await tradeOutcomeCollector.recordOutcome(position);
-        } catch (error) {
-          logger.error('Failed to record trade outcome', {
-            positionId: position.id,
-            error: error instanceof Error ? error.message : String(error),
-          });
+      try {
+        broadcast({ type: 'PositionUpdate', payload: position });
+        await syncPositionToSupabase(position);
+        
+        // Record outcome for ML training when position is closed
+        if (position.side === 'flat' && tradeOutcomeCollector?.isEnabled()) {
+          try {
+            await tradeOutcomeCollector.recordOutcome(position);
+          } catch (error) {
+            logger.error('Failed to record trade outcome', {
+              positionId: position.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
         }
+      } catch (err) {
+        logger.error('Failed to handle position:update', { error: String(err) });
       }
     });
 
     tradingEngine.on('risk:alert', async (alert) => {
-      if (alert?.type === 'kill_switch') {
-        killSwitchActiveGauge.set(1);
-        runtimeState.killSwitch.active = true;
-        runtimeState.killSwitch.reasons = Array.isArray(alert?.reasons) ? alert.reasons : [alert?.message || 'Kill switch'];
-        runtimeState.killSwitch.since = Date.now();
+      try {
+        if (alert?.type === 'kill_switch') {
+          killSwitchActiveGauge.set(1);
+          runtimeState.killSwitch.active = true;
+          runtimeState.killSwitch.reasons = Array.isArray(alert?.reasons) ? alert.reasons : [alert?.message || 'Kill switch'];
+          runtimeState.killSwitch.since = Date.now();
+        }
+        broadcast({ type: 'RiskEvent', payload: alert });
+        await createSupabaseAlert(alert);
+      } catch (err) {
+        logger.error('Failed to handle risk:alert', { error: String(err) });
       }
-      broadcast({ type: 'RiskEvent', payload: alert });
-      await createSupabaseAlert(alert);
     });
 
     tradingEngine.on('risk:metrics', (metrics: any) => {
@@ -1050,53 +1080,58 @@ app.post('/api/engine/start', async (req, res) => {
 
     // Listen for signals and create orders
     signalProcessor.on('signal:generated', async (signal) => {
-      logger.info('Signal generated', signal);
-      broadcast({ type: 'Signal', payload: signal });
-
-      // Capture signal context for ML training
-      if (tradeOutcomeCollector?.isEnabled()) {
-        const regimeState = signalProcessor!.getRegimeState(signal.symbol);
-        const indicators = signal.metadata?.indicators as Record<string, number> || {};
-        
-        tradeOutcomeCollector.captureSignalContext(
-          {
-            id: signal.id,
-            symbol: signal.symbol,
-            strategy: signal.strategy,
-            direction: signal.direction,
-            strength: signal.strength,
-            price: signal.price,
-            stopLoss: signal.stopLoss,
-            takeProfit: signal.takeProfit,
-            timestamp: signal.timestamp,
-            metadata: signal.metadata || {},
-          },
-          regimeState || {
-            regime: 'ranging',
-            confidence: 0.5,
-            adx: 0,
-            atrPercent: 0,
-            bbWidth: 0,
-            choppiness: 0,
-            trendDirection: 'neutral',
-            mtfAlignment: 0,
-            lastUpdate: new Date(),
-          },
-          indicators,
-          {
-            volumeRatio: indicators.volumeRatio,
-            metaFilterScore: signal.metadata?.metaQualityScore as number,
-            coldStreakActive: signal.metadata?.coldStreakActive as boolean,
-            positionMultiplier: signal.metadata?.positionMultiplier as number,
-          }
-        );
-      }
-      
-      // Store signal in Supabase
-      await syncSignalToSupabase(signal);
-      
-      // Create order if risk checks pass
       try {
+        logger.info('Signal generated', signal);
+        broadcast({ type: 'Signal', payload: signal });
+
+        // Capture signal context for ML training
+        if (tradeOutcomeCollector?.isEnabled()) {
+          const regimeState = signalProcessor!.getRegimeState(signal.symbol);
+          const indicators = signal.metadata?.indicators as Record<string, number> || {};
+          
+          tradeOutcomeCollector.captureSignalContext(
+            {
+              id: signal.id,
+              symbol: signal.symbol,
+              strategy: signal.strategy,
+              direction: signal.direction,
+              strength: signal.strength,
+              price: signal.price,
+              stopLoss: signal.stopLoss,
+              takeProfit: signal.takeProfit,
+              timestamp: signal.timestamp,
+              metadata: signal.metadata || {},
+            },
+            regimeState || {
+              regime: 'ranging',
+              confidence: 0.5,
+              adx: 0,
+              plusDI: 0,
+              minusDI: 0,
+              atrPercent: 0,
+              bbWidth: 0,
+              choppiness: 0,
+              trendDirection: 'neutral',
+              directionConsistency: 0.5,
+              mtfAlignment: 0,
+              lastUpdated: new Date(),
+              regimeSince: new Date(),
+            },
+            indicators,
+            {
+              volumeRatio: indicators.volumeRatio,
+              metaFilterScore: signal.metadata?.metaQualityScore as number,
+              coldStreakActive: signal.metadata?.coldStreakActive as boolean,
+              positionMultiplier: signal.metadata?.positionMultiplier as number,
+            }
+          );
+        }
+        
+        // Store signal in Supabase
+        await syncSignalToSupabase(signal);
+        
+        // Create order if risk checks pass
+        try {
         const shortAllowed = Boolean(guardrails.strategy.allow_short);
         const isExitSignal = signal.direction === 'sell' && !shortAllowed;
         
@@ -1251,6 +1286,9 @@ app.post('/api/engine/start', async (req, res) => {
       } catch (error) {
         logger.error('Failed to place order from signal:', error);
       }
+      } catch (err) {
+        logger.error('Failed to handle signal:generated', { error: String(err) });
+      }
     });
 
     // Start the engine
@@ -1290,6 +1328,8 @@ app.post('/api/engine/start', async (req, res) => {
     };
     logger.error('Failed to start trading engine:', errorDetails);
     res.status(500).json({ error: 'Failed to start trading engine', details: errorDetails });
+  } finally {
+    engineOperationInProgress = false;
   }
 });
 
@@ -1435,6 +1475,10 @@ async function runLivePreflight(input: {
 
 // Stop trading engine
 app.post('/api/engine/stop', async (req, res) => {
+  if (engineOperationInProgress) {
+    return res.status(409).json({ error: 'Engine operation already in progress' });
+  }
+  engineOperationInProgress = true;
   try {
     if (!tradingEngine) {
       return res.status(400).json({ error: 'Trading engine not running' });
@@ -1458,11 +1502,17 @@ app.post('/api/engine/stop', async (req, res) => {
   } catch (error) {
     logger.error('Failed to stop trading engine:', error);
     res.status(500).json({ error: 'Failed to stop trading engine' });
+  } finally {
+    engineOperationInProgress = false;
   }
 });
 
 // Emergency kill switch
 app.post('/api/engine/kill', async (req, res) => {
+  if (engineOperationInProgress) {
+    return res.status(409).json({ error: 'Engine operation already in progress' });
+  }
+  engineOperationInProgress = true;
   try {
     const reason = 'User activated kill switch';
     
@@ -1512,6 +1562,8 @@ app.post('/api/engine/kill', async (req, res) => {
   } catch (error) {
     logger.error('Failed to activate kill switch:', error);
     res.status(500).json({ error: 'Failed to activate kill switch' });
+  } finally {
+    engineOperationInProgress = false;
   }
 });
 
@@ -2478,7 +2530,7 @@ app.get('/api/risk/analytics', (req, res) => {
   
   res.json({
     session: {
-      trades: summary?.trades || 0,
+      trades: summary?.positionCount || 0,
       wins: 0, // Would need TradeAnalytics
       losses: 0,
       winRate: 0,
@@ -3178,6 +3230,10 @@ async function gracefulShutdown(signal: string) {
   logger.info(`${signal} received, shutting down gracefully...`);
   
   try {
+    // Clear periodic intervals
+    if (metricsInterval) { clearInterval(metricsInterval); metricsInterval = null; }
+    if (statusBroadcastInterval) { clearInterval(statusBroadcastInterval); statusBroadcastInterval = null; }
+
     // Stop supervisor first
     supervisor.stop();
     

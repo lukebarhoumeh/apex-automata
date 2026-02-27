@@ -2,12 +2,14 @@
  * Supabase Writer - Unified Write Layer
  * 
  * Single entry point for all Supabase writes with:
- * - Bounded in-memory queue
+ * - Bounded in-memory queue with backpressure (evicts oldest non-critical)
  * - Retry with exponential backoff + jitter
  * - Coalescing for high-frequency snapshot tables
  * - Connectivity state tracking
  * - Schema error detection (non-retryable)
  * - Optional disk spool for critical facts
+ * - Per-operation timeout to prevent hanging calls
+ * - Circuit breaker to stop writes after consecutive failures
  */
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
@@ -51,6 +53,28 @@ const dbSpoolDepth = new Gauge({
   help: 'Number of operations in disk spool',
 });
 
+const dbCircuitBreakerStatus = new Gauge({
+  name: 'atlas_db_circuit_breaker_open',
+  help: 'Circuit breaker state (1=open/tripped, 0=closed)',
+});
+
+const dbCircuitBreakerTrips = new Counter({
+  name: 'atlas_db_circuit_breaker_trips_total',
+  help: 'Total times the circuit breaker has tripped',
+});
+
+const dbOperationTimeouts = new Counter({
+  name: 'atlas_db_operation_timeouts_total',
+  help: 'Total operations that timed out',
+  labelNames: ['table'],
+});
+
+const dbBackpressureEvictions = new Counter({
+  name: 'atlas_db_backpressure_evictions_total',
+  help: 'Total non-critical operations evicted by backpressure',
+  labelNames: ['table'],
+});
+
 // ============ Types ============
 
 export type WriteKind = 'insert' | 'upsert' | 'update';
@@ -81,6 +105,8 @@ export interface WriterHealth {
   lastSuccessAt?: number;
   lastError?: string;
   spoolDepth: number;
+  circuitBreakerOpen: boolean;
+  consecutiveFailures: number;
 }
 
 export interface WriterConfig {
@@ -101,6 +127,12 @@ export interface WriterConfig {
   spoolDir?: string;
   /** Flush interval (ms) */
   flushIntervalMs?: number;
+  /** Timeout per Supabase operation (ms). 0 = no timeout. */
+  operationTimeoutMs?: number;
+  /** Consecutive failures before circuit breaker opens */
+  circuitBreakerThreshold?: number;
+  /** How long circuit breaker stays open before half-open probe (ms) */
+  circuitBreakerCooldownMs?: number;
 }
 
 // ============ Schema Error Detection ============
@@ -167,6 +199,10 @@ export class SupabaseWriter {
   private isFlushing = false;
   private isShuttingDown = false;
 
+  // Circuit breaker state
+  private consecutiveFailures = 0;
+  private circuitBreakerOpenUntil = 0;
+
   // Config
   private maxQueueSize: number;
   private maxRetries: number;
@@ -175,6 +211,9 @@ export class SupabaseWriter {
   private enableSpool: boolean;
   private spoolDir: string;
   private flushIntervalMs: number;
+  private operationTimeoutMs: number;
+  private circuitBreakerThreshold: number;
+  private circuitBreakerCooldownMs: number;
 
   constructor(config: WriterConfig) {
     this.supabase = createClient(config.supabaseUrl, config.supabaseServiceKey, {
@@ -189,6 +228,9 @@ export class SupabaseWriter {
     this.enableSpool = config.enableSpool ?? false;
     this.spoolDir = config.spoolDir ?? './spool';
     this.flushIntervalMs = config.flushIntervalMs ?? 2000;
+    this.operationTimeoutMs = config.operationTimeoutMs ?? 10000;
+    this.circuitBreakerThreshold = config.circuitBreakerThreshold ?? 10;
+    this.circuitBreakerCooldownMs = config.circuitBreakerCooldownMs ?? 30000;
 
     // Initialize spool directory
     if (this.enableSpool) {
@@ -208,10 +250,14 @@ export class SupabaseWriter {
     }, this.flushIntervalMs);
 
     dbConnectionStatus.set(1);
+    dbCircuitBreakerStatus.set(0);
     this.logger.info('SupabaseWriter initialized', {
       maxQueueSize: this.maxQueueSize,
       flushIntervalMs: this.flushIntervalMs,
       enableSpool: this.enableSpool,
+      operationTimeoutMs: this.operationTimeoutMs,
+      circuitBreakerThreshold: this.circuitBreakerThreshold,
+      circuitBreakerCooldownMs: this.circuitBreakerCooldownMs,
     });
   }
 
@@ -237,19 +283,29 @@ export class SupabaseWriter {
       return;
     }
 
-    // Check queue overflow
+    // Backpressure: when queue is full, evict oldest non-critical ops to make room
     if (this.queue.length >= this.maxQueueSize) {
       if (op.critical) {
-        // Spool critical ops
-        if (this.enableSpool) {
-          this.spoolOp(op);
-        } else {
-          this.logger.error('Queue overflow, dropping critical write (spool disabled)', { table: op.table });
+        // Critical op: evict oldest non-critical to make room
+        const evicted = this.evictOldestNonCritical();
+        if (!evicted) {
+          // Queue is entirely critical ops — spool or drop
+          if (this.enableSpool) {
+            this.spoolOp(op);
+          } else {
+            this.logger.error('Queue overflow, all critical — dropping critical write (spool disabled)', { table: op.table });
+          }
+          return;
         }
       } else {
-        this.logger.warn('Queue overflow, dropping non-critical write', { table: op.table });
+        // Non-critical incoming: evict oldest non-critical (could be this op or an older one)
+        const evicted = this.evictOldestNonCritical();
+        if (!evicted) {
+          // No non-critical ops to evict — queue is all critical, drop this non-critical op
+          this.logger.warn('Queue overflow (all critical), dropping non-critical write', { table: op.table });
+          return;
+        }
       }
-      return;
     }
 
     if (op.dedupeKey) {
@@ -258,6 +314,25 @@ export class SupabaseWriter {
 
     this.queue.push(op);
     dbWriteQueueDepth.set(this.queue.length + this.coalescedOps.size);
+  }
+
+  /**
+   * Evict the oldest non-critical operation from the queue.
+   * Returns true if an op was evicted, false if no non-critical ops exist.
+   */
+  private evictOldestNonCritical(): boolean {
+    for (let i = 0; i < this.queue.length; i++) {
+      if (!this.queue[i].critical) {
+        const evicted = this.queue.splice(i, 1)[0];
+        if (evicted.dedupeKey) {
+          this.dedupeSet.delete(evicted.dedupeKey);
+        }
+        dbBackpressureEvictions.labels({ table: evicted.table }).inc();
+        this.logger.warn('Backpressure: evicted oldest non-critical write', { table: evicted.table });
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -277,6 +352,8 @@ export class SupabaseWriter {
       lastSuccessAt: this.lastSuccessAt,
       lastError: this.lastError,
       spoolDepth: this.getSpoolDepth(),
+      circuitBreakerOpen: this.isCircuitOpen(),
+      consecutiveFailures: this.consecutiveFailures,
     };
   }
 
@@ -348,6 +425,14 @@ export class SupabaseWriter {
     this.isFlushing = true;
 
     try {
+      // Circuit breaker: skip flush if open (except during shutdown)
+      if (this.isCircuitOpen() && !this.isShuttingDown) {
+        this.logger.debug('Circuit breaker open, skipping flush', {
+          cooldownRemainingMs: this.circuitBreakerOpenUntil - Date.now(),
+        });
+        return;
+      }
+
       // Replay spool first
       if (this.enableSpool) {
         await this.replaySpool();
@@ -361,6 +446,14 @@ export class SupabaseWriter {
 
       // Process queue
       while (this.queue.length > 0 && !this.isShuttingDown) {
+        // If circuit breaker tripped mid-flush, stop processing
+        if (this.isCircuitOpen()) {
+          this.logger.warn('Circuit breaker tripped mid-flush, pausing', {
+            remainingOps: this.queue.length,
+          });
+          break;
+        }
+
         const op = this.queue.shift()!;
         await this.executeOp(op);
       }
@@ -375,29 +468,26 @@ export class SupabaseWriter {
     try {
       let error: any = null;
 
-      switch (op.kind) {
-        case 'insert': {
-          const result = await this.supabase.from(op.table).insert(op.row || op.rows);
-          error = result.error;
-          break;
-        }
-        case 'upsert': {
-          const result = await this.supabase.from(op.table).upsert(op.row || op.rows, {
-            onConflict: op.onConflict,
-          });
-          error = result.error;
-          break;
-        }
-        case 'update': {
-          let query = this.supabase.from(op.table).update(op.patch!);
-          for (const [key, value] of Object.entries(op.match!)) {
-            query = query.eq(key, value);
+      const supabaseCall = async (): Promise<any> => {
+        switch (op.kind) {
+          case 'insert':
+            return this.supabase.from(op.table).insert(op.row || op.rows);
+          case 'upsert':
+            return this.supabase.from(op.table).upsert(op.row || op.rows, {
+              onConflict: op.onConflict,
+            });
+          case 'update': {
+            let query = this.supabase.from(op.table).update(op.patch!);
+            for (const [key, value] of Object.entries(op.match!)) {
+              query = query.eq(key, value);
+            }
+            return query;
           }
-          const result = await query;
-          error = result.error;
-          break;
         }
-      }
+      };
+
+      const result = await this.withTimeout(supabaseCall(), op.table);
+      error = result.error;
 
       if (error) {
         await this.handleError(op, error);
@@ -409,12 +499,42 @@ export class SupabaseWriter {
     }
   }
 
+  /**
+   * Wrap a promise with a timeout. Rejects with a timeout error if the
+   * operation doesn't resolve within operationTimeoutMs.
+   */
+  private async withTimeout<T>(promise: Promise<T>, table: string): Promise<T> {
+    if (this.operationTimeoutMs <= 0) return promise;
+
+    let timer: NodeJS.Timeout;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        dbOperationTimeouts.labels({ table }).inc();
+        reject(new Error(`Operation timed out after ${this.operationTimeoutMs}ms`));
+      }, this.operationTimeoutMs);
+    });
+
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      clearTimeout(timer!);
+    }
+  }
+
   private onSuccess(op: WriteOp): void {
     this.isConnected = true;
     this.lastSuccessAt = Date.now();
     this.lastError = undefined;
     dbConnectionStatus.set(1);
     dbWriteTotal.labels({ table: op.table, result: 'success' }).inc();
+
+    // Reset circuit breaker on success
+    if (this.consecutiveFailures > 0) {
+      this.consecutiveFailures = 0;
+      this.circuitBreakerOpenUntil = 0;
+      dbCircuitBreakerStatus.set(0);
+      this.logger.info('Circuit breaker reset after successful write', { table: op.table });
+    }
 
     // Clear dedupe key
     if (op.dedupeKey) {
@@ -427,6 +547,12 @@ export class SupabaseWriter {
 
   private async handleError(op: WriteOp, error: any): Promise<void> {
     this.lastError = error.message || String(error);
+
+    // Track consecutive failures for circuit breaker (all error types count)
+    this.consecutiveFailures++;
+    if (this.consecutiveFailures >= this.circuitBreakerThreshold && !this.isCircuitOpen()) {
+      this.tripCircuitBreaker();
+    }
 
     // Schema errors are not retryable
     if (isSchemaError(error)) {
@@ -476,6 +602,12 @@ export class SupabaseWriter {
       return;
     }
 
+    // If circuit breaker is open, don't bother retrying — re-enqueue and let next flush handle it
+    if (this.isCircuitOpen()) {
+      this.queue.unshift(op);
+      return;
+    }
+
     // Calculate backoff with jitter
     const delay = Math.min(
       this.retryBaseDelayMs * Math.pow(2, op._retries - 1) + Math.random() * 1000,
@@ -496,6 +628,31 @@ export class SupabaseWriter {
 
     // Re-enqueue at front of queue
     this.queue.unshift(op);
+  }
+
+  // ============ Circuit Breaker ============
+
+  private isCircuitOpen(): boolean {
+    if (this.circuitBreakerOpenUntil === 0) return false;
+    if (Date.now() >= this.circuitBreakerOpenUntil) {
+      // Cooldown expired — move to half-open (allow next flush to probe)
+      this.circuitBreakerOpenUntil = 0;
+      dbCircuitBreakerStatus.set(0);
+      this.logger.info('Circuit breaker cooldown expired, moving to half-open');
+      return false;
+    }
+    return true;
+  }
+
+  private tripCircuitBreaker(): void {
+    this.circuitBreakerOpenUntil = Date.now() + this.circuitBreakerCooldownMs;
+    dbCircuitBreakerStatus.set(1);
+    dbCircuitBreakerTrips.inc();
+    this.logger.error('Circuit breaker OPEN — stopping writes', {
+      consecutiveFailures: this.consecutiveFailures,
+      cooldownMs: this.circuitBreakerCooldownMs,
+      resumeAt: new Date(this.circuitBreakerOpenUntil).toISOString(),
+    });
   }
 
   // ============ Disk Spool ============

@@ -304,14 +304,12 @@ describe('RiskEngine', () => {
       (riskEngine as any).checkKillSwitches();
       
       expect(riskEngine.getMetrics().killSwitchActive).toBe(true);
-      
-      // Note: Position flattening is now optional and config-driven.
-      // Kill switch halts new trades but does NOT auto-close positions.
-      // Position monitor handles exits (stop/TP/trailing) separately.
+      // Position flattening is now config-driven and not automatic
+      expect(closeSpy).toHaveBeenCalledTimes(0);
       
       // Idempotent: repeated checks shouldn't re-trigger
       (riskEngine as any).checkKillSwitches();
-      expect(riskEngine.getMetrics().killSwitchActive).toBe(true);
+      expect(closeSpy).toHaveBeenCalledTimes(0);
     });
   });
   
@@ -407,9 +405,8 @@ describe('RiskEngine', () => {
       
       // Before any positions open, computeOrderSize should be quarter-risk + quarter exposure cap.
       const sized = softEngine.computeOrderSize('BTC-USD', 50000, 49000);
-      // Base would be ~0.1 (risk $100 / $1000), soft launch should cap to ~0.025.
-      // Allow 2 decimal places tolerance for rounding differences
-      expect(sized).toBeCloseTo(0.025, 2);
+      // Base risk = 0.025, but capped by exposure limit with 2% safety margin → 0.0245.
+      expect(sized).toBeCloseTo(0.0245, 6);
       
       // Soft per-symbol cap: 0.006 BTC @ 50k = $300 > $250 should be rejected during soft launch.
       const check = await softEngine.checkOrder({
@@ -443,10 +440,9 @@ describe('RiskEngine', () => {
       await positionTracker.processFill(mkFill({ trade_id: 13, side: 'buy', price: '1000' }) as any);
       await positionTracker.processFill(mkFill({ trade_id: 14, side: 'sell', price: '1100' }) as any);
       
-      // Now soft launch should be inactive, sizing should revert to base (~0.1).
-      // Allow 2 decimal places tolerance for rounding differences
+      // Now soft launch should be inactive, sizing reverts to base capped by 2% safety margin → 0.098.
       const sizedAfter = softEngine.computeOrderSize('BTC-USD', 50000, 49000);
-      expect(sizedAfter).toBeCloseTo(0.1, 2);
+      expect(sizedAfter).toBeCloseTo(0.098, 6);
       
       softEngine.stop();
     });

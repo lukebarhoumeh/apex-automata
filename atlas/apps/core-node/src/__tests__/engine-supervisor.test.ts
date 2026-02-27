@@ -4,7 +4,7 @@
  * Tests for 24/7 resilience: watchdog, recovery, and state management
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi, Mock } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach, type Mock } from 'vitest';
 import { EngineSupervisor, DEFAULT_SUPERVISOR_CONFIG, RestartReason } from '../runtime/engine-supervisor';
 import { Logger } from '../core/logger';
 
@@ -142,8 +142,8 @@ describe('EngineSupervisor', () => {
   });
 
   describe('Watchdog Recovery', () => {
-    let restartCallback: vi.Mock;
-    let reconnectCallback: vi.Mock;
+    let restartCallback: Mock;
+    let reconnectCallback: Mock;
 
     beforeEach(() => {
       restartCallback = vi.fn().mockResolvedValue(true);
@@ -159,10 +159,7 @@ describe('EngineSupervisor', () => {
       supervisor.setActualState('running');
       
       // Don't record heartbeat, let it go stale
-      vi.advanceTimersByTime(6000); // > engineHeartbeatStaleMs
-      
-      // Wait for async restart
-      await vi.runAllTimersAsync();
+      await vi.advanceTimersByTimeAsync(6000); // > engineHeartbeatStaleMs
       
       expect(restartCallback).toHaveBeenCalledWith('engine_heartbeat_stale');
     });
@@ -173,10 +170,7 @@ describe('EngineSupervisor', () => {
       // Record heartbeat but not market data
       supervisor.recordEngineHeartbeat();
       
-      vi.advanceTimersByTime(4000); // > marketDataStaleMs
-      
-      // Wait for async reconnect
-      await vi.runAllTimersAsync();
+      await vi.advanceTimersByTimeAsync(4000); // > marketDataStaleMs
       
       expect(reconnectCallback).toHaveBeenCalled();
     });
@@ -185,14 +179,16 @@ describe('EngineSupervisor', () => {
       supervisor.setActualState('running');
       
       // Trigger first restart
-      vi.advanceTimersByTime(6000);
-      await vi.runAllTimersAsync();
+      await vi.advanceTimersByTimeAsync(6000);
       
       expect(restartCallback).toHaveBeenCalledTimes(1);
       
-      // Try to trigger another restart immediately
-      vi.advanceTimersByTime(1000);
-      await vi.runAllTimersAsync();
+      // Force heartbeat stale (bypass the reset that happens after successful restart)
+      // so the next tick detects stale within the cooldown window
+      (supervisor as any).lastEngineHeartbeatAt = 0;
+      
+      // Advance 1s — heartbeat is stale but within cooldown (2000ms)
+      await vi.advanceTimersByTimeAsync(1000);
       
       // Should be blocked by cooldown
       expect(restartCallback).toHaveBeenCalledTimes(1);
@@ -207,8 +203,7 @@ describe('EngineSupervisor', () => {
       supervisor.activateKillSwitch(['test']);
       
       // Let heartbeat go stale
-      vi.advanceTimersByTime(6000);
-      await vi.runAllTimersAsync();
+      await vi.advanceTimersByTimeAsync(6000);
       
       // Should not have tried to restart
       expect(restartCallback).not.toHaveBeenCalled();
@@ -217,12 +212,13 @@ describe('EngineSupervisor', () => {
     it('should limit consecutive restarts', async () => {
       supervisor.setActualState('running');
       
-      // Trigger multiple restarts
-      for (let i = 0; i < 5; i++) {
-        vi.advanceTimersByTime(3000); // Wait for cooldown + stale
-        await vi.runAllTimersAsync();
-        supervisor.recordEngineHeartbeat(); // Prevent stale during restart
+      // Trigger 4 restart cycles: 3 succeed, 4th is blocked by maxConsecutiveRestarts
+      for (let i = 0; i < 4; i++) {
+        await vi.advanceTimersByTimeAsync(6000); // > stale threshold (5000) and > cooldown (2000)
       }
+      
+      // Only 3 restarts should have succeeded (maxConsecutiveRestarts = 3)
+      expect(restartCallback).toHaveBeenCalledTimes(3);
       
       // After max restarts, should log error
       expect(mockLogger.error).toHaveBeenCalledWith(
@@ -241,8 +237,7 @@ describe('EngineSupervisor', () => {
       supervisor.setActualState('running');
       
       // Trigger restart
-      vi.advanceTimersByTime(6000);
-      await vi.runAllTimersAsync();
+      await vi.advanceTimersByTimeAsync(6000);
       
       const state = supervisor.getState();
       expect(state.restartCount).toBe(1);
@@ -253,7 +248,7 @@ describe('EngineSupervisor', () => {
     it('should reset restart tracking', () => {
       supervisor.resetRestartTracking();
       
-      expect(mockLogger.info).toHaveBeenCalledWith('Restart tracking reset');
+      expect(mockLogger.info).toHaveBeenCalledWith('Supervisor restart tracking reset');
     });
   });
 

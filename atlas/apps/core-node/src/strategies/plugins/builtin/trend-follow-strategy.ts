@@ -263,9 +263,9 @@ export class TrendFollowStrategy extends BaseStrategy {
       // Check if we have 1h EMA data (would need indicator calculation on 1h candles)
       // For now, use trend direction from regime detector as proxy
       const regimeTrend = context.regime.trendDirection;
-      if (bullishCrossover && regimeTrend === 'bearish') {
+      if (bullishCrossover && regimeTrend === 'down') {
         mtfAligned = false;
-      } else if (bearishCrossover && regimeTrend === 'bullish') {
+      } else if (bearishCrossover && regimeTrend === 'up') {
         mtfAligned = false;
       }
     }
@@ -316,12 +316,12 @@ export class TrendFollowStrategy extends BaseStrategy {
 
       signals.push(
         this.createSignal({
-          symbol,
+          context,
           direction: 'buy',
           strength,
-          price,
           stopLoss,
           takeProfit,
+          reason: `Bullish EMA crossover (${fastEmaPeriod}/${slowEmaPeriod}) with price confirmation`,
           metadata: {
             fastEma: currentFastEma,
             slowEma: currentSlowEma,
@@ -330,7 +330,6 @@ export class TrendFollowStrategy extends BaseStrategy {
             crossoverBarsAgo,
             mtfAligned,
             regime: context.regime.regime,
-            reason: `Bullish EMA crossover (${fastEmaPeriod}/${slowEmaPeriod}) with price confirmation`,
           },
         })
       );
@@ -340,12 +339,12 @@ export class TrendFollowStrategy extends BaseStrategy {
 
       signals.push(
         this.createSignal({
-          symbol,
+          context,
           direction: 'sell',
           strength,
-          price,
           stopLoss,
           takeProfit,
+          reason: `Bearish EMA crossover (${fastEmaPeriod}/${slowEmaPeriod}) with price confirmation`,
           metadata: {
             fastEma: currentFastEma,
             slowEma: currentSlowEma,
@@ -354,7 +353,6 @@ export class TrendFollowStrategy extends BaseStrategy {
             crossoverBarsAgo,
             mtfAligned,
             regime: context.regime.regime,
-            reason: `Bearish EMA crossover (${fastEmaPeriod}/${slowEmaPeriod}) with price confirmation`,
           },
         })
       );
