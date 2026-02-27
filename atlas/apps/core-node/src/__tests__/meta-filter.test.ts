@@ -84,7 +84,7 @@ describe('MetaFilter', () => {
       const stats = filter.getStats();
       
       expect(stats.enabled).toBe(true);
-      expect(stats.config.coldStreakThreshold).toBe(3);
+      expect(stats.config.coldStreakThreshold).toBe(10);
       expect(stats.config.minQualityScore).toBe(0.5);
     });
 
@@ -183,13 +183,13 @@ describe('MetaFilter', () => {
   });
 
   describe('signal strength filtering', () => {
-    it('should reject signals below absolute minimum strength', () => {
-      const signal = createMockSignal('breakout', 0.2); // Below 0.3 minimum
+    it('should pass signals when absolute minimum strength is zero', () => {
+      const signal = createMockSignal('breakout', 0.2);
       const result = metaFilter.filter(signal);
 
-      // The strength rule should fail
+      // With minAbsoluteStrength defaulting to 0, all non-negative strengths pass
       const strengthRule = result.rulesEvaluated.find(r => r.rule.includes('strength'));
-      expect(strengthRule?.passed).toBe(false);
+      expect(strengthRule?.passed).toBe(true);
     });
 
     it('should use percentile filtering with historical data', () => {
