@@ -1368,15 +1368,6 @@ async function runLivePreflight(input: {
 }): Promise<LivePreflightResult> {
   const warnings: string[] = [];
   
-  // This API server currently uses the legacy Exchange (Coinbase Pro) endpoints via `CoinbaseRestClient`.
-  if (env.COINBASE_API_VERSION !== 'exchange') {
-    return {
-      ok: false,
-      error: `COINBASE_API_VERSION must be 'exchange' for live trading (current engine integration). Got: ${env.COINBASE_API_VERSION}`,
-      warnings,
-    };
-  }
-  
   if (!env.COINBASE_API_KEY || !env.COINBASE_API_SECRET) {
     return {
       ok: false,
@@ -1385,12 +1376,17 @@ async function runLivePreflight(input: {
     };
   }
   
-  if (!env.COINBASE_API_PASSPHRASE) {
+  // Legacy Exchange API requires a passphrase; Advanced Trade API does not
+  if (env.COINBASE_API_VERSION === 'exchange' && !env.COINBASE_API_PASSPHRASE) {
     return {
       ok: false,
       error: 'Missing COINBASE_API_PASSPHRASE for live trading (required for Coinbase Exchange API auth)',
       warnings,
     };
+  }
+  
+  if (env.COINBASE_API_VERSION === 'advanced') {
+    warnings.push('Using Coinbase Advanced Trade API for live trading');
   }
   
   // Ensure exchange credentials are stored in Supabase (the trading engine loads secrets from Supabase).
@@ -1449,14 +1445,19 @@ async function runLivePreflight(input: {
   }
   
   try {
+    const isAdvanced = env.COINBASE_API_VERSION === 'advanced';
     const exchange = new CoinbaseExchange(
       {
         apiKey: credentials.apiKey,
         apiSecret: credentials.apiSecret,
         apiPassphrase: credentials.apiPassphrase,
         environment: 'production',
-        wsUrl: 'wss://ws-feed.exchange.coinbase.com',
-        restUrl: 'https://api.exchange.coinbase.com',
+        wsUrl: isAdvanced
+          ? 'wss://advanced-trade-ws.coinbase.com'
+          : 'wss://ws-feed.exchange.coinbase.com',
+        restUrl: isAdvanced
+          ? 'https://api.coinbase.com'
+          : 'https://api.exchange.coinbase.com',
       },
       logger
     );

@@ -561,12 +561,18 @@ export class TradingEngine extends EventEmitter {
       apiSecret: credentials.apiSecret,
       apiPassphrase: credentials.apiPassphrase,
       environment: this.config.exchange.environment,
-      wsUrl: this.config.exchange.environment === 'production'
-        ? 'wss://ws-feed.exchange.coinbase.com'
-        : 'wss://ws-feed-public.sandbox.exchange.coinbase.com',
-      restUrl: this.config.exchange.environment === 'production'
-        ? 'https://api.exchange.coinbase.com'
-        : 'https://api-public.sandbox.exchange.coinbase.com'
+      // For paper mode, use public exchange WS feed (no auth needed, still active)
+      // For live mode with Advanced Trade API, use the new endpoint
+      wsUrl: this.config.mode === 'live'
+        ? 'wss://advanced-trade-ws.coinbase.com'
+        : (this.config.exchange.environment === 'production'
+          ? 'wss://ws-feed.exchange.coinbase.com'
+          : 'wss://ws-feed-public.sandbox.exchange.coinbase.com'),
+      restUrl: this.config.mode === 'live'
+        ? 'https://api.coinbase.com'
+        : (this.config.exchange.environment === 'production'
+          ? 'https://api.exchange.coinbase.com'
+          : 'https://api-public.sandbox.exchange.coinbase.com')
     };
 
     this.exchange = new CoinbaseExchange(coinbaseConfig, this.logger);
