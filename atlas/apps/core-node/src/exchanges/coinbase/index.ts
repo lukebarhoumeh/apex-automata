@@ -503,6 +503,16 @@ export class CoinbaseExchange extends EventEmitter {
         }
       }
     }
+
+    // Cleanup stale entries older than 24 hours to prevent unbounded growth
+    const twentyFourHoursAgo = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [orderId, order] of this.activeOrders) {
+      const createdAt = new Date(order.created_at).getTime();
+      if (createdAt < twentyFourHoursAgo) {
+        this.activeOrders.delete(orderId);
+        this.logger.warn('Removed stale active order (>24h old)', { orderId });
+      }
+    }
   }
 
   // Utility methods

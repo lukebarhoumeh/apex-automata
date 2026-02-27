@@ -117,6 +117,7 @@ export class TradingEngine extends EventEmitter {
   
   // Order timing for latency tracking
   private orderTimestamps: Map<string, number> = new Map();
+  private orderTimestampsCleanupInterval: NodeJS.Timeout | null = null;
   
   // Per-symbol market data timestamp tracking for data gap detection
   private lastMarketDataPerSymbol: Map<string, number> = new Map();
@@ -239,6 +240,9 @@ export class TradingEngine extends EventEmitter {
       
       // Start heartbeat for supervisor monitoring
       this.startHeartbeat();
+
+      // Periodic cleanup of stale order timestamps (every 5 minutes)
+      this.orderTimestampsCleanupInterval = setInterval(() => this.cleanupOrderTimestamps(), 5 * 60 * 1000);
 
       this.isRunning = true;
       this.setEngineState('running', 'start_complete');
@@ -434,6 +438,11 @@ export class TradingEngine extends EventEmitter {
       if (this.dataGapMonitor) {
         clearInterval(this.dataGapMonitor);
         this.dataGapMonitor = null;
+      }
+
+      if (this.orderTimestampsCleanupInterval) {
+        clearInterval(this.orderTimestampsCleanupInterval);
+        this.orderTimestampsCleanupInterval = null;
       }
 
       this.isRunning = false;
@@ -1051,6 +1060,15 @@ export class TradingEngine extends EventEmitter {
       this.lastMarketDataPerSymbol.set(symbol, now);
     }
     this.logger.info('Data gap tracking reset after reconnection');
+  }
+
+  private cleanupOrderTimestamps(): void {
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    for (const [orderId, timestamp] of this.orderTimestamps) {
+      if (timestamp < oneHourAgo) {
+        this.orderTimestamps.delete(orderId);
+      }
+    }
   }
 
   private handleTicker(ticker: Ticker): void {
