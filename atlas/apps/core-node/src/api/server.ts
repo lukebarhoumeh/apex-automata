@@ -929,38 +929,63 @@ app.post('/api/engine/start', async (req, res) => {
     signalProcessor = new SignalProcessor(signalConfig, logger);
 
     // Set up data loader from exchange for historical data
+    // Uses Coinbase public API (no auth required) for candle history
     signalProcessor.setDataLoader(async (symbol: string, limit: number) => {
-      if (!tradingEngine) {
-        return [];
-      }
       try {
-        // Get exchange from trading engine to fetch candles
-        const exchange = (tradingEngine as any).exchange;
-        if (!exchange) {
-          logger.warn('No exchange available for historical data loading');
-          return [];
-        }
+        // Try public Coinbase API directly (no auth needed for market data)
+        const fetch = (await import('node-fetch')).default;
+        const end = Math.floor(Date.now() / 1000);
+        const start = end - (limit * 60); // limit minutes ago
         
-        // Calculate time range for historical candles (1 minute granularity)
-        const end = new Date();
-        const start = new Date(end.getTime() - limit * 60 * 1000);
+        // Try Coinbase Advanced Trade public endpoint first
+        const url = `https://api.coinbase.com/api/v3/brokerage/market/products/${symbol}/candles?start=${start}&end=${end}&granularity=ONE_MINUTE`;
+        logger.info(`Fetching historical candles for ${symbol} from Coinbase public API`);
         
-        const candles = await exchange.getCandles(symbol, {
-          start: start.toISOString(),
-          end: end.toISOString(),
-          granularity: 60, // 1 minute
+        const response = await fetch(url, {
+          headers: { 'Content-Type': 'application/json' },
+          signal: AbortSignal.timeout(15000),
         });
         
-        return candles.map((c: any) => ({
-          time: c.time * 1000, // Convert to milliseconds
-          open: c.open,
-          high: c.high,
-          low: c.low,
-          close: c.close,
-          volume: c.volume,
-        }));
+        if (response.ok) {
+          const data = await response.json() as any;
+          const candles = (data.candles || []).map((c: any) => ({
+            time: parseInt(c.start) * 1000,
+            open: parseFloat(c.open),
+            high: parseFloat(c.high),
+            low: parseFloat(c.low),
+            close: parseFloat(c.close),
+            volume: parseFloat(c.volume),
+          }));
+          logger.info(`Loaded ${candles.length} historical candles for ${symbol}`);
+          return candles;
+        }
+        
+        // Fallback: Try legacy Exchange API public endpoint
+        const legacyUrl = `https://api.exchange.coinbase.com/products/${symbol}/candles?granularity=60&start=${new Date(start * 1000).toISOString()}&end=${new Date(end * 1000).toISOString()}`;
+        const legacyResponse = await fetch(legacyUrl, {
+          headers: { 'Content-Type': 'application/json' },
+          signal: AbortSignal.timeout(15000),
+        });
+        
+        if (legacyResponse.ok) {
+          const data = await legacyResponse.json() as any;
+          // Legacy format: [[time, low, high, open, close, volume], ...]
+          const candles = (data || []).map((c: any) => ({
+            time: c[0] * 1000,
+            open: c[3],
+            high: c[2],
+            low: c[1],
+            close: c[4],
+            volume: c[5],
+          }));
+          logger.info(`Loaded ${candles.length} historical candles for ${symbol} (legacy API)`);
+          return candles;
+        }
+
+        logger.warn(`Failed to fetch candles for ${symbol}: ${response.status} / ${legacyResponse.status}`);
+        return [];
       } catch (error) {
-        logger.warn(`Failed to load historical candles for ${symbol} from exchange:`, error);
+        logger.warn(`Failed to load historical candles for ${symbol}:`, error);
         return [];
       }
     });
