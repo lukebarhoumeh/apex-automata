@@ -18,10 +18,11 @@ import { CoinbaseReconciler, ReconcilerState } from './reconciliation/reconciler
 import { MarketDataGapFiller } from './reconciliation/gap-filler';
 
 export * from './types';
-export { CoinbaseWsHealth } from './websocket';
-export { CoinbaseChannelSpec, ICoinbaseWsClient, SubscriptionManager } from './ws/coinbase-ws.interface';
-export { RestClientHealth } from './rest-client';
-export { ReconcilerState } from './reconciliation/reconciler';
+export type { CoinbaseWsHealth } from './websocket';
+export type { CoinbaseChannelSpec, ICoinbaseWsClient } from './ws/coinbase-ws.interface';
+export { SubscriptionManager } from './ws/coinbase-ws.interface';
+export type { RestClientHealth } from './rest-client';
+export type { ReconcilerState } from './reconciliation/reconciler';
 export * from './http/errors';
 
 /**
