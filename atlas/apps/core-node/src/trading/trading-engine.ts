@@ -103,6 +103,7 @@ export class TradingEngine extends EventEmitter {
   private riskEngine: RiskEngine | null = null;
   private positionMonitor: PositionMonitor | null = null;
   private tradeAnalytics: TradeAnalytics | null = null;
+  private signalProcessor: any = null;
   private secretManager: SecretManager;
   private paperSimulator: PaperTradingSimulator | null = null;
   private isRunning = false;
@@ -169,6 +170,10 @@ export class TradingEngine extends EventEmitter {
 
   public getConfig(): TradingEngineConfig {
     return this.config;
+  }
+
+  public setSignalProcessor(sp: any): void {
+    this.signalProcessor = sp;
   }
 
   public get engineRunning(): boolean {
@@ -821,7 +826,7 @@ export class TradingEngine extends EventEmitter {
           direction: position.side === 'long' ? 'buy' : 'sell',
           signalStrength: position.metadata?.signalStrength || 0.5,
           entryTime: position.openTime,
-          exitTime: position.closeTime || new Date(),
+          exitTime: position.closedAt || new Date(),
           pnl: position.realizedPnL,
           outcome,
           regime: position.metadata?.regime,

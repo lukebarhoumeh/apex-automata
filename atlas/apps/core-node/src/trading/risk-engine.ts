@@ -988,8 +988,8 @@ export class RiskEngine extends EventEmitter {
     
     // Step 5: Update canonical risk math snapshot
     const portfolioSummary = this.positionTracker.getPortfolioSummary();
-    const realizedPnl = portfolioSummary.realizedPnL || 0;
-    const unrealizedPnl = portfolioSummary.unrealizedPnL || portfolioSummary.totalPnL || 0;
+    const realizedPnl = portfolioSummary.totalRealizedPnL || 0;
+    const unrealizedPnl = portfolioSummary.totalUnrealizedPnL || 0;
     this.riskMath.computeSnapshot(realizedPnl, unrealizedPnl);
     
     // Check for day rollover
