@@ -145,6 +145,12 @@ export class RiskEngine extends EventEmitter {
   private rapidLossThresholdUsd: number;
   private maxOpenPositionsLimit: number;
   
+  // Dynamic equity tracking for profit compounding
+  private initialAccountEquity: number;
+  private equityHighWaterMark: number = 0;
+  private lastEquityRecalcAt: number = 0;
+  private readonly EQUITY_RECALC_THRESHOLD = 0.01; // Recalc limits when equity changes by 1%
+  
   // Soft launch state
   private softLaunchEntryTrades = 0;
   
@@ -171,6 +177,8 @@ export class RiskEngine extends EventEmitter {
 
     this.guardrails = config.guardrails;
     this.accountEquity = config.accountEquity;
+    this.initialAccountEquity = config.accountEquity;
+    this.equityHighWaterMark = config.accountEquity;
     const riskCfg = this.guardrails.risk;
     const accountCfg = this.guardrails.account;
     const circuitCfg = this.guardrails.circuit_breakers;
@@ -600,11 +608,84 @@ export class RiskEngine extends EventEmitter {
   }
 
   private async calculateCurrentEquity(): Promise<number> {
-    // Get account balances
-    // This is simplified - in production, you'd get actual balances from exchange
-    const baseEquity = this.accountEquity;
+    // Calculate current equity = initial capital + all PnL (realized + unrealized)
     const portfolioSummary = this.positionTracker.getPortfolioSummary();
-    return baseEquity + portfolioSummary.totalPnL;
+    return this.initialAccountEquity + portfolioSummary.totalPnL;
+  }
+
+  /**
+   * Dynamic equity tracking: updates accountEquity and all derived risk limits
+   * when equity changes by more than EQUITY_RECALC_THRESHOLD (1%).
+   * This implements profit compounding - as profits grow, position sizes grow.
+   * As equity shrinks from losses, position sizes shrink (capital preservation).
+   */
+  private updateDynamicEquity(currentEquity: number): void {
+    if (!Number.isFinite(currentEquity) || currentEquity <= 0) {
+      return;
+    }
+
+    // Update high water mark
+    this.equityHighWaterMark = Math.max(this.equityHighWaterMark, currentEquity);
+
+    // Only recalculate limits when equity changes by more than threshold
+    const equityChangePct = Math.abs(currentEquity - this.accountEquity) / this.accountEquity;
+    const now = Date.now();
+    
+    // Throttle: recalc at most every 30 seconds and only on significant change
+    if (equityChangePct < this.EQUITY_RECALC_THRESHOLD || (now - this.lastEquityRecalcAt < 30_000)) {
+      return;
+    }
+
+    const previousEquity = this.accountEquity;
+    this.accountEquity = currentEquity;
+    this.lastEquityRecalcAt = now;
+
+    // Recalculate all equity-derived risk limits
+    const riskCfg = this.guardrails.risk;
+    const accountCfg = this.guardrails.account;
+    const circuitCfg = this.guardrails.circuit_breakers;
+
+    this.dailyLossLimitUsd = Math.abs(riskCfg.daily_loss_limit) * this.accountEquity;
+    this.weeklyLossLimitUsd = Math.abs(riskCfg.weekly_loss_limit) * this.accountEquity;
+    this.maxDrawdownUsd = Math.abs(riskCfg.max_drawdown_limit) * this.accountEquity;
+    this.maxPositionExposureUsd = this.accountEquity * riskCfg.max_position_exposure_pct;
+    this.minOrderNotionalUsd = this.accountEquity * accountCfg.risk_per_trade * accountCfg.min_notional_buffer;
+    this.rapidLossThresholdUsd = Math.abs(circuitCfg.rapid_loss_trigger) * this.accountEquity;
+
+    // Update config limits so checkOrder() uses new values
+    this.config.limits.maxPositionSize = this.maxPositionExposureUsd;
+    this.config.limits.maxTotalExposure = this.accountEquity * accountCfg.max_account_leverage;
+    this.config.limits.maxOrderSize = this.maxPositionExposureUsd;
+    this.config.limits.minOrderSize = this.minOrderNotionalUsd;
+    this.config.limits.maxDailyLoss = this.dailyLossLimitUsd;
+    this.config.killSwitches.dailyLossLimit = this.dailyLossLimitUsd;
+    this.config.accountEquity = this.accountEquity;
+
+    // Update risk math with new equity
+    this.riskMath.updateEquity(this.accountEquity);
+
+    this.logger.info('Dynamic equity update: risk limits recalculated', {
+      previousEquity: previousEquity.toFixed(2),
+      newEquity: this.accountEquity.toFixed(2),
+      changePct: (equityChangePct * 100).toFixed(2) + '%',
+      highWaterMark: this.equityHighWaterMark.toFixed(2),
+      newDailyLossLimit: this.dailyLossLimitUsd.toFixed(2),
+      newMaxPositionExposure: this.maxPositionExposureUsd.toFixed(2),
+    });
+  }
+
+  /**
+   * Get current account equity (dynamic, includes compounded profits)
+   */
+  public getAccountEquity(): number {
+    return this.accountEquity;
+  }
+
+  /**
+   * Get equity high water mark
+   */
+  public getEquityHighWaterMark(): number {
+    return this.equityHighWaterMark;
   }
 
   // Pre-trade risk check
@@ -975,6 +1056,9 @@ export class RiskEngine extends EventEmitter {
     this.metrics.dailyLossPercentage = this.dailyStartEquity !== 0
       ? (this.metrics.dailyPnL / this.dailyStartEquity) * 100
       : 0;
+
+    // Dynamic equity tracking: compound profits into position sizing
+    this.updateDynamicEquity(currentEquity);
 
     // Portfolio-level drawdown from intraday high water mark.
     if (this.dailyHighEquity <= 0) {

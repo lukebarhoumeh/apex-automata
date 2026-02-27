@@ -276,6 +276,21 @@ export class RiskMath {
   }
 
   /**
+   * Update account equity for dynamic profit compounding.
+   * This updates the day start equity used for risk unit (1R) calculations,
+   * so position sizing scales with accumulated profits/losses.
+   */
+  public updateEquity(newEquityUsd: number): void {
+    if (!Number.isFinite(newEquityUsd) || newEquityUsd <= 0) {
+      return;
+    }
+    this.dayStartEquityUsd = newEquityUsd;
+    if (newEquityUsd > this.intradayHighUsd) {
+      this.intradayHighUsd = newEquityUsd;
+    }
+  }
+
+  /**
    * Set day start equity (on startup or from database)
    */
   public setDayStartEquity(equity: number): void {
