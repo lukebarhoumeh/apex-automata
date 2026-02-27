@@ -4,23 +4,24 @@
  * Tests for 24/7 resilience: watchdog, recovery, and state management
  */
 
+import { vi, describe, it, expect, beforeEach, afterEach, type Mock } from 'vitest';
 import { EngineSupervisor, DEFAULT_SUPERVISOR_CONFIG, RestartReason } from '../runtime/engine-supervisor';
 import { Logger } from '../core/logger';
 
 // Mock logger
 const mockLogger: Logger = {
-  info: jest.fn(),
-  warn: jest.fn(),
-  error: jest.fn(),
-  debug: jest.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
 } as any;
 
 describe('EngineSupervisor', () => {
   let supervisor: EngineSupervisor;
 
   beforeEach(() => {
-    jest.useFakeTimers();
-    jest.clearAllMocks();
+    vi.useFakeTimers();
+    vi.clearAllMocks();
     
     supervisor = new EngineSupervisor({
       engineHeartbeatStaleMs: 5000,
@@ -35,7 +36,7 @@ describe('EngineSupervisor', () => {
 
   afterEach(() => {
     supervisor.stop();
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   describe('Initialization', () => {
@@ -62,7 +63,7 @@ describe('EngineSupervisor', () => {
     it('should record engine heartbeat', () => {
       const before = supervisor.getState().lastEngineHeartbeatAt;
       
-      jest.advanceTimersByTime(1000);
+      vi.advanceTimersByTime(1000);
       supervisor.recordEngineHeartbeat();
       
       const after = supervisor.getState().lastEngineHeartbeatAt;
@@ -72,7 +73,7 @@ describe('EngineSupervisor', () => {
     it('should record market data', () => {
       const before = supervisor.getState().lastMarketDataAt;
       
-      jest.advanceTimersByTime(1000);
+      vi.advanceTimersByTime(1000);
       supervisor.recordMarketData();
       
       const after = supervisor.getState().lastMarketDataAt;
@@ -90,7 +91,7 @@ describe('EngineSupervisor', () => {
     });
 
     it('should update actual state and emit event', () => {
-      const stateChangedHandler = jest.fn();
+      const stateChangedHandler = vi.fn();
       supervisor.on('supervisor:state_changed', stateChangedHandler);
       
       supervisor.setActualState('running', 'test_reason');
@@ -102,7 +103,7 @@ describe('EngineSupervisor', () => {
 
   describe('Kill Switch', () => {
     it('should activate kill switch', () => {
-      const killSwitchHandler = jest.fn();
+      const killSwitchHandler = vi.fn();
       supervisor.on('supervisor:killswitch_activated', killSwitchHandler);
       
       supervisor.activateKillSwitch(['test_reason']);
@@ -125,7 +126,7 @@ describe('EngineSupervisor', () => {
     });
 
     it('should deactivate kill switch', () => {
-      const deactivatedHandler = jest.fn();
+      const deactivatedHandler = vi.fn();
       supervisor.on('supervisor:killswitch_deactivated', deactivatedHandler);
       
       supervisor.setDesiredState('running');
@@ -141,12 +142,12 @@ describe('EngineSupervisor', () => {
   });
 
   describe('Watchdog Recovery', () => {
-    let restartCallback: jest.Mock;
-    let reconnectCallback: jest.Mock;
+    let restartCallback: Mock;
+    let reconnectCallback: Mock;
 
     beforeEach(() => {
-      restartCallback = jest.fn().mockResolvedValue(true);
-      reconnectCallback = jest.fn().mockResolvedValue(true);
+      restartCallback = vi.fn().mockResolvedValue(true);
+      reconnectCallback = vi.fn().mockResolvedValue(true);
       
       supervisor.setRestartEngineCallback(restartCallback);
       supervisor.setReconnectExchangeCallback(reconnectCallback);
@@ -158,10 +159,10 @@ describe('EngineSupervisor', () => {
       supervisor.setActualState('running');
       
       // Don't record heartbeat, let it go stale
-      jest.advanceTimersByTime(6000); // > engineHeartbeatStaleMs
+      vi.advanceTimersByTime(6000); // > engineHeartbeatStaleMs
       
       // Wait for async restart
-      await jest.runAllTimersAsync();
+      await vi.runAllTimersAsync();
       
       expect(restartCallback).toHaveBeenCalledWith('engine_heartbeat_stale');
     });
@@ -172,10 +173,10 @@ describe('EngineSupervisor', () => {
       // Record heartbeat but not market data
       supervisor.recordEngineHeartbeat();
       
-      jest.advanceTimersByTime(4000); // > marketDataStaleMs
+      vi.advanceTimersByTime(4000); // > marketDataStaleMs
       
       // Wait for async reconnect
-      await jest.runAllTimersAsync();
+      await vi.runAllTimersAsync();
       
       expect(reconnectCallback).toHaveBeenCalled();
     });
@@ -184,14 +185,14 @@ describe('EngineSupervisor', () => {
       supervisor.setActualState('running');
       
       // Trigger first restart
-      jest.advanceTimersByTime(6000);
-      await jest.runAllTimersAsync();
+      vi.advanceTimersByTime(6000);
+      await vi.runAllTimersAsync();
       
       expect(restartCallback).toHaveBeenCalledTimes(1);
       
       // Try to trigger another restart immediately
-      jest.advanceTimersByTime(1000);
-      await jest.runAllTimersAsync();
+      vi.advanceTimersByTime(1000);
+      await vi.runAllTimersAsync();
       
       // Should be blocked by cooldown
       expect(restartCallback).toHaveBeenCalledTimes(1);
@@ -206,8 +207,8 @@ describe('EngineSupervisor', () => {
       supervisor.activateKillSwitch(['test']);
       
       // Let heartbeat go stale
-      jest.advanceTimersByTime(6000);
-      await jest.runAllTimersAsync();
+      vi.advanceTimersByTime(6000);
+      await vi.runAllTimersAsync();
       
       // Should not have tried to restart
       expect(restartCallback).not.toHaveBeenCalled();
@@ -218,8 +219,8 @@ describe('EngineSupervisor', () => {
       
       // Trigger multiple restarts
       for (let i = 0; i < 5; i++) {
-        jest.advanceTimersByTime(3000); // Wait for cooldown + stale
-        await jest.runAllTimersAsync();
+        vi.advanceTimersByTime(3000); // Wait for cooldown + stale
+        await vi.runAllTimersAsync();
         supervisor.recordEngineHeartbeat(); // Prevent stale during restart
       }
       
@@ -233,15 +234,15 @@ describe('EngineSupervisor', () => {
 
   describe('Restart Tracking', () => {
     it('should track restart count', async () => {
-      const restartCallback = jest.fn().mockResolvedValue(true);
+      const restartCallback = vi.fn().mockResolvedValue(true);
       supervisor.setRestartEngineCallback(restartCallback);
       supervisor.start();
       supervisor.setDesiredState('running');
       supervisor.setActualState('running');
       
       // Trigger restart
-      jest.advanceTimersByTime(6000);
-      await jest.runAllTimersAsync();
+      vi.advanceTimersByTime(6000);
+      await vi.runAllTimersAsync();
       
       const state = supervisor.getState();
       expect(state.restartCount).toBe(1);
@@ -258,7 +259,7 @@ describe('EngineSupervisor', () => {
 
   describe('Status Heartbeat', () => {
     it('should emit status heartbeat on interval', () => {
-      const heartbeatHandler = jest.fn();
+      const heartbeatHandler = vi.fn();
       supervisor.on('supervisor:status_heartbeat', heartbeatHandler);
       
       supervisor.start();
@@ -267,10 +268,10 @@ describe('EngineSupervisor', () => {
       expect(heartbeatHandler).toHaveBeenCalledTimes(1);
       
       // After interval
-      jest.advanceTimersByTime(1000);
+      vi.advanceTimersByTime(1000);
       expect(heartbeatHandler).toHaveBeenCalledTimes(2);
       
-      jest.advanceTimersByTime(1000);
+      vi.advanceTimersByTime(1000);
       expect(heartbeatHandler).toHaveBeenCalledTimes(3);
     });
   });

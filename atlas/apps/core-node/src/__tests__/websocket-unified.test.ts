@@ -9,6 +9,7 @@
  * 5. Stall detection
  */
 
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { SubscriptionManager, CoinbaseChannelSpec } from '../exchanges/coinbase/ws/coinbase-ws.interface';
 import { CoinbaseWebSocket } from '../exchanges/coinbase/websocket';
 import { CoinbaseExchange } from '../exchanges/coinbase';
@@ -16,15 +17,15 @@ import { Logger } from '../core/logger';
 import WebSocket from 'ws';
 
 // Mock ws module
-jest.mock('ws');
-const MockWebSocket = WebSocket as jest.MockedClass<typeof WebSocket>;
+vi.mock('ws');
+const MockWebSocket = WebSocket as any;
 
 // Mock logger
 const mockLogger: Logger = {
-  info: jest.fn(),
-  warn: jest.fn(),
-  error: jest.fn(),
-  debug: jest.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
 } as any;
 
 describe('SubscriptionManager', () => {
@@ -141,16 +142,16 @@ describe('CoinbaseWebSocket - Unified Implementation', () => {
   let mockWsInstance: any;
 
   beforeEach(() => {
-    jest.useFakeTimers();
-    jest.clearAllMocks();
+    vi.useFakeTimers();
+    vi.clearAllMocks();
     
     mockWsInstance = {
-      on: jest.fn(),
-      send: jest.fn(),
-      close: jest.fn(),
-      ping: jest.fn(),
+      on: vi.fn(),
+      send: vi.fn(),
+      close: vi.fn(),
+      ping: vi.fn(),
       readyState: WebSocket.OPEN,
-      removeAllListeners: jest.fn(),
+      removeAllListeners: vi.fn(),
     };
     
     MockWebSocket.mockImplementation(() => mockWsInstance);
@@ -166,7 +167,7 @@ describe('CoinbaseWebSocket - Unified Implementation', () => {
 
   afterEach(() => {
     wsClient.disconnect();
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   describe('Idempotent Subscribe', () => {
@@ -239,7 +240,7 @@ describe('CoinbaseWebSocket - Unified Implementation', () => {
       if (onClose) onClose(1006, 'Connection lost');
       
       // Advance timer for reconnect
-      jest.advanceTimersByTime(2000);
+      vi.advanceTimersByTime(2000);
       
       // Reconnect
       MockWebSocket.mockImplementation(() => mockWsInstance);
@@ -306,7 +307,7 @@ describe('CoinbaseWebSocket - Unified Implementation', () => {
       expect(health.isStalled).toBe(false);
       
       // Advance time past stall threshold
-      jest.advanceTimersByTime(60000);
+      vi.advanceTimersByTime(60000);
       
       health = wsClient.getHealth();
       expect(health.isStalled).toBe(true);
@@ -315,7 +316,7 @@ describe('CoinbaseWebSocket - Unified Implementation', () => {
 
   describe('Event Emissions', () => {
     it('should emit ws:connected on open', () => {
-      const connectedHandler = jest.fn();
+      const connectedHandler = vi.fn();
       wsClient.on('ws:connected', connectedHandler);
       
       wsClient.connect();
@@ -329,7 +330,7 @@ describe('CoinbaseWebSocket - Unified Implementation', () => {
     });
 
     it('should emit ws:subscribed after subscribe', () => {
-      const subscribedHandler = jest.fn();
+      const subscribedHandler = vi.fn();
       wsClient.on('ws:subscribed', subscribedHandler);
       
       wsClient.connect();
@@ -345,7 +346,7 @@ describe('CoinbaseWebSocket - Unified Implementation', () => {
     });
 
     it('should emit ws:resubscribed after reconnect', () => {
-      const resubscribedHandler = jest.fn();
+      const resubscribedHandler = vi.fn();
       wsClient.on('ws:resubscribed', resubscribedHandler);
       
       wsClient.connect();
@@ -362,7 +363,7 @@ describe('CoinbaseWebSocket - Unified Implementation', () => {
       
       // Simulate disconnect and reconnect
       if (onClose) onClose(1006, 'Connection lost');
-      jest.advanceTimersByTime(2000);
+      vi.advanceTimersByTime(2000);
       
       MockWebSocket.mockImplementation(() => mockWsInstance);
       if (onOpen) onOpen();

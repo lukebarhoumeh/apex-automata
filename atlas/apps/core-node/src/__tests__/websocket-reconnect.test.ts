@@ -4,21 +4,22 @@
  * Tests for infinite reconnection and health monitoring
  */
 
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { CoinbaseWebSocket, WebSocketHealth } from '../exchanges/coinbase/websocket';
 import { CoinbaseConfig } from '../exchanges/coinbase/types';
 import { Logger } from '../core/logger';
 import WebSocket from 'ws';
 
 // Mock ws module
-jest.mock('ws');
-const MockWebSocket = WebSocket as jest.MockedClass<typeof WebSocket>;
+vi.mock('ws');
+const MockWebSocket = WebSocket as any;
 
 // Mock logger
 const mockLogger: Logger = {
-  info: jest.fn(),
-  warn: jest.fn(),
-  error: jest.fn(),
-  debug: jest.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
 } as any;
 
 // Mock config
@@ -36,17 +37,17 @@ describe('CoinbaseWebSocket - Infinite Reconnection', () => {
   let mockWsInstance: any;
 
   beforeEach(() => {
-    jest.useFakeTimers();
-    jest.clearAllMocks();
+    vi.useFakeTimers();
+    vi.clearAllMocks();
     
     // Create mock WebSocket instance
     mockWsInstance = {
-      on: jest.fn(),
-      send: jest.fn(),
-      close: jest.fn(),
-      ping: jest.fn(),
+      on: vi.fn(),
+      send: vi.fn(),
+      close: vi.fn(),
+      ping: vi.fn(),
       readyState: WebSocket.OPEN,
-      removeAllListeners: jest.fn(),
+      removeAllListeners: vi.fn(),
     };
     
     MockWebSocket.mockImplementation(() => mockWsInstance);
@@ -56,7 +57,7 @@ describe('CoinbaseWebSocket - Infinite Reconnection', () => {
 
   afterEach(() => {
     wsClient.disconnect();
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   describe('Health API', () => {
@@ -104,7 +105,7 @@ describe('CoinbaseWebSocket - Infinite Reconnection', () => {
         if (onClose) {
           onClose(1006, 'Connection lost');
         }
-        jest.advanceTimersByTime(60001); // Max delay + 1
+        vi.advanceTimersByTime(60001); // Max delay + 1
         
         // Re-set the mock for new connection
         MockWebSocket.mockImplementation(() => mockWsInstance);
@@ -136,7 +137,7 @@ describe('CoinbaseWebSocket - Infinite Reconnection', () => {
     });
 
     it('should emit reconnect_failed event after many attempts', () => {
-      const reconnectFailedHandler = jest.fn();
+      const reconnectFailedHandler = vi.fn();
       wsClient.on('reconnect_failed', reconnectFailedHandler);
       
       wsClient.connect();
@@ -150,7 +151,7 @@ describe('CoinbaseWebSocket - Infinite Reconnection', () => {
         if (onClose) {
           onClose(1006, 'Connection lost');
         }
-        jest.advanceTimersByTime(60001);
+        vi.advanceTimersByTime(60001);
         MockWebSocket.mockImplementation(() => mockWsInstance);
       }
       
@@ -175,7 +176,7 @@ describe('CoinbaseWebSocket - Infinite Reconnection', () => {
         onClose(1000, 'Manual disconnect');
       }
       
-      jest.advanceTimersByTime(5000);
+      vi.advanceTimersByTime(5000);
       
       // Should not be reconnecting
       expect(wsClient.getHealth().reconnecting).toBe(false);
@@ -215,11 +216,11 @@ describe('CoinbaseWebSocket - Infinite Reconnection', () => {
         onOpen();
       }
       
-      const healthDegradedHandler = jest.fn();
+      const healthDegradedHandler = vi.fn();
       wsClient.on('health_degraded', healthDegradedHandler);
       
       // Advance time past heartbeat timeout
-      jest.advanceTimersByTime(50000);
+      vi.advanceTimersByTime(50000);
       
       // Should have detected degraded health
       expect(healthDegradedHandler).toHaveBeenCalled();
@@ -289,7 +290,7 @@ describe('CoinbaseWebSocket - Infinite Reconnection', () => {
         if (onClose) {
           onClose(1006, 'Connection lost');
         }
-        jest.advanceTimersByTime(2000);
+        vi.advanceTimersByTime(2000);
         
         // Reset mock for new connection
         MockWebSocket.mockImplementation(() => mockWsInstance);

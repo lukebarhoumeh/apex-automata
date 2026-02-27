@@ -4,19 +4,20 @@
  * Tests for idempotent start/stop, heartbeat, and kill switch behavior
  */
 
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { TradingEngine, TradingEngineConfig, EngineState } from '../trading/trading-engine';
 import { Logger } from '../core/logger';
 
 // Mock dependencies
-jest.mock('../config/secrets');
-jest.mock('../exchanges/coinbase');
+vi.mock('../config/secrets');
+vi.mock('../exchanges/coinbase');
 
 // Mock logger
 const mockLogger: Logger = {
-  info: jest.fn(),
-  warn: jest.fn(),
-  error: jest.fn(),
-  debug: jest.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
 } as any;
 
 // Mock guardrails
@@ -88,8 +89,8 @@ describe('TradingEngine Lifecycle', () => {
   let engine: TradingEngine;
 
   beforeEach(() => {
-    jest.useFakeTimers();
-    jest.clearAllMocks();
+    vi.useFakeTimers();
+    vi.clearAllMocks();
     
     engine = new TradingEngine(mockConfig, mockLogger);
   });
@@ -100,7 +101,7 @@ describe('TradingEngine Lifecycle', () => {
     } catch (e) {
       // Ignore stop errors in cleanup
     }
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   describe('Engine State', () => {
@@ -110,7 +111,7 @@ describe('TradingEngine Lifecycle', () => {
     });
 
     it('should track state changes', async () => {
-      const stateChangedHandler = jest.fn();
+      const stateChangedHandler = vi.fn();
       engine.on('engine:state_changed', stateChangedHandler);
       
       // State should change when we try to start (will fail due to mocks, but state changes first)
@@ -172,7 +173,7 @@ describe('TradingEngine Lifecycle', () => {
 
   describe('Heartbeat', () => {
     it('should emit heartbeat events', () => {
-      const heartbeatHandler = jest.fn();
+      const heartbeatHandler = vi.fn();
       engine.on('engine:heartbeat', heartbeatHandler);
       
       // Manually start heartbeat (normally done in start())
@@ -182,7 +183,7 @@ describe('TradingEngine Lifecycle', () => {
       expect(heartbeatHandler).toHaveBeenCalledTimes(1);
       
       // Advance timer for next heartbeat
-      jest.advanceTimersByTime(2000);
+      vi.advanceTimersByTime(2000);
       expect(heartbeatHandler).toHaveBeenCalledTimes(2);
       
       // Stop heartbeat
@@ -201,7 +202,7 @@ describe('TradingEngine Lifecycle', () => {
 
   describe('Kill Switch Behavior', () => {
     it('should transition to halted state on kill switch', () => {
-      const stateChangedHandler = jest.fn();
+      const stateChangedHandler = vi.fn();
       engine.on('engine:state_changed', stateChangedHandler);
       
       // Simulate kill switch by calling setEngineState
@@ -228,7 +229,7 @@ describe('TradingEngine Lifecycle', () => {
 
   describe('Fatal Error Handling', () => {
     it('should emit fatal event for supervisor', () => {
-      const fatalHandler = jest.fn();
+      const fatalHandler = vi.fn();
       engine.on('engine:fatal', fatalHandler);
       
       const testError = new Error('Test fatal error');
@@ -251,7 +252,7 @@ describe('TradingEngine Lifecycle', () => {
       };
       (engine as any).riskEngine = mockRiskEngine;
       
-      const fatalHandler = jest.fn();
+      const fatalHandler = vi.fn();
       engine.on('engine:fatal', fatalHandler);
       
       engine.handleFatal(new Error('Test'), 'test');
