@@ -18,10 +18,11 @@ import { CoinbaseReconciler, ReconcilerState } from './reconciliation/reconciler
 import { MarketDataGapFiller } from './reconciliation/gap-filler';
 
 export * from './types';
-export { CoinbaseWsHealth } from './websocket';
-export { CoinbaseChannelSpec, ICoinbaseWsClient, SubscriptionManager } from './ws/coinbase-ws.interface';
-export { RestClientHealth } from './rest-client';
-export { ReconcilerState } from './reconciliation/reconciler';
+export type { CoinbaseWsHealth } from './websocket';
+export type { CoinbaseChannelSpec, ICoinbaseWsClient } from './ws/coinbase-ws.interface';
+export { SubscriptionManager } from './ws/coinbase-ws.interface';
+export type { RestClientHealth } from './rest-client';
+export type { ReconcilerState } from './reconciliation/reconciler';
 export * from './http/errors';
 
 /**
@@ -500,6 +501,16 @@ export class CoinbaseExchange extends EventEmitter {
           this.logger.error(`Failed to get final status for order ${orderId}:`, error);
           this.activeOrders.delete(orderId);
         }
+      }
+    }
+
+    // Cleanup stale entries older than 24 hours to prevent unbounded growth
+    const twentyFourHoursAgo = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [orderId, order] of this.activeOrders) {
+      const createdAt = new Date(order.created_at).getTime();
+      if (createdAt < twentyFourHoursAgo) {
+        this.activeOrders.delete(orderId);
+        this.logger.warn('Removed stale active order (>24h old)', { orderId });
       }
     }
   }

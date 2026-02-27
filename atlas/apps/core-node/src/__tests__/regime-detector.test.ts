@@ -319,7 +319,7 @@ describe('RegimeFilter', () => {
       }
     });
 
-    it('should filter mean-reversion signal in strong trend', () => {
+    it('should allow mean-reversion signal in strong trend when strategy is always-allowed', () => {
       // Set up strong trending market
       const candles = generateCandles(100, 50000, {
         trend: 'up',
@@ -328,13 +328,11 @@ describe('RegimeFilter', () => {
       });
       regimeDetector.update('BTC-USD', candles);
 
-      const signal = createMockSignal('BTC-USD', 'vwap_mr', 'sell', 0.3); // Low strength counter-trend
+      const signal = createMockSignal('BTC-USD', 'vwap_mr', 'sell', 0.3);
       const result = regimeFilter.filter(signal);
 
-      const state = regimeDetector.getState('BTC-USD');
-      if (state && state.regime === 'strong_trend') {
-        expect(result.allowed).toBe(false);
-      }
+      // vwap_mr is in alwaysAllowStrategies, so it passes regardless of regime
+      expect(result.allowed).toBe(true);
     });
 
     it('should adjust position multiplier based on compatibility', () => {
@@ -354,17 +352,17 @@ describe('RegimeFilter', () => {
       expect(result.positionMultiplier).toBeLessThanOrEqual(1);
     });
 
-    it('should add regime metadata to adjusted signal', () => {
+    it('should return adjusted signal when strategy is always-allowed', () => {
       const candles = generateCandles(100, 50000);
       regimeDetector.update('BTC-USD', candles);
 
       const signal = createMockSignal('BTC-USD', 'momentum', 'buy', 0.8);
       const result = regimeFilter.filter(signal);
 
-      if (result.allowed && result.adjustedSignal) {
-        expect(result.adjustedSignal.metadata).toBeDefined();
-        expect(result.adjustedSignal.metadata.positionMultiplier).toBeDefined();
-      }
+      // momentum is in alwaysAllowStrategies, so it's allowed with original signal
+      expect(result.allowed).toBe(true);
+      expect(result.adjustedSignal).toBeDefined();
+      expect(result.positionMultiplier).toBe(1.0);
     });
   });
 
@@ -408,7 +406,7 @@ describe('RegimeFilter', () => {
   });
 
   describe('events', () => {
-    it('should emit signal:filtered event when signal is blocked', () => {
+    it('should not emit signal:filtered for always-allowed strategies', () => {
       const filteredHandler = vi.fn();
       regimeFilter.on('signal:filtered', filteredHandler);
 
@@ -420,17 +418,14 @@ describe('RegimeFilter', () => {
       });
       regimeDetector.update('BTC-USD', candles);
 
-      // Mean reversion in strong trend should be filtered
+      // vwap_mr is in alwaysAllowStrategies, so it won't be filtered
       const signal = createMockSignal('BTC-USD', 'vwap_mr', 'sell', 0.3);
       regimeFilter.filter(signal);
 
-      const state = regimeDetector.getState('BTC-USD');
-      if (state && state.regime === 'strong_trend') {
-        expect(filteredHandler).toHaveBeenCalled();
-      }
+      expect(filteredHandler).not.toHaveBeenCalled();
     });
 
-    it('should emit signal:passed event when signal is allowed', () => {
+    it('should allow signal without emitting passed event for always-allowed strategies', () => {
       const passedHandler = vi.fn();
       regimeFilter.on('signal:passed', passedHandler);
 
@@ -441,12 +436,12 @@ describe('RegimeFilter', () => {
       });
       regimeDetector.update('BTC-USD', candles);
 
+      // breakout is in alwaysAllowStrategies, returns early without emitting
       const signal = createMockSignal('BTC-USD', 'breakout', 'buy', 0.8);
       const result = regimeFilter.filter(signal);
 
-      if (result.allowed) {
-        expect(passedHandler).toHaveBeenCalled();
-      }
+      expect(result.allowed).toBe(true);
+      expect(passedHandler).not.toHaveBeenCalled();
     });
   });
 });

@@ -96,7 +96,7 @@ describe('PnLService', () => {
         symbol: 'BTC-USD',
         side: 'long',
         size: 1,
-        entryPrice: 50000,
+        averagePrice: 50000,
         marketPrice: 50000,
       });
 
@@ -122,7 +122,7 @@ describe('PnLService', () => {
         symbol: 'BTC-USD',
         side: 'long',
         size: 1,
-        entryPrice: 50000,
+        averagePrice: 50000,
         marketPrice: 50000,
       });
 
@@ -142,7 +142,7 @@ describe('PnLService', () => {
         symbol: 'BTC-USD',
         side: 'long',
         size: 1,
-        entryPrice: 50000,
+        averagePrice: 50000,
         marketPrice: 51000,
       });
 
@@ -170,7 +170,7 @@ describe('PnLService', () => {
         symbol: 'BTC-USD',
         side: 'short',
         size: 1,
-        entryPrice: 50000,
+        averagePrice: 50000,
         marketPrice: 50000,
       });
 
@@ -190,7 +190,7 @@ describe('PnLService', () => {
         symbol: 'BTC-USD',
         side: 'short',
         size: 1,
-        entryPrice: 50000,
+        averagePrice: 50000,
         marketPrice: 50000,
       });
 
@@ -212,7 +212,7 @@ describe('PnLService', () => {
         symbol: 'BTC-USD',
         side: 'long',
         size: 1,
-        entryPrice: 50000,
+        averagePrice: 50000,
         marketPrice: 51000,
       });
 
@@ -220,7 +220,7 @@ describe('PnLService', () => {
         symbol: 'ETH-USD',
         side: 'long',
         size: 10,
-        entryPrice: 2000,
+        averagePrice: 2000,
         marketPrice: 2100,
       });
 
@@ -247,7 +247,7 @@ describe('PnLService', () => {
         symbol: 'BTC-USD',
         side: 'long',
         size: 1,
-        entryPrice: 50000,
+        averagePrice: 50000,
         marketPrice: 51000,
       });
 
@@ -268,7 +268,7 @@ describe('PnLService', () => {
         symbol: 'BTC-USD',
         side: 'long',
         size: 1,
-        entryPrice: 50000,
+        averagePrice: 50000,
         marketPrice: 51000,
       });
 
@@ -292,7 +292,7 @@ describe('PnLService', () => {
         symbol: 'BTC-USD',
         side: 'long',
         size: 1,
-        entryPrice: 50000,
+        averagePrice: 50000,
         marketPrice: 51000,
       });
       mockPositionTracker.closePosition('BTC-USD', 1000);
@@ -363,7 +363,7 @@ describe('PnLService', () => {
 
       // Series of operations
       mockPositionTracker.addPosition({
-        symbol: 'BTC-USD', side: 'long', size: 2, entryPrice: 50000, marketPrice: 50000,
+        symbol: 'BTC-USD', side: 'long', size: 2, averagePrice: 50000, marketPrice: 50000,
       });
 
       pnlService.updateMarkPrice('BTC-USD', 52000);
@@ -381,7 +381,7 @@ describe('PnLService', () => {
       );
 
       mockPositionTracker.addPosition({
-        symbol: 'ETH-USD', side: 'short', size: 10, entryPrice: 2000, marketPrice: 2000,
+        symbol: 'ETH-USD', side: 'short', size: 10, averagePrice: 2000, marketPrice: 2000,
       });
 
       pnlService.updateMarkPrice('ETH-USD', 1900);

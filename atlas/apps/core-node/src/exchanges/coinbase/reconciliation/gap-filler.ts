@@ -8,7 +8,7 @@
 import { EventEmitter } from 'events';
 import { Counter, Gauge } from 'prom-client';
 import { Logger } from '../../../core/logger';
-import { Candle, HistoricRatesParams } from '../types';
+import { Candle, Granularity, HistoricRatesParams } from '../types';
 
 // Prometheus metrics
 const gapFillRunsTotal = new Counter({
@@ -302,7 +302,7 @@ export class MarketDataGapFiller extends EventEmitter {
 
       // Fetch candles from REST
       const candles = await this.restClient.getProductCandles(tracker.symbol, {
-        granularity: tracker.granularity,
+        granularity: tracker.granularity as Granularity,
         start: new Date(startTime * 1000).toISOString(),
         end: new Date(now * 1000).toISOString(),
       });

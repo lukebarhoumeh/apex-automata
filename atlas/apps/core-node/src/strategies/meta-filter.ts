@@ -819,6 +819,9 @@ export class MetaFilter extends EventEmitter {
     };
 
     this.decisionLogBuffer.push(logEntry);
+    if (this.decisionLogBuffer.length > 500) {
+      this.decisionLogBuffer = this.decisionLogBuffer.slice(-500);
+    }
     this.emit('decision:logged', logEntry);
   }
 

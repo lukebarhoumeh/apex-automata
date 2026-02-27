@@ -6,6 +6,9 @@
  * 2. Retry logic with backoff
  * 3. Schema error handling (non-retryable)
  * 4. Idempotency / dedupe
+ * 5. Backpressure (evict oldest non-critical on overflow)
+ * 6. Operation timeout
+ * 7. Circuit breaker
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -273,21 +276,193 @@ describe('SupabaseWriter', () => {
     });
   });
 
-  describe('Queue Overflow', () => {
-    it('should drop non-critical writes on overflow', async () => {
+  describe('Backpressure', () => {
+    it('should evict oldest non-critical when queue is full and new non-critical arrives', async () => {
       writer = createWriter({ maxQueueSize: 5 });
 
-      // Fill queue
+      // Fill queue with 10 non-critical writes — oldest get evicted
       for (let i = 0; i < 10; i++) {
         writer.insert('alerts', { message: `Alert ${i}` });
       }
 
-      // Only 5 should be queued
+      // Queue should be capped at 5
       expect(writer.getHealth().queueDepth).toBe(5);
       expect(mockLogger.warn).toHaveBeenCalledWith(
-        'Queue overflow, dropping non-critical write',
+        'Backpressure: evicted oldest non-critical write',
         expect.anything()
       );
+    });
+
+    it('should evict oldest non-critical to make room for critical op', async () => {
+      writer = createWriter({ maxQueueSize: 3 });
+
+      // Fill with non-critical
+      writer.insert('alerts', { message: 'A' });
+      writer.insert('alerts', { message: 'B' });
+      writer.insert('alerts', { message: 'C' });
+      expect(writer.getHealth().queueDepth).toBe(3);
+
+      // Now enqueue a critical op — should evict oldest non-critical
+      writer.insert('positions', { symbol: 'BTC' }, { critical: true });
+      expect(writer.getHealth().queueDepth).toBe(3);
+
+      // Flush and verify the critical op gets written
+      await writer.flushNow();
+      expect(mockInsert).toHaveBeenCalledWith({ symbol: 'BTC' });
+    });
+
+    it('should never evict critical ops via backpressure', async () => {
+      writer = createWriter({ maxQueueSize: 2 });
+
+      // Fill queue with critical ops
+      writer.insert('positions', { symbol: 'BTC' }, { critical: true });
+      writer.insert('positions', { symbol: 'ETH' }, { critical: true });
+      expect(writer.getHealth().queueDepth).toBe(2);
+
+      // Non-critical can't evict critical, so it gets dropped
+      writer.insert('alerts', { message: 'low priority' });
+      expect(writer.getHealth().queueDepth).toBe(2);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        'Queue overflow (all critical), dropping non-critical write',
+        expect.anything()
+      );
+    });
+  });
+
+  describe('Operation Timeout', () => {
+    it('should timeout hanging operations', async () => {
+      writer = createWriter({
+        operationTimeoutMs: 50,
+        maxRetries: 0,
+        circuitBreakerThreshold: 100,
+      });
+
+      // Simulate a hanging insert
+      mockInsert.mockImplementation(() => new Promise(() => {}));
+
+      writer.insert('alerts', { message: 'test' });
+      await writer.flushNow();
+
+      expect(mockLogger.error).not.toHaveBeenCalledWith(
+        'Schema mismatch (non-retryable)',
+        expect.anything()
+      );
+      // The error should be logged as non-retryable or max retries
+      const health = writer.getHealth();
+      expect(health.lastError).toContain('timed out');
+    });
+
+    it('should not timeout fast operations', async () => {
+      writer = createWriter({ operationTimeoutMs: 5000 });
+
+      mockInsert.mockResolvedValue({ error: null });
+      writer.insert('alerts', { message: 'test' });
+      await writer.flushNow();
+
+      const health = writer.getHealth();
+      expect(health.lastError).toBeUndefined();
+      expect(health.lastSuccessAt).toBeDefined();
+    });
+
+    it('should disable timeout when set to 0', async () => {
+      writer = createWriter({ operationTimeoutMs: 0 });
+
+      mockInsert.mockResolvedValue({ error: null });
+      writer.insert('alerts', { message: 'test' });
+      await writer.flushNow();
+
+      expect(mockInsert).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('Circuit Breaker', () => {
+    it('should trip after consecutive failures reach threshold', async () => {
+      writer = createWriter({
+        circuitBreakerThreshold: 3,
+        circuitBreakerCooldownMs: 60000,
+        maxRetries: 0,
+      });
+
+      mockInsert.mockResolvedValue({ error: { code: '42703', message: 'column does not exist' } });
+
+      // Enqueue 3 operations that will all fail
+      writer.insert('alerts', { message: '1' });
+      writer.insert('alerts', { message: '2' });
+      writer.insert('alerts', { message: '3' });
+      await writer.flushNow();
+
+      const health = writer.getHealth();
+      expect(health.circuitBreakerOpen).toBe(true);
+      expect(health.consecutiveFailures).toBe(3);
+
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        'Circuit breaker OPEN — stopping writes',
+        expect.objectContaining({ consecutiveFailures: 3 })
+      );
+    });
+
+    it('should skip flush when circuit breaker is open', async () => {
+      writer = createWriter({
+        circuitBreakerThreshold: 1,
+        circuitBreakerCooldownMs: 60000,
+        maxRetries: 0,
+      });
+
+      // Trip the circuit breaker
+      mockInsert.mockResolvedValue({ error: { code: '42703', message: 'column does not exist' } });
+      writer.insert('alerts', { message: 'fail' });
+      await writer.flushNow();
+
+      expect(writer.getHealth().circuitBreakerOpen).toBe(true);
+
+      // Now enqueue more ops — flush should be skipped
+      mockInsert.mockResolvedValue({ error: null });
+      writer.insert('alerts', { message: 'should not flush' });
+      await writer.flushNow();
+
+      // The second insert mock should NOT have been called (circuit is open)
+      // mockInsert was called once for the first fail
+      expect(mockInsert).toHaveBeenCalledTimes(1);
+
+      // Queue should still have the pending op
+      expect(writer.getHealth().queueDepth).toBe(1);
+    });
+
+    it('should reset after a successful write', async () => {
+      writer = createWriter({
+        circuitBreakerThreshold: 5,
+        circuitBreakerCooldownMs: 60000,
+        maxRetries: 0,
+      });
+
+      // Fail 3 times (below threshold)
+      mockInsert.mockResolvedValue({ error: { code: '42703', message: 'column does not exist' } });
+      writer.insert('alerts', { message: '1' });
+      writer.insert('alerts', { message: '2' });
+      writer.insert('alerts', { message: '3' });
+      await writer.flushNow();
+
+      expect(writer.getHealth().consecutiveFailures).toBe(3);
+
+      // Now succeed
+      mockInsert.mockResolvedValue({ error: null });
+      writer.insert('alerts', { message: 'success' });
+      await writer.flushNow();
+
+      const health = writer.getHealth();
+      expect(health.consecutiveFailures).toBe(0);
+      expect(health.circuitBreakerOpen).toBe(false);
+    });
+
+    it('should report circuit breaker status in health', async () => {
+      writer = createWriter({
+        circuitBreakerThreshold: 100,
+        circuitBreakerCooldownMs: 60000,
+      });
+
+      const health = writer.getHealth();
+      expect(health.circuitBreakerOpen).toBe(false);
+      expect(health.consecutiveFailures).toBe(0);
     });
   });
 });

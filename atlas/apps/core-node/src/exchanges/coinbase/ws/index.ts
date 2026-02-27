@@ -12,11 +12,12 @@
  * - Import interfaces from here for type definitions
  */
 
-export {
+export type {
   ICoinbaseWsClient,
   CoinbaseWsHealth,
   CoinbaseWsConfig,
   CoinbaseWsEvents,
   CoinbaseChannelSpec,
-  SubscriptionManager,
 } from './coinbase-ws.interface';
+
+export { SubscriptionManager } from './coinbase-ws.interface';
