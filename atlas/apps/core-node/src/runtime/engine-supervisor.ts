@@ -284,7 +284,7 @@ export class EngineSupervisor extends EventEmitter {
 
     // Even when kill switch is active, check market data health
     // (we want to stay connected to market data for visibility)
-    if (this.killSwitchActive && this.desiredState !== 'stopped') {
+    if (this.killSwitchActive) {
       this.checkMarketDataHealth(now);
     }
   }

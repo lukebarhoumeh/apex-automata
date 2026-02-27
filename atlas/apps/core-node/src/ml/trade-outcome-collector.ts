@@ -369,7 +369,7 @@ export class TradeOutcomeCollector extends EventEmitter {
       : undefined;
 
     // Check for trailing stop (if we have MFE data)
-    if (Number.isFinite(maxFavorableExcursion) && maxFavorableExcursion > 0 && position.realizedPnL < maxFavorableExcursion * 0.5) {
+    if (maxFavorableExcursion !== undefined && maxFavorableExcursion > 0 && position.realizedPnL < maxFavorableExcursion * 0.5) {
       return 'trailing_stop';
     }
     
