@@ -18,7 +18,7 @@ export const EnvSchema = z.object({
   // Coinbase API version toggle
   // 'exchange' = deprecated GDAX/Exchange API (current default)
   // 'advanced' = new Coinbase Advanced Trade API
-  COINBASE_API_VERSION: z.enum(['exchange', 'advanced']).default('exchange'),
+  COINBASE_API_VERSION: z.enum(['exchange', 'advanced']).default('advanced'),
   
   // Supabase - REQUIRED for engine operation
   SUPABASE_URL: z.string().url({ message: 'SUPABASE_URL must be a valid URL' }),
