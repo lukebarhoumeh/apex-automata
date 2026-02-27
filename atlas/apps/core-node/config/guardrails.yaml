@@ -6,8 +6,8 @@ account:
   min_notional_buffer: 1.1
 
 risk:
-  daily_loss_limit: -0.008
-  weekly_loss_limit: -0.025
+  daily_loss_limit: -0.03
+  weekly_loss_limit: -0.06
   max_drawdown_limit: -0.1
   max_position_exposure_pct: 0.5
   funding_cost_tolerance_bps: 20
