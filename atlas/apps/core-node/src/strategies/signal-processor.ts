@@ -45,6 +45,9 @@ export interface SignalProcessorConfig {
   signalArbiter?: Partial<SignalArbiterConfig>;
   // Whether to enable signal arbitration (default: true)
   enableArbiter?: boolean;
+  // Signal cooldown in milliseconds (default: 300000 = 5 minutes)
+  // Should match guardrails trade_cooldown_min * 60 * 1000
+  signalCooldownMs?: number;
 }
 
 export interface BreakoutConfig {
@@ -926,13 +929,14 @@ export class SignalProcessor extends EventEmitter {
   }
 
   private async processSignal(signal: Signal): Promise<void> {
-    // Check if we recently generated a similar signal
+    // Check if we recently generated a similar signal (cooldown enforcement)
+    const cooldownMs = this.config.signalCooldownMs ?? 300000; // Default 5 min, configurable via guardrails
     const lastSignal = this.lastSignals.get(signal.symbol);
     if (lastSignal && 
         lastSignal.strategy === signal.strategy &&
         lastSignal.direction === signal.direction &&
-        Date.now() - lastSignal.timestamp.getTime() < 300000) { // 5 minutes
-      this.emit('signal:filtered', signal, 'Too soon after previous signal');
+        Date.now() - lastSignal.timestamp.getTime() < cooldownMs) {
+      this.emit('signal:filtered', signal, `Too soon after previous signal (cooldown: ${cooldownMs / 60000}min)`);
       return;
     }
 

@@ -923,7 +923,9 @@ app.post('/api/engine/start', async (req, res) => {
       metaLabeling: {
         enabled: false,
         threshold: 0.5
-      }
+      },
+      // Signal cooldown from guardrails (trade_cooldown_min in minutes → milliseconds)
+      signalCooldownMs: (guardrails.strategy.trade_cooldown_min || 15) * 60 * 1000,
     };
 
     signalProcessor = new SignalProcessor(signalConfig, logger);
