@@ -157,6 +157,18 @@ export class RiskMath {
   }
 
   /**
+   * Update account equity (for profit compounding).
+   * Updates the config equity used for risk unit calculations.
+   */
+  public updateEquity(newEquityUsd: number): void {
+    if (!Number.isFinite(newEquityUsd) || newEquityUsd <= 0) {
+      this.logger.warn('Ignoring invalid equity update', { newEquityUsd });
+      return;
+    }
+    this.config.accountEquityUsd = newEquityUsd;
+  }
+
+  /**
    * Get validated per-trade risk fraction
    */
   public getPerTradeRiskFraction(): number {

@@ -137,6 +137,8 @@ export class RiskEngine extends EventEmitter {
   private metricsUpdateInterval: NodeJS.Timeout | null = null;
   private guardrails: GuardrailConfig;
   private accountEquity: number;
+  private initialAccountEquity: number; // Floor for equity tracking
+  private cumulativeRealizedPnL: number = 0; // Tracks total realized P&L for equity compounding
   private dailyLossLimitUsd: number;
   private weeklyLossLimitUsd: number;
   private maxDrawdownUsd: number;
@@ -171,6 +173,7 @@ export class RiskEngine extends EventEmitter {
 
     this.guardrails = config.guardrails;
     this.accountEquity = config.accountEquity;
+    this.initialAccountEquity = config.accountEquity; // Floor: never size below 50% of this
     const riskCfg = this.guardrails.risk;
     const accountCfg = this.guardrails.account;
     const circuitCfg = this.guardrails.circuit_breakers;
@@ -326,6 +329,55 @@ export class RiskEngine extends EventEmitter {
     } else {
       this.metrics.consecutiveLosses = 0;
     }
+
+    // Dynamic equity compounding: update account equity based on realized P&L
+    this.cumulativeRealizedPnL += realized;
+    this.updateAccountEquity();
+  }
+
+  /**
+   * Update account equity based on cumulative realized P&L.
+   * This enables profit compounding (winners increase position sizes)
+   * and risk reduction (losers decrease position sizes).
+   * Floor: equity never drops below 50% of initial to prevent spiraling.
+   */
+  private updateAccountEquity(): void {
+    const rawEquity = this.initialAccountEquity + this.cumulativeRealizedPnL;
+    const floor = this.initialAccountEquity * 0.5;
+    const newEquity = Math.max(rawEquity, floor);
+
+    if (Math.abs(newEquity - this.accountEquity) < 0.01) {
+      return; // No meaningful change
+    }
+
+    const oldEquity = this.accountEquity;
+    this.accountEquity = newEquity;
+
+    // Recalculate derived limits that depend on accountEquity
+    const riskCfg = this.guardrails.risk;
+    const accountCfg = this.guardrails.account;
+    const circuitCfg = this.guardrails.circuit_breakers;
+
+    this.maxPositionExposureUsd = this.accountEquity * riskCfg.max_position_exposure_pct;
+    this.minOrderNotionalUsd = this.accountEquity * accountCfg.risk_per_trade * accountCfg.min_notional_buffer;
+    this.rapidLossThresholdUsd = Math.abs(circuitCfg.rapid_loss_trigger) * this.accountEquity;
+
+    // Update risk math module with new equity
+    this.riskMath.updateEquity(this.accountEquity);
+
+    this.logger.info('Account equity updated (profit compounding)', {
+      oldEquity: oldEquity.toFixed(2),
+      newEquity: newEquity.toFixed(2),
+      cumulativePnL: this.cumulativeRealizedPnL.toFixed(2),
+      floor: floor.toFixed(2),
+    });
+  }
+
+  /**
+   * Get current account equity (for external consumers)
+   */
+  public getAccountEquity(): number {
+    return this.accountEquity;
   }
   
   /**
