@@ -629,11 +629,17 @@ app.post('/api/killswitch/deactivate', async (req, res) => {
     
     if (tradingEngine) {
       tradingEngine.getRiskEngineInstance()?.deactivateKillSwitch();
+      // Transition engine state back to 'running' from 'halted'
+      if (tradingEngine.resumeFromHalt('kill_switch_deactivated')) {
+        supervisor.setActualState('running', 'kill_switch_deactivated');
+        logger.info('Engine resumed from halted state');
+      }
     }
     
     runtimeState.killSwitch.active = false;
     runtimeState.killSwitch.reasons = [];
     runtimeState.killSwitch.since = null;
+    runtimeState.dailyStopHit = false;
     
     killSwitchActiveGauge.set(0);
     

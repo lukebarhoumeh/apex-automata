@@ -322,6 +322,17 @@ export class TradingEngine extends EventEmitter {
   }
 
   /**
+   * Resume trading from halted state (after kill switch deactivation)
+   */
+  public resumeFromHalt(reason: string = 'manual'): boolean {
+    if (this.engineState !== 'halted' || !this.isRunning) {
+      return false;
+    }
+    this.setEngineState('running', reason);
+    return true;
+  }
+
+  /**
    * Get last heartbeat timestamp
    */
   public getLastHeartbeatAt(): number {
