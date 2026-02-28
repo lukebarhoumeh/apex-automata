@@ -45,6 +45,8 @@ export interface SignalProcessorConfig {
   signalArbiter?: Partial<SignalArbiterConfig>;
   // Whether to enable signal arbitration (default: true)
   enableArbiter?: boolean;
+  // Signal duplicate cooldown in milliseconds (default: 300000 = 5 min)
+  signalCooldownMs?: number;
 }
 
 export interface BreakoutConfig {
@@ -926,12 +928,13 @@ export class SignalProcessor extends EventEmitter {
   }
 
   private async processSignal(signal: Signal): Promise<void> {
-    // Check if we recently generated a similar signal
+    // Check if we recently generated a similar signal (configurable cooldown)
+    const cooldownMs = this.config.signalCooldownMs ?? 300000; // Default 5 minutes
     const lastSignal = this.lastSignals.get(signal.symbol);
     if (lastSignal && 
         lastSignal.strategy === signal.strategy &&
         lastSignal.direction === signal.direction &&
-        Date.now() - lastSignal.timestamp.getTime() < 300000) { // 5 minutes
+        Date.now() - lastSignal.timestamp.getTime() < cooldownMs) {
       this.emit('signal:filtered', signal, 'Too soon after previous signal');
       return;
     }

@@ -147,6 +147,13 @@ logger.info('Using fixed USER_ID for single-user mode:', USER_ID);
 
 const DEFAULT_LIVE_CONFIRM_PHRASE = 'ENABLE LIVE';
 
+// Log Coinbase API version for visibility
+if (env.COINBASE_API_VERSION === 'advanced') {
+  logger.info('Coinbase Advanced Trade API configured — live trading will use Advanced Trade endpoints (JWT/ES256 auth)');
+} else {
+  logger.info('Coinbase Exchange API configured (legacy GDAX endpoints)');
+}
+
 // Supabase client
 const supabase = createClient(
   env.SUPABASE_URL || '',
@@ -923,44 +930,80 @@ app.post('/api/engine/start', async (req, res) => {
       metaLabeling: {
         enabled: false,
         threshold: 0.5
-      }
+      },
+      // Signal cooldown matches guardrails trade_cooldown_min
+      signalCooldownMs: (strategyGuard.trade_cooldown_min ?? 5) * 60 * 1000,
     };
 
     signalProcessor = new SignalProcessor(signalConfig, logger);
 
     // Set up data loader from exchange for historical data
+    // Uses public Coinbase REST API (no auth needed) as primary source
     signalProcessor.setDataLoader(async (symbol: string, limit: number) => {
-      if (!tradingEngine) {
-        return [];
-      }
       try {
-        // Get exchange from trading engine to fetch candles
-        const exchange = (tradingEngine as any).exchange;
-        if (!exchange) {
-          logger.warn('No exchange available for historical data loading');
-          return [];
-        }
-        
         // Calculate time range for historical candles (1 minute granularity)
         const end = new Date();
         const start = new Date(end.getTime() - limit * 60 * 1000);
         
-        const candles = await exchange.getCandles(symbol, {
-          start: start.toISOString(),
-          end: end.toISOString(),
-          granularity: 60, // 1 minute
+        // Primary: Use public Coinbase REST API (works without auth)
+        const axios = (await import('axios')).default;
+        const url = `https://api.exchange.coinbase.com/products/${symbol}/candles`;
+        const response = await axios.get(url, {
+          params: {
+            start: start.toISOString(),
+            end: end.toISOString(),
+            granularity: 60,
+          },
+          timeout: 10000,
+          headers: { 'User-Agent': 'AtlasBot/1.0' },
         });
         
-        return candles.map((c: any) => ({
-          time: c.time * 1000, // Convert to milliseconds
-          open: c.open,
-          high: c.high,
-          low: c.low,
-          close: c.close,
-          volume: c.volume,
+        if (!Array.isArray(response.data) || response.data.length === 0) {
+          logger.warn(`No historical candles returned for ${symbol}`);
+          return [];
+        }
+        
+        // Coinbase public candle format: [time, low, high, open, close, volume]
+        const candles = response.data.map((c: number[]) => ({
+          time: c[0] * 1000, // Convert seconds to milliseconds
+          open: c[3],
+          high: c[2],
+          low: c[1],
+          close: c[4],
+          volume: c[5],
         }));
+        
+        logger.info(`Loaded ${candles.length} historical candles for ${symbol} from public API`);
+        return candles;
       } catch (error) {
-        logger.warn(`Failed to load historical candles for ${symbol} from exchange:`, error);
+        logger.warn(`Failed to load historical candles for ${symbol} from public API:`, error);
+        
+        // Fallback: try exchange instance if available
+        try {
+          if (tradingEngine) {
+            const exchange = (tradingEngine as any).exchange;
+            if (exchange) {
+              const end = new Date();
+              const start = new Date(end.getTime() - limit * 60 * 1000);
+              const candles = await exchange.getCandles(symbol, {
+                start: start.toISOString(),
+                end: end.toISOString(),
+                granularity: 60,
+              });
+              return candles.map((c: any) => ({
+                time: c.time * 1000,
+                open: c.open,
+                high: c.high,
+                low: c.low,
+                close: c.close,
+                volume: c.volume,
+              }));
+            }
+          }
+        } catch (fallbackError) {
+          logger.warn(`Fallback historical loading also failed for ${symbol}:`, fallbackError);
+        }
+        
         return [];
       }
     });

@@ -48,9 +48,9 @@ export class RuntimeWsClient {
   private subscribers: Set<SubscriberEntry> = new Set();
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 20;
   private baseReconnectDelay = 1000;
   private maxReconnectDelay = 30000;
+  private recoveryInterval: ReturnType<typeof setInterval> | null = null;
   
   private _state: RuntimeWsConnectionState = {
     connected: false,
@@ -69,6 +69,7 @@ export class RuntimeWsClient {
   constructor(private autoConnect = true) {
     if (this.autoConnect) {
       this.connect();
+      this.startRecoveryCheck();
     }
   }
   
@@ -105,6 +106,11 @@ export class RuntimeWsClient {
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
+    }
+    
+    if (this.recoveryInterval) {
+      clearInterval(this.recoveryInterval);
+      this.recoveryInterval = null;
     }
     
     if (this.ws) {
@@ -281,14 +287,10 @@ export class RuntimeWsClient {
       return;
     }
     
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      this.updateState({ error: 'Max reconnection attempts reached' });
-      return;
-    }
-    
-    // Exponential backoff with jitter
+    // INFINITE reconnection — never give up (matches backend WS resilience)
+    // Exponential backoff with jitter, capped at maxReconnectDelay
     const delay = Math.min(
-      this.baseReconnectDelay * Math.pow(2, this.reconnectAttempts) + Math.random() * 1000,
+      this.baseReconnectDelay * Math.pow(2, Math.min(this.reconnectAttempts, 10)) + Math.random() * 1000,
       this.maxReconnectDelay
     );
     
@@ -303,6 +305,24 @@ export class RuntimeWsClient {
       this.reconnectTimeout = null;
       this.connect();
     }, delay);
+  }
+
+  /**
+   * Start periodic connection recovery check.
+   * If disconnected with no pending reconnect, force a reconnect attempt.
+   * This catches edge cases where reconnection logic stalls.
+   */
+  private startRecoveryCheck(): void {
+    if (this.recoveryInterval) return;
+    
+    this.recoveryInterval = setInterval(() => {
+      if (!this._state.connected && !this.reconnectTimeout && !this.ws) {
+        if (DEBUG_WS) {
+          console.log('[RuntimeWS] Recovery check: forcing reconnect');
+        }
+        this.connect();
+      }
+    }, 60_000); // Check every 60 seconds
   }
   
   private dispatchEvent(event: RuntimeEventEnvelope): void {
