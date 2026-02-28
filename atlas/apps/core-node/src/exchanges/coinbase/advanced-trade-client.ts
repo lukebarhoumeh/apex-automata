@@ -4,14 +4,21 @@
  * This is the new API replacing the deprecated GDAX/Exchange API.
  * Use COINBASE_API_VERSION=advanced to enable.
  * 
- * Key differences:
- * - Different authentication method (JWT for v3)
- * - Different endpoint paths (/api/v3/brokerage/...)
- * - Different order/account structure
+ * Authentication: JWT signed with ES256 (EC private key)
+ * The API key format is: "organizations/{org_id}/apiKeys/{key_id}"
+ * The secret is a PEM-encoded EC private key.
+ * 
+ * JWT payload:
+ *   sub: apiKey
+ *   iss: "coinbase-cloud"
+ *   nbf: now (seconds)
+ *   exp: now + 120 (seconds)
+ *   uri: "METHOD host/path"
  */
 
 import axios, { AxiosInstance, InternalAxiosRequestConfig } from 'axios';
 import crypto from 'crypto';
+import { importPKCS8, SignJWT } from 'jose';
 import { Logger } from '../../core/logger';
 import {
   Account,
@@ -23,8 +30,8 @@ import {
 } from './types';
 
 export interface AdvancedTradeConfig {
-  apiKey: string;
-  apiSecret: string;
+  apiKey: string;    // e.g. "organizations/{org_id}/apiKeys/{key_id}"
+  apiSecret: string; // PEM-encoded EC private key (ES256)
   environment: 'production' | 'sandbox';
 }
 
@@ -67,11 +74,15 @@ interface ATOrder {
 
 /**
  * Coinbase Advanced Trade REST API Client
+ * 
+ * Uses JWT/ES256 authentication as required by Coinbase Advanced Trade API
+ * with EC private key credentials.
  */
 export class AdvancedTradeRestClient {
   private client: AxiosInstance;
   private config: AdvancedTradeConfig;
   private logger: Logger;
+  private host: string;
 
   constructor(config: AdvancedTradeConfig, logger: Logger) {
     this.config = config;
@@ -80,6 +91,8 @@ export class AdvancedTradeRestClient {
     const baseURL = config.environment === 'production'
       ? 'https://api.coinbase.com'
       : 'https://api-sandbox.coinbase.com';
+
+    this.host = new URL(baseURL).host;
 
     this.client = axios.create({
       baseURL,
@@ -90,36 +103,56 @@ export class AdvancedTradeRestClient {
       },
     });
 
-    // Add authentication interceptor
+    // Add JWT authentication interceptor
     this.client.interceptors.request.use(
-      this.addAuthHeaders.bind(this),
+      (reqConfig) => this.addJwtAuthHeaders(reqConfig),
       error => Promise.reject(error)
     );
   }
 
   /**
-   * Generate authentication headers for Advanced Trade API
-   * Uses HMAC-SHA256 signature
+   * Generate JWT for Coinbase Advanced Trade API authentication.
+   * 
+   * The JWT is signed with ES256 using the EC private key from the API credentials.
+   * Coinbase expects:
+   *   - sub: the full API key name (organizations/{org_id}/apiKeys/{key_id})
+   *   - iss: "coinbase-cloud"
+   *   - nbf: current time in seconds
+   *   - exp: current time + 120 seconds
+   *   - uri: "METHOD host/path" (e.g., "GET api.coinbase.com/api/v3/brokerage/accounts")
    */
-  private addAuthHeaders(config: InternalAxiosRequestConfig): InternalAxiosRequestConfig {
-    const timestamp = Math.floor(Date.now() / 1000).toString();
-    const method = config.method?.toUpperCase() || 'GET';
-    const path = config.url || '';
-    const body = config.data ? JSON.stringify(config.data) : '';
+  private async addJwtAuthHeaders(config: InternalAxiosRequestConfig): Promise<InternalAxiosRequestConfig> {
+    try {
+      const method = (config.method?.toUpperCase() || 'GET');
+      const path = config.url || '';
+      const uri = `${method} ${this.host}${path}`;
 
-    // Create signature
-    const message = timestamp + method + path + body;
-    const signature = crypto
-      .createHmac('sha256', this.config.apiSecret)
-      .update(message)
-      .digest('hex');
+      const now = Math.floor(Date.now() / 1000);
 
-    const headers = config.headers as any;
-    headers['CB-ACCESS-KEY'] = this.config.apiKey;
-    headers['CB-ACCESS-SIGN'] = signature;
-    headers['CB-ACCESS-TIMESTAMP'] = timestamp;
+      // Parse the EC private key — handle escaped newlines from .env
+      const pemKey = this.config.apiSecret.replace(/\\n/g, '\n');
+      const ecKey = await importPKCS8(pemKey, 'ES256');
 
-    return config;
+      // Build and sign JWT
+      const jwt = await new SignJWT({
+        sub: this.config.apiKey,
+        iss: 'coinbase-cloud',
+        uri,
+      })
+        .setProtectedHeader({ alg: 'ES256', kid: this.config.apiKey, nonce: crypto.randomBytes(16).toString('hex') })
+        .setIssuedAt(now)
+        .setNotBefore(now)
+        .setExpirationTime(now + 120)
+        .sign(ecKey);
+
+      const headers = config.headers as any;
+      headers['Authorization'] = `Bearer ${jwt}`;
+
+      return config;
+    } catch (error) {
+      this.logger.error('Failed to generate JWT for Advanced Trade API:', error);
+      throw error;
+    }
   }
 
   /**
@@ -212,7 +245,7 @@ export class AdvancedTradeRestClient {
       const response = await this.client.post('/api/v3/brokerage/orders', atOrder);
       const atResponse = response.data;
 
-      // Convert response to legacy format
+      // Convert response to legacy format for compatibility
       return {
         id: atResponse.order_id || atResponse.success_response?.order_id,
         product_id: order.product_id,
