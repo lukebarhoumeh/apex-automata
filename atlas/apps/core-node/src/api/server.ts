@@ -160,6 +160,36 @@ const supabase = createClient(
   env.SUPABASE_SERVICE_KEY || ''
 );
 
+// Supabase availability flag — set to false if DNS/network fails on startup
+// When false, all DB writes are silently skipped to prevent error spam + error-rate kill switch
+let supabaseAvailable = true;
+let lastSupabaseWarnAt = 0;
+
+function logSupabaseUnavailable(context: string): void {
+  const now = Date.now();
+  // Debounce: log at most once per 60 seconds
+  if (now - lastSupabaseWarnAt > 60_000) {
+    lastSupabaseWarnAt = now;
+    logger.warn(`Supabase unavailable — skipping DB write (${context}). This is expected on VMs without external DNS.`);
+  }
+}
+
+// Check Supabase connectivity at startup
+(async () => {
+  try {
+    const { error } = await supabase.from('positions').select('id').limit(1);
+    if (error && (error.message?.includes('fetch failed') || error.message?.includes('ENOTFOUND'))) {
+      supabaseAvailable = false;
+      logger.warn('Supabase connectivity check failed — DB writes will be skipped. Engine will function without persistence.');
+    } else {
+      logger.info('Supabase connectivity check passed');
+    }
+  } catch (err) {
+    supabaseAvailable = false;
+    logger.warn('Supabase connectivity check threw — DB writes will be skipped.', { error: String(err) });
+  }
+})();
+
 // Trading engine instance
 let tradingEngine: TradingEngine | null = null;
 let signalProcessor: SignalProcessor | null = null;
@@ -1341,11 +1371,11 @@ app.post('/api/engine/start', async (req, res) => {
     supervisor.setDesiredState('running', mode as any);
     supervisor.setActualState('running', 'engine_started');
     
-    // Load historical data for warmup (don't await - do in background)
+    // Load historical data for warmup with bounded wait (10s timeout)
     const activeSymbols = tradingEngine.getActiveSymbols();
     logger.info(`Starting warmup for ${activeSymbols.length} symbols`);
     
-    Promise.all(
+    const warmupPromise = Promise.all(
       activeSymbols.map(symbol => 
         signalProcessor!.loadHistoricalData(symbol).catch(err => {
           logger.warn(`Warmup failed for ${symbol}:`, err);
@@ -1357,10 +1387,24 @@ app.post('/api/engine/start', async (req, res) => {
       runtimeState.candlesBuffered = signalProcessor!.getAllCandleCounts();
     });
 
+    // Wait up to 10 seconds for warmup to complete
+    const warmupTimeout = new Promise<void>(resolve => setTimeout(resolve, 10_000));
+    await Promise.race([warmupPromise, warmupTimeout]);
+
+    // Gather warmup status for response
+    const candleCounts = signalProcessor!.getAllCandleCounts();
+    const warmedUp = signalProcessor!.isAllWarmedUp();
+    runtimeState.warmupComplete = warmedUp;
+    runtimeState.candlesBuffered = candleCounts;
+
     res.json({
       success: true,
       message: `Trading engine started in ${mode} mode`,
       activeSymbols,
+      warmup: {
+        complete: warmedUp,
+        candlesBuffered: candleCounts,
+      },
     });
 
   } catch (error) {
@@ -2884,6 +2928,7 @@ async function updateSupabasePrice(symbol: string, price: number) {
 }
 
 async function updateAccountMetrics() {
+  if (!supabaseAvailable) { logSupabaseUnavailable('updateAccountMetrics'); return; }
   try {
     const { data, error } = await supabase.rpc('upsert_account_metrics', {
       p_user_id: USER_ID
@@ -2908,6 +2953,7 @@ async function updateAccountMetrics() {
 
 // Initialize account metrics with starting balance
 async function initializeAccountMetrics() {
+  if (!supabaseAvailable) { logSupabaseUnavailable('initializeAccountMetrics'); return; }
   try {
     const today = new Date().toISOString().split('T')[0];
     
@@ -2953,6 +2999,7 @@ async function initializeAccountMetrics() {
 }
 
 async function syncOrderToSupabase(order: any) {
+  if (!supabaseAvailable) { logSupabaseUnavailable('syncOrderToSupabase'); return; }
   const mapOrderStatus = (status?: string) => {
     switch ((status || '').toLowerCase()) {
       case 'open':
@@ -3043,6 +3090,7 @@ async function syncOrderToSupabase(order: any) {
 }
 
 async function syncFillToSupabase(fill: any) {
+  if (!supabaseAvailable) { logSupabaseUnavailable('syncFillToSupabase'); return; }
   try {
     const { error } = await supabase
       .from('fills')
@@ -3067,6 +3115,7 @@ async function syncFillToSupabase(fill: any) {
 }
 
 async function syncPositionToSupabase(position: any) {
+  if (!supabaseAvailable) { logSupabaseUnavailable('syncPositionToSupabase'); return; }
   try {
     const symbol = position.symbol || position.product;
     const side = position.side as 'long' | 'short' | 'flat' | undefined;
@@ -3121,6 +3170,7 @@ async function syncPositionToSupabase(position: any) {
 }
 
 async function syncSignalToSupabase(signal: any) {
+  if (!supabaseAvailable) { logSupabaseUnavailable('syncSignalToSupabase'); return; }
   try {
     const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     const maybeId = (typeof signal.id === 'string' && uuidV4.test(signal.id)) ? signal.id : undefined;
@@ -3163,6 +3213,7 @@ async function syncSignalToSupabase(signal: any) {
 }
 
 async function createSupabaseAlert(alert: any) {
+  if (!supabaseAvailable) { logSupabaseUnavailable('createSupabaseAlert'); return; }
   try {
     const { error } = await supabase
       .from('alerts')
