@@ -943,6 +943,15 @@ export class RiskEngine extends EventEmitter {
       size = Math.min(size, maxSizeByExposure);
     }
 
+    // Cap by per-symbol notional limit (especially important during soft launch)
+    const perSymbolCap = this.getEffectivePerSymbolNotionalCapUsd();
+    if (perSymbolCap !== null && Number.isFinite(perSymbolCap) && perSymbolCap > 0) {
+      const maxSizeByCap = (perSymbolCap * 0.98) / entryPrice; // 2% safety margin
+      if (Number.isFinite(maxSizeByCap)) {
+        size = Math.min(size, maxSizeByCap);
+      }
+    }
+
     const notional = size * entryPrice;
     const minNotionalUsd = soft?.minOrderSizeUsd && Number.isFinite(soft.minOrderSizeUsd) && soft.minOrderSizeUsd > 0
       ? Math.min(this.minOrderNotionalUsd, soft.minOrderSizeUsd)

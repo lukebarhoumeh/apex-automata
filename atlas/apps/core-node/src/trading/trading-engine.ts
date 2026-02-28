@@ -691,7 +691,7 @@ export class TradingEngine extends EventEmitter {
           maxTotalExposureMultiplier: 0.75,
           maxOrderSizeMultiplier: 0.5,
           maxDailyLossMultiplier: 0.5,
-          perSymbolNotionalCapUsd: 1000,
+          perSymbolNotionalCapUsd: 5000,
           minOrderSizeUsd: 25,
         }
       : undefined;
