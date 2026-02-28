@@ -6,9 +6,9 @@ account:
   min_notional_buffer: 1.1
 
 risk:
-  daily_loss_limit: -0.008
-  weekly_loss_limit: -0.025
-  max_drawdown_limit: -0.1
+  daily_loss_limit: -0.03
+  weekly_loss_limit: -0.06
+  max_drawdown_limit: -0.08
   max_position_exposure_pct: 0.5
   funding_cost_tolerance_bps: 20
   slippage_estimate_bps: 3
@@ -55,7 +55,7 @@ strategy:
   # - 'sell' on flat position = no action (cannot open short on Coinbase spot)
   # To enable shorting, use an exchange that supports margin/futures (e.g., Binance Futures, dYdX)
   allow_short: false
-  trade_cooldown_min: 15
+  trade_cooldown_min: 5
 
 execution:
   order_type: marketable_limit

@@ -685,13 +685,13 @@ export class TradingEngine extends EventEmitter {
     const softLaunch = enableSoftLaunch
       ? {
           enabled: true,
-          maxEntryTrades: 10,
-          riskPerTradeMultiplier: 0.25,
-          maxPositionSizeMultiplier: 0.25,
-          maxTotalExposureMultiplier: 0.5,
-          maxOrderSizeMultiplier: 0.25,
+          maxEntryTrades: 5,
+          riskPerTradeMultiplier: 0.5,
+          maxPositionSizeMultiplier: 0.5,
+          maxTotalExposureMultiplier: 0.75,
+          maxOrderSizeMultiplier: 0.5,
           maxDailyLossMultiplier: 0.5,
-          perSymbolNotionalCapUsd: 250,
+          perSymbolNotionalCapUsd: 1000,
           minOrderSizeUsd: 25,
         }
       : undefined;
