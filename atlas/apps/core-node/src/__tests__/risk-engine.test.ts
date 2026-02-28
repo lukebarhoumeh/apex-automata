@@ -442,9 +442,11 @@ describe('RiskEngine', () => {
       await positionTracker.processFill(mkFill({ trade_id: 13, side: 'buy', price: '1000' }) as any);
       await positionTracker.processFill(mkFill({ trade_id: 14, side: 'sell', price: '1100' }) as any);
       
-      // Now soft launch should be inactive, sizing reverts to base capped by 2% safety margin → 0.098.
+      // Now soft launch should be inactive, sizing reverts to base capped by 2% safety margin.
+      // After 2 profitable trades ($100 each, buy@1000 sell@1100, size=1), equity compounded:
+      // equity = 10000 + 200 = 10200, maxExposure = 10200 * 0.5 * 0.98 = 4998, size = 4998/50000 = 0.09996
       const sizedAfter = softEngine.computeOrderSize('BTC-USD', 50000, 49000);
-      expect(sizedAfter).toBeCloseTo(0.098, 6);
+      expect(sizedAfter).toBeCloseTo(0.09996, 4);
       
       softEngine.stop();
     });
