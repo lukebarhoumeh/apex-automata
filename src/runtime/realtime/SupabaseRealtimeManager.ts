@@ -139,7 +139,8 @@ class SupabaseRealtimeManager {
   private config: RealtimeSubscriptionConfig | null = null;
   private latencyStats: RealtimeLatencyStats;
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
+  // Infinite reconnect — Supabase realtime should never permanently disconnect
+  private maxReconnectAttempts = Infinity;
   private reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null;
   
   constructor() {
@@ -266,9 +267,9 @@ class SupabaseRealtimeManager {
    * Schedule a reconnection attempt.
    */
   private scheduleReconnect(): void {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('[SupabaseRealtimeManager] Max reconnect attempts reached');
-      return;
+    // Never give up — log every 20 attempts for visibility
+    if (this.reconnectAttempts > 0 && this.reconnectAttempts % 20 === 0) {
+      console.warn(`[SupabaseRealtimeManager] Still reconnecting after ${this.reconnectAttempts} attempts`);
     }
     
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
