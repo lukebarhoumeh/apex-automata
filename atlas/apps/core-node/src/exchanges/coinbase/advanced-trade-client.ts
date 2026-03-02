@@ -4,10 +4,19 @@
  * This is the new API replacing the deprecated GDAX/Exchange API.
  * Use COINBASE_API_VERSION=advanced to enable.
  * 
- * Key differences:
- * - Different authentication method (JWT for v3)
- * - Different endpoint paths (/api/v3/brokerage/...)
- * - Different order/account structure
+ * Authentication: ES256 JWT signed with EC private key
+ * Endpoints: /api/v3/brokerage/...
+ * 
+ * JWT claims format (per Coinbase CDP docs):
+ * - sub: Full API key resource name (organizations/{org_id}/apiKeys/{key_id})
+ * - iss: "cdp" (issuer)
+ * - aud: ["cdp_service"]
+ * - nbf: Current timestamp
+ * - exp: Current timestamp + 120 seconds
+ * - Header kid: API key ID (the full resource name)
+ * - Header nonce: Random hex string
+ * 
+ * Reference: https://docs.cdp.coinbase.com/get-started/authentication/jwt-authentication
  */
 
 import axios, { AxiosInstance, InternalAxiosRequestConfig } from 'axios';
@@ -23,8 +32,8 @@ import {
 } from './types';
 
 export interface AdvancedTradeConfig {
-  apiKey: string;
-  apiSecret: string;
+  apiKey: string;    // Full key: organizations/{org_id}/apiKeys/{key_id}
+  apiSecret: string; // EC private key in PEM format
   environment: 'production' | 'sandbox';
 }
 
@@ -66,23 +75,134 @@ interface ATOrder {
 }
 
 /**
+ * Base64url encode (no padding, URL-safe)
+ */
+function base64url(buffer: Buffer): string {
+  return buffer
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+/**
+ * Convert DER-encoded ECDSA signature to raw R||S format (64 bytes for P-256).
+ * Node.js crypto.sign() returns DER by default; JWT ES256 requires raw format.
+ */
+function derToRaw(derSig: Buffer): Buffer {
+  // DER format: 0x30 [total-len] 0x02 [r-len] [r] 0x02 [s-len] [s]
+  let offset = 2; // skip 0x30 and total length
+
+  // Read R
+  if (derSig[offset] !== 0x02) throw new Error('Invalid DER signature: expected 0x02 for R');
+  offset++;
+  const rLen = derSig[offset];
+  offset++;
+  let r = derSig.subarray(offset, offset + rLen);
+  offset += rLen;
+
+  // Read S
+  if (derSig[offset] !== 0x02) throw new Error('Invalid DER signature: expected 0x02 for S');
+  offset++;
+  const sLen = derSig[offset];
+  offset++;
+  let s = derSig.subarray(offset, offset + sLen);
+
+  // Remove leading zeros (DER uses signed integers, may have leading 0x00)
+  if (r.length > 32) r = r.subarray(r.length - 32);
+  if (s.length > 32) s = s.subarray(s.length - 32);
+
+  // Pad to 32 bytes each
+  const raw = Buffer.alloc(64);
+  r.copy(raw, 32 - r.length);
+  s.copy(raw, 64 - s.length);
+
+  return raw;
+}
+
+/**
+ * Generate a JWT for Coinbase Advanced Trade API.
+ * Uses ES256 (ECDSA with P-256 curve and SHA-256).
+ */
+function generateCoinbaseJwt(
+  apiKey: string,
+  privateKeyPem: string,
+  requestMethod: string,
+  requestPath: string,
+): string {
+  const now = Math.floor(Date.now() / 1000);
+  const nonce = crypto.randomBytes(16).toString('hex');
+
+  // Construct the URI for the request
+  const uri = `${requestMethod} ${requestPath}`;
+
+  // JWT Header
+  const header = {
+    alg: 'ES256',
+    typ: 'JWT',
+    kid: apiKey,
+    nonce,
+  };
+
+  // JWT Payload per Coinbase CDP docs
+  const payload = {
+    sub: apiKey,
+    iss: 'cdp',
+    aud: ['cdp_service'],
+    nbf: now,
+    exp: now + 120,
+    uri,
+  };
+
+  // Encode header and payload
+  const headerB64 = base64url(Buffer.from(JSON.stringify(header)));
+  const payloadB64 = base64url(Buffer.from(JSON.stringify(payload)));
+  const signingInput = `${headerB64}.${payloadB64}`;
+
+  // Parse the EC private key — handle \n escape sequences in env vars
+  const cleanPem = privateKeyPem.replace(/\\n/g, '\n').trim();
+
+  // Sign with ES256
+  const privateKey = crypto.createPrivateKey({
+    key: cleanPem,
+    format: 'pem',
+    type: 'sec1', // EC private key format
+  });
+
+  const derSignature = crypto.sign('sha256', Buffer.from(signingInput), {
+    key: privateKey,
+    dsaEncoding: 'der',
+  });
+
+  // Convert DER to raw R||S format for JWT
+  const rawSignature = derToRaw(derSignature);
+  const signatureB64 = base64url(rawSignature);
+
+  return `${signingInput}.${signatureB64}`;
+}
+
+/**
  * Coinbase Advanced Trade REST API Client
+ * 
+ * Uses ES256 JWT authentication with EC private key.
+ * Compatible with Coinbase CDP API keys (organizations/... format).
  */
 export class AdvancedTradeRestClient {
   private client: AxiosInstance;
   private config: AdvancedTradeConfig;
   private logger: Logger;
+  private baseURL: string;
 
   constructor(config: AdvancedTradeConfig, logger: Logger) {
     this.config = config;
     this.logger = logger;
 
-    const baseURL = config.environment === 'production'
+    this.baseURL = config.environment === 'production'
       ? 'https://api.coinbase.com'
       : 'https://api-sandbox.coinbase.com';
 
     this.client = axios.create({
-      baseURL,
+      baseURL: this.baseURL,
       timeout: 15000,
       headers: {
         'Content-Type': 'application/json',
@@ -90,7 +210,7 @@ export class AdvancedTradeRestClient {
       },
     });
 
-    // Add authentication interceptor
+    // Add JWT authentication interceptor
     this.client.interceptors.request.use(
       this.addAuthHeaders.bind(this),
       error => Promise.reject(error)
@@ -98,28 +218,34 @@ export class AdvancedTradeRestClient {
   }
 
   /**
-   * Generate authentication headers for Advanced Trade API
-   * Uses HMAC-SHA256 signature
+   * Generate JWT authentication headers for Advanced Trade API.
+   * Creates a fresh ES256 JWT for each request (120s expiry).
    */
   private addAuthHeaders(config: InternalAxiosRequestConfig): InternalAxiosRequestConfig {
-    const timestamp = Math.floor(Date.now() / 1000).toString();
-    const method = config.method?.toUpperCase() || 'GET';
-    const path = config.url || '';
-    const body = config.data ? JSON.stringify(config.data) : '';
+    // Skip auth if no credentials (allows public endpoint access)
+    if (!this.config.apiKey || !this.config.apiSecret) {
+      return config;
+    }
 
-    // Create signature
-    const message = timestamp + method + path + body;
-    const signature = crypto
-      .createHmac('sha256', this.config.apiSecret)
-      .update(message)
-      .digest('hex');
+    try {
+      const method = (config.method?.toUpperCase() || 'GET');
+      const path = config.url || '';
 
-    const headers = config.headers as any;
-    headers['CB-ACCESS-KEY'] = this.config.apiKey;
-    headers['CB-ACCESS-SIGN'] = signature;
-    headers['CB-ACCESS-TIMESTAMP'] = timestamp;
+      const jwt = generateCoinbaseJwt(
+        this.config.apiKey,
+        this.config.apiSecret,
+        method,
+        `api.coinbase.com${path}`,
+      );
 
-    return config;
+      const headers = config.headers as any;
+      headers['Authorization'] = `Bearer ${jwt}`;
+
+      return config;
+    } catch (error) {
+      this.logger.error('Failed to generate JWT for Coinbase API:', error);
+      throw error;
+    }
   }
 
   /**
@@ -146,7 +272,7 @@ export class AdvancedTradeRestClient {
   }
 
   /**
-   * Get all products
+   * Get all products (public endpoint — works without auth)
    */
   async getProducts(): Promise<Product[]> {
     try {
@@ -181,7 +307,7 @@ export class AdvancedTradeRestClient {
   }
 
   /**
-   * Create an order
+   * Create an order (requires auth)
    */
   async createOrder(order: OrderRequest): Promise<CoinbaseOrder> {
     try {
@@ -195,8 +321,8 @@ export class AdvancedTradeRestClient {
       if (order.type === 'market') {
         atOrder.order_configuration = {
           market_market_ioc: {
-            quote_size: order.funds,
-            base_size: order.size,
+            ...(order.size ? { base_size: order.size } : {}),
+            ...(order.funds ? { quote_size: order.funds } : {}),
           },
         };
       } else if (order.type === 'limit') {
@@ -212,7 +338,7 @@ export class AdvancedTradeRestClient {
       const response = await this.client.post('/api/v3/brokerage/orders', atOrder);
       const atResponse = response.data;
 
-      // Convert response to legacy format
+      // Convert response to legacy format for compatibility
       return {
         id: atResponse.order_id || atResponse.success_response?.order_id,
         product_id: order.product_id,
@@ -317,7 +443,7 @@ export class AdvancedTradeRestClient {
   }
 
   /**
-   * Get product candles (OHLCV)
+   * Get product candles (OHLCV) — public endpoint, works without auth
    */
   async getCandles(productId: string, granularity: number, start?: string, end?: string): Promise<Candle[]> {
     try {
@@ -341,6 +467,65 @@ export class AdvancedTradeRestClient {
       }));
     } catch (error) {
       this.logger.error('Failed to get candles:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get open orders
+   */
+  async getOrders(status?: string[], productId?: string, limit?: number): Promise<CoinbaseOrder[]> {
+    try {
+      const params: any = {};
+      if (productId) params.product_id = productId;
+      if (limit) params.limit = limit;
+      if (status && status.length > 0) {
+        // Advanced Trade uses order_status filter
+        params.order_status = status.map(s => s.toUpperCase());
+      }
+
+      const response = await this.client.get('/api/v3/brokerage/orders/historical', { params });
+      const orders: ATOrder[] = response.data.orders || [];
+
+      return orders.map(o => ({
+        id: o.order_id,
+        product_id: o.product_id,
+        side: o.side.toLowerCase() as 'buy' | 'sell',
+        type: o.order_type.toLowerCase() as 'limit' | 'market',
+        size: o.filled_size,
+        price: o.average_filled_price,
+        status: this.mapOrderStatus(o.status),
+        created_at: o.created_time,
+        done_at: '',
+        fill_fees: o.fee,
+        filled_size: o.filled_size,
+        executed_value: o.filled_value,
+        settled: o.status === 'FILLED',
+        post_only: false,
+        time_in_force: 'GTC',
+      }));
+    } catch (error) {
+      this.logger.error('Failed to get orders:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Cancel all orders for a product
+   */
+  async cancelAllOrders(productId?: string): Promise<string[]> {
+    try {
+      // Get open orders first, then batch cancel
+      const openOrders = await this.getOrders(['OPEN', 'PENDING'], productId);
+      if (openOrders.length === 0) return [];
+
+      const orderIds = openOrders.map(o => o.id);
+      const response = await this.client.post('/api/v3/brokerage/orders/batch_cancel', {
+        order_ids: orderIds,
+      });
+      return response.data.results?.map((r: any) => r.order_id) || orderIds;
+    } catch (error) {
+      this.logger.error('Failed to cancel all orders:', error);
       throw error;
     }
   }

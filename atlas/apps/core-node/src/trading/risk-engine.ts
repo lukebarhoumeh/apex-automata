@@ -867,13 +867,34 @@ export class RiskEngine extends EventEmitter {
     };
   }
 
+  /**
+   * Get dynamic equity for position sizing (profit compounding).
+   * 
+   * Uses current equity (base + PnL) instead of static config value.
+   * Floors at 50% of initial equity to prevent over-shrinking after losses.
+   * Caps at 200% of initial equity to prevent over-leveraging after big wins.
+   */
+  public getCurrentEquityForSizing(): number {
+    const currentEquity = this.dailyStartEquity + this.metrics.dailyPnL;
+    const floor = this.accountEquity * 0.5;   // Never size below 50% of initial
+    const ceiling = this.accountEquity * 2.0;  // Never size above 200% of initial
+    
+    if (!Number.isFinite(currentEquity) || currentEquity <= 0) {
+      return this.accountEquity; // Fallback to static config
+    }
+    
+    return Math.max(floor, Math.min(ceiling, currentEquity));
+  }
+
   public computeOrderSize(productId: string, entryPrice: number, stopPrice: number): number {
     const stopDistance = Math.abs(entryPrice - stopPrice);
     if (!Number.isFinite(stopDistance) || stopDistance === 0) {
       return 0;
     }
 
-    let riskUsd = this.accountEquity * this.guardrails.account.risk_per_trade;
+    // Use dynamic equity for profit compounding — positions scale with accumulated PnL
+    const sizingEquity = this.getCurrentEquityForSizing();
+    let riskUsd = sizingEquity * this.guardrails.account.risk_per_trade;
     const soft = this.getSoftLaunch();
     if (soft) {
       riskUsd = this.scaleUsd(riskUsd, soft.riskPerTradeMultiplier);

@@ -48,7 +48,9 @@ export class RuntimeWsClient {
   private subscribers: Set<SubscriberEntry> = new Set();
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 20;
+  // Infinite reconnect — matches backend WS behavior for 24/7 operation.
+  // Previous value of 20 caused the UI to permanently disconnect after ~30 minutes.
+  private maxReconnectAttempts = Infinity;
   private baseReconnectDelay = 1000;
   private maxReconnectDelay = 30000;
   
@@ -281,9 +283,10 @@ export class RuntimeWsClient {
       return;
     }
     
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      this.updateState({ error: 'Max reconnection attempts reached' });
-      return;
+    // Never give up reconnecting — crypto runs 24/7
+    // Log a warning every 50 attempts for visibility
+    if (this.reconnectAttempts > 0 && this.reconnectAttempts % 50 === 0) {
+      console.warn(`[RuntimeWS] Still reconnecting after ${this.reconnectAttempts} attempts`);
     }
     
     // Exponential backoff with jitter
