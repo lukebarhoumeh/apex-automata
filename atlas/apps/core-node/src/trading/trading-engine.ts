@@ -555,18 +555,50 @@ export class TradingEngine extends EventEmitter {
       throw new Error(`No credentials found for ${this.config.exchange.name} (${this.config.exchange.environment})`);
     }
 
+    // Determine WS and REST URLs based on API version and environment
+    // Advanced Trade API uses different endpoints than legacy Exchange API
+    const apiVersion = process.env.COINBASE_API_VERSION || 'exchange';
+    const isProduction = this.config.exchange.environment === 'production';
+    
+    let wsUrl: string;
+    let restUrl: string;
+    
+    if (apiVersion === 'advanced') {
+      // Coinbase Advanced Trade API endpoints
+      // WS: advanced-trade-ws.coinbase.com (authenticated channels)
+      // For public market data (ticker), the legacy WS still works and is more reliable
+      // Use legacy WS for market data since it doesn't require auth
+      wsUrl = isProduction
+        ? 'wss://ws-feed.exchange.coinbase.com'
+        : 'wss://ws-feed-public.sandbox.exchange.coinbase.com';
+      // REST: api.coinbase.com (Advanced Trade v3 endpoints)
+      restUrl = isProduction
+        ? 'https://api.coinbase.com'
+        : 'https://api-sandbox.coinbase.com';
+      
+      this.logger.info('Using Coinbase Advanced Trade API endpoints', {
+        wsUrl,
+        restUrl,
+        apiVersion,
+      });
+    } else {
+      // Legacy Coinbase Exchange (GDAX/Pro) endpoints
+      wsUrl = isProduction
+        ? 'wss://ws-feed.exchange.coinbase.com'
+        : 'wss://ws-feed-public.sandbox.exchange.coinbase.com';
+      restUrl = isProduction
+        ? 'https://api.exchange.coinbase.com'
+        : 'https://api-public.sandbox.exchange.coinbase.com';
+    }
+
     // Configure Coinbase
     const coinbaseConfig: CoinbaseConfig = {
       apiKey: credentials.apiKey,
       apiSecret: credentials.apiSecret,
       apiPassphrase: credentials.apiPassphrase,
       environment: this.config.exchange.environment,
-      wsUrl: this.config.exchange.environment === 'production'
-        ? 'wss://ws-feed.exchange.coinbase.com'
-        : 'wss://ws-feed-public.sandbox.exchange.coinbase.com',
-      restUrl: this.config.exchange.environment === 'production'
-        ? 'https://api.exchange.coinbase.com'
-        : 'https://api-public.sandbox.exchange.coinbase.com'
+      wsUrl,
+      restUrl,
     };
 
     this.exchange = new CoinbaseExchange(coinbaseConfig, this.logger);
