@@ -1390,14 +1390,8 @@ async function runLivePreflight(input: {
 }): Promise<LivePreflightResult> {
   const warnings: string[] = [];
   
-  // This API server currently uses the legacy Exchange (Coinbase Pro) endpoints via `CoinbaseRestClient`.
-  if (env.COINBASE_API_VERSION !== 'exchange') {
-    return {
-      ok: false,
-      error: `COINBASE_API_VERSION must be 'exchange' for live trading (current engine integration). Got: ${env.COINBASE_API_VERSION}`,
-      warnings,
-    };
-  }
+  // Validate API version and credentials
+  const apiVersion = env.COINBASE_API_VERSION || 'exchange';
   
   if (!env.COINBASE_API_KEY || !env.COINBASE_API_SECRET) {
     return {
@@ -1407,12 +1401,26 @@ async function runLivePreflight(input: {
     };
   }
   
-  if (!env.COINBASE_API_PASSPHRASE) {
+  if (apiVersion === 'exchange' && !env.COINBASE_API_PASSPHRASE) {
     return {
       ok: false,
-      error: 'Missing COINBASE_API_PASSPHRASE for live trading (required for Coinbase Exchange API auth)',
+      error: 'Missing COINBASE_API_PASSPHRASE for live trading (required for legacy Coinbase Exchange API auth)',
       warnings,
     };
+  }
+  
+  if (apiVersion === 'advanced') {
+    // Advanced Trade API uses JWT with EC private key — validate key format
+    const secret = env.COINBASE_API_SECRET || '';
+    const cleanSecret = secret.replace(/\\n/g, '\n').trim();
+    if (!cleanSecret.includes('BEGIN EC PRIVATE KEY') && !cleanSecret.includes('BEGIN PRIVATE KEY')) {
+      return {
+        ok: false,
+        error: 'COINBASE_API_SECRET must be an EC private key in PEM format for Advanced Trade API',
+        warnings,
+      };
+    }
+    warnings.push('Using Coinbase Advanced Trade API (JWT auth with ES256)');
   }
   
   // Ensure exchange credentials are stored in Supabase (the trading engine loads secrets from Supabase).
