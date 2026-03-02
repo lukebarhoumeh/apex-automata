@@ -929,38 +929,85 @@ app.post('/api/engine/start', async (req, res) => {
     signalProcessor = new SignalProcessor(signalConfig, logger);
 
     // Set up data loader from exchange for historical data
+    // Uses Coinbase public REST endpoint (no auth required) for fast warmup
     signalProcessor.setDataLoader(async (symbol: string, limit: number) => {
-      if (!tradingEngine) {
-        return [];
+      // Try primary: exchange REST client (works with credentials)
+      if (tradingEngine) {
+        try {
+          const exchange = (tradingEngine as any).exchange;
+          if (exchange) {
+            const end = new Date();
+            const start = new Date(end.getTime() - limit * 60 * 1000);
+            
+            const candles = await exchange.getCandles(symbol, {
+              start: start.toISOString(),
+              end: end.toISOString(),
+              granularity: 60,
+            });
+            
+            if (candles && candles.length > 0) {
+              return candles.map((c: any) => ({
+                time: c.time * 1000,
+                open: c.open,
+                high: c.high,
+                low: c.low,
+                close: c.close,
+                volume: c.volume,
+              }));
+            }
+          }
+        } catch (error) {
+          logger.warn(`Exchange REST candle fetch failed for ${symbol}, trying public API fallback`);
+        }
       }
+      
+      // Fallback: Coinbase public REST API (no auth required)
+      // Works in paper mode without credentials — essential for fast warmup
       try {
-        // Get exchange from trading engine to fetch candles
-        const exchange = (tradingEngine as any).exchange;
-        if (!exchange) {
-          logger.warn('No exchange available for historical data loading');
+        const end = Math.floor(Date.now() / 1000);
+        const start = end - (limit * 60);
+        const url = `https://api.exchange.coinbase.com/products/${symbol}/candles?granularity=60&start=${start}&end=${end}`;
+        
+        logger.info(`Loading historical candles from public API for ${symbol}`, { limit });
+        
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+        
+        const response = await fetch(url, {
+          headers: { 'User-Agent': 'AtlasBot/1.0' },
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        
+        if (!response.ok) {
+          logger.warn(`Public candle API returned ${response.status} for ${symbol}`);
           return [];
         }
         
-        // Calculate time range for historical candles (1 minute granularity)
-        const end = new Date();
-        const start = new Date(end.getTime() - limit * 60 * 1000);
+        const data = await response.json() as number[][];
         
-        const candles = await exchange.getCandles(symbol, {
-          start: start.toISOString(),
-          end: end.toISOString(),
-          granularity: 60, // 1 minute
-        });
+        // Coinbase public API returns: [time, low, high, open, close, volume]
+        // Each element is an array of 6 numbers, newest first
+        if (!Array.isArray(data) || data.length === 0) {
+          return [];
+        }
         
-        return candles.map((c: any) => ({
-          time: c.time * 1000, // Convert to milliseconds
-          open: c.open,
-          high: c.high,
-          low: c.low,
-          close: c.close,
-          volume: c.volume,
-        }));
+        const candles = data
+          .filter((c: any) => Array.isArray(c) && c.length >= 6)
+          .map((c: number[]) => ({
+            time: c[0] * 1000, // Convert to milliseconds
+            open: c[3],
+            high: c[2],
+            low: c[1],
+            close: c[4],
+            volume: c[5],
+          }))
+          .sort((a: any, b: any) => a.time - b.time); // Sort oldest first
+        
+        logger.info(`Loaded ${candles.length} historical candles from public API for ${symbol}`);
+        return candles;
       } catch (error) {
-        logger.warn(`Failed to load historical candles for ${symbol} from exchange:`, error);
+        logger.warn(`Public API candle fetch failed for ${symbol}:`, error);
         return [];
       }
     });
@@ -1343,14 +1390,8 @@ async function runLivePreflight(input: {
 }): Promise<LivePreflightResult> {
   const warnings: string[] = [];
   
-  // This API server currently uses the legacy Exchange (Coinbase Pro) endpoints via `CoinbaseRestClient`.
-  if (env.COINBASE_API_VERSION !== 'exchange') {
-    return {
-      ok: false,
-      error: `COINBASE_API_VERSION must be 'exchange' for live trading (current engine integration). Got: ${env.COINBASE_API_VERSION}`,
-      warnings,
-    };
-  }
+  // Validate API version and credentials
+  const apiVersion = env.COINBASE_API_VERSION || 'exchange';
   
   if (!env.COINBASE_API_KEY || !env.COINBASE_API_SECRET) {
     return {
@@ -1360,12 +1401,26 @@ async function runLivePreflight(input: {
     };
   }
   
-  if (!env.COINBASE_API_PASSPHRASE) {
+  if (apiVersion === 'exchange' && !env.COINBASE_API_PASSPHRASE) {
     return {
       ok: false,
-      error: 'Missing COINBASE_API_PASSPHRASE for live trading (required for Coinbase Exchange API auth)',
+      error: 'Missing COINBASE_API_PASSPHRASE for live trading (required for legacy Coinbase Exchange API auth)',
       warnings,
     };
+  }
+  
+  if (apiVersion === 'advanced') {
+    // Advanced Trade API uses JWT with EC private key — validate key format
+    const secret = env.COINBASE_API_SECRET || '';
+    const cleanSecret = secret.replace(/\\n/g, '\n').trim();
+    if (!cleanSecret.includes('BEGIN EC PRIVATE KEY') && !cleanSecret.includes('BEGIN PRIVATE KEY')) {
+      return {
+        ok: false,
+        error: 'COINBASE_API_SECRET must be an EC private key in PEM format for Advanced Trade API',
+        warnings,
+      };
+    }
+    warnings.push('Using Coinbase Advanced Trade API (JWT auth with ES256)');
   }
   
   // Ensure exchange credentials are stored in Supabase (the trading engine loads secrets from Supabase).

@@ -6,8 +6,12 @@ account:
   min_notional_buffer: 1.1
 
 risk:
-  daily_loss_limit: -0.008
-  weekly_loss_limit: -0.025
+  # 3% daily = $1,500 — allows 3 full-risk losing trades before kill switch
+  # Previous value (-0.008 = 0.8% = $400) was LESS than risk_per_trade (1% = $500),
+  # meaning a single losing trade triggered the kill switch.
+  daily_loss_limit: -0.03
+  # 6% weekly = $3,000 — 2x daily limit
+  weekly_loss_limit: -0.06
   max_drawdown_limit: -0.1
   max_position_exposure_pct: 0.5
   funding_cost_tolerance_bps: 20
@@ -17,21 +21,21 @@ risk:
 per_symbol:
   BTC-USD:
     max_notional_usd: 30000
-    max_daily_loss_usd: 500
+    max_daily_loss_usd: 750
     strategy_overrides:
       breakout:
         atrMultiplier: 1.8
         volumeThreshold: 1.0
   ETH-USD:
     max_notional_usd: 25000
-    max_daily_loss_usd: 400
+    max_daily_loss_usd: 600
     strategy_overrides:
       breakout:
         atrMultiplier: 2.0
         volumeThreshold: 1.1
   SOL-USD:
     max_notional_usd: 20000
-    max_daily_loss_usd: 300
+    max_daily_loss_usd: 500
     strategy_overrides:
       breakout:
         atrMultiplier: 2.5
@@ -55,7 +59,8 @@ strategy:
   # - 'sell' on flat position = no action (cannot open short on Coinbase spot)
   # To enable shorting, use an exchange that supports margin/futures (e.g., Binance Futures, dYdX)
   allow_short: false
-  trade_cooldown_min: 15
+  # Reduced from 15 to 5 — crypto markets move fast, 15 min cooldown misses opportunities
+  trade_cooldown_min: 5
 
 execution:
   order_type: marketable_limit
@@ -70,7 +75,8 @@ execution:
     - 30000
 
 circuit_breakers:
-  rapid_loss_trigger: -0.003
+  # 1.5% = $750 in 10 minutes — previous value (-0.003 = $150) was triggered by normal market moves
+  rapid_loss_trigger: -0.015
   fill_rate_collapse: 0.1
   adverse_selection_spike: 0.6
   correlation_spike: 0.8
@@ -81,9 +87,32 @@ filters:
   atr_volatility_min: 0.0005  # Lowered to allow more trades (0.05% ATR)
   atr_volatility_max: 0.05    # Raised to allow higher volatility
   funding_bias_enabled: true
-  time_filter_enabled: true
+  # Crypto trades 24/7 — no hour restriction needed
+  time_filter_enabled: false
   allowed_hours_utc:
     - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    - 17
+    - 18
+    - 19
+    - 20
+    - 21
+    - 22
     - 23
 
 compliance:
