@@ -30,11 +30,12 @@ export const RiskDashboard = () => {
   // Risk heat from snapshot (exposure / equity)
   const riskHeat = totalEquity > 0 ? (exposureUsd / totalEquity) * 100 : 0;
   
-  // Max drawdown would come from session stats or separate tracking
-  // For now, derive from daily P&L if negative
-  const maxDrawdownPct = dailyPnL < 0 && totalEquity > 0
-    ? Math.abs(dailyPnL / totalEquity) * 100
-    : 0;
+  // Max drawdown from snapshot (already in 0-100 percentage range)
+  const maxDrawdownPct = (snapshot as any)?.maxDrawdownPct ?? (
+    dailyPnL < 0 && totalEquity > 0
+      ? Math.abs(dailyPnL / totalEquity) * 100
+      : 0
+  );
 
   const hasData = snapshot !== null && source !== 'none';
 

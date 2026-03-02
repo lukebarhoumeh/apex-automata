@@ -1241,7 +1241,7 @@ export class RiskEngine extends EventEmitter {
     try {
       const { error } = await this.supabase
         .from('risk_metrics')
-        .insert({
+        .upsert({
           user_id: this.userId,
           daily_pnl: this.metrics.dailyPnL,
           max_drawdown: this.metrics.maxDrawdown,
@@ -1250,7 +1250,7 @@ export class RiskEngine extends EventEmitter {
           kill_switch_active: this.metrics.killSwitchActive,
           exposure_usd: this.metrics.currentExposure,
           updated_at: this.metrics.lastUpdated.toISOString(),
-        });
+        }, { onConflict: 'user_id' });
 
       if (error) {
         // Table doesn't exist is less severe, but still track it

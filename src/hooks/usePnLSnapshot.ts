@@ -63,6 +63,34 @@ function normalizeSnapshot(raw: unknown): PnLSnapshot | null {
 }
 
 /**
+ * Build a PnL snapshot object from /api/status response shape
+ * when /api/pnl is not available and .pnl is missing from status.
+ */
+function buildSnapshotFromStatus(status: Record<string, unknown>): Record<string, unknown> | null {
+  const risk = status.risk as Record<string, unknown> | undefined;
+  if (!risk) return null;
+  
+  const dailyPnlUsd = Number(risk.dailyPnLUsd ?? 0);
+  const exposureUsd = Number(risk.exposureUsd ?? 0);
+  
+  return {
+    ts: Number(status.timestamp ?? Date.now()),
+    executionMode: status.mode ?? 'paper',
+    riskDay: new Date().toISOString().split('T')[0],
+    sessionStartEquityUsd: 50_000,
+    dayStartEquityUsd: 50_000,
+    totalEquityUsd: 50_000 + dailyPnlUsd,
+    dailyPnlUsd,
+    dailyPnlR: 0,
+    riskUnitUsd: 500,
+    realizedPnlUsd: 0,
+    unrealizedPnlUsd: 0,
+    exposureUsd,
+    openPositionsCount: 0,
+  };
+}
+
+/**
  * Primary P&L snapshot hook
  * 
  * Returns the current snapshot state with source tracking and staleness detection.
@@ -102,25 +130,28 @@ export const usePnLSnapshot = (): PnLSnapshotState => {
         // Try /api/pnl first (dedicated endpoint)
         let response = await fetch(`${API_URL}/api/pnl`);
         
-        // Fall back to /api/status which may contain pnl data
-        if (!response.ok) {
-          response = await fetch(`${API_URL}/api/status`);
+        if (response.ok) {
+          const data = await response.json();
+          const normalized = normalizeSnapshot(data);
+          if (normalized && (normalized.totalEquityUsd > 0 || normalized.dailyPnlUsd !== 0)) {
+            lastSnapshotTsRef.current = normalized.ts;
+            if (source !== 'ws') setSource('rest');
+            return normalized;
+          }
         }
         
-        if (!response.ok) {
-          return null;
-        }
+        // Fall back to /api/status which has pnl nested under .pnl
+        response = await fetch(`${API_URL}/api/status`);
+        if (!response.ok) return null;
         
-        const data = await response.json();
-        // /api/status may have pnl nested
-        const pnlData = data.pnl || data;
+        const statusData = await response.json();
+        // Extract from .pnl sub-object first, then fall back to building from .risk
+        const pnlData = statusData.pnl || buildSnapshotFromStatus(statusData);
         const normalized = normalizeSnapshot(pnlData);
         
         if (normalized) {
           lastSnapshotTsRef.current = normalized.ts;
-          if (source !== 'ws') {
-            setSource('rest');
-          }
+          if (source !== 'ws') setSource('rest');
         }
         
         return normalized;

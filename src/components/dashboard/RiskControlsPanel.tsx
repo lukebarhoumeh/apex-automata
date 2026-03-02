@@ -187,10 +187,10 @@ export function RiskControlsPanel() {
             label="Exposure" 
             value={`$${status.metrics.currentExposure.toLocaleString()}`}
           />
-          <StatBox 
-            label="Max DD" 
-            value={formatPercent(-status.metrics.maxDrawdown)}
-            color={status.metrics.maxDrawdown > 0.05 ? '#ef4444' : undefined}
+          <StatBox
+            label="Max DD"
+            value={formatPercent(-status.metrics.maxDrawdown / 100)}
+            color={status.metrics.maxDrawdown > 5 ? '#ef4444' : undefined}
           />
         </div>
 

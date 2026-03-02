@@ -367,6 +367,14 @@ statusBroadcastInterval = setInterval(() => {
   
   const isEngineRunning = tradingEngine !== null && tradingEngine.engineRunning;
   
+  // Build PnL snapshot for broadcast
+  const pnlSnapshot = buildPnLSnapshot();
+  
+  // Broadcast PnL snapshot as separate event so the frontend pnl:snapshot handler picks it up
+  if (pnlSnapshot) {
+    broadcast({ type: 'PnLSnapshot', payload: pnlSnapshot });
+  }
+  
   broadcast({
     type: 'StatusUpdate',
     payload: {
@@ -379,6 +387,8 @@ statusBroadcastInterval = setInterval(() => {
       restLatencyMs: runtimeState.restLatencyMs,
       spreadPctile: runtimeState.spreadPctile,
       regime: runtimeState.regime,
+      risk: runtimeState.risk,
+      pnl: pnlSnapshot,
       activeSymbols: tradingEngine?.getActiveSymbols() || [],
       warmupComplete: runtimeState.warmupComplete,
       candlesBuffered: runtimeState.candlesBuffered,
@@ -391,7 +401,7 @@ statusBroadcastInterval = setInterval(() => {
       restartCount: runtimeState.restartCount,
       lastRestartReason: runtimeState.lastRestartReason,
       lastRestartAt: runtimeState.lastRestartAt,
-      timestamp: Date.now(), // Explicit timestamp for staleness detection
+      timestamp: Date.now(),
     }
   });
 }, 1500);
@@ -455,6 +465,54 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true, timestamp: Date.now() });
 });
 
+// Build PnL snapshot from trading engine state for frontend consumption
+function buildPnLSnapshot(): Record<string, unknown> | null {
+  if (!tradingEngine?.engineRunning) return null;
+  
+  const riskEngine = tradingEngine.getRiskEngineInstance();
+  const positionTracker = tradingEngine.getPositionTrackerInstance();
+  if (!riskEngine || !positionTracker) return null;
+  
+  const riskMetrics = riskEngine.getMetrics();
+  const riskStatus = riskEngine.getRiskStatus();
+  const portfolio = positionTracker.getPortfolioSummary();
+  const config = tradingEngine.getConfig();
+  const accountEquity = config.guardrails?.account?.equity_usd ?? 50_000;
+  
+  const totalEquity = riskEngine.getCurrentEquityForSizing();
+  const dailyPnlUsd = riskMetrics.dailyPnL;
+  const riskUnitUsd = riskStatus.riskUnitUsd ?? (accountEquity * 0.01);
+  const dailyPnlR = riskUnitUsd > 0 ? dailyPnlUsd / riskUnitUsd : 0;
+  
+  return {
+    ts: Date.now(),
+    userId: config.supabase?.userId ?? '',
+    sessionId: `paper-${new Date().toISOString().split('T')[0]}`,
+    executionMode: config.mode ?? 'paper',
+    riskDay: new Date().toISOString().split('T')[0],
+    sessionStartEquityUsd: accountEquity,
+    dayStartEquityUsd: riskStatus.dayStartEquityUsd ?? accountEquity,
+    realizedPnlUsd: portfolio.totalRealizedPnL,
+    unrealizedPnlUsd: portfolio.totalUnrealizedPnL,
+    totalEquityUsd: totalEquity,
+    dailyPnlUsd,
+    dailyPnlR,
+    riskUnitUsd,
+    openPositionsCount: portfolio.positionCount,
+    exposureUsd: riskMetrics.currentExposure,
+    maxDrawdownPct: riskMetrics.maxDrawdown,
+  };
+}
+
+// Dedicated PnL snapshot endpoint
+app.get('/api/pnl', (req, res) => {
+  const snapshot = buildPnLSnapshot();
+  if (!snapshot) {
+    return res.status(503).json({ error: 'Engine not running' });
+  }
+  res.json(snapshot);
+});
+
 // Get trading engine status (UI contract) with 24/7 resilience fields
 app.get('/api/status', (req, res) => {
   const isEngineRunning = tradingEngine !== null && tradingEngine.engineRunning;
@@ -467,6 +525,9 @@ app.get('/api/status', (req, res) => {
   const restHealth = exchange ? (exchange as any).getRestHealth?.() : null;
   const reconcilerState = exchange ? (exchange as any).getReconcilerState?.() : null;
   
+  // Include PnL snapshot for frontend consumption
+  const pnlSnapshot = buildPnLSnapshot();
+  
   res.json({
     engineRunning: isEngineRunning,
     mode: isEngineRunning ? tradingEngine!.getConfig().mode : null,
@@ -478,6 +539,7 @@ app.get('/api/status', (req, res) => {
     spreadPctile: runtimeState.spreadPctile,
     regime: runtimeState.regime,
     risk: runtimeState.risk,
+    pnl: pnlSnapshot,
     activeSymbols: tradingEngine?.getActiveSymbols() || [],
     warmupComplete: runtimeState.warmupComplete ?? false,
     candlesBuffered: runtimeState.candlesBuffered ?? {},
@@ -888,6 +950,14 @@ app.post('/api/engine/start', async (req, res) => {
       exposureGauge.set(runtimeState.risk.exposureUsd);
       dailyPnlGauge.set(runtimeState.risk.dailyPnLUsd);
       killSwitchActiveGauge.set(runtimeState.risk.killSwitchActive ? 1 : 0);
+      
+      // Sync kill switch state from risk engine to runtimeState
+      if (runtimeState.risk.killSwitchActive && !runtimeState.killSwitch.active) {
+        runtimeState.killSwitch.active = true;
+        runtimeState.killSwitch.reasons = [`Daily loss: $${Math.abs(runtimeState.risk.dailyPnLUsd).toFixed(2)}`];
+        runtimeState.killSwitch.since = runtimeState.killSwitch.since || Date.now();
+      }
+      
       broadcast({ type: 'RiskMetrics', payload: metrics });
     });
 
