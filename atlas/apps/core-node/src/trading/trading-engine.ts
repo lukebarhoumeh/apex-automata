@@ -775,8 +775,8 @@ export class TradingEngine extends EventEmitter {
     
     this.positionMonitor = new PositionMonitor(config, this.logger, this.positionTracker!);
     
-    // Set up order creator for exit orders
-    this.positionMonitor.setOrderCreator(async (symbol, side, size) => {
+    // Set up order creator for exit orders (receives exitType from position monitor)
+    this.positionMonitor.setOrderCreator(async (symbol, side, size, exitType) => {
       try {
         const order = await this.createOrder({
           product_id: symbol,
@@ -786,8 +786,8 @@ export class TradingEngine extends EventEmitter {
         }, {
           strategy: 'system',
           metadata: {
-            tag: 'exit',
-            reason: 'position_exit',
+            tag: exitType || 'exit',
+            reason: exitType || 'position_exit',
           }
         });
         return order !== null;

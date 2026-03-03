@@ -3162,6 +3162,19 @@ async function syncFillToSupabase(fill: any) {
   }
 }
 
+// Map exit reason tags to Supabase trade_exit_reason enum values
+function mapExitReason(reason?: string): string | null {
+  if (!reason) return null;
+  const validReasons = ['take_profit', 'stop_loss', 'time_stop', 'manual_exit', 'daily_stop', 'kill_switch', 'signal_exit'];
+  if (validReasons.includes(reason)) return reason;
+  // Map common tags to valid enum values
+  if (reason === 'exit' || reason === 'flatten') return 'manual_exit';
+  if (reason.includes('stop_loss') || reason.includes('stop')) return 'stop_loss';
+  if (reason.includes('take_profit') || reason.includes('profit')) return 'take_profit';
+  if (reason.includes('signal')) return 'signal_exit';
+  return 'manual_exit'; // fallback
+}
+
 async function syncPositionToSupabase(position: any) {
   try {
     const symbol = position.symbol || position.product;
@@ -3200,7 +3213,7 @@ async function syncPositionToSupabase(position: any) {
       opened_at: openedAt,
       closed_at: closedAt,
       exit_price: exitPrice,
-      exit_reason: position.exitReason ?? position.exit_reason ?? null,
+      exit_reason: mapExitReason(position.exitReason ?? position.exit_reason) ?? null,
       realized_pnl_usd: Number(position.realizedPnL ?? position.realizedPnl ?? position.realized_pnl_usd ?? 0),
     };
 
