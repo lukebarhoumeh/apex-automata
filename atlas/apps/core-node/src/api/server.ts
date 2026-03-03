@@ -420,8 +420,10 @@ wss.on('connection', (ws) => {
     logger.error('WebSocket error:', error);
   });
 
-  // Send initial StatusUpdate
+  // Send initial StatusUpdate (must match periodic broadcast payload)
   const isEngineRunningOnConnect = tradingEngine !== null && tradingEngine.engineRunning;
+  const supervisorStateOnConnect = supervisor.getState();
+  const pnlSnapshotOnConnect = buildPnLSnapshot();
   
   ws.send(JSON.stringify({
     type: 'StatusUpdate',
@@ -436,9 +438,20 @@ wss.on('connection', (ws) => {
       restLatencyMs: runtimeState.restLatencyMs,
       spreadPctile: runtimeState.spreadPctile,
       regime: runtimeState.regime,
+      risk: runtimeState.risk,
+      pnl: pnlSnapshotOnConnect,
       activeSymbols: tradingEngine?.getActiveSymbols() || [],
       warmupComplete: runtimeState.warmupComplete,
       candlesBuffered: runtimeState.candlesBuffered,
+      runtimeAlive: runtimeState.runtimeAlive,
+      engineState: runtimeState.engineState,
+      engineDesiredState: supervisorStateOnConnect.engineDesiredState,
+      lastMarketDataAt: runtimeState.lastMarketDataAt,
+      lastEngineHeartbeatAt: runtimeState.lastEngineHeartbeatAt,
+      restartCount: runtimeState.restartCount,
+      lastRestartReason: runtimeState.lastRestartReason,
+      lastRestartAt: runtimeState.lastRestartAt,
+      timestamp: Date.now(),
     }
   }));
 });
@@ -2652,22 +2665,23 @@ app.get('/api/risk/analytics', (req, res) => {
   const metrics = riskEngine.getMetrics();
   const positionTracker = tradingEngine?.getPositionTrackerInstance();
   const summary = positionTracker?.getPortfolioSummary();
+  const sessionStats = tradingEngine?.getSessionStats();
   
   res.json({
     session: {
-      trades: summary?.positionCount || 0,
-      wins: 0, // Would need TradeAnalytics
-      losses: 0,
-      winRate: 0,
-      profitFactor: 0,
+      trades: sessionStats?.totalTrades ?? summary?.positionCount ?? 0,
+      wins: sessionStats?.winningTrades ?? 0,
+      losses: sessionStats?.losingTrades ?? 0,
+      winRate: sessionStats?.winRate ?? 0,
+      profitFactor: sessionStats?.profitFactor ?? 0,
     },
     equity: {
       current: summary?.totalValue || 0,
       dailyPnL: metrics.dailyPnL,
-      maxDrawdown: metrics.maxDrawdown,
+      maxDrawdown: sessionStats?.maxDrawdown ?? metrics.maxDrawdown,
     },
     streaks: {
-      consecutiveWins: 0,
+      consecutiveWins: 0, // Not tracked in SessionStats; risk engine tracks losses only
       consecutiveLosses: metrics.consecutiveLosses,
       maxConsecutiveLosses: metrics.consecutiveLosses,
     },
@@ -3128,7 +3142,7 @@ async function syncFillToSupabase(fill: any) {
   try {
     const { error } = await supabase
       .from('fills')
-      .insert({
+      .upsert({
         user_id: USER_ID,
         order_id: fill.order_id,
         trade_id: fill.trade_id !== undefined ? String(fill.trade_id) : null,
@@ -3138,7 +3152,7 @@ async function syncFillToSupabase(fill: any) {
         fee_amount: parseFloat(fill.fee),
         maker: fill.liquidity === 'M',
         filled_at: fill.created_at
-      });
+      }, { onConflict: 'user_id,trade_id' });
 
     if (error) {
       logger.error('Failed to sync fill to Supabase:', error);
@@ -3192,7 +3206,7 @@ async function syncPositionToSupabase(position: any) {
 
     const { error } = await supabase
       .from('positions')
-      .upsert(mappedPosition);
+      .upsert(mappedPosition, { onConflict: 'user_id,symbol' });
 
     if (error) {
       logger.error('Failed to sync position to Supabase:', error);

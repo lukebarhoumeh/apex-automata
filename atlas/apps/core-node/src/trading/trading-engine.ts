@@ -948,12 +948,13 @@ export class TradingEngine extends EventEmitter {
     // Risk engine events
     this.riskEngine!.on('risk:alert', (symbol, alert) => this.emit('risk:alert', { symbol, alert }));
     this.riskEngine!.on('risk:killswitch:triggered', async (reason) => {
-      this.logger.error(`Kill switch triggered: ${reason}`);
+      const reasonStr = typeof reason === 'string' ? reason : JSON.stringify(reason);
+      this.logger.error('Kill switch triggered:', reasonStr);
       // IMPORTANT: Do NOT stop the engine on kill switch
       // Instead, transition to halted state - runtime stays alive, trading stops
-      this.setEngineState('halted', `kill_switch: ${reason}`);
+      this.setEngineState('halted', `kill_switch: ${reasonStr}`);
       // Emit event for UI to show clear indication
-      this.emit('risk:alert', { type: 'kill_switch', reasons: [reason], message: reason });
+      this.emit('risk:alert', { type: 'kill_switch', reasons: [reasonStr], message: reasonStr });
     });
     this.riskEngine!.on('risk:metrics:update', (metrics) => this.emit('risk:metrics', metrics));
   }
