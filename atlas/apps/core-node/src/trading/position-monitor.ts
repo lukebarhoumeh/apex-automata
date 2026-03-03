@@ -50,7 +50,7 @@ export class PositionMonitor extends EventEmitter {
   private monitoredPositions: Map<string, MonitoredPosition> = new Map();
   private marketPrices: Map<string, number> = new Map();
   private checkInterval: NodeJS.Timeout | null = null;
-  private orderCreator: ((symbol: string, side: 'buy' | 'sell', size: number) => Promise<boolean>) | null = null;
+  private orderCreator: ((symbol: string, side: 'buy' | 'sell', size: number, exitType?: string) => Promise<boolean>) | null = null;
   
   constructor(
     config: PositionMonitorConfig,
@@ -71,7 +71,7 @@ export class PositionMonitor extends EventEmitter {
    * Set the order creator function for placing exit orders.
    */
   public setOrderCreator(
-    creator: (symbol: string, side: 'buy' | 'sell', size: number) => Promise<boolean>
+    creator: (symbol: string, side: 'buy' | 'sell', size: number, exitType?: string) => Promise<boolean>
   ): void {
     this.orderCreator = creator;
   }
@@ -373,13 +373,14 @@ export class PositionMonitor extends EventEmitter {
     // Determine exit order side (opposite of position)
     const exitSide: 'buy' | 'sell' = position.side === 'long' ? 'sell' : 'buy';
     
-    // Place exit order
+    // Place exit order (pass condition type for exitReason tracking)
     if (this.orderCreator) {
       try {
         const success = await this.orderCreator(
           monitored.symbol,
           exitSide,
-          position.size
+          position.size,
+          condition.type
         );
         
         if (success) {

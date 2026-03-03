@@ -222,6 +222,10 @@ export class PositionTracker extends EventEmitter {
     if (position.size === 0) {
       position.closedAt = trade.timestamp;
       position.exitPrice = trade.price;
+      // Set exitReason from context tag if available (stop_loss, take_profit, time_stop, signal_exit, etc.)
+      if (!position.exitReason && context?.tag) {
+        position.exitReason = context.tag;
+      }
       if (preTradeSide !== 'flat') {
         // Preserve last non-flat side for downstream persistence (Supabase enum doesn't allow 'flat')
         position.side = preTradeSide;
