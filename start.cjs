@@ -238,21 +238,10 @@ async function checkAndInstallDeps() {
     });
   }
   
-  // Build backend if needed
-  if (!fs.existsSync(path.join(backendPath, 'dist'))) {
-    log.warning('Building backend...');
-    await new Promise((resolve, reject) => {
-      const build = spawn(pnpmCmd, ['build'], { 
-        cwd: backendPath, 
-        stdio: 'inherit',
-        shell: true 
-      });
-      build.on('close', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error('Failed to build backend'));
-      });
-    });
-  }
+  // NOTE: Backend runs via tsx (direct TS execution), NOT compiled JS.
+  // The `pnpm api` command uses tsx which bypasses tsc compilation.
+  // Do NOT run `pnpm build` here — it has pre-existing type errors
+  // that don't affect runtime execution via tsx.
 }
 
 // Start the trading engine
@@ -374,7 +363,7 @@ async function start() {
     console.log('  📝 API Health: http://localhost:3001/health');
     console.log('  📈 Status:     http://localhost:3001/api/status');
     console.log('\n  💡 Tips:');
-    console.log('  - Signals start after ~50 minutes of market data');
+    console.log('  - Signals start ~1 minute after engine start (200 candle warmup)');
     console.log('  - Check logs/ folder for detailed output');
     console.log('  - Press Ctrl+C to stop all services');
     console.log('\n' + '═'.repeat(60) + '\n');
