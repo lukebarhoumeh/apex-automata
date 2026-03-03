@@ -390,12 +390,19 @@ export class RiskEngine extends EventEmitter {
         }
 
         if (this.config.ignorePersistedKillSwitch) {
-          if (this.metrics.killSwitchActive) {
-            this.logger.warn('Ignoring persisted kill switch state for current session');
+          if (this.metrics.killSwitchActive || this.metrics.maxDrawdown > 0 || this.metrics.consecutiveLosses > 0) {
+            this.logger.warn('Resetting persisted risk state for clean session start', {
+              killSwitch: this.metrics.killSwitchActive,
+              maxDrawdown: this.metrics.maxDrawdown,
+              consecutiveLosses: this.metrics.consecutiveLosses,
+            });
           }
           this.metrics.killSwitchActive = false;
           this.killSwitchActive = false;
           this.metrics.errorRate = 0;
+          this.metrics.maxDrawdown = 0;
+          this.metrics.consecutiveLosses = 0;
+          this.metrics.dailyPnL = 0;
         }
       }
       

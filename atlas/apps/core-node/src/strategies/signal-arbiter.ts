@@ -74,8 +74,8 @@ interface SymbolState {
 }
 
 const DEFAULT_CONFIG: SignalArbiterConfig = {
-  flipCooldownMs: 1 * 60 * 1000, // AGGRESSIVE: 1 minute between flips (was 5)
-  minSignalStrength: 0.1,  // AGGRESSIVE: Very low threshold (was 0.3)
+  flipCooldownMs: 5 * 60 * 1000, // 5 minutes between direction flips to prevent churn
+  minSignalStrength: 0.3,  // Require medium-strength signals (filters weak counter-signals)
   requireConsensus: false,
   minConsensusCount: 2,
   strategyPriorities: {

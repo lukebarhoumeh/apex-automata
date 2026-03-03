@@ -59,8 +59,9 @@ strategy:
   # - 'sell' on flat position = no action (cannot open short on Coinbase spot)
   # To enable shorting, use an exchange that supports margin/futures (e.g., Binance Futures, dYdX)
   allow_short: false
-  # Reduced from 15 to 5 — crypto markets move fast, 15 min cooldown misses opportunities
-  trade_cooldown_min: 5
+  # 15 min cooldown prevents rapid entry→exit churn that gets destroyed by fees.
+  # Was reduced to 5 but that caused 2-5 minute round-trips losing $370+ in fees alone.
+  trade_cooldown_min: 15
 
 execution:
   order_type: marketable_limit

@@ -901,8 +901,8 @@ export class TradingEngine extends EventEmitter {
         ['BTC', 0],
         ['ETH', 0]
       ]),
-      makerFee: 0.004,  // 0.4%
-      takerFee: 0.006,  // 0.6%
+      makerFee: 0.0025, // 0.25% — Coinbase Advanced $10k-$50k tier
+      takerFee: 0.004,  // 0.40% — Coinbase Advanced $10k-$50k tier
       slippage: 0.001,  // 0.1%
       latencyMs: 100    // 100ms simulated latency
     };

@@ -1286,6 +1286,20 @@ app.post('/api/engine/start', async (req, res) => {
             return;
           }
           
+          // Enforce minimum hold time — don't exit positions too early (fee drag killer)
+          // Stop-loss and take-profit from position monitor bypass this (they use order creator directly)
+          const holdTimeMs = Date.now() - openPosition.openTime.getTime();
+          const minHoldMs = (guardrails.strategy.trade_cooldown_min || 15) * 60 * 1000;
+          if (holdTimeMs < minHoldMs) {
+            logger.info('Exit signal ignored (position too young)', {
+              symbol: signal.symbol,
+              holdTimeSec: Math.round(holdTimeMs / 1000),
+              minHoldSec: Math.round(minHoldMs / 1000),
+              strategy: signal.strategy,
+            });
+            return;
+          }
+          
           const closeOrder: Omit<OrderRequest, 'client_oid'> = {
             product_id: signal.symbol,
             side: 'sell',
