@@ -88,6 +88,18 @@ const DEFAULT_CONFIG: SignalArbiterConfig = {
 };
 
 /**
+ * Per-strategy observed strength ranges for min-max normalization.
+ * Strategies emit strength on different internal scales — normalizing to [0,1]
+ * before cross-strategy comparison prevents one strategy from dominating.
+ */
+const STRATEGY_STRENGTH_RANGE: Record<string, { min: number; max: number }> = {
+  'breakout':     { min: 0.3, max: 1.0 },
+  'vwap_mr':      { min: 0.2, max: 0.8 },
+  'momentum':     { min: 0.4, max: 0.9 },
+  'trend_follow': { min: 0.3, max: 0.85 },
+};
+
+/**
  * Regime-based strategy compatibility for arbitration.
  * When strategies conflict, prefer the one better suited to current regime.
  */
@@ -333,15 +345,24 @@ export class SignalArbiter extends EventEmitter {
   }
 
   /**
+   * Normalize raw signal strength to [0,1] using per-strategy observed ranges.
+   */
+  private normalizeStrength(strategy: string, raw: number): number {
+    const range = STRATEGY_STRENGTH_RANGE[strategy];
+    if (!range || range.max <= range.min) return Math.max(0, Math.min(1, raw));
+    const normalized = (raw - range.min) / (range.max - range.min);
+    return Math.max(0, Math.min(1, normalized));
+  }
+
+  /**
    * Calculate a single signal's adjusted score.
    */
   private calculateSignalScore(signal: StrategySignal, regime: RegimeState): number {
-    const baseStrength = signal.strength;
+    const normalized = this.normalizeStrength(signal.strategy, signal.strength);
     const priority = this.config.strategyPriorities[signal.strategy] ?? 1.0;
     const regimeBonus = REGIME_PREFERENCE[regime.regime]?.[signal.strategy] ?? 0.5;
     
-    // Weighted combination
-    return baseStrength * priority * regimeBonus;
+    return normalized * priority * regimeBonus;
   }
 
   /**

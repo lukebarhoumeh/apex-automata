@@ -117,13 +117,13 @@ export interface RegimeFilterConfig {
 
 const DEFAULT_CONFIG: RegimeFilterConfig = {
   enabled: true,
-  minCompatibilityScore: 0.1,   // AGGRESSIVE: Very low
-  counterRegimeStrengthBoost: 0,  // AGGRESSIVE: No boost required
+  minCompatibilityScore: 0.3,
+  counterRegimeStrengthBoost: 0,
   maxPositionMultiplier: 1.0,
-  minPositionMultiplier: 0.1,   // AGGRESSIVE: Allow smaller positions
-  minRegimeConfidence: 0.1,     // AGGRESSIVE: Low confidence ok
-  alwaysAllowStrategies: ['vwap_mr', 'breakout', 'momentum', 'trend_follow'],  // AGGRESSIVE: Always allow all
-  requireMTFAlignment: false,   // AGGRESSIVE: No MTF required
+  minPositionMultiplier: 0.25,
+  minRegimeConfidence: 0.4,
+  alwaysAllowStrategies: [],
+  requireMTFAlignment: false,
   mtfAlignmentThreshold: 0.3,
 };
 

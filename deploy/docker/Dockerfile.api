@@ -11,7 +11,7 @@ COPY atlas/apps/core-node ./atlas/apps/core-node
 
 # Install dependencies and build
 RUN corepack enable && \
-    npm i -g pnpm && \
+    corepack prepare pnpm@latest --activate && \
     cd atlas && \
     pnpm install --frozen-lockfile && \
     cd apps/core-node && \

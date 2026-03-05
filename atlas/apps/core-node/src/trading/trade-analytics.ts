@@ -385,11 +385,12 @@ export class TradeAnalytics extends EventEmitter {
     // Combine entry and exit slippage
     const totalSlippage = (trade.slippageBps ?? 0) + (adjustedExitSlippage ?? 0);
     
-    // Determine outcome
+    // Determine outcome — $1.00 threshold filters out micro-fee noise
+    const BREAKEVEN_THRESHOLD = 1.00;
     let outcome: 'win' | 'loss' | 'breakeven';
-    if (params.realizedPnl > 0.01) {
+    if (params.realizedPnl > BREAKEVEN_THRESHOLD) {
       outcome = 'win';
-    } else if (params.realizedPnl < -0.01) {
+    } else if (params.realizedPnl < -BREAKEVEN_THRESHOLD) {
       outcome = 'loss';
     } else {
       outcome = 'breakeven';

@@ -1,7 +1,7 @@
 account:
-  equity_usd: 50000
-  risk_per_trade: 0.01
-  max_open_positions: 5
+  equity_usd: 10000
+  risk_per_trade: 0.005
+  max_open_positions: 2
   max_account_leverage: 3.0
   min_notional_buffer: 1.1
 
@@ -9,7 +9,7 @@ risk:
   daily_loss_limit: -0.02
   weekly_loss_limit: -0.05
   max_drawdown_limit: -0.15
-  max_position_exposure_pct: 0.75  # AGGRESSIVE: Allow larger positions for testing
+  max_position_exposure_pct: 0.30
   funding_cost_tolerance_bps: 20
   slippage_estimate_bps: 3
 
@@ -23,50 +23,49 @@ risk:
 #   - BTC: Lower volatility, tighter stops
 #   - SOL: Higher volatility, wider stops and higher volume threshold
 per_symbol:
-  # AGGRESSIVE SETTINGS FOR TESTING
   BTC-USD:
-    max_notional_usd: 50000  # TESTING: Very high limit
-    max_daily_loss_usd: 5000
+    max_notional_usd: 3000
+    max_daily_loss_usd: 200
     strategy_overrides:
       breakout:
         atrMultiplier: 2.0
-        volumeThreshold: 0.3      # Very low - any volume ok
-        period: 8                 # Short lookback
+        volumeThreshold: 1.5
+        period: 20
       vwap_mr:
-        deviationEntry: 0.1       # ULTRA AGGRESSIVE - any small deviation
+        deviationEntry: 2.0
       momentum:
         atrMultiplier: 2.0
-        rsiOversold: 45           # Near neutral (must be <= 45)
-        rsiOverbought: 55         # Near neutral (must be >= 55)
+        rsiOversold: 30
+        rsiOverbought: 70
   ETH-USD:
-    max_notional_usd: 50000  # TESTING: Very high limit
-    max_daily_loss_usd: 5000
+    max_notional_usd: 3000
+    max_daily_loss_usd: 200
     strategy_overrides:
       breakout:
         atrMultiplier: 2.0
-        volumeThreshold: 0.3
-        period: 8
+        volumeThreshold: 1.5
+        period: 20
       vwap_mr:
-        deviationEntry: 0.1       # ULTRA AGGRESSIVE
+        deviationEntry: 2.0
       momentum:
         atrMultiplier: 2.0
-        rsiOversold: 45
-        rsiOverbought: 55
+        rsiOversold: 30
+        rsiOverbought: 70
   SOL-USD:
-    max_notional_usd: 50000  # TESTING: Very high limit
-    max_daily_loss_usd: 5000
+    max_notional_usd: 3000
+    max_daily_loss_usd: 200
     strategy_overrides:
       breakout:
         atrMultiplier: 2.5
-        volumeThreshold: 0.3
-        period: 8
+        volumeThreshold: 1.5
+        period: 20
       vwap_mr:
-        deviationEntry: 0.1       # ULTRA AGGRESSIVE
+        deviationEntry: 2.0
         maxDeviation: 10.0
       momentum:
         atrMultiplier: 2.5
-        rsiOversold: 45
-        rsiOverbought: 55
+        rsiOversold: 30
+        rsiOverbought: 70
 
 strategy:
   mode: momentum_futures

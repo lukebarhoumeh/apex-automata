@@ -629,6 +629,26 @@ export class RiskEngine extends EventEmitter {
       }
     };
 
+    // Reject orders with non-finite values before any further processing
+    const rawSize = parseFloat(order.size || '0');
+    const rawPrice = parseFloat(order.price || '0') || currentPrice;
+    const rawNotional = rawSize * rawPrice;
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0
+      || (!Number.isFinite(rawSize) && !Number.isFinite(parseFloat(order.funds || '')))
+      || !Number.isFinite(rawNotional)) {
+      check.passed = false;
+      check.reason = `Non-finite order values rejected: size=${rawSize}, price=${rawPrice}, currentPrice=${currentPrice}`;
+      check.checks.orderSize = false;
+      this.logger.warn('Risk check rejected non-finite order', {
+        size: order.size,
+        price: order.price,
+        funds: order.funds,
+        currentPrice,
+      });
+      this.emit('risk:check:failed', order.client_oid || '', check.reason);
+      return check;
+    }
+
     const symbol = order.product_id;
     const position = this.positionTracker.getPosition(symbol);
     const exposureSim = this.simulatePositionAfterOrder(position, order, currentPrice);
@@ -894,6 +914,9 @@ export class RiskEngine extends EventEmitter {
   }
 
   public computeOrderSize(productId: string, entryPrice: number, stopPrice: number): number {
+    if (!Number.isFinite(entryPrice) || entryPrice <= 0) return 0;
+    if (!Number.isFinite(stopPrice) || stopPrice <= 0) return 0;
+
     const stopDistance = Math.abs(entryPrice - stopPrice);
     if (!Number.isFinite(stopDistance) || stopDistance === 0) {
       return 0;
@@ -927,8 +950,9 @@ export class RiskEngine extends EventEmitter {
       return 0;
     }
 
-    // Round to 6 decimals for crypto lot sizes
-    return parseFloat(size.toFixed(6));
+    // Final sanity gate — never return non-finite values
+    const rounded = parseFloat(size.toFixed(6));
+    return Number.isFinite(rounded) && rounded > 0 ? rounded : 0;
   }
 
   private calculateTotalExposure(): number {

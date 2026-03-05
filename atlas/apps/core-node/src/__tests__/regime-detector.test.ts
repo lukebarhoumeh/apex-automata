@@ -320,6 +320,10 @@ describe('RegimeFilter', () => {
     });
 
     it('should allow mean-reversion signal in strong trend when strategy is always-allowed', () => {
+      const filterWithAllow = new RegimeFilter(regimeDetector, {
+        alwaysAllowStrategies: ['vwap_mr'],
+      }, mockLogger);
+
       // Set up strong trending market
       const candles = generateCandles(100, 50000, {
         trend: 'up',
@@ -329,7 +333,7 @@ describe('RegimeFilter', () => {
       regimeDetector.update('BTC-USD', candles);
 
       const signal = createMockSignal('BTC-USD', 'vwap_mr', 'sell', 0.3);
-      const result = regimeFilter.filter(signal);
+      const result = filterWithAllow.filter(signal);
 
       // vwap_mr is in alwaysAllowStrategies, so it passes regardless of regime
       expect(result.allowed).toBe(true);
@@ -353,11 +357,15 @@ describe('RegimeFilter', () => {
     });
 
     it('should return adjusted signal when strategy is always-allowed', () => {
+      const filterWithAllow = new RegimeFilter(regimeDetector, {
+        alwaysAllowStrategies: ['momentum'],
+      }, mockLogger);
+
       const candles = generateCandles(100, 50000);
       regimeDetector.update('BTC-USD', candles);
 
       const signal = createMockSignal('BTC-USD', 'momentum', 'buy', 0.8);
-      const result = regimeFilter.filter(signal);
+      const result = filterWithAllow.filter(signal);
 
       // momentum is in alwaysAllowStrategies, so it's allowed with original signal
       expect(result.allowed).toBe(true);
@@ -407,8 +415,11 @@ describe('RegimeFilter', () => {
 
   describe('events', () => {
     it('should not emit signal:filtered for always-allowed strategies', () => {
+      const filterWithAllow = new RegimeFilter(regimeDetector, {
+        alwaysAllowStrategies: ['vwap_mr'],
+      }, mockLogger);
       const filteredHandler = vi.fn();
-      regimeFilter.on('signal:filtered', filteredHandler);
+      filterWithAllow.on('signal:filtered', filteredHandler);
 
       // Set up strong trend
       const candles = generateCandles(100, 50000, {
@@ -420,14 +431,17 @@ describe('RegimeFilter', () => {
 
       // vwap_mr is in alwaysAllowStrategies, so it won't be filtered
       const signal = createMockSignal('BTC-USD', 'vwap_mr', 'sell', 0.3);
-      regimeFilter.filter(signal);
+      filterWithAllow.filter(signal);
 
       expect(filteredHandler).not.toHaveBeenCalled();
     });
 
     it('should allow signal without emitting passed event for always-allowed strategies', () => {
+      const filterWithAllow = new RegimeFilter(regimeDetector, {
+        alwaysAllowStrategies: ['breakout'],
+      }, mockLogger);
       const passedHandler = vi.fn();
-      regimeFilter.on('signal:passed', passedHandler);
+      filterWithAllow.on('signal:passed', passedHandler);
 
       const candles = generateCandles(100, 50000, {
         trend: 'up',
@@ -438,7 +452,7 @@ describe('RegimeFilter', () => {
 
       // breakout is in alwaysAllowStrategies, returns early without emitting
       const signal = createMockSignal('BTC-USD', 'breakout', 'buy', 0.8);
-      const result = regimeFilter.filter(signal);
+      const result = filterWithAllow.filter(signal);
 
       expect(result.allowed).toBe(true);
       expect(passedHandler).not.toHaveBeenCalled();

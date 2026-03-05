@@ -49,6 +49,7 @@ export class PositionMonitor extends EventEmitter {
   private positionTracker: PositionTracker;
   private monitoredPositions: Map<string, MonitoredPosition> = new Map();
   private marketPrices: Map<string, number> = new Map();
+  private exitInProgress: Set<string> = new Set();
   private checkInterval: NodeJS.Timeout | null = null;
   private orderCreator: ((symbol: string, side: 'buy' | 'sell', size: number, exitType?: string) => Promise<boolean>) | null = null;
   
@@ -102,6 +103,7 @@ export class PositionMonitor extends EventEmitter {
       clearInterval(this.checkInterval);
       this.checkInterval = null;
     }
+    this.exitInProgress.clear();
     this.logger.info('Position monitor stopped');
   }
   
@@ -212,6 +214,7 @@ export class PositionMonitor extends EventEmitter {
    */
   private handlePositionClosed(position: Position): void {
     this.monitoredPositions.delete(position.id);
+    this.exitInProgress.delete(position.id);
     this.logger.debug(`Position ${position.id} removed from monitoring`);
   }
   
@@ -354,35 +357,35 @@ export class PositionMonitor extends EventEmitter {
     monitored: MonitoredPosition,
     condition: PositionExitCondition
   ): Promise<void> {
-    this.logger.warn(`Exit condition triggered for ${monitored.symbol}`, {
-      positionId,
-      type: condition.type,
-      reason: condition.reason,
-    });
-    
-    this.emit('exit:triggered', condition);
-    
-    // Get position size from tracker
-    const position = this.positionTracker.getPosition(monitored.symbol);
-    if (!position || position.size === 0) {
-      this.logger.warn(`Position ${positionId} already closed`);
-      this.monitoredPositions.delete(positionId);
-      return;
-    }
-    
-    // Determine exit order side (opposite of position)
-    const exitSide: 'buy' | 'sell' = position.side === 'long' ? 'sell' : 'buy';
-    
-    // Place exit order (pass condition type for exitReason tracking)
-    if (this.orderCreator) {
-      try {
+    if (this.exitInProgress.has(positionId)) return;
+    this.exitInProgress.add(positionId);
+
+    try {
+      this.logger.warn(`Exit condition triggered for ${monitored.symbol}`, {
+        positionId,
+        type: condition.type,
+        reason: condition.reason,
+      });
+
+      this.emit('exit:triggered', condition);
+
+      const position = this.positionTracker.getPosition(monitored.symbol);
+      if (!position || position.size === 0) {
+        this.logger.warn(`Position ${positionId} already closed`);
+        this.monitoredPositions.delete(positionId);
+        return;
+      }
+
+      const exitSide: 'buy' | 'sell' = position.side === 'long' ? 'sell' : 'buy';
+
+      if (this.orderCreator) {
         const success = await this.orderCreator(
           monitored.symbol,
           exitSide,
           position.size,
           condition.type
         );
-        
+
         if (success) {
           this.emit('exit:executed', positionId, condition);
           this.monitoredPositions.delete(positionId);
@@ -396,13 +399,15 @@ export class PositionMonitor extends EventEmitter {
           this.emit('exit:failed', positionId, new Error('Order creation returned false'));
           this.logger.error(`Failed to place exit order for ${monitored.symbol}`);
         }
-      } catch (error) {
-        this.emit('exit:failed', positionId, error as Error);
-        this.logger.error(`Error placing exit order for ${monitored.symbol}:`, error);
+      } else {
+        this.logger.error('No order creator set - cannot execute exit');
+        this.emit('exit:failed', positionId, new Error('No order creator configured'));
       }
-    } else {
-      this.logger.error('No order creator set - cannot execute exit');
-      this.emit('exit:failed', positionId, new Error('No order creator configured'));
+    } catch (error) {
+      this.emit('exit:failed', positionId, error as Error);
+      this.logger.error(`Error placing exit order for ${monitored.symbol}:`, error);
+    } finally {
+      this.exitInProgress.delete(positionId);
     }
   }
   

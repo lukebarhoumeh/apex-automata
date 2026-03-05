@@ -553,10 +553,14 @@ export class AdvancedBacktestEngine extends EventEmitter {
     const grossPnL = priceDiff * position.quantity;
     const totalCommission = position.commission + commissionCost;
     const totalSlippage = position.slippage + slippageCost;
-    const netPnL = grossPnL - totalCommission - totalSlippage;
+    const netPnL = grossPnL - totalCommission;
     
-    // Update capital
+    // Capital must stay consistent with netPnL — slippage is already in actualExitPrice
     this.capital += (actualExitPrice * position.quantity) - commissionCost;
+    
+    // Store total costs on trade record for reporting
+    position.commission = totalCommission;
+    position.slippage = totalSlippage;
     
     // Complete trade record
     position.exitTime = timestamp;

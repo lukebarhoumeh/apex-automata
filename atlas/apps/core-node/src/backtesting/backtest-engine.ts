@@ -71,6 +71,7 @@ export interface BacktestMetrics {
   netProfit: number;
   profitFactor: number;
   sharpeRatio: number;
+  sortinoRatio: number;
   maxDrawdown: number;
   maxDrawdownPercent: number;
   averageWin: number;
@@ -102,6 +103,8 @@ export class BacktestEngine extends EventEmitter {
   private peakCapital: number;
   private equityCurve: { timestamp: Date; equity: number; drawdown: number }[] = [];
   private dailyReturns: Map<string, number> = new Map();
+  private dailyStartEquity: number = 0;
+  private currentDay: string = '';
 
   constructor(config: BacktestConfig, logger: Logger) {
     super();
@@ -109,6 +112,7 @@ export class BacktestEngine extends EventEmitter {
     this.logger = logger;
     this.capital = config.initialCapital;
     this.peakCapital = config.initialCapital;
+    this.dailyStartEquity = config.initialCapital;
   }
 
   public async loadHistoricalData(dataProvider: (product: string, start: Date, end: Date) => Promise<OHLCV[]>): Promise<void> {
@@ -136,6 +140,13 @@ export class BacktestEngine extends EventEmitter {
 
     // Close any remaining positions
     this.closeAllPositions('end_of_data');
+
+    // Record final day's return
+    if (this.currentDay) {
+      const finalEquity = this.calculateCurrentEquity();
+      const finalReturn = (finalEquity - this.dailyStartEquity) / this.dailyStartEquity;
+      this.dailyReturns.set(this.currentDay, finalReturn);
+    }
 
     // Calculate metrics
     const metrics = this.calculateMetrics();
@@ -292,8 +303,7 @@ export class BacktestEngine extends EventEmitter {
       signal
     };
 
-    // Deduct from capital
-    this.capital -= (trade.size * trade.entryPrice + trade.entryFee);
+    this.capital -= trade.entryFee;
 
     // Create position
     const position: BacktestPosition = {
@@ -341,10 +351,11 @@ export class BacktestEngine extends EventEmitter {
       this.closedTrades.push(trade);
     }
 
-    // Return capital
     const firstTrade = position.trades[0];
     const exitFee = firstTrade?.exitFee ?? 0;
-    this.capital += position.size * exitPrice - exitFee;
+    const sideMultiplier = position.side === 'long' ? 1 : -1;
+    const pnl = (exitPrice - position.entryPrice) * position.size * sideMultiplier;
+    this.capital += pnl - exitFee;
 
     // Remove position
     this.positions.delete(product);
@@ -368,16 +379,18 @@ export class BacktestEngine extends EventEmitter {
       position.unrealizedPnl = (position.entryPrice - currentPrice) * position.size;
     }
 
-    // Update daily returns
-    const [dateKeyRaw] = timestamp.toISOString().split('T');
-    const dateKey = dateKeyRaw ?? timestamp.toISOString().slice(0, 10);
+    const dateKey = timestamp.toISOString().split('T')[0] ?? '';
     const currentEquity = this.calculateCurrentEquity();
-    const previousEquity = this.equityCurve.length > 0 
-      ? this.equityCurve[this.equityCurve.length - 1].equity 
-      : this.config.initialCapital;
-    
-    const dailyReturn = (currentEquity - previousEquity) / previousEquity;
-    this.dailyReturns.set(dateKey, dailyReturn);
+
+    if (!this.currentDay) {
+      this.currentDay = dateKey;
+      this.dailyStartEquity = currentEquity;
+    } else if (dateKey !== this.currentDay) {
+      const dailyReturn = (currentEquity - this.dailyStartEquity) / this.dailyStartEquity;
+      this.dailyReturns.set(this.currentDay, dailyReturn);
+      this.dailyStartEquity = currentEquity;
+      this.currentDay = dateKey;
+    }
   }
 
   private checkExitConditions(product: string, candle: OHLCV, timestamp: Date): void {
@@ -409,10 +422,15 @@ export class BacktestEngine extends EventEmitter {
   }
 
   private calculatePositionSize(signal: Signal): number {
-    // Use Kelly Criterion or fixed percentage
-    const availableCapital = this.capital;
+    let openExposure = 0;
+    for (const pos of this.positions.values()) {
+      openExposure += pos.size * pos.entryPrice;
+    }
+    const availableCapital = this.capital - openExposure;
+    if (availableCapital <= 0) return 0;
+
     const maxPositionValue = Math.min(
-      availableCapital * 0.95, // Leave some for fees
+      availableCapital * 0.95,
       this.config.risk.maxPositionSize
     );
 
@@ -480,11 +498,20 @@ export class BacktestEngine extends EventEmitter {
 
     // Calculate Sharpe ratio
     const returns = Array.from(this.dailyReturns.values());
-    const avgReturn = returns.reduce((a, b) => a + b, 0) / returns.length;
-    const stdDev = Math.sqrt(
-      returns.reduce((sum, r) => sum + Math.pow(r - avgReturn, 2), 0) / returns.length
-    );
-    const sharpeRatio = stdDev > 0 ? (avgReturn * 252) / (stdDev * Math.sqrt(252)) : 0;
+    const avgReturn = returns.length > 0
+      ? returns.reduce((a, b) => a + b, 0) / returns.length
+      : 0;
+    const stdDev = returns.length > 1
+      ? Math.sqrt(returns.reduce((sum, r) => sum + Math.pow(r - avgReturn, 2), 0) / returns.length)
+      : 0;
+    const sharpeRatio = stdDev > 0 ? (avgReturn / stdDev) * Math.sqrt(252) : 0;
+
+    // Sortino ratio — downside-only deviation
+    const downsideReturns = returns.filter(r => r < 0);
+    const downsideDev = downsideReturns.length > 0
+      ? Math.sqrt(downsideReturns.reduce((sum, r) => sum + r * r, 0) / downsideReturns.length)
+      : 0;
+    const sortinoRatio = downsideDev > 0 ? (avgReturn / downsideDev) * Math.sqrt(252) : 0;
 
     // Max drawdown
     let maxDrawdown = 0;
@@ -508,6 +535,7 @@ export class BacktestEngine extends EventEmitter {
       netProfit,
       profitFactor: grossLoss > 0 ? grossProfit / grossLoss : 0,
       sharpeRatio,
+      sortinoRatio,
       maxDrawdown,
       maxDrawdownPercent,
       averageWin: winningTrades.length > 0 ? grossProfit / winningTrades.length : 0,

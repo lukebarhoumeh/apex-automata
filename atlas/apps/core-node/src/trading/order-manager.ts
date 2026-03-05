@@ -76,6 +76,7 @@ export class OrderManager extends EventEmitter {
   private exchangeIdToManagedId: Map<string, string> = new Map();
   private twapOrders: Map<string, TWAPOrder> = new Map();
   private twapTimers: Map<string, NodeJS.Timeout[]> = new Map();
+  private fillLocks: Set<string> = new Set();
 
   constructor(
     config: OrderManagerConfig,
@@ -155,44 +156,52 @@ export class OrderManager extends EventEmitter {
   }
 
   private async handleExchangeFill(fill: Fill): Promise<void> {
-    const managedOrder = this.resolveManagedOrderByExchangeId(fill.order_id);
-    if (!managedOrder) {
-      return;
+    const orderId = fill.order_id;
+
+    while (this.fillLocks.has(orderId)) {
+      await new Promise(resolve => setTimeout(resolve, 10));
     }
+    this.fillLocks.add(orderId);
 
-    const fillSize = Number.parseFloat(fill.size);
-    const fillPrice = Number.parseFloat(fill.price);
-    const fillFee = Number.parseFloat(fill.fee);
-    const fillUsdValue = fill.usd_volume
-      ? Number.parseFloat(fill.usd_volume)
-      : (fillPrice * fillSize);
+    try {
+      const managedOrder = this.resolveManagedOrderByExchangeId(orderId);
+      if (!managedOrder) {
+        return;
+      }
 
-    const safeFillSize = Number.isFinite(fillSize) ? fillSize : 0;
-    const safeFillUsdValue = Number.isFinite(fillUsdValue) ? fillUsdValue : 0;
-    const safeFillFee = Number.isFinite(fillFee) ? fillFee : 0;
+      const fillSize = Number.parseFloat(fill.size);
+      const fillPrice = Number.parseFloat(fill.price);
+      const fillFee = Number.parseFloat(fill.fee);
+      const fillUsdValue = fill.usd_volume
+        ? Number.parseFloat(fill.usd_volume)
+        : (fillPrice * fillSize);
 
-    // Accumulate fills (Coinbase can emit multiple fills per order)
-    managedOrder.filledSize = Math.max(0, managedOrder.filledSize + safeFillSize);
-    managedOrder.executedValue = Math.max(0, managedOrder.executedValue + safeFillUsdValue);
-    managedOrder.fee = Math.max(0, managedOrder.fee + safeFillFee);
+      const safeFillSize = Number.isFinite(fillSize) ? fillSize : 0;
+      const safeFillUsdValue = Number.isFinite(fillUsdValue) ? fillUsdValue : 0;
+      const safeFillFee = Number.isFinite(fillFee) ? fillFee : 0;
 
-    // Best-effort status update from fill progress
-    const epsilon = 1e-12;
-    if (managedOrder.size > 0 && managedOrder.filledSize + epsilon >= managedOrder.size) {
-      managedOrder.status = 'filled';
-      managedOrder.filledSize = managedOrder.size;
-    } else if (safeFillSize > 0) {
-      managedOrder.status = 'partially_filled';
-    }
-    managedOrder.updatedAt = new Date(fill.created_at);
-    managedOrder.fills = [...managedOrder.fills, fill];
+      managedOrder.filledSize = Math.max(0, managedOrder.filledSize + safeFillSize);
+      managedOrder.executedValue = Math.max(0, managedOrder.executedValue + safeFillUsdValue);
+      managedOrder.fee = Math.max(0, managedOrder.fee + safeFillFee);
 
-    await this.persistOrder(managedOrder);
-    this.emit('order:filled', managedOrder, fill);
+      const epsilon = 1e-12;
+      if (managedOrder.size > 0 && managedOrder.filledSize + epsilon >= managedOrder.size) {
+        managedOrder.status = 'filled';
+        managedOrder.filledSize = managedOrder.size;
+      } else if (safeFillSize > 0) {
+        managedOrder.status = 'partially_filled';
+      }
+      managedOrder.updatedAt = new Date(fill.created_at);
+      managedOrder.fills = [...managedOrder.fills, fill];
 
-    // Check if this completes a TWAP slice
-    if (managedOrder.parentOrderId) {
-      await this.checkTWAPProgress(managedOrder.parentOrderId);
+      await this.persistOrder(managedOrder);
+      this.emit('order:filled', managedOrder, fill);
+
+      if (managedOrder.parentOrderId) {
+        await this.checkTWAPProgress(managedOrder.parentOrderId);
+      }
+    } finally {
+      this.fillLocks.delete(orderId);
     }
   }
 
@@ -509,6 +518,10 @@ export class OrderManager extends EventEmitter {
 
   // Cancel order
   public async cancelOrder(orderId: string): Promise<boolean> {
+    if (this.twapOrders.has(orderId)) {
+      return this.cancelTWAPOrder(orderId);
+    }
+
     const order = this.orders.get(orderId);
     if (!order) {
       throw new Error(`Order ${orderId} not found`);
@@ -592,6 +605,17 @@ export class OrderManager extends EventEmitter {
     this.emit('order:created', order);
   }
   
+  /**
+   * Clean up all timers and locks. Call on engine shutdown.
+   */
+  public destroy(): void {
+    for (const [id, timers] of this.twapTimers) {
+      timers.forEach(timer => clearTimeout(timer));
+    }
+    this.twapTimers.clear();
+    this.fillLocks.clear();
+  }
+
   // Mark an order cancelled without calling the exchange (paper mode, local cancels)
   public cancelLocalOrder(orderId: string): ManagedOrder | null {
     const order = this.orders.get(orderId);

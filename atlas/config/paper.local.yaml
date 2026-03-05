@@ -3,7 +3,7 @@ exchange: coinbase-advanced
 symbols: [BTC-USD, ETH-USD]
 bars: { tf_primary: 5m }
 risk:
-  per_trade_risk_bp: 70
+  per_trade_risk_bp: 50
   max_heat_bp: 300
   daily_stop_R: -2.0
 signals:

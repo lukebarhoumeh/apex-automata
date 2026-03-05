@@ -292,38 +292,37 @@ export class PositionTracker extends EventEmitter {
     if (previousSide === 'flat' || previousSize === 0) {
       position.side = trade.side === 'buy' ? 'long' : 'short';
       position.size = size;
-      // Incorporate entry fee into cost basis / proceeds so P&L matches fills.
+      const absFee = Math.abs(fee);
       position.averagePrice = position.side === 'long'
-        ? ((size * price) + fee) / size
-        : ((size * price) - fee) / size;
+        ? ((size * price) + absFee) / size
+        : ((size * price) - absFee) / size;
     } else if (previousSide === 'long') {
       if (trade.side === 'buy') {
         // Add to long
         const newSize = previousSize + size;
-        const totalCost = (previousSize * previousAvgPrice) + (size * price) + fee;
+        const totalCost = (previousSize * previousAvgPrice) + (size * price) + Math.abs(fee);
         position.averagePrice = totalCost / newSize;
         position.size = newSize;
         position.side = 'long';
       } else {
         // Sell reduces long or flips to short
         const closingSize = Math.min(previousSize, size);
-        const feeClose = allocateFee(closingSize);
+        const feeClose = Math.abs(allocateFee(closingSize));
         const realizedPnL = closingSize * (price - previousAvgPrice) - feeClose;
         trade.realizedPnL = realizedPnL;
         position.realizedPnL += realizedPnL;
 
         const remainingLong = previousSize - closingSize;
         const flipSize = size - closingSize;
-        const feeOpen = fee - feeClose;
+        const feeOpen = Math.abs(fee) - feeClose;
 
         if (flipSize > 0) {
           position.side = 'short';
           position.size = flipSize;
-          position.averagePrice = ((flipSize * price) - feeOpen) / flipSize;
+          position.averagePrice = ((flipSize * price) - Math.abs(feeOpen)) / flipSize;
         } else {
           position.size = remainingLong;
           position.side = position.size === 0 ? 'flat' : 'long';
-          // Keep existing cost basis for remaining position (or for post-close reporting).
           position.averagePrice = previousAvgPrice;
         }
       }
@@ -331,26 +330,26 @@ export class PositionTracker extends EventEmitter {
       if (trade.side === 'sell') {
         // Add to short
         const newSize = previousSize + size;
-        const totalProceeds = (previousSize * previousAvgPrice) + (size * price) - fee;
+        const totalProceeds = (previousSize * previousAvgPrice) + (size * price) - Math.abs(fee);
         position.averagePrice = totalProceeds / newSize;
         position.size = newSize;
         position.side = 'short';
       } else {
         // Buy reduces short or flips to long
         const closingSize = Math.min(previousSize, size);
-        const feeClose = allocateFee(closingSize);
+        const feeClose = Math.abs(allocateFee(closingSize));
         const realizedPnL = closingSize * (previousAvgPrice - price) - feeClose;
         trade.realizedPnL = realizedPnL;
         position.realizedPnL += realizedPnL;
 
         const remainingShort = previousSize - closingSize;
         const flipSize = size - closingSize;
-        const feeOpen = fee - feeClose;
+        const feeOpen = Math.abs(fee) - feeClose;
 
         if (flipSize > 0) {
           position.side = 'long';
           position.size = flipSize;
-          position.averagePrice = ((flipSize * price) + feeOpen) / flipSize;
+          position.averagePrice = ((flipSize * price) + Math.abs(feeOpen)) / flipSize;
         } else {
           position.size = remainingShort;
           position.side = position.size === 0 ? 'flat' : 'short';

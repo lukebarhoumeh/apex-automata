@@ -18,6 +18,91 @@ import { SecretManager } from '../config/secrets';
 import { CoinbaseExchange } from '../exchanges/coinbase';
 import { TradeOutcomeCollector } from '../ml/trade-outcome-collector';
 import { EngineSupervisor, SupervisorState, RestartReason } from '../runtime/engine-supervisor';
+import rateLimit from 'express-rate-limit';
+import { z } from 'zod';
+
+// ── Zod schemas for config POST endpoints ──
+
+const riskConfigSchema = z.object({
+  per_trade_risk: z.number().min(0.001).max(0.05).optional(),
+  max_open_positions: z.number().int().min(1).max(10).optional(),
+  daily_loss_limit: z.number().min(-0.10).max(0).optional(),
+  max_drawdown_limit: z.number().min(-0.30).max(0).optional(),
+  max_position_exposure_pct: z.number().min(0.01).max(1.0).optional(),
+}).passthrough();
+
+const signalsConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  minStrength: z.number().min(0).max(1).optional(),
+  strategies: z.record(z.object({
+    enabled: z.boolean().optional(),
+    weight: z.number().min(0).max(10).optional(),
+  }).passthrough()).optional(),
+}).passthrough();
+
+const toggleSchema = z.object({
+  enabled: z.boolean(),
+});
+
+const regimeFilterConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  minCompatibilityScore: z.number().min(0).max(1).optional(),
+  maxPositionMultiplier: z.number().min(0).max(5).optional(),
+  minPositionMultiplier: z.number().min(0).max(1).optional(),
+  minRegimeConfidence: z.number().min(0).max(1).optional(),
+  alwaysAllowStrategies: z.array(z.string()).optional(),
+  requireMTFAlignment: z.boolean().optional(),
+  mtfAlignmentThreshold: z.number().min(0).max(1).optional(),
+}).passthrough();
+
+const metaFilterConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  minWinRate: z.number().min(0).max(1).optional(),
+  minProfitFactor: z.number().min(0).max(100).optional(),
+  minSampleSize: z.number().int().min(0).max(1000).optional(),
+  maxConsecutiveLosses: z.number().int().min(1).max(50).optional(),
+  coldStreakEnabled: z.boolean().optional(),
+}).passthrough();
+
+const tradeOutcomeSchema = z.object({
+  signalId: z.string().min(1),
+  strategy: z.string().min(1),
+  symbol: z.string().min(1),
+  outcome: z.string().min(1),
+  entryTime: z.string().optional(),
+  exitTime: z.string().optional(),
+  hourOfDay: z.number().int().min(0).max(23).optional(),
+  dayOfWeek: z.number().int().min(0).max(6).optional(),
+  filtersPassed: z.array(z.string()).optional(),
+  filtersBlocked: z.array(z.string()).optional(),
+}).passthrough();
+
+const arbiterConfigSchema = z.object({
+  flipCooldownMs: z.number().int().min(0).optional(),
+  minSignalStrength: z.number().min(0).max(1).optional(),
+  requireConsensus: z.boolean().optional(),
+  minConsensusCount: z.number().int().min(1).max(10).optional(),
+  strategyPriorities: z.record(z.number().min(0).max(10)).optional(),
+  verbose: z.boolean().optional(),
+}).passthrough();
+
+const strategyConfigSchema = z.record(z.unknown()).refine(
+  (val) => Object.keys(val).length > 0,
+  { message: 'Config must have at least one parameter' }
+);
+
+const strategyImportSchema = z.object({
+  strategies: z.record(z.record(z.unknown())),
+});
+
+const symbolOverridesSchema = z.record(z.unknown()).refine(
+  (val) => typeof val === 'object' && val !== null,
+  { message: 'Body must be an object with parameter overrides' }
+);
+
+const bulkSymbolOverridesSchema = z.object({
+  overrides: z.record(z.record(z.record(z.unknown()))),
+});
 
 const app = express();
 const server = createServer(app);
@@ -41,6 +126,17 @@ server.on('upgrade', (request, socket, head) => {
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+const apiLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, try again later' },
+});
+app.use('/api', apiLimiter);
+
+const MAX_WS_CLIENTS = 50;
 
 // Prometheus metrics
 client.collectDefaultMetrics({ prefix: 'atlas_' });
@@ -408,6 +504,12 @@ statusBroadcastInterval = setInterval(() => {
 
 // WebSocket connection handler
 wss.on('connection', (ws) => {
+  if (wss.clients.size > MAX_WS_CLIENTS) {
+    logger.warn('WebSocket connection rejected: max clients exceeded', { clients: wss.clients.size, max: MAX_WS_CLIENTS });
+    ws.close(1013, 'Try Again Later');
+    return;
+  }
+
   logger.info('New WebSocket client connected');
   wsClients.add(ws);
 
@@ -1360,13 +1462,28 @@ app.post('/api/engine/start', async (req, res) => {
           logger.debug('Funding bias guardrail enabled (spot mode stub) - no action taken');
         }
 
-        const computedSize = tradingEngine!.computeOrderSize(signal.symbol, entryPrice, stopPrice);
-        if (!Number.isFinite(computedSize) || computedSize <= 0) {
+        const rawSize = tradingEngine!.computeOrderSize(signal.symbol, entryPrice, stopPrice);
+        if (!Number.isFinite(rawSize) || rawSize <= 0) {
           logger.warn('Guardrail sizing returned zero/invalid size, skipping signal', {
             signalId: signal.id,
             symbol: signal.symbol,
             entryPrice,
             stopPrice
+          });
+          return;
+        }
+
+        // Apply regime-based position multiplier from signal metadata
+        const rawMultiplier = signal.metadata?.positionMultiplier as number | undefined;
+        const positionMultiplier = (typeof rawMultiplier === 'number' && Number.isFinite(rawMultiplier) && rawMultiplier > 0)
+          ? rawMultiplier
+          : 1.0;
+        const computedSize = parseFloat((rawSize * positionMultiplier).toFixed(6));
+        if (computedSize <= 0) {
+          logger.warn('Position multiplier reduced size to zero, skipping signal', {
+            signalId: signal.id,
+            rawSize,
+            positionMultiplier,
           });
           return;
         }
@@ -1406,6 +1523,8 @@ app.post('/api/engine/start', async (req, res) => {
           direction: signal.direction,
           entryPrice,
           stopPrice,
+          rawSize,
+          positionMultiplier,
           size: computedSize,
           orderType,
           notionalUsd: (computedSize * entryPrice),
@@ -1777,14 +1896,22 @@ app.post('/api/control/close-all', async (req, res) => {
 
 // Config: risk
 app.post('/api/config/risk', (req, res) => {
-  riskConfig = req.body || {};
+  const parsed = riskConfigSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid risk config', details: parsed.error.format() });
+  }
+  riskConfig = parsed.data;
   logger.info('Risk config updated', { riskConfig });
   res.json({ ok: true });
 });
 
 // Config: signals
 app.post('/api/config/signals', (req, res) => {
-  signalsConfig = req.body || {};
+  const parsed = signalsConfigSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid signals config', details: parsed.error.format() });
+  }
+  signalsConfig = parsed.data;
   logger.info('Signals config updated', { signalsConfig });
   res.json({ ok: true });
 });
@@ -1832,7 +1959,7 @@ app.get('/api/analytics/trades', (req, res) => {
     return res.status(400).json({ error: 'Trading engine not running' });
   }
   
-  const limit = Math.min(parseInt(req.query.limit as string) || 50, 500);
+  const limit = Math.min(parseInt(req.query.limit as string, 10) || 50, 500);
   const trades = tradingEngine.getRecentTrades(limit);
   
   res.json({ trades });
@@ -1842,7 +1969,7 @@ app.get('/api/analytics/trades', (req, res) => {
 app.get('/api/analytics/trade-history', async (req, res) => {
   const startDate = req.query.start as string || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
   const endDate = req.query.end as string || new Date().toISOString().split('T')[0];
-  const limit = Math.min(parseInt(req.query.limit as string) || 100, 1000);
+  const limit = Math.min(parseInt(req.query.limit as string, 10) || 100, 1000);
   
   try {
     const { data, error } = await supabase
@@ -1871,7 +1998,7 @@ app.get('/api/analytics/trade-history', async (req, res) => {
 
 // Get daily trade summary
 app.get('/api/analytics/daily-summary', async (req, res) => {
-  const days = Math.min(parseInt(req.query.days as string) || 30, 365);
+  const days = Math.min(parseInt(req.query.days as string, 10) || 30, 365);
   const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
   
   try {
@@ -1900,7 +2027,7 @@ app.get('/api/analytics/daily-summary', async (req, res) => {
 
 // Get historical sessions
 app.get('/api/analytics/sessions', async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+  const limit = Math.min(parseInt(req.query.limit as string, 10) || 20, 100);
   
   try {
     const { data, error } = await supabase
@@ -2066,17 +2193,17 @@ app.post('/api/regime/filter/toggle', (req, res) => {
     return res.status(400).json({ error: 'Signal processor not running' });
   }
 
-  const { enabled } = req.body;
-  if (typeof enabled !== 'boolean') {
-    return res.status(400).json({ error: 'enabled must be a boolean' });
+  const parsed = toggleSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid toggle payload', details: parsed.error.format() });
   }
 
-  signalProcessor.setRegimeFilterEnabled(enabled);
+  signalProcessor.setRegimeFilterEnabled(parsed.data.enabled);
   
   res.json({ 
     success: true, 
-    message: `Regime filtering ${enabled ? 'enabled' : 'disabled'}`,
-    enabled,
+    message: `Regime filtering ${parsed.data.enabled ? 'enabled' : 'disabled'}`,
+    enabled: parsed.data.enabled,
   });
 });
 
@@ -2086,10 +2213,14 @@ app.post('/api/regime/filter/config', (req, res) => {
     return res.status(400).json({ error: 'Signal processor not running' });
   }
 
-  const config = req.body;
-  signalProcessor.updateRegimeFilterConfig(config);
+  const parsed = regimeFilterConfigSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid regime filter config', details: parsed.error.format() });
+  }
 
-  logger.info('Regime filter config updated via API', { config });
+  signalProcessor.updateRegimeFilterConfig(parsed.data);
+
+  logger.info('Regime filter config updated via API', { config: parsed.data });
   
   res.json({ 
     success: true, 
@@ -2166,7 +2297,7 @@ app.get('/api/metafilter/decisions', (req, res) => {
     return res.status(400).json({ error: 'Signal processor not running' });
   }
 
-  const limit = parseInt(req.query.limit as string) || 50;
+  const limit = parseInt(req.query.limit as string, 10) || 50;
   const decisions = signalProcessor.getRecentFilterDecisions(limit);
 
   res.json({
@@ -2181,17 +2312,17 @@ app.post('/api/metafilter/toggle', (req, res) => {
     return res.status(400).json({ error: 'Signal processor not running' });
   }
 
-  const { enabled } = req.body;
-  if (typeof enabled !== 'boolean') {
-    return res.status(400).json({ error: 'enabled must be a boolean' });
+  const parsed = toggleSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid toggle payload', details: parsed.error.format() });
   }
 
-  signalProcessor.setMetaFilterEnabled(enabled);
+  signalProcessor.setMetaFilterEnabled(parsed.data.enabled);
   
   res.json({ 
     success: true, 
-    message: `Meta filter ${enabled ? 'enabled' : 'disabled'}`,
-    enabled,
+    message: `Meta filter ${parsed.data.enabled ? 'enabled' : 'disabled'}`,
+    enabled: parsed.data.enabled,
   });
 });
 
@@ -2201,10 +2332,14 @@ app.post('/api/metafilter/config', (req, res) => {
     return res.status(400).json({ error: 'Signal processor not running' });
   }
 
-  const config = req.body;
-  signalProcessor.updateMetaFilterConfig(config);
+  const parsed = metaFilterConfigSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid meta filter config', details: parsed.error.format() });
+  }
 
-  logger.info('Meta filter config updated via API', { config });
+  signalProcessor.updateMetaFilterConfig(parsed.data);
+
+  logger.info('Meta filter config updated via API', { config: parsed.data });
   
   res.json({ 
     success: true, 
@@ -2219,16 +2354,13 @@ app.post('/api/metafilter/outcome', (req, res) => {
     return res.status(400).json({ error: 'Signal processor not running' });
   }
 
-  const outcome = req.body;
-  
-  // Validate required fields
-  if (!outcome.signalId || !outcome.strategy || !outcome.symbol || !outcome.outcome) {
-    return res.status(400).json({ 
-      error: 'Missing required fields: signalId, strategy, symbol, outcome' 
-    });
+  const parsed = tradeOutcomeSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid trade outcome', details: parsed.error.format() });
   }
 
-  // Add timestamps if not provided
+  const outcome = parsed.data as any;
+
   outcome.entryTime = outcome.entryTime ? new Date(outcome.entryTime) : new Date();
   outcome.exitTime = outcome.exitTime ? new Date(outcome.exitTime) : new Date();
   outcome.hourOfDay = outcome.hourOfDay ?? new Date().getUTCHours();
@@ -2360,15 +2492,18 @@ app.post('/api/strategies/:strategyId/config', (req, res) => {
   }
 
   const { strategyId } = req.params;
-  const config = req.body;
+  const parsed = strategyConfigSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid strategy config', details: parsed.error.format() });
+  }
 
-  const success = signalProcessor.updateStrategyConfig(strategyId, config);
+  const success = signalProcessor.updateStrategyConfig(strategyId, parsed.data);
 
   if (!success) {
     return res.status(404).json({ error: `Strategy not found: ${strategyId}` });
   }
 
-  logger.info(`Strategy config updated via API: ${strategyId}`, { config });
+  logger.info(`Strategy config updated via API: ${strategyId}`, { config: parsed.data });
   
   const updatedInfo = signalProcessor.getStrategyInfo(strategyId);
   res.json({ 
@@ -2397,18 +2532,18 @@ app.post('/api/strategies/config/import', (req, res) => {
     return res.status(400).json({ error: 'Signal processor not running' });
   }
 
-  const { strategies } = req.body;
-  if (!strategies || typeof strategies !== 'object') {
-    return res.status(400).json({ error: 'Invalid import format. Expected: { strategies: {...} }' });
+  const parsed = strategyImportSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid import format', details: parsed.error.format() });
   }
 
-  signalProcessor.importStrategyConfigs(strategies);
+  signalProcessor.importStrategyConfigs(parsed.data.strategies);
   
   logger.info('Strategy configs imported via API');
   res.json({ 
     success: true, 
     message: 'Strategy configurations imported',
-    imported: Object.keys(strategies),
+    imported: Object.keys(parsed.data.strategies),
   });
 });
 
@@ -2418,16 +2553,16 @@ app.post('/api/strategies/plugin-mode', (req, res) => {
     return res.status(400).json({ error: 'Signal processor not running' });
   }
 
-  const { enabled } = req.body;
-  if (typeof enabled !== 'boolean') {
-    return res.status(400).json({ error: 'enabled must be a boolean' });
+  const parsed = toggleSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid toggle payload', details: parsed.error.format() });
   }
 
-  signalProcessor.setPluginStrategiesEnabled(enabled);
+  signalProcessor.setPluginStrategiesEnabled(parsed.data.enabled);
   
   res.json({ 
     success: true, 
-    message: `Plugin strategy mode ${enabled ? 'enabled' : 'disabled'}`,
+    message: `Plugin strategy mode ${parsed.data.enabled ? 'enabled' : 'disabled'}`,
     pluginModeEnabled: signalProcessor.isPluginStrategiesEnabled(),
   });
 });
@@ -2486,13 +2621,12 @@ app.post('/api/arbiter/toggle', (req, res) => {
     return res.status(400).json({ error: 'Signal processor not running' });
   }
 
-  const { enabled } = req.body;
-  
-  if (typeof enabled !== 'boolean') {
-    return res.status(400).json({ error: 'enabled must be a boolean' });
+  const parsed = toggleSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid toggle payload', details: parsed.error.format() });
   }
 
-  signalProcessor.setArbiterEnabled(enabled);
+  signalProcessor.setArbiterEnabled(parsed.data.enabled);
   
   res.json({
     success: true,
@@ -2506,13 +2640,12 @@ app.post('/api/arbiter/config', (req, res) => {
     return res.status(400).json({ error: 'Signal processor not running' });
   }
 
-  const config = req.body;
-  
-  if (!config || typeof config !== 'object') {
-    return res.status(400).json({ error: 'Request body must be a config object' });
+  const parsed = arbiterConfigSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid arbiter config', details: parsed.error.format() });
   }
 
-  signalProcessor.updateArbiterConfig(config);
+  signalProcessor.updateArbiterConfig(parsed.data);
   
   const arbiter = signalProcessor.getSignalArbiter();
   res.json({
@@ -2589,19 +2722,17 @@ app.post('/api/strategies/:strategyId/symbol-overrides/:symbol', (req, res) => {
   }
 
   const { strategyId, symbol } = req.params;
-  const overrides = req.body;
-
-  if (!overrides || typeof overrides !== 'object') {
-    return res.status(400).json({ error: 'Request body must be an object with parameter overrides' });
+  const parsed = symbolOverridesSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid overrides payload', details: parsed.error.format() });
   }
 
-  const success = signalProcessor.setStrategySymbolOverrides(strategyId, symbol, overrides);
+  const success = signalProcessor.setStrategySymbolOverrides(strategyId, symbol, parsed.data);
 
   if (!success) {
     return res.status(404).json({ error: `Strategy ${strategyId} not found or not a BaseStrategy` });
   }
 
-  // Get the new effective config to return
   const effectiveConfig = signalProcessor.getEffectiveStrategyConfig(strategyId, symbol);
 
   res.json({
@@ -2609,7 +2740,7 @@ app.post('/api/strategies/:strategyId/symbol-overrides/:symbol', (req, res) => {
     message: `Updated overrides for ${strategyId} on ${symbol}`,
     strategyId,
     symbol,
-    appliedOverrides: overrides,
+    appliedOverrides: parsed.data,
     effectiveConfig,
   });
 });
@@ -2620,20 +2751,17 @@ app.post('/api/strategies/symbol-overrides/bulk', (req, res) => {
     return res.status(400).json({ error: 'Signal processor not running' });
   }
 
-  const { overrides } = req.body;
-
-  if (!overrides || typeof overrides !== 'object') {
-    return res.status(400).json({ 
-      error: 'Request body must have "overrides" object with format: { symbol: { strategyId: { params } } }' 
-    });
+  const parsed = bulkSymbolOverridesSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid bulk overrides payload', details: parsed.error.format() });
   }
 
-  signalProcessor.loadPerSymbolOverrides(overrides);
+  signalProcessor.loadPerSymbolOverrides(parsed.data.overrides);
 
   res.json({
     success: true,
     message: 'Bulk updated per-symbol strategy overrides',
-    symbols: Object.keys(overrides),
+    symbols: Object.keys(parsed.data.overrides),
   });
 });
 

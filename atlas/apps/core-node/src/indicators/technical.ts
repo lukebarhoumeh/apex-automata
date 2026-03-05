@@ -81,9 +81,12 @@ export class TechnicalIndicators {
       avgGain = (avgGain * (period - 1) + gains[i]) / period;
       avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
       
-      const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-      const rsi = 100 - (100 / (1 + rs));
-      result.push(rsi);
+      if (avgLoss === 0) {
+        result.push(100);
+        continue;
+      }
+      const rs = avgGain / avgLoss;
+      result.push(100 - (100 / (1 + rs)));
     }
     
     return result;
@@ -175,17 +178,15 @@ export class TechnicalIndicators {
     let cumulativeTPV = 0;
     let cumulativeVolume = 0;
     
-    // Reset at each trading day
-    let lastDate = new Date(candles[0].time);
+    let lastDay = new Date(candles[0].time).toISOString().split('T')[0];
     
     for (const candle of candles) {
-      const currentDate = new Date(candle.time);
+      const currentDay = new Date(candle.time).toISOString().split('T')[0];
       
-      // Reset if new day
-      if (currentDate.getDate() !== lastDate.getDate()) {
+      if (currentDay !== lastDay) {
         cumulativeTPV = 0;
         cumulativeVolume = 0;
-        lastDate = currentDate;
+        lastDay = currentDay;
       }
       
       const typicalPrice = (candle.high + candle.low + candle.close) / 3;
