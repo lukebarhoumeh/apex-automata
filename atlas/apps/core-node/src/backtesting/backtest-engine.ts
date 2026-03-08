@@ -422,11 +422,15 @@ export class BacktestEngine extends EventEmitter {
   }
 
   private calculatePositionSize(signal: Signal): number {
-    let openExposure = 0;
+    // Sum notional value of all open positions (allocated capital)
+    let allocatedCapital = 0;
     for (const pos of this.positions.values()) {
-      openExposure += pos.size * pos.entryPrice;
+      allocatedCapital += pos.size * pos.entryPrice;
     }
-    const availableCapital = this.capital - openExposure;
+
+    // Size against equity (cash + unrealized P&L), not raw cash
+    const equity = this.calculateCurrentEquity();
+    const availableCapital = equity - allocatedCapital;
     if (availableCapital <= 0) return 0;
 
     const maxPositionValue = Math.min(

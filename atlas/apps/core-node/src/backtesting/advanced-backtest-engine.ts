@@ -3,6 +3,7 @@ import { Logger } from '../core/logger';
 import { OHLCV } from '../indicators/technical';
 import { Signal } from '../strategies/signal-processor';
 import { AdvancedRiskManager, RiskConfig } from '../risk/advanced-risk-manager';
+import { HistoricalDataLoader } from './data-loader';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
@@ -274,8 +275,21 @@ export class AdvancedBacktestEngine extends EventEmitter {
   }
   
   private async loadDataFromAPI(symbol: string): Promise<OHLCV[]> {
-    // In real implementation, would call exchange API
-    throw new Error('API data loading not implemented in this example');
+    const loader = new HistoricalDataLoader({
+      supabaseUrl: process.env.SUPABASE_URL || '',
+      supabaseKey: process.env.SUPABASE_SERVICE_KEY || '',
+    }, this.logger);
+
+    const granularitySeconds = this.getTimeframeMinutes() * 60;
+    const result = await loader.loadCandles(
+      symbol,
+      this.config.startDate,
+      this.config.endDate,
+      granularitySeconds
+    );
+
+    this.logger.info(`Loaded ${result.candles.length} candles from ${result.source} for ${symbol}`);
+    return result.candles;
   }
   
   private generateSyntheticData(symbol: string): OHLCV[] {
@@ -850,37 +864,16 @@ export class AdvancedBacktestEngine extends EventEmitter {
     return { bestHour, worstHour, bestDay, worstDay };
   }
   
-  // Walk-forward analysis for robustness testing
+  /**
+   * @deprecated Walk-forward analysis is not implemented. Use
+   * BacktestRunner.runOptimization() (backtest-runner.ts) for grid-search
+   * parameter optimization instead.
+   */
   private async runWalkForwardAnalysis(): Promise<BacktestMetrics> {
-    const results: BacktestMetrics[] = [];
-    const totalDuration = this.config.endDate.getTime() - this.config.startDate.getTime();
-    const periodDuration = totalDuration / this.config.walkForwardPeriods;
-    
-    for (let i = 0; i < this.config.walkForwardPeriods; i++) {
-      // In-sample period (80%)
-      const inSampleStart = new Date(this.config.startDate.getTime() + i * periodDuration);
-      const inSampleEnd = new Date(inSampleStart.getTime() + periodDuration * 0.8);
-      
-      // Out-of-sample period (20%)
-      const outSampleStart = inSampleEnd;
-      const outSampleEnd = new Date(inSampleStart.getTime() + periodDuration);
-      
-      // Optimize on in-sample
-      // (simplified - would run actual optimization in real implementation)
-      
-      // Test on out-of-sample
-      this.config.startDate = outSampleStart;
-      this.config.endDate = outSampleEnd;
-      
-      const metrics = await this.runBacktest();
-      results.push(metrics);
-      
-      // Reset state
-      this.reset();
-    }
-    
-    // Aggregate results
-    return this.aggregateWalkForwardResults(results);
+    throw new Error(
+      'Walk-forward analysis is not implemented. ' +
+      'Use BacktestRunner.runOptimization() from backtest-runner.ts for parameter optimization.'
+    );
   }
   
   // Monte Carlo simulation for confidence intervals

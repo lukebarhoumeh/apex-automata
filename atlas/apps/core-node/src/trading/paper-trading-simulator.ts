@@ -76,6 +76,10 @@ export class PaperTradingSimulator extends EventEmitter {
   private orderSequence = 0;
   private fillSequence = 0;
   
+  // Realized P&L tracking (mirrors position-tracker.ts pattern)
+  private realizedPnL: number = 0;
+  private costBasis: Map<string, { totalCost: number; size: number }> = new Map();
+  
   // TWAP order tracking
   private twapOrders: Map<string, TWAPOrder> = new Map();
   private twapTimer: NodeJS.Timeout | null = null;
@@ -580,7 +584,8 @@ export class PaperTradingSimulator extends EventEmitter {
   }
 
   /**
-   * Update balances after fill
+   * Update balances after fill and track realized P&L.
+   * Realized P&L is computed using average cost basis (same approach as position-tracker.ts).
    */
   private updateBalances(order: SimulatedOrder, fill: Fill): void {
     const [baseCurrency, quoteCurrency] = order.productId.split('-');
@@ -599,6 +604,12 @@ export class PaperTradingSimulator extends EventEmitter {
       
       // Add base currency
       this.balances.set(baseCurrency, this.getBalance(baseCurrency) + fillSize);
+
+      // Update cost basis (average cost method)
+      const existing = this.costBasis.get(baseCurrency) || { totalCost: 0, size: 0 };
+      existing.totalCost += fillSize * fillPrice + fee;
+      existing.size += fillSize;
+      this.costBasis.set(baseCurrency, existing);
     } else {
       // Deduct base currency
       this.balances.set(baseCurrency, this.getBalance(baseCurrency) - fillSize);
@@ -606,6 +617,22 @@ export class PaperTradingSimulator extends EventEmitter {
       // Add quote currency (minus fee)
       const quoteReceived = fillSize * fillPrice - fee;
       this.balances.set(quoteCurrency, this.getBalance(quoteCurrency) + quoteReceived);
+
+      // Compute realized P&L from cost basis
+      const existing = this.costBasis.get(baseCurrency);
+      if (existing && existing.size > 0) {
+        const avgCost = existing.totalCost / existing.size;
+        const pnl = (fillPrice - avgCost) * fillSize - fee;
+        this.realizedPnL += pnl;
+
+        // Reduce cost basis proportionally
+        const proportion = Math.min(fillSize / existing.size, 1);
+        existing.totalCost *= (1 - proportion);
+        existing.size -= fillSize;
+        if (existing.size <= 0) {
+          this.costBasis.delete(baseCurrency);
+        }
+      }
     }
 
     this.logger.debug('Balances updated', {
@@ -662,14 +689,15 @@ export class PaperTradingSimulator extends EventEmitter {
       }
     }
 
-    const unrealizedPnL = totalValue - initialValue;
-    const returnPercent = initialValue > 0 ? (unrealizedPnL / initialValue) * 100 : 0;
+    const totalPnL = totalValue - initialValue;
+    const unrealizedPnL = totalPnL - this.realizedPnL;
+    const returnPercent = initialValue > 0 ? (totalPnL / initialValue) * 100 : 0;
 
     return {
       totalValue,
       initialValue,
       unrealizedPnL,
-      realizedPnL: 0, // TODO: Track realized P&L from closed positions
+      realizedPnL: this.realizedPnL,
       returnPercent
     };
   }
@@ -683,6 +711,8 @@ export class PaperTradingSimulator extends EventEmitter {
     this.marketPrices.clear();
     this.orderSequence = 0;
     this.fillSequence = 0;
+    this.realizedPnL = 0;
+    this.costBasis.clear();
     
     this.logger.info('Paper trading simulator reset');
   }

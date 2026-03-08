@@ -3007,50 +3007,32 @@ app.post('/api/backtest/run', async (req, res) => {
     // Create backtest engine
     const backtestEngine = new BacktestEngine(backtestConfig, logger);
 
-    // Mock data provider - generates synthetic price data for backtesting
-    const dataProvider = async (product: string, start: Date, end: Date) => {
-      logger.info(`Generating mock historical data for ${product} from ${start} to ${end}`);
-      
-      // Generate synthetic OHLCV data
-      const bars = [];
-      const basePrice = product === 'BTC-USD' ? 60000 : product === 'ETH-USD' ? 3000 : 100;
-      let currentPrice = basePrice;
-      
-      // Generate 5-minute bars
-      const current = new Date(start);
-      const endTime = new Date(end);
-      
-      while (current <= endTime) {
-        // Random walk with mean reversion
-        const volatility = 0.001; // 0.1% per 5 minutes
-        const drift = (basePrice - currentPrice) / basePrice * 0.001; // Mean reversion
-        const change = (Math.random() - 0.5 + drift) * volatility;
-        
-        currentPrice = currentPrice * (1 + change);
-        
-        // Generate OHLCV
-        const open = currentPrice;
-        const close = currentPrice * (1 + (Math.random() - 0.5) * volatility);
-        const high = Math.max(open, close) * (1 + Math.random() * volatility * 0.5);
-        const low = Math.min(open, close) * (1 - Math.random() * volatility * 0.5);
-        const volume = 100 + Math.random() * 900; // Random volume 100-1000
-        
-        bars.push({
-          time: current.getTime(),
-          open,
-          high,
-          low,
-          close,
-          volume
-        });
-        
-        currentPrice = close;
-        current.setMinutes(current.getMinutes() + 5); // 5-minute intervals
-      }
-      
-      logger.info(`Generated ${bars.length} bars for ${product}`);
-      return bars;
-    };
+    const useSynthetic = req.query.synthetic === 'true';
+
+    let dataProvider: (product: string, start: Date, end: Date) => Promise<OHLCV[]>;
+
+    if (useSynthetic) {
+      dataProvider = async (product: string, start: Date, end: Date) => {
+        const { HistoricalDataLoader } = await import('../backtesting/data-loader');
+        const loader = new HistoricalDataLoader({
+          supabaseUrl: '',
+          supabaseKey: '',
+        }, logger);
+        const result = await loader.loadCandles(product, start, end, 300);
+        return result.candles;
+      };
+    } else {
+      dataProvider = async (product: string, start: Date, end: Date) => {
+        const { HistoricalDataLoader } = await import('../backtesting/data-loader');
+        const loader = new HistoricalDataLoader({
+          supabaseUrl: process.env.SUPABASE_URL || '',
+          supabaseKey: process.env.SUPABASE_SERVICE_KEY || '',
+        }, logger);
+        const result = await loader.loadCandles(product, start, end, 300);
+        logger.info(`Loaded ${result.candles.length} candles from ${result.source} for ${product}`);
+        return result.candles;
+      };
+    }
 
     // Load historical data
     await backtestEngine.loadHistoricalData(dataProvider);

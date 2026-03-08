@@ -29,6 +29,44 @@ export interface DataLoaderResult {
 }
 
 /**
+ * Validates a single OHLCV candle for data integrity.
+ * Returns true if the candle has valid OHLCV values.
+ */
+export function validateCandle(candle: OHLCV): boolean {
+  if (candle.open <= 0 || candle.close <= 0) return false;
+  if (candle.high < candle.low) return false;
+  if (candle.volume < 0) return false;
+  if (candle.high < Math.max(candle.open, candle.close)) return false;
+  if (candle.low > Math.min(candle.open, candle.close)) return false;
+  return true;
+}
+
+/**
+ * Filters an array of candles, removing invalid entries and logging warnings.
+ */
+function filterValidCandles(candles: OHLCV[], product: string, logger: Logger): OHLCV[] {
+  const valid: OHLCV[] = [];
+  let invalidCount = 0;
+
+  for (const candle of candles) {
+    if (validateCandle(candle)) {
+      valid.push(candle);
+    } else {
+      invalidCount++;
+    }
+  }
+
+  if (invalidCount > 0) {
+    logger.warn(`Filtered ${invalidCount} invalid candles for ${product}`, {
+      totalLoaded: candles.length,
+      validCount: valid.length,
+    });
+  }
+
+  return valid;
+}
+
+/**
  * HistoricalDataLoader loads candle data from various sources.
  */
 export class HistoricalDataLoader {
@@ -144,7 +182,7 @@ export class HistoricalDataLoader {
 
       this.logger.info(`Loaded ${data.length} candles from Supabase for ${product}`);
 
-      return data.map((row: any) => ({
+      const candles = data.map((row: any) => ({
         time: new Date(row.time).getTime(),
         open: parseFloat(row.open),
         high: parseFloat(row.high),
@@ -152,6 +190,7 @@ export class HistoricalDataLoader {
         close: parseFloat(row.close),
         volume: parseFloat(row.volume),
       }));
+      return filterValidCandles(candles, product, this.logger);
     } catch (error) {
       this.logger.warn(`Failed to load from Supabase:`, error);
       return [];
@@ -224,8 +263,9 @@ export class HistoricalDataLoader {
       // Sort by time
       allCandles.sort((a, b) => a.time - b.time);
 
-      this.logger.info(`Loaded ${allCandles.length} candles from exchange for ${product}`);
-      return allCandles;
+      const validated = filterValidCandles(allCandles, product, this.logger);
+      this.logger.info(`Loaded ${validated.length} candles from exchange for ${product}`);
+      return validated;
     } catch (error) {
       this.logger.warn(`Failed to load from exchange:`, error);
       return [];
@@ -284,8 +324,9 @@ export class HistoricalDataLoader {
       currentTime += intervalMs;
     }
 
-    this.logger.info(`Generated ${candles.length} synthetic candles for ${product}`);
-    return candles;
+    const validated = filterValidCandles(candles, product, this.logger);
+    this.logger.info(`Generated ${validated.length} synthetic candles for ${product}`);
+    return validated;
   }
 
   /**
