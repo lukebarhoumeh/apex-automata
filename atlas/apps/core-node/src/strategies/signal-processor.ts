@@ -32,6 +32,8 @@ export interface SignalProcessorConfig {
     modelPath?: string;
     threshold: number;
   };
+  // Strategies permanently killed by backtest verdict — never fire signals
+  disabledStrategies?: string[];
   // Regime detection configuration
   regimeDetector?: Partial<RegimeDetectorConfig>;
   regimeFilter?: Partial<RegimeFilterConfig>;
@@ -423,6 +425,11 @@ export class SignalProcessor extends EventEmitter {
    */
   public getCandleCount(symbol: string): number {
     return this.candles.get(symbol)?.length || 0;
+  }
+
+  /** Get a copy of the candle buffer for a symbol (used for warmup mirroring) */
+  public getCandleBuffer(symbol: string): OHLCV[] {
+    return [...(this.candles.get(symbol) || [])];
   }
   
   /**
@@ -926,6 +933,14 @@ export class SignalProcessor extends EventEmitter {
   }
 
   private async processSignal(signal: Signal): Promise<void> {
+    // Hard-reject signals from disabled strategies (Phase 3 backtest kill list)
+    const disabledStrategies = this.config.disabledStrategies || [];
+    if (disabledStrategies.includes(signal.strategy)) {
+      this.logger.warn(`Signal from disabled strategy "${signal.strategy}" rejected — strategy killed per Phase 3 backtest verdict`);
+      this.emit('signal:filtered', signal, `Disabled strategy: ${signal.strategy}`);
+      return;
+    }
+
     // Check if we recently generated a similar signal
     const lastSignal = this.lastSignals.get(signal.symbol);
     if (lastSignal && 

@@ -1,9 +1,17 @@
 account:
   equity_usd: 10000
   risk_per_trade: 0.005
-  max_open_positions: 2
+  max_open_positions: 4
   max_account_leverage: 3.0
   min_notional_buffer: 1.1
+
+# Strategies permanently disabled based on Phase 3 backtest verdict (March 2026)
+# VWAP MR: Zero/1 trade across 12 months — ADX ranging regime too short
+# Breakout: Negative-EV even at zero fees — signal has no edge
+# See PHASE3_BACKTEST_VERDICT.md for full analysis
+disabled_strategies:
+  - vwap_mr
+  - breakout
 
 risk:
   daily_loss_limit: -0.02
@@ -41,16 +49,27 @@ per_symbol:
     max_notional_usd: 3000
     max_daily_loss_usd: 200
     strategy_overrides:
+      trend_follow:
+        emaFast: 12
+        emaSlow: 15
+        stopAtr: 2.5
+        takeProfitAtr: 5.0
+      momentum:
+        rsiPeriod: 10
+        rsiOversold: 40
+        rsiOverbought: 55
+        macdFast: 8
+        macdSlow: 21
+        macdSignal: 5
+        stopAtr: 2.0
+        takeProfitAtr: 4.0
+        atrMultiplier: 2.0
       breakout:
         atrMultiplier: 2.0
         volumeThreshold: 1.5
         period: 20
       vwap_mr:
         deviationEntry: 2.0
-      momentum:
-        atrMultiplier: 2.0
-        rsiOversold: 30
-        rsiOverbought: 70
   SOL-USD:
     max_notional_usd: 3000
     max_daily_loss_usd: 200
@@ -78,14 +97,72 @@ strategy:
   stop_init_atr: 1.5
   stop_trail_atr: 1.0
   time_stop_bars: 96
-  # IMPORTANT: allow_short is false because Coinbase spot markets do not support shorting.
-  # This is a PLATFORM LIMITATION, not a strategy choice.
-  # - Strategies may still generate 'sell' signals for analytics/backtesting
-  # - 'sell' on a long position = close position (valid)
-  # - 'sell' on flat position = no action (cannot open short on Coinbase spot)
-  # To enable shorting, use an exchange that supports margin/futures (e.g., Binance Futures, dYdX)
-  allow_short: false
+  # Shorting enabled via Coinbase Perpetual Futures (CFTC-regulated)
+  # - Spot adapter ('coinbase'): shorts still blocked at execution level
+  # - Perps adapter ('coinbase-perps'): full long/short capability
+  # - Strategies generate both long and short signals
+  allow_short: true
   trade_cooldown_min: 15
+
+# Perpetual Futures Configuration
+# Applies only when trading via 'coinbase-perps' adapter
+perps:
+  # Risk per trade for leveraged positions (1.5% approved — quarter-Kelly at leverage)
+  risk_per_trade: 0.015
+  # Default leverage for new positions (conservative start)
+  default_leverage: 3
+  # Maximum leverage allowed (Coinbase limit: 10x intraday)
+  max_leverage: 10
+  # Minimum distance from liquidation price before position is auto-reduced (%)
+  liquidation_buffer_pct: 0.20
+  # Maximum funding rate (bps) before position bias is applied
+  max_funding_rate_bps: 50
+  # Funding rate check interval (seconds)
+  funding_check_interval_sec: 300
+  # Fee schedule for perps (decimal format)
+  maker_fee: 0.0000
+  taker_fee: 0.0003
+  # Contract specifications
+  nano_contract_size: 0.01
+
+# Per-symbol perpetual futures configuration
+perps_symbols:
+  ETH-PERP-INTX:
+    max_notional_usd: 5000
+    max_daily_loss_usd: 300
+    default_leverage: 3
+    max_leverage: 5
+    strategy_overrides:
+      trend_follow:
+        emaFast: 12
+        emaSlow: 15
+        stopAtr: 2.5
+        takeProfitAtr: 5.0
+      momentum:
+        rsiPeriod: 10
+        rsiOversold: 40
+        rsiOverbought: 55
+        macdFast: 8
+        macdSlow: 21
+        macdSignal: 5
+        stopAtr: 2.0
+        takeProfitAtr: 4.0
+        atrMultiplier: 2.0
+  BTC-PERP-INTX:
+    max_notional_usd: 5000
+    max_daily_loss_usd: 300
+    default_leverage: 3
+    max_leverage: 5
+    strategy_overrides:
+      momentum:
+        atrMultiplier: 2.0
+        rsiOversold: 30
+        rsiOverbought: 70
+      trend_follow:
+        emaFast: 12
+        emaSlow: 26
+        stopAtr: 2.0
+        takeProfitAtr: 4.0
 
 execution:
   order_type: marketable_limit

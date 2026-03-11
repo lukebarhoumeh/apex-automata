@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 import { Logger } from '../core/logger';
 import { CoinbaseExchange, CoinbaseOrder, OrderRequest, Fill } from '../exchanges/coinbase';
+import { IExchangeAdapter, AdapterOrderResult } from '../exchanges/types';
 
 export interface OrderManagerConfig {
   supabaseUrl: string;
@@ -72,6 +73,7 @@ export class OrderManager extends EventEmitter {
   private config: OrderManagerConfig;
   private logger: Logger;
   private exchange: CoinbaseExchange;
+  private exchangeAdapter: IExchangeAdapter | null = null;
   private orders: Map<string, ManagedOrder> = new Map();
   private exchangeIdToManagedId: Map<string, string> = new Map();
   private twapOrders: Map<string, TWAPOrder> = new Map();
@@ -95,7 +97,36 @@ export class OrderManager extends EventEmitter {
     this.exchange.on('order', this.handleExchangeOrder.bind(this));
     this.exchange.on('fill', this.handleExchangeFill.bind(this));
   }
-  
+
+  /**
+   * Set an exchange adapter for decoupled exchange access.
+   * When set, order update events from the adapter are bridged into the existing
+   * event flow, so downstream handlers (position tracker, risk engine) work unchanged.
+   * This enables multi-exchange support without modifying existing order logic.
+   */
+  public setExchangeAdapter(adapter: IExchangeAdapter): void {
+    this.exchangeAdapter = adapter;
+    this.logger.info(`OrderManager: Exchange adapter set to '${adapter.id}'`);
+
+    adapter.on('order:update', (result: AdapterOrderResult) => {
+      const mappedOrder: any = {
+        id: result.orderId,
+        product_id: result.symbol,
+        side: result.side,
+        type: result.type,
+        status: result.status === 'filled' ? 'done' : result.status === 'cancelled' ? 'canceled' : result.status,
+        filled_size: result.filledSize,
+        executed_value: String(parseFloat(result.filledSize) * parseFloat(result.avgFillPrice)),
+        fill_fees: result.fees,
+        created_at: new Date(result.timestamp).toISOString(),
+        settled: result.status === 'filled',
+        size: result.size,
+        price: result.avgFillPrice,
+      };
+      this.handleExchangeOrder(mappedOrder);
+    });
+  }
+
   private resolveManagedOrderByExchangeId(exchangeOrderId: string): ManagedOrder | undefined {
     // Paper mode often uses the client order id as the order id.
     const direct = this.orders.get(exchangeOrderId);

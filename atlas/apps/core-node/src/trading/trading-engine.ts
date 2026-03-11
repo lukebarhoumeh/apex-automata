@@ -1447,10 +1447,10 @@ export class TradingEngine extends EventEmitter {
     await this.stop();
   }
 
-  public computeOrderSize(productId: string, entryPrice: number, stopPrice: number): number {
+  public computeOrderSize(productId: string, entryPrice: number, stopPrice: number, riskPerTradeOverride?: number): number {
     if (!this.riskEngine) {
       return 0;
     }
-    return this.riskEngine.computeOrderSize(productId, entryPrice, stopPrice);
+    return this.riskEngine.computeOrderSize(productId, entryPrice, stopPrice, riskPerTradeOverride);
   }
 }

@@ -108,9 +108,9 @@ export class MomentumStrategy extends BaseStrategy {
         default: false,
       },
       {
-        key: 'atrMultiplier',
-        name: 'ATR Multiplier',
-        description: 'Multiplier for ATR-based stop loss',
+        key: 'stopAtr',
+        name: 'Stop Loss ATR Multiplier',
+        description: 'Multiplier for ATR-based stop loss distance',
         type: 'number',
         default: 2.0,
         min: 1.0,
@@ -118,9 +118,19 @@ export class MomentumStrategy extends BaseStrategy {
         step: 0.5,
       },
       {
-        key: 'targetMultiplier',
-        name: 'Target Multiplier',
-        description: 'Risk:reward ratio for take profit',
+        key: 'takeProfitAtr',
+        name: 'Take Profit ATR Multiplier',
+        description: 'Take profit distance as multiple of ATR',
+        type: 'number',
+        default: 4.0,
+        min: 1.0,
+        max: 8.0,
+        step: 0.5,
+      },
+      {
+        key: 'atrMultiplier',
+        name: 'ATR Multiplier (legacy)',
+        description: 'Legacy alias for stopAtr — prefer stopAtr',
         type: 'number',
         default: 2.0,
         min: 1.0,
@@ -169,13 +179,13 @@ export class MomentumStrategy extends BaseStrategy {
     const signals: StrategySignal[] = [];
     const { symbol } = context;
 
-    // Get config (with per-symbol overrides) - AGGRESSIVE defaults
-    const rsiOversold = this.getConfig<number>('rsiOversold', 45, symbol);  // Raised from 30
-    const rsiOverbought = this.getConfig<number>('rsiOverbought', 55, symbol);  // Lowered from 70
-    const requireMacdConfirm = this.getConfig<boolean>('requireMacdConfirm', false, symbol);  // Disabled
+    // Get config (with per-symbol overrides from guardrails.yaml)
+    const rsiOversold = this.getConfig<number>('rsiOversold', 40, symbol);
+    const rsiOverbought = this.getConfig<number>('rsiOverbought', 55, symbol);
+    const requireMacdConfirm = this.getConfig<boolean>('requireMacdConfirm', false, symbol);
     const requireMacdCrossover = this.getConfig<boolean>('requireMacdCrossover', false, symbol);
-    const atrMultiplier = this.getConfig<number>('atrMultiplier', 2.0, symbol);
-    const targetMultiplier = this.getConfig<number>('targetMultiplier', 2.0, symbol);
+    const stopAtr = this.getConfig<number>('stopAtr', 2.0, symbol);
+    const takeProfitAtr = this.getConfig<number>('takeProfitAtr', 4.0, symbol);
 
     const { indicators } = context;
 
@@ -197,8 +207,8 @@ export class MomentumStrategy extends BaseStrategy {
     }
 
     const currentPrice = context.latestCandle.close;
-    const stopDistance = atr * atrMultiplier;
-    const targetDistance = stopDistance * targetMultiplier;
+    const stopDistance = atr * stopAtr;
+    const targetDistance = atr * takeProfitAtr;
 
     // Check for bullish signal (RSI oversold with MACD confirmation)
     const rsiOversoldNow = rsi <= rsiOversold;

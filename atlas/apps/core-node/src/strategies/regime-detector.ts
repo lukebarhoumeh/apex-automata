@@ -78,9 +78,13 @@ export interface RegimeState {
 }
 
 export interface RegimeDetectorConfig {
+  // Classification mode: 'adx_primary' uses pure ADX thresholds (backtested),
+  // 'multi_factor' uses weighted scoring across all indicators
+  classificationMode: 'adx_primary' | 'multi_factor';
+
   // ADX thresholds
-  adxStrongTrend: number;    // ADX > this = strong trend (default: 35)
-  adxWeakTrend: number;      // ADX > this = weak trend (default: 25)
+  adxStrongTrend: number;    // ADX >= this = strong trend (default: 40)
+  adxWeakTrend: number;      // ADX >= this = weak trend (default: 20)
   adxRanging: number;        // ADX < this = ranging (default: 20)
   
   // Choppiness thresholds
@@ -101,8 +105,9 @@ export interface RegimeDetectorConfig {
 }
 
 const DEFAULT_CONFIG: RegimeDetectorConfig = {
-  adxStrongTrend: 35,
-  adxWeakTrend: 25,
+  classificationMode: 'adx_primary',
+  adxStrongTrend: 40,
+  adxWeakTrend: 20,
   adxRanging: 20,
   chopHighThreshold: 61.8,
   chopLowThreshold: 38.2,
@@ -349,7 +354,9 @@ export class RegimeDetector extends EventEmitter {
   }
 
   /**
-   * Classify regime using weighted scoring from multiple indicators
+   * Classify regime using the configured mode.
+   * 'adx_primary' — pure ADX thresholds validated by Phase 3 backtest (+18.6% edge).
+   * 'multi_factor' — weighted scoring across ADX, choppiness, BB width, ATR%, direction.
    */
   private classifyRegime(metrics: {
     adx: number;
@@ -359,6 +366,20 @@ export class RegimeDetector extends EventEmitter {
     directionConsistency: number;
     mtfAlignment: number;
   }): { regime: MarketRegime; confidence: number } {
+
+    if (this.config.classificationMode === 'adx_primary') {
+      const { adx } = metrics;
+      if (adx >= this.config.adxStrongTrend) {
+        return { regime: 'strong_trend', confidence: Math.min(adx / 50, 1.0) };
+      }
+      if (adx >= this.config.adxWeakTrend) {
+        return { regime: 'weak_trend', confidence: (adx - this.config.adxWeakTrend) / (this.config.adxStrongTrend - this.config.adxWeakTrend) };
+      }
+      return { regime: 'ranging', confidence: 1 - (adx / this.config.adxWeakTrend) };
+    }
+
+    // --- multi_factor: existing weighted scoring ---
+
     const scores = {
       strong_trend: 0,
       weak_trend: 0,
@@ -406,10 +427,8 @@ export class RegimeDetector extends EventEmitter {
 
     // BB Width scoring (weight: 15%)
     if (metrics.bbWidth <= this.config.bbSqueezeThreshold) {
-      // Squeeze - potential breakout, but currently ranging
       scores.ranging += 0.15;
     } else if (metrics.bbWidth >= this.config.bbExpansionThreshold) {
-      // Expansion - trending
       scores.strong_trend += 0.10;
       scores.weak_trend += 0.05;
     } else {
@@ -444,7 +463,7 @@ export class RegimeDetector extends EventEmitter {
     // Calculate confidence based on score margin
     const sortedScores = Object.values(scores).sort((a, b) => b - a);
     const margin = sortedScores[0] - sortedScores[1];
-    const confidence = Math.min(1, 0.5 + margin * 2); // Base 50% + margin boost
+    const confidence = Math.min(1, 0.5 + margin * 2);
 
     return { regime, confidence };
   }

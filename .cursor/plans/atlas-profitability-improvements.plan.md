@@ -1,3 +1,10 @@
+---
+name: ""
+overview: ""
+todos: []
+isProject: false
+---
+
 # AtlasBot Profitability Improvements Plan
 
 > **Goal**: Transform AtlasBot from a ~95% complete system to a production-ready, profitable trading bot.
@@ -33,12 +40,14 @@ const STRATEGY_TYPES: Record<string, StrategyType> = {
 ```
 
 But `MomentumStrategy` marks `ranging` as `optimal` (multiplier 1.0). This creates a conflict:
+
 - RegimeFilter blocks momentum in ranging (trend_following × ranging = 0.3)
 - MomentumStrategy says ranging is optimal
 
 **Solution**: Reclassify momentum as `neutral` OR create a new `oscillator` type with its own compatibility matrix.
 
 **Recommendation**: Create new type `oscillator` with:
+
 ```typescript
 'ranging': { oscillator: 0.9 },      // Nearly optimal
 'weak_trend': { oscillator: 1.0 },   // Optimal  
@@ -47,6 +56,7 @@ But `MomentumStrategy` marks `ranging` as `optimal` (multiplier 1.0). This creat
 ```
 
 **Files to modify**:
+
 - `atlas/apps/core-node/src/strategies/regime-filter.ts`
 
 ---
@@ -68,6 +78,7 @@ readonly requiredIndicators: IndicatorRequirement[] = [
 **Solution**: Add `bbMiddle` to the indicator requirements.
 
 **Files to modify**:
+
 - `atlas/apps/core-node/src/strategies/plugins/builtin/vwap-mr-strategy.ts`
 
 ---
@@ -75,17 +86,20 @@ readonly requiredIndicators: IndicatorRequirement[] = [
 ### 1.3 Verify ONNX MetaLabel Model Status
 
 **Current State**:
+
 - `atlas/apps/core-node/src/ml/meta-label.ts` - Full inference infrastructure ✓
 - Model loading from `config.modelPath` - Implemented ✓
 - Feature extraction and normalization - Implemented ✓
 - **Missing**: Actual trained `.onnx` model file
 
 **Action Required**:
+
 1. Check if `.onnx` file exists in config path
 2. If not, document that ML filtering is currently disabled (falls back to rule-based)
 3. Add clear console warning at startup if model missing
 
 **Files to check/modify**:
+
 - `atlas/apps/core-node/src/ml/meta-label.ts` (add startup warning)
 - Config files for `metaLabeling.modelPath`
 
@@ -94,17 +108,20 @@ readonly requiredIndicators: IndicatorRequirement[] = [
 ### 1.4 Document Coinbase Spot Short Limitation
 
 **Current State**:
+
 - `guardrails.yaml` has `allow_short: false`
 - `risk-engine.ts` correctly blocks shorts when disabled
 - Strategies still generate `sell` signals
 
 **Clarification Needed**:
+
 - `sell` signals on flat position = no action (can't short on Coinbase spot)
 - `sell` signals on long position = close position (valid)
 
 **Action**: Add comment in guardrails.yaml explaining this is a platform limitation, not a strategy choice.
 
 **Files to modify**:
+
 - `atlas/config/guardrails.yaml` (add documentation comment)
 
 ---
@@ -114,6 +131,7 @@ readonly requiredIndicators: IndicatorRequirement[] = [
 ### Rationale
 
 BTC, ETH, and SOL have different volatility profiles:
+
 - **BTC**: Lower volatility, more institutional, needs tighter ATR multipliers
 - **ETH**: Medium volatility, follows BTC but with beta > 1
 - **SOL**: Highest volatility, needs wider stops, higher volume thresholds
@@ -123,6 +141,7 @@ Currently, all three share the same strategy parameters. This leaves money on th
 ### 2.1 Extend BaseStrategy for Per-Symbol Overrides
 
 **Current State**:
+
 ```typescript
 // base-strategy.ts
 protected getConfig<T>(key: string, defaultValue: T): T {
@@ -132,6 +151,7 @@ protected getConfig<T>(key: string, defaultValue: T): T {
 ```
 
 **Proposed Enhancement**:
+
 ```typescript
 protected getConfig<T>(key: string, defaultValue: T, symbol?: string): T {
   // Check symbol-specific override first
@@ -145,6 +165,7 @@ protected getConfig<T>(key: string, defaultValue: T, symbol?: string): T {
 ```
 
 **Files to modify**:
+
 - `atlas/apps/core-node/src/strategies/plugins/base-strategy.ts`
 - `atlas/apps/core-node/src/strategies/plugins/types.ts` (add type)
 
@@ -153,6 +174,7 @@ protected getConfig<T>(key: string, defaultValue: T, symbol?: string): T {
 ### 2.2 Add Per-Symbol Strategy Params to Guardrails
 
 **Current guardrails.yaml** has per-symbol risk limits:
+
 ```yaml
 per_symbol:
   BTC-USD:
@@ -161,6 +183,7 @@ per_symbol:
 ```
 
 **Proposed addition**:
+
 ```yaml
 per_symbol:
   BTC-USD:
@@ -182,6 +205,7 @@ per_symbol:
 ```
 
 **Files to modify**:
+
 - `atlas/apps/core-node/src/config/loadGuardrails.ts` (update schema)
 - `atlas/config/guardrails.yaml` (add examples)
 
@@ -200,6 +224,7 @@ const volumeThreshold = this.getConfig<number>('volumeThreshold', 1.1, context.s
 ```
 
 **Files to modify**:
+
 - `atlas/apps/core-node/src/strategies/plugins/builtin/breakout-strategy.ts`
 - `atlas/apps/core-node/src/strategies/plugins/builtin/vwap-mr-strategy.ts`
 - `atlas/apps/core-node/src/strategies/plugins/builtin/momentum-strategy.ts`
@@ -211,6 +236,7 @@ const volumeThreshold = this.getConfig<number>('volumeThreshold', 1.1, context.s
 ### Rationale
 
 With 3 strategies running simultaneously, conflicts will occur:
+
 - Breakout says BUY, VWAP Mean Reversion says SELL
 - Result: Position flips back and forth, bleeding fees
 
@@ -223,6 +249,7 @@ Current mitigation (5-minute dedup window) is strategy-specific, not cross-strat
 **Location**: `atlas/apps/core-node/src/strategies/signal-arbiter.ts`
 
 **Logic**:
+
 ```
 1. Collect signals within 30-second window
 2. Group by symbol
@@ -235,6 +262,7 @@ Current mitigation (5-minute dedup window) is strategy-specific, not cross-strat
 ```
 
 **Key Features**:
+
 - Configurable window size
 - Priority rules per regime
 - Logging for post-analysis
@@ -257,6 +285,7 @@ interface CooldownState {
 ```
 
 **Files to modify**:
+
 - `atlas/apps/core-node/src/strategies/signal-arbiter.ts` (new file)
 - `atlas/apps/core-node/src/trading/position-tracker.ts` (emit flip events)
 
@@ -288,6 +317,7 @@ if (!arbitrationResult.allowed) {
 ### Rationale
 
 Current strategies operate on 1-minute candles. This captures intraday moves but misses multi-day trends. During a 30% BTC rally over 2 weeks:
+
 - Breakout: Catches initial breakout, exits at 2×ATR target (~2-3%)
 - Momentum: Catches dips, exits at 2×ATR
 - VWAP MR: Actually fights the trend (tries to short)
@@ -299,6 +329,7 @@ Current strategies operate on 1-minute candles. This captures intraday moves but
 **Location**: `atlas/apps/core-node/src/strategies/plugins/builtin/trend-follow-strategy.ts`
 
 **Logic**:
+
 ```
 Entry Conditions:
 - 20-period EMA > 50-period EMA on 1-hour chart (bullish) OR inverse (bearish)
@@ -316,6 +347,7 @@ Position Sizing:
 ```
 
 **Regime Compatibility**:
+
 ```typescript
 readonly regimeCompatibility: RegimeCompatibility[] = [
   { regime: 'strong_trend', compatibility: 'optimal', positionMultiplier: 1.0 },
@@ -334,6 +366,7 @@ readonly regimeCompatibility: RegimeCompatibility[] = [
 **Position Monitor**: Already supports trailing stops
 
 **Key Addition**: The strategy needs to calculate indicators on hourly data:
+
 ```typescript
 // Use 1h candles for EMA calculation
 const hourlyCloses = context.mtfCandles?.h1?.map(c => c.close) || [];
@@ -346,6 +379,7 @@ const ema50 = TechnicalIndicators.EMA(hourlyCloses, 50);
 ### 4.3 Register in Builtin Strategies
 
 **Files to modify**:
+
 - `atlas/apps/core-node/src/strategies/plugins/builtin/index.ts`
 - `atlas/apps/core-node/src/strategies/signal-processor.ts` (add config)
 
@@ -440,12 +474,14 @@ this.positionTracker.on('position:closed', async (position) => {
 ### 5.3 Document ML Training Workflow
 
 **Step 1**: Export training data
+
 ```bash
 # Export from Supabase
 psql $DATABASE_URL -c "COPY (SELECT * FROM trade_outcomes WHERE outcome IS NOT NULL) TO STDOUT WITH CSV HEADER" > training_data.csv
 ```
 
 **Step 2**: Train model (Python)
+
 ```python
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -470,6 +506,7 @@ with open('meta_label_model.onnx', 'wb') as f:
 ```
 
 **Step 3**: Deploy model
+
 ```bash
 cp meta_label_model.onnx atlas/models/
 # Update config: metaLabeling.modelPath = 'models/meta_label_model.onnx'
@@ -479,13 +516,15 @@ cp meta_label_model.onnx atlas/models/
 
 ## Implementation Priority
 
-| Phase | Priority | Effort | Impact | Risk |
-|-------|----------|--------|--------|------|
-| 1. Minor Corrections | HIGH | 2 hrs | Medium | Low |
-| 2. Per-Asset Tuning | HIGH | 4 hrs | High | Low |
-| 3. Signal Deconfliction | HIGH | 6 hrs | High | Medium |
-| 4. Trend Strategy | MEDIUM | 8 hrs | High | Medium |
-| 5. ML Pipeline | LOW | 12 hrs | Medium | High |
+
+| Phase                   | Priority | Effort | Impact | Risk   |
+| ----------------------- | -------- | ------ | ------ | ------ |
+| 1. Minor Corrections    | HIGH     | 2 hrs  | Medium | Low    |
+| 2. Per-Asset Tuning     | HIGH     | 4 hrs  | High   | Low    |
+| 3. Signal Deconfliction | HIGH     | 6 hrs  | High   | Medium |
+| 4. Trend Strategy       | MEDIUM   | 8 hrs  | High   | Medium |
+| 5. ML Pipeline          | LOW      | 12 hrs | Medium | High   |
+
 
 **Recommended Order**: 1 → 2 → 3 → 4 → 5
 
@@ -508,22 +547,27 @@ Phase 5: Depends on Phase 3 (needs clean signal flow for data collection)
 ## Testing Plan
 
 ### Phase 1
+
 - Unit tests for regime filter with momentum strategy
 - Integration test for VWAP strategy with useBollinger=true
 
 ### Phase 2
+
 - Unit tests for BaseStrategy.getConfig with symbol overrides
 - Config validation tests
 
 ### Phase 3
+
 - Unit tests for SignalArbiter priority logic
 - Integration test with conflicting signals
 
 ### Phase 4
+
 - Backtest TrendFollowStrategy on historical BTC/ETH/SOL data
 - Compare Sharpe ratio before/after adding strategy
 
 ### Phase 5
+
 - Validate ONNX model loads correctly
 - A/B test ML filter vs rule-based filter
 
@@ -542,6 +586,7 @@ Phase 5: Depends on Phase 3 (needs clean signal flow for data collection)
 ## Rollback Plan
 
 Each phase is independent. If issues arise:
+
 - Phase 1: Revert single file changes
 - Phase 2: Disable per-symbol overrides in config
 - Phase 3: Bypass SignalArbiter with config flag

@@ -1,4 +1,12 @@
 /**
+ * @deprecated KILLED — Phase 3 backtest verdict (March 2026)
+ * VWAP MR: Zero/1 trade across 12 months. ADX ranging regime too short-lived
+ * for mean reversion signals to generate meaningful trade volume.
+ * Hard-disabled via guardrails.yaml disabled_strategies list.
+ * See PHASE3_BACKTEST_VERDICT.md for full analysis.
+ */
+
+/**
  * VWAP Mean Reversion Strategy Plugin
  * 
  * Generates signals when price deviates significantly from VWAP,

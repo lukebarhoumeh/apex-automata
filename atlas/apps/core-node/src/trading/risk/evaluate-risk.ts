@@ -440,6 +440,7 @@ export function buildThresholdsFromGuardrails(
       data_gap_sec: number;
     };
     per_symbol?: Record<string, { max_notional_usd: number; max_daily_loss_usd: number }>;
+    perps_symbols?: Record<string, { max_notional_usd: number; max_daily_loss_usd: number }>;
   }
 ): RiskThresholds {
   const equity = guardrails.account.equity_usd;
@@ -460,7 +461,15 @@ export function buildThresholdsFromGuardrails(
       maxDailyLossPerSymbolUsd[symbol] = limits.max_daily_loss_usd;
     }
   }
-  
+
+  // Merge perps symbol limits (same structure, different symbols)
+  if (guardrails.perps_symbols) {
+    for (const [symbol, limits] of Object.entries(guardrails.perps_symbols)) {
+      maxExposurePerSymbolUsd[symbol] = limits.max_notional_usd;
+      maxDailyLossPerSymbolUsd[symbol] = limits.max_daily_loss_usd;
+    }
+  }
+
   return {
     dailyStopR,
     dailyStopUsd,

@@ -52,11 +52,13 @@ const strategyErrorCounter = new Counter({
 export interface StrategyRegistryConfig {
   maxErrorsBeforeDisable: number;  // Auto-disable after N errors
   signalDedupeWindowMs: number;    // Dedupe window for same strategy/symbol
+  disabledStrategies: string[];    // Strategy IDs killed by backtest — never register
 }
 
 const DEFAULT_CONFIG: StrategyRegistryConfig = {
   maxErrorsBeforeDisable: 5,
   signalDedupeWindowMs: 300000, // 5 minutes
+  disabledStrategies: [],
 };
 
 export class StrategyRegistry extends EventEmitter {
@@ -79,6 +81,11 @@ export class StrategyRegistry extends EventEmitter {
    * Register a strategy plugin.
    */
   public register(plugin: StrategyPlugin): boolean {
+    if (this.config.disabledStrategies.includes(plugin.id)) {
+      this.logger.info(`Strategy "${plugin.id}" is disabled — skipping registration (Phase 3 backtest verdict)`);
+      return false;
+    }
+
     if (this.strategies.has(plugin.id)) {
       this.logger.warn(`Strategy ${plugin.id} already registered, skipping`);
       return false;

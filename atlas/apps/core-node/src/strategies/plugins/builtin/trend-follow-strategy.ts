@@ -45,20 +45,20 @@ export class TrendFollowStrategy extends BaseStrategy {
   readonly configSchema: StrategyConfigSchema = {
     parameters: [
       {
-        key: 'fastEmaPeriod',
+        key: 'emaFast',
         name: 'Fast EMA Period',
         description: 'Period for the fast EMA',
         type: 'number',
-        default: 9,
+        default: 12,
         min: 3,
         max: 50,
       },
       {
-        key: 'slowEmaPeriod',
+        key: 'emaSlow',
         name: 'Slow EMA Period',
         description: 'Period for the slow EMA',
         type: 'number',
-        default: 21,
+        default: 15,
         min: 10,
         max: 100,
       },
@@ -72,8 +72,8 @@ export class TrendFollowStrategy extends BaseStrategy {
         max: 50,
       },
       {
-        key: 'atrMultiplier',
-        name: 'ATR Trailing Stop Multiplier',
+        key: 'stopAtr',
+        name: 'Stop Loss ATR Multiplier',
         description: 'Multiplier for ATR-based trailing stop distance',
         type: 'number',
         default: 2.5,
@@ -82,13 +82,13 @@ export class TrendFollowStrategy extends BaseStrategy {
         step: 0.5,
       },
       {
-        key: 'targetMultiplier',
-        name: 'Target Multiplier',
-        description: 'Take profit as multiple of stop distance',
+        key: 'takeProfitAtr',
+        name: 'Take Profit ATR Multiplier',
+        description: 'Take profit distance as multiple of ATR',
         type: 'number',
-        default: 3.0,
+        default: 5.0,
         min: 1.5,
-        max: 6.0,
+        max: 10.0,
         step: 0.5,
       },
       {
@@ -96,7 +96,7 @@ export class TrendFollowStrategy extends BaseStrategy {
         name: 'Minimum ADX',
         description: 'Minimum ADX value to confirm trend strength (0 to disable)',
         type: 'number',
-        default: 0,  // AGGRESSIVE: Disabled ADX filter
+        default: 0,
         min: 0,
         max: 50,
       },
@@ -105,14 +105,14 @@ export class TrendFollowStrategy extends BaseStrategy {
         name: 'Require MTF Alignment',
         description: 'Require higher timeframe (1h) EMA alignment',
         type: 'boolean',
-        default: false,  // AGGRESSIVE: Disabled MTF requirement
+        default: false,
       },
       {
         key: 'crossoverLookback',
         name: 'Crossover Lookback',
         description: 'Number of candles to look back for recent crossover',
         type: 'number',
-        default: 10,  // AGGRESSIVE: Look back further for crossovers
+        default: 10,
         min: 1,
         max: 20,
       },
@@ -130,8 +130,8 @@ export class TrendFollowStrategy extends BaseStrategy {
   };
 
   readonly requiredIndicators: IndicatorRequirement[] = [
-    { name: 'ema9', required: true, description: 'Fast EMA (9-period by default)' },
-    { name: 'ema21', required: true, description: 'Slow EMA (21-period by default)' },
+    { name: 'ema12', required: true, description: 'Fast EMA (12-period by default)' },
+    { name: 'ema15', required: true, description: 'Slow EMA (15-period by default)' },
     { name: 'atr', required: true, description: 'ATR for stop/target calculation' },
     { name: 'adx', required: false, description: 'ADX for trend strength confirmation' },
   ];
@@ -167,20 +167,19 @@ export class TrendFollowStrategy extends BaseStrategy {
     const signals: StrategySignal[] = [];
     const { symbol } = context;
 
-    // Get config (with per-symbol overrides)
-    const fastEmaPeriod = this.getConfig<number>('fastEmaPeriod', 9, symbol);
-    const slowEmaPeriod = this.getConfig<number>('slowEmaPeriod', 21, symbol);
-    const atrMultiplier = this.getConfig<number>('atrMultiplier', 2.5, symbol);
-    const targetMultiplier = this.getConfig<number>('targetMultiplier', 3.0, symbol);
-    const minAdx = this.getConfig<number>('minAdx', 0, symbol);  // AGGRESSIVE: Disabled
-    const requireMtfAlignment = this.getConfig<boolean>('requireMtfAlignment', false, symbol);  // AGGRESSIVE: Disabled
-    const crossoverLookback = this.getConfig<number>('crossoverLookback', 15, symbol);  // AGGRESSIVE: Look back further
-    const minStrength = this.getConfig<number>('minStrength', 0.1, symbol);  // AGGRESSIVE: Very low
+    // Get config (with per-symbol overrides from guardrails.yaml)
+    const emaFast = this.getConfig<number>('emaFast', 12, symbol);
+    const emaSlow = this.getConfig<number>('emaSlow', 15, symbol);
+    const stopAtr = this.getConfig<number>('stopAtr', 2.5, symbol);
+    const takeProfitAtr = this.getConfig<number>('takeProfitAtr', 5.0, symbol);
+    const minAdx = this.getConfig<number>('minAdx', 0, symbol);
+    const requireMtfAlignment = this.getConfig<boolean>('requireMtfAlignment', false, symbol);
+    const crossoverLookback = this.getConfig<number>('crossoverLookback', 10, symbol);
+    const minStrength = this.getConfig<number>('minStrength', 0.5, symbol);
 
-    // Get indicators
     // Use dynamic indicator names based on config
-    const fastEmaKey = `ema${fastEmaPeriod}`;
-    const slowEmaKey = `ema${slowEmaPeriod}`;
+    const fastEmaKey = `ema${emaFast}`;
+    const slowEmaKey = `ema${emaSlow}`;
     
     const fastEma = context.indicators[fastEmaKey] || context.indicators.ema9;
     const slowEma = context.indicators[slowEmaKey] || context.indicators.ema21;
@@ -307,8 +306,8 @@ export class TrendFollowStrategy extends BaseStrategy {
     }
 
     // Generate signal
-    const stopDistance = currentAtr * atrMultiplier;
-    const targetDistance = stopDistance * targetMultiplier;
+    const stopDistance = currentAtr * stopAtr;
+    const targetDistance = currentAtr * takeProfitAtr;
 
     if (bullishCrossover && priceAboveBothEmas && mtfAligned) {
       const stopLoss = price - stopDistance;
@@ -321,7 +320,7 @@ export class TrendFollowStrategy extends BaseStrategy {
           strength,
           stopLoss,
           takeProfit,
-          reason: `Bullish EMA crossover (${fastEmaPeriod}/${slowEmaPeriod}) with price confirmation`,
+          reason: `Bullish EMA crossover (${emaFast}/${emaSlow}) with price confirmation`,
           metadata: {
             fastEma: currentFastEma,
             slowEma: currentSlowEma,
@@ -344,7 +343,7 @@ export class TrendFollowStrategy extends BaseStrategy {
           strength,
           stopLoss,
           takeProfit,
-          reason: `Bearish EMA crossover (${fastEmaPeriod}/${slowEmaPeriod}) with price confirmation`,
+          reason: `Bearish EMA crossover (${emaFast}/${emaSlow}) with price confirmation`,
           metadata: {
             fastEma: currentFastEma,
             slowEma: currentSlowEma,
@@ -362,8 +361,10 @@ export class TrendFollowStrategy extends BaseStrategy {
   }
 
   validateContext(context: MarketContext): { valid: boolean; reason?: string } {
-    const fastEma = context.indicators.ema9;
-    const slowEma = context.indicators.ema21;
+    const emaFast = this.getConfig<number>('emaFast', 12);
+    const emaSlow = this.getConfig<number>('emaSlow', 15);
+    const fastEma = context.indicators[`ema${emaFast}`] || context.indicators.ema12;
+    const slowEma = context.indicators[`ema${emaSlow}`] || context.indicators.ema15;
     const atr = context.indicators.atr;
 
     if (!fastEma || fastEma.length < 25) {

@@ -11,7 +11,11 @@ import {
   Product,
   Candle,
   HistoricRatesParams,
-  RateLimitInfo
+  RateLimitInfo,
+  CoinbasePerpsProduct,
+  CoinbaseIntxPosition,
+  CoinbaseIntxPortfolio,
+  CoinbaseFundingRate,
 } from './types';
 import {
   ResilientHttpClient,
@@ -283,6 +287,126 @@ export class CoinbaseRestClient {
       close: candle[4],
       volume: candle[5]
     }));
+  }
+
+  // ============ Perpetual Futures Endpoints ============
+
+  /**
+   * List all perpetual futures products.
+   * Uses the standard products endpoint with product_type=FUTURE filter.
+   * Falls back to filtering the full product list if the filter param isn't supported.
+   */
+  public async getPerpsProducts(): Promise<CoinbasePerpsProduct[]> {
+    try {
+      const response = await this.client.get('/api/v3/brokerage/products', {
+        params: {
+          product_type: 'FUTURE',
+          contract_expiry_type: 'PERPETUAL',
+        },
+      });
+      const products = response.data?.products || response.data || [];
+      return products.filter((p: any) =>
+        p.product_type === 'FUTURE' && (p.contract_expiry_type === 'PERPETUAL' || p.product_id?.includes('-PERP-'))
+      );
+    } catch (error) {
+      this.logger.warn('Failed to fetch perps products via v3 endpoint, falling back to product list filter');
+      try {
+        const allProducts = await this.getProducts();
+        return allProducts
+          .filter((p: any) => p.product_id?.includes('-PERP-') || p.product_type === 'FUTURE')
+          .map((p: any) => ({
+            product_id: p.product_id || p.id,
+            product_type: 'FUTURE' as const,
+            contract_expiry_type: 'PERPETUAL' as const,
+            base_currency: p.base_currency || p.product_id?.split('-')[0] || '',
+            quote_currency: p.quote_currency || 'USD',
+            contract_size: p.contract_size || '0.01',
+            max_leverage: p.max_leverage || '10',
+            base_increment: p.base_increment || '0.01',
+            quote_increment: p.quote_increment || '0.01',
+            status: p.status || 'online',
+            trading_disabled: p.trading_disabled || false,
+          }));
+      } catch (fallbackError) {
+        this.logger.warn('Fallback product list fetch also failed — returning empty perps list', {
+          primaryError: error instanceof Error ? error.message : String(error),
+          fallbackError: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+        });
+        return [];
+      }
+    }
+  }
+
+  /**
+   * Get all INTX (perpetual futures) positions for the portfolio.
+   * Returns open positions with PnL, leverage, and liquidation data.
+   */
+  public async getIntxPositions(): Promise<CoinbaseIntxPosition[]> {
+    try {
+      const response = await this.client.get('/api/v3/brokerage/intx/positions');
+      return response.data?.positions || response.data || [];
+    } catch (error) {
+      this.logger.warn('Failed to fetch INTX positions:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get a specific INTX position by product ID.
+   */
+  public async getIntxPosition(productId: string): Promise<CoinbaseIntxPosition | null> {
+    try {
+      const response = await this.client.get(`/api/v3/brokerage/intx/positions/${productId}`);
+      return response.data?.position || response.data || null;
+    } catch (error) {
+      this.logger.warn(`Failed to fetch INTX position for ${productId}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Get INTX portfolio summary (collateral, margin, buying power).
+   */
+  public async getIntxPortfolio(): Promise<CoinbaseIntxPortfolio | null> {
+    try {
+      const response = await this.client.get('/api/v3/brokerage/intx/portfolio');
+      return response.data?.portfolio || response.data || null;
+    } catch (error) {
+      this.logger.warn('Failed to fetch INTX portfolio:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get current funding rate for a perpetual contract.
+   * Funding accrues hourly, settles twice daily on Coinbase.
+   */
+  public async getFundingRate(productId: string): Promise<CoinbaseFundingRate | null> {
+    try {
+      const response = await this.client.get(`/api/v3/brokerage/products/${productId}/funding`, {});
+      return response.data || null;
+    } catch (error) {
+      this.logger.warn(`Failed to fetch funding rate for ${productId}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Set leverage for a perpetual futures product.
+   * Leverage is per-product, not per-position. Max: 10x intraday.
+   */
+  public async setLeverage(productId: string, leverage: number): Promise<boolean> {
+    try {
+      await this.client.post('/api/v3/brokerage/intx/leverage', {
+        product_id: productId,
+        leverage: String(leverage),
+      });
+      this.logger.info(`Leverage set to ${leverage}x for ${productId}`);
+      return true;
+    } catch (error) {
+      this.logger.error(`Failed to set leverage for ${productId}:`, error);
+      return false;
+    }
   }
 
   // Rate limit info

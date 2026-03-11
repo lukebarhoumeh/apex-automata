@@ -17,6 +17,17 @@ const PerSymbolLimitSchema = z.object({
   strategy_overrides: StrategyOverridesSchema,
 });
 
+// Per-symbol perpetual futures configuration
+const PerpsSymbolLimitSchema = z.object({
+  max_notional_usd: z.number().nonnegative(),
+  max_daily_loss_usd: z.number().nonnegative(),
+  default_leverage: z.number().int().min(1).max(10).optional(),
+  max_leverage: z.number().int().min(1).max(10).optional(),
+  strategy_overrides: StrategyOverridesSchema,
+});
+
+export type PerpsSymbolLimit = z.infer<typeof PerpsSymbolLimitSchema>;
+
 export type PerSymbolLimit = z.infer<typeof PerSymbolLimitSchema>;
 export type StrategyOverrides = z.infer<typeof StrategyOverridesSchema>;
 
@@ -50,6 +61,18 @@ const GuardrailsSchema = z.object({
     allow_short: z.boolean(),
     trade_cooldown_min: z.number().int().nonnegative()
   }),
+  perps: z.object({
+    risk_per_trade: z.number().positive(),
+    default_leverage: z.number().int().min(1).max(10),
+    max_leverage: z.number().int().min(1).max(10),
+    liquidation_buffer_pct: z.number().min(0).max(1),
+    max_funding_rate_bps: z.number().nonnegative(),
+    funding_check_interval_sec: z.number().int().positive(),
+    maker_fee: z.number().min(0),
+    taker_fee: z.number().min(0),
+    nano_contract_size: z.number().positive(),
+  }).optional(),
+  perps_symbols: z.record(z.string(), PerpsSymbolLimitSchema).optional(),
   execution: z.object({
     order_type: z.string(),
     price_offset_ticks: z.number().int().nonnegative(),

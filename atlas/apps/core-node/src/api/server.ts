@@ -16,6 +16,8 @@ import { OrderRequest } from '../exchanges/coinbase';
 import { MetricsTracker } from '../trading/metrics-tracker';
 import { SecretManager } from '../config/secrets';
 import { CoinbaseExchange } from '../exchanges/coinbase';
+import { CoinbasePerpsAdapter } from '../exchanges/coinbase-perps-adapter';
+import { PerpsRiskMonitor } from '../trading/perps';
 import { TradeOutcomeCollector } from '../ml/trade-outcome-collector';
 import { EngineSupervisor, SupervisorState, RestartReason } from '../runtime/engine-supervisor';
 import rateLimit from 'express-rate-limit';
@@ -253,6 +255,9 @@ const supabase = createClient(
 let tradingEngine: TradingEngine | null = null;
 let signalProcessor: SignalProcessor | null = null;
 let tradeOutcomeCollector: TradeOutcomeCollector | null = null;
+let perpsRiskMonitor: PerpsRiskMonitor | null = null;
+let perpsAdapter: CoinbasePerpsAdapter | null = null;
+let activeSpotToPerpsMap: Map<string, string> = new Map();
 
 // Engine Supervisor for 24/7 resilience
 const supervisor = new EngineSupervisor({}, logger);
@@ -398,6 +403,12 @@ function processTickerForCandles(ticker: { product_id: string; price: string; la
             timestamp: candle.time,
           }
         });
+
+        // Mirror spot candle to perps symbol (spot price proxy for signal generation)
+        const perpsSymbol = activeSpotToPerpsMap.get(symbol);
+        if (perpsSymbol && signalProcessor) {
+          signalProcessor.addCandle(perpsSymbol, candle);
+        }
       } catch (err) {
         logger.error('Failed to add candle to signal processor', err);
       }
@@ -860,6 +871,29 @@ app.post('/api/engine/start', async (req, res) => {
       }
     }
 
+    // Build dynamic products list from guardrails config
+    const spotSymbols = guardrails.per_symbol ? Object.keys(guardrails.per_symbol) : ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+    const perpsSymbols = guardrails.perps_symbols ? Object.keys(guardrails.perps_symbols) : [];
+    const engineProducts = [...spotSymbols];
+
+    // Map spot symbols to their perps counterparts for candle mirroring
+    const spotToPerpsMap = new Map<string, string>();
+    for (const perpsSymbol of perpsSymbols) {
+      const base = perpsSymbol.split('-')[0];
+      const spotSymbol = `${base}-USD`;
+      if (spotSymbols.includes(spotSymbol)) {
+        spotToPerpsMap.set(spotSymbol, perpsSymbol);
+      }
+    }
+    activeSpotToPerpsMap = spotToPerpsMap;
+
+    logger.info('Dynamic products list built', {
+      spot: spotSymbols,
+      perps: perpsSymbols,
+      engineProducts,
+      spotToPerpsMapping: Object.fromEntries(spotToPerpsMap),
+    });
+
     // Clone guardrails so live preflight can safely adjust session-specific parameters
     const engineGuardrails = structuredClone(guardrails);
 
@@ -867,7 +901,7 @@ app.post('/api/engine/start', async (req, res) => {
     if (mode === 'live') {
       const preflight = await runLivePreflight({
         engineGuardrails,
-        products: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+        products: engineProducts,
       });
       if (!preflight.ok) {
         return res.status(400).json({
@@ -889,7 +923,7 @@ app.post('/api/engine/start', async (req, res) => {
         // For market data connectivity (used by WS/REST for price data)
         environment: resolvedMarketDataEnv
       },
-      products: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+      products: engineProducts,
       supabase: {
         url: env.SUPABASE_URL || '',
         serviceKey: env.SUPABASE_SERVICE_KEY || '',
@@ -915,7 +949,63 @@ app.post('/api/engine/start', async (req, res) => {
 
     // Create trading engine
     tradingEngine = new TradingEngine(engineConfig, logger);
-    
+
+    // Register perps adapter and start risk monitor
+    perpsAdapter = new CoinbasePerpsAdapter(logger);
+    const perpsCredentials = {
+      apiKey: env.COINBASE_API_KEY || '',
+      apiSecret: env.COINBASE_API_SECRET || '',
+      environment: resolvedMarketDataEnv,
+    };
+    await perpsAdapter.initialize(perpsCredentials);
+    logger.info('Coinbase Perps adapter registered');
+
+    const perpsConfig = engineGuardrails.perps;
+    perpsRiskMonitor = null;
+    if (perpsConfig) {
+      perpsRiskMonitor = new PerpsRiskMonitor(
+        {
+          riskPerTrade: perpsConfig.risk_per_trade,
+          defaultLeverage: perpsConfig.default_leverage,
+          maxLeverage: perpsConfig.max_leverage,
+          liquidationBufferPct: perpsConfig.liquidation_buffer_pct,
+          maxFundingRateBps: perpsConfig.max_funding_rate_bps,
+          fundingCheckIntervalSec: perpsConfig.funding_check_interval_sec,
+          makerFee: perpsConfig.maker_fee,
+          takerFee: perpsConfig.taker_fee,
+          nanoContractSize: perpsConfig.nano_contract_size,
+        },
+        logger
+      );
+      perpsRiskMonitor.setAdapter(perpsAdapter);
+      perpsRiskMonitor.start();
+      logger.info('Perps risk monitor started');
+
+      // Apply per-symbol leverage from perps_symbols config
+      if (guardrails.perps_symbols) {
+        for (const [symbol, config] of Object.entries(guardrails.perps_symbols)) {
+          const leverage = config.default_leverage ?? guardrails.perps?.default_leverage ?? 3;
+          perpsAdapter.setLeverage(symbol, leverage).catch((err) => {
+            logger.warn(`Failed to set initial leverage for ${symbol}:`, err);
+          });
+        }
+        logger.info('Applied per-symbol leverage settings', {
+          symbols: Object.entries(guardrails.perps_symbols).map(([s, c]) => ({
+            symbol: s,
+            leverage: c.default_leverage ?? guardrails.perps?.default_leverage ?? 3,
+          })),
+        });
+      }
+
+      perpsRiskMonitor.on('perps:liquidation_warning', (risk) => {
+        logger.warn('LIQUIDATION WARNING', { symbol: risk.symbol, distance: risk.liquidationDistance });
+      });
+
+      perpsRiskMonitor.on('perps:leverage_warning', (summary) => {
+        logger.warn('LEVERAGE WARNING', { effectiveLeverage: summary.effectiveLeverage, max: summary.maxLeverage });
+      });
+    }
+
     // Update metrics
     engineRunningGauge.set(1);
 
@@ -1200,8 +1290,16 @@ app.post('/api/engine/start', async (req, res) => {
     // Load per-symbol strategy overrides from guardrails
     if (guardrails.per_symbol) {
       signalProcessor.loadPerSymbolOverridesFromGuardrails(guardrails.per_symbol);
-      logger.info('Loaded per-symbol strategy overrides', {
+      logger.info('Loaded per-symbol strategy overrides (spot)', {
         symbols: Object.keys(guardrails.per_symbol),
+      });
+    }
+
+    // Load perps-specific strategy overrides (MACD params, RSI thresholds, etc.)
+    if (guardrails.perps_symbols) {
+      signalProcessor.loadPerSymbolOverridesFromGuardrails(guardrails.perps_symbols);
+      logger.info('Loaded per-symbol strategy overrides (perps)', {
+        symbols: Object.keys(guardrails.perps_symbols),
       });
     }
 
@@ -1408,7 +1506,11 @@ app.post('/api/engine/start', async (req, res) => {
             type: 'market',
             size: openPosition.size.toString(),
           };
-          
+          // For perps symbols, add reduce_only flag to prevent accidental flip
+          if (signal.symbol.includes('-PERP-')) {
+            (closeOrder as any).reduce_only = true;
+          }
+
           const exit = await tradingEngine!.createOrder(closeOrder, {
             strategy: signal.strategy,
             metadata: {
@@ -1458,11 +1560,27 @@ app.post('/api/engine/start', async (req, res) => {
           }
         }
 
-        if (guardrails.filters.funding_bias_enabled) {
-          logger.debug('Funding bias guardrail enabled (spot mode stub) - no action taken');
+        // Funding bias guardrail — check if funding rate is excessive for perps symbols
+        if (guardrails.filters.funding_bias_enabled && perpsRiskMonitor) {
+          const riskSummary = perpsRiskMonitor.getLastSummary();
+          if (riskSummary && riskSummary.positionsWithHighFunding.includes(signal.symbol)) {
+            logger.info('Signal filtered by funding bias guardrail', {
+              symbol: signal.symbol,
+              direction: signal.direction,
+              reason: 'excessive_funding_rate',
+            });
+            return;
+          }
         }
 
-        const rawSize = tradingEngine!.computeOrderSize(signal.symbol, entryPrice, stopPrice);
+        // Use perps risk_per_trade for perpetual symbols, spot risk for others
+        const isPerpsSymbol = signal.symbol.includes('-PERP-');
+        const effectiveRiskPerTrade = isPerpsSymbol && guardrails.perps
+          ? guardrails.perps.risk_per_trade
+          : guardrails.account.risk_per_trade;
+        const rawSize = isPerpsSymbol && guardrails.perps
+          ? tradingEngine!.computeOrderSize(signal.symbol, entryPrice, stopPrice, effectiveRiskPerTrade)
+          : tradingEngine!.computeOrderSize(signal.symbol, entryPrice, stopPrice);
         if (!Number.isFinite(rawSize) || rawSize <= 0) {
           logger.warn('Guardrail sizing returned zero/invalid size, skipping signal', {
             signalId: signal.id,
@@ -1573,6 +1691,18 @@ app.post('/api/engine/start', async (req, res) => {
       )
     ).then(() => {
       logger.info('All symbol warmup attempts completed');
+
+      // Mirror warmup candles from spot to perps symbols
+      for (const [spotSym, perpsSym] of activeSpotToPerpsMap.entries()) {
+        const spotCandles = signalProcessor!.getCandleBuffer(spotSym);
+        if (spotCandles && spotCandles.length > 0) {
+          for (const candle of spotCandles) {
+            signalProcessor!.addCandle(perpsSym, candle);
+          }
+          logger.info(`Mirrored ${spotCandles.length} warmup candles from ${spotSym} to ${perpsSym}`);
+        }
+      }
+
       runtimeState.warmupComplete = signalProcessor!.isAllWarmedUp();
       runtimeState.candlesBuffered = signalProcessor!.getAllCandleCounts();
     });
@@ -1581,6 +1711,8 @@ app.post('/api/engine/start', async (req, res) => {
       success: true,
       message: `Trading engine started in ${mode} mode`,
       activeSymbols,
+      perpsSymbols: perpsSymbols,
+      spotToPerpsMapping: Object.fromEntries(activeSpotToPerpsMap),
     });
 
   } catch (error) {
@@ -1590,6 +1722,29 @@ app.post('/api/engine/start', async (req, res) => {
       name: error instanceof Error ? error.name : typeof error,
     };
     logger.error('Failed to start trading engine:', errorDetails);
+
+    // Clean up partially-initialized state so next start attempt works
+    try {
+      if (perpsRiskMonitor) {
+        perpsRiskMonitor.stop();
+        perpsRiskMonitor.removeAllListeners();
+        perpsRiskMonitor = null;
+      }
+      if (tradingEngine) {
+        tradingEngine.removeAllListeners();
+        tradingEngine = null;
+      }
+      perpsAdapter = null;
+      activeSpotToPerpsMap = new Map();
+      if (signalProcessor) {
+        signalProcessor = null;
+      }
+      engineRunningGauge.set(0);
+      logger.info('Cleaned up partial engine state after startup failure');
+    } catch (cleanupErr) {
+      logger.error('Error during startup failure cleanup:', cleanupErr);
+    }
+
     res.status(500).json({ error: 'Failed to start trading engine', details: errorDetails });
   } finally {
     engineOperationInProgress = false;
@@ -1759,8 +1914,15 @@ app.post('/api/engine/stop', async (req, res) => {
     supervisor.setDesiredState('stopped');
     
     await tradingEngine.stop('api_request');
+    if (perpsRiskMonitor) {
+      perpsRiskMonitor.stop();
+      perpsRiskMonitor.removeAllListeners();
+    }
     tradingEngine = null;
     signalProcessor = null;
+    perpsRiskMonitor = null;
+    perpsAdapter = null;
+    activeSpotToPerpsMap = new Map();
     
     // Update supervisor actual state
     supervisor.setActualState('stopped', 'api_stop_request');
@@ -3513,6 +3675,13 @@ async function gracefulShutdown(signal: string) {
     // Stop supervisor first
     supervisor.stop();
     
+    // Stop perps risk monitor
+    if (perpsRiskMonitor) {
+      perpsRiskMonitor.stop();
+      perpsRiskMonitor.removeAllListeners();
+      logger.info('Perps risk monitor stopped');
+    }
+
     // Stop trading engine
     if (tradingEngine) {
       await tradingEngine.stop(`${signal}_shutdown`);

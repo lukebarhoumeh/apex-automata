@@ -913,7 +913,7 @@ export class RiskEngine extends EventEmitter {
     return Math.max(floor, Math.min(ceiling, currentEquity));
   }
 
-  public computeOrderSize(productId: string, entryPrice: number, stopPrice: number): number {
+  public computeOrderSize(productId: string, entryPrice: number, stopPrice: number, riskPerTradeOverride?: number): number {
     if (!Number.isFinite(entryPrice) || entryPrice <= 0) return 0;
     if (!Number.isFinite(stopPrice) || stopPrice <= 0) return 0;
 
@@ -924,7 +924,8 @@ export class RiskEngine extends EventEmitter {
 
     // Use dynamic equity for profit compounding — positions scale with accumulated PnL
     const sizingEquity = this.getCurrentEquityForSizing();
-    let riskUsd = sizingEquity * this.guardrails.account.risk_per_trade;
+    const riskPerTrade = riskPerTradeOverride ?? this.guardrails.account.risk_per_trade;
+    let riskUsd = sizingEquity * riskPerTrade;
     const soft = this.getSoftLaunch();
     if (soft) {
       riskUsd = this.scaleUsd(riskUsd, soft.riskPerTradeMultiplier);

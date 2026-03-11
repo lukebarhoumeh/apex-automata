@@ -156,3 +156,59 @@ export interface RateLimitInfo {
   remaining: number;
   reset: number;
 }
+
+// ============ Perpetual Futures Types ============
+
+/** Coinbase perpetual futures product metadata */
+export interface CoinbasePerpsProduct {
+  product_id: string;                    // e.g., 'BTC-PERP-INTX'
+  product_type: 'FUTURE';
+  contract_expiry_type: 'PERPETUAL';
+  base_currency: string;                 // e.g., 'BTC'
+  quote_currency: string;                // e.g., 'USD'
+  contract_size: string;                 // e.g., '0.01' for nano contracts
+  max_leverage: string;                  // e.g., '10'
+  base_increment: string;
+  quote_increment: string;
+  status: string;
+  trading_disabled: boolean;
+}
+
+/** Coinbase INTX position from /api/v3/brokerage/intx/positions */
+export interface CoinbaseIntxPosition {
+  product_id: string;                    // e.g., 'BTC-PERP-INTX'
+  side: 'LONG' | 'SHORT' | 'UNKNOWN';
+  number_of_contracts: string;
+  avg_entry_price: string;
+  current_price: string;                 // mark price
+  unrealized_pnl: string;
+  liquidation_price?: string;
+  margin_type?: string;
+  leverage?: string;
+  margin_used?: string;
+}
+
+/** Coinbase INTX portfolio summary */
+export interface CoinbaseIntxPortfolio {
+  portfolio_uuid: string;
+  collateral: string;                    // total collateral in USD
+  unrealized_pnl: string;
+  buying_power: string;
+  margin_used: string;
+  max_withdrawal: string;
+}
+
+/** Funding rate data for a perpetual contract */
+export interface CoinbaseFundingRate {
+  product_id: string;
+  funding_rate: string;                  // decimal (e.g., '0.0001' = 0.01%)
+  funding_time: string;                  // ISO timestamp of next settlement
+  mark_price: string;
+  index_price: string;
+}
+
+/** Leverage setting request */
+export interface CoinbaseLeverageRequest {
+  product_id: string;
+  leverage: string;                      // e.g., '3'
+}

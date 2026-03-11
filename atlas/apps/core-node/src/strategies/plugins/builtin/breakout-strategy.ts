@@ -1,4 +1,12 @@
 /**
+ * @deprecated KILLED — Phase 3 backtest verdict (March 2026)
+ * Donchian Breakout: Negative-EV even at zero fees. 40.9% win rate with
+ * avg_loss 1.9x avg_win. Systematically enters exhaustion moves.
+ * Hard-disabled via guardrails.yaml disabled_strategies list.
+ * See PHASE3_BACKTEST_VERDICT.md for full analysis.
+ */
+
+/**
  * Breakout Strategy Plugin
  * 
  * Generates signals when price breaks above/below Donchian channel highs/lows

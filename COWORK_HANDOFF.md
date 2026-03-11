@@ -1,433 +1,376 @@
 # Apex Automata (AtlasBot v2) — Complete Cowork Handoff
 
-**Created:** March 8, 2026
-**Purpose:** Full context transfer for continuing work on a new Cowork session (Windows machine). This document captures everything done across multiple sessions so the new Cowork can pick up exactly where we left off.
-**GitHub:** https://github.com/lukebarhoumeh/apex-automata
-**Latest Commit:** `94646fa` — "Phase 3.0: Fix backtest infrastructure (6 fixes)"
+**Created:** March 10, 2026
+**Purpose:** Full context transfer from Windows Cowork to MacBook Cowork. Covers all work from project inception through Phase 4D, including the current startup blocker and pending fix.
+**GitHub:** https://github.com/lukebarhoumeh/apex-automata (private)
 
 ---
 
 ## Table of Contents
 
 1. [Project Overview](#1-project-overview)
-2. [Infrastructure & Credentials](#2-infrastructure--credentials)
-3. [Phase 0: Emergency Security Fixes — COMPLETED](#3-phase-0-emergency-security-fixes--completed)
-4. [Phase 1: Critical Trading Bug Fixes — COMPLETED (17/17)](#4-phase-1-critical-trading-bug-fixes--completed-1717)
-5. [Phase 2: Database & Infrastructure — COMPLETED (10/10)](#5-phase-2-database--infrastructure--completed-1010)
-6. [Phase 3: Backtest Validation — COMPLETED](#6-phase-3-backtest-validation--completed)
-7. [Phase 3 Backtest Verdict (Critical Findings)](#7-phase-3-backtest-verdict-critical-findings)
-8. [Revised Implementation Plan (Phase 4+)](#8-revised-implementation-plan-phase-4)
-9. [Key Files Reference](#9-key-files-reference)
+2. [Two-AI Architecture (How We Work)](#2-two-ai-architecture)
+3. [Infrastructure & Credentials](#3-infrastructure--credentials)
+4. [Completed Phases (0-3)](#4-completed-phases-0-3)
+5. [Phase 4 Work (Current) — Exchange Abstraction + Coinbase Perps](#5-phase-4-work-current)
+6. [CURRENT BLOCKER — Bot Won't Start](#6-current-blocker--bot-wont-start)
+7. [TASK_004 Is Ready — Immediate Next Step](#7-task_004-is-ready--immediate-next-step)
+8. [Key Files Reference (Phase 4 State)](#8-key-files-reference-phase-4-state)
+9. [Architecture Decisions Made in Phase 4](#9-architecture-decisions-made-in-phase-4)
 10. [Known Issues & Technical Debt](#10-known-issues--technical-debt)
-11. [Tools & Model Preferences](#11-tools--model-preferences)
-12. [How to Continue](#12-how-to-continue)
+11. [What Comes After TASK_004](#11-what-comes-after-task_004)
+12. [Strategy & Backtest Verdicts (Phase 3 Summary)](#12-strategy--backtest-verdicts-phase-3-summary)
+13. [How to Continue](#13-how-to-continue)
 
 ---
 
 ## 1. Project Overview
 
-Apex Automata is a professional algorithmic cryptocurrency trading system. It was built to trade BTC, ETH, and SOL on Coinbase using four strategies: VWAP Mean Reversion, Donchian Breakout, EMA Trend Follow, and RSI/MACD Momentum.
-
-**The bot previously lost $1,090 in 3 live trades** on Coinbase due to a cascade of bugs: the regime filter was bypassed (all strategies in `alwaysAllowStrategies`), position sizing was wrong, risk engine had no NaN guards, and the backtest engine had broken P&L accounting that showed false profits.
-
-A comprehensive 3-round audit identified **80 issues across 10 phases**. Phases 0-3 are now complete. The Phase 3 backtest analysis revealed that **all strategies are negative-EV on Coinbase due to 0.60% taker fees**, but two strategies (Trend Follow and Momentum on ETH) have validated edge on Hyperliquid (0.05% fees).
+Apex Automata is a professional algorithmic cryptocurrency trading system. It trades BTC, ETH, and SOL using four strategies: VWAP Mean Reversion, Donchian Breakout, EMA Trend Follow, and RSI/MACD Momentum. Only Trend Follow and Momentum on ETH have validated edge (see Section 12).
 
 **Stack:**
-- Backend: Node.js/TypeScript (core-node), Express API, WebSocket
-- Frontend: React/Vite, TailwindCSS, Supabase hooks
+- Backend: Node.js/TypeScript (core-node), Express API, WebSocket broadcasts
+- Frontend: React/Vite/TailwindCSS via Lovable, Supabase hooks for real-time data
 - Database: Supabase (PostgreSQL)
-- Exchange: Currently Coinbase only (migrating to Hyperliquid)
-- Package Manager: pnpm (standardized in Phase 2)
+- Exchange: Coinbase Advanced Trade (spot + perpetual futures via INTX)
+- Package Manager: pnpm
 - Monorepo: `atlas/apps/core-node/` for backend, `src/` for frontend
 
+**The bot previously lost $1,090 in 3 live trades** due to bugs fixed in Phases 0-2. Phase 3 backtest analysis confirmed strategies need low-fee venues (Hyperliquid or perps) to be profitable. Phase 4 builds Coinbase Perpetual Futures support as the bridge to low-fee trading.
+
 ---
 
-## 2. Infrastructure & Credentials
+## 2. Two-AI Architecture
+
+This project uses a strict division of labor between two AIs:
+
+**Cowork Claude (you) = CEO / Architect:**
+- Writes task specification files in `CURSOR_TASKS/TASK_XXX_name.md`
+- Each task has precise FIND/REPLACE code blocks, constraints, and a verification checklist
+- Writes companion verify scripts in `CURSOR_TASKS/verify/verify_XXX.js`
+- After Cursor implements, Cowork reads the codebase to cross-verify all changes
+- Makes all strategic/architectural decisions
+- Does NOT write code directly into the codebase
+
+**Cursor (IDE AI) = Engineer:**
+- Reads and executes task files written by Cowork
+- Makes all code changes following the spec exactly
+- Runs verify scripts to confirm implementation
+- Luke tells Cursor: `Read and execute CURSOR_TASKS/TASK_XXX_name.md`
+- After completion, Luke runs: `node CURSOR_TASKS/verify/verify_XXX.js`
+
+**Workflow:** Cowork writes task → Luke gives to Cursor → Cursor implements → Luke runs verify → If green, comes back to Cowork for next task. If red, Cowork diagnoses.
+
+---
+
+## 3. Infrastructure & Credentials
 
 ### Supabase
-- **URL:** `https://gdrdaajvutmewgxbjurk.supabase.co`
-- **Service Key:** `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdkcmRhYWp2dXRtZXdneGJqdXJrIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MDM2MDM5NywiZXhwIjoyMDc1OTM2Mzk3fQ.aEg70BeVaxmWFpCFxkYPBNxjNAauM4X-JoY39xYOxrY`
-- **Historical Data:** 86,888 candles cached in `bars` table:
-  - BTC-USD: 35,018 candles (2025-03-05 to 2026-03-05, 15m intervals)
-  - ETH-USD: 34,516 candles (2025-03-05 to 2026-03-05, 15m intervals — 500 rows lost to SSL error, coverage sufficient)
-  - SOL-USD: 17,354 candles (2025-09-05 to 2026-03-05, 15m intervals)
+- URL: `https://gdrdaajvutmewgxbjurk.supabase.co`
+- Service Key: `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdkcmRhYWp2dXRtZXdneGJqdXJrIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MDM2MDM5NywiZXhwIjoyMDc1OTM2Mzk3fQ.aEg70BeVaxmWFpCFxkYPBNxjNAauM4X-JoY39xYOxrY`
+- Historical Data: 86,888 candles in `bars` table (BTC/ETH/SOL, 15m intervals, ~12 months)
 
 ### GitHub
-- **Repo:** https://github.com/lukebarhoumeh/apex-automata (private)
-- **Latest commit:** `94646fa` — Phase 3.0 backtest infrastructure fixes
-- **Note:** Can't `git pull` from Cowork due to auth (`fatal: could not read Username`). Verify code state from local repo.
+- Repo: https://github.com/lukebarhoumeh/apex-automata (private)
+- Note: Git auth from Cowork may not work — verify code state from local repo
 
 ### Coinbase
-- API keys were in `.env` committed to git (Phase 0 flagged this)
-- Keys should have been rotated — verify with Luke
+- API keys in `.env` (should be in .gitignore)
+- Keys may NOT have INTX (perpetual futures) entitlements — this is the current blocker
+
+### Running the Bot
+- `cd atlas/apps/core-node && pnpm api` — starts Express API server on port 8080
+- POST `http://localhost:8080/api/engine/start` with `{ "mode": "paper" }` to start paper trading
+- Frontend (Lovable): runs separately, connects to the API via WebSocket for live data
 
 ---
 
-## 3. Phase 0: Emergency Security Fixes — COMPLETED
+## 4. Completed Phases (0-3)
 
-These were addressed in the Phase 1 & 2 combined commit (`c92e753`):
+### Phase 0: Emergency Security Fixes — DONE
+Fixed exposed secrets, added API auth middleware, CORS restrictions, request size limits, memory leak in event listeners.
 
-| # | Fix | Status |
-|---|-----|--------|
-| 0.1 | Revoke exposed secrets, fix .env handling | DONE (`.env` in `.gitignore`) |
-| 0.2 | Add authentication to API endpoints | DONE (API key middleware) |
-| 0.3 | Restrict CORS | DONE (origin allowlist) |
-| 0.4 | Add request size limit | DONE (`express.json({ limit: '10kb' })`) |
-| 0.5 | Fix memory leak: event listeners on engine stop | DONE (`removeAllListeners()`) |
+### Phase 1: Critical Trading Bug Fixes (17/17) — DONE
+Fixed regime filter bypass, position sizing, backtest P&L accounting, Sharpe/Sortino NaN guards, VWAP daily reset, RSI NaN guard, fill race condition, position flip P&L, risk engine bounds checking, TWAP memory leak, trade outcome threshold, production parameters, exit race condition, slippage tracking, signal normalization.
 
----
+### Phase 2: Database & Infrastructure (10/10) — DONE
+Created `bars` table, added `exchange_id` to trading tables, FK indexes, unique constraints, numeric precision, Zod validation, rate limiting, parseInt radix, WebSocket cap, pnpm standardization.
 
-## 4. Phase 1: Critical Trading Bug Fixes — COMPLETED (17/17)
-
-All 17 fixes were implemented in commit `c92e753`. Verified against the live codebase.
-
-| # | Fix | File | Verification |
-|---|-----|------|-------------|
-| 1.1 | Regime filter DEFAULT_CONFIG fixed (6 values) | `regime-filter.ts` | `alwaysAllowStrategies: []`, `minCompatibilityScore: 0.3`, `minRegimeConfidence: 0.4` |
-| 1.2 | positionMultiplier wired into order sizing | `server.ts ~L1395` | `adjustedSize = computedSize * multiplier` |
-| 1.3 | Backtest capital accounting fixed | `backtest-engine.ts L345-347` | PnL = `(exitPrice - entryPrice) * size * sideMultiplier` |
-| 1.4 | Daily returns calculation fixed | `backtest-engine.ts L371-380` | Proper daily snapshots |
-| 1.5 | Sharpe ratio NaN guard | `backtest-engine.ts L482-487` | `stdDev === 0 ? 0 : ...` |
-| 1.6 | Sortino ratio formula fixed | `backtest-engine.ts` | Uses downside deviation only |
-| 1.7 | VWAP daily reset fixed (month boundary) | `technical.ts L184` | ISO date string comparison |
-| 1.8 | RSI NaN with zero avg loss | `technical.ts` | `if (avgLoss === 0) return 100` |
-| 1.9 | Order-manager fill race condition | `order-manager.ts L157-197` | Fill lock mutex |
-| 1.10 | Position-tracker P&L on position flips | `position-tracker.ts L299-360` | Fees always subtracted |
-| 1.11 | Risk engine bounds checking | `risk-engine.ts` | 28 `Number.isFinite()` calls confirmed |
-| 1.12 | TWAP memory leak fixed | `order-manager.ts` | Timer cleanup on cancel |
-| 1.13 | Trade outcome threshold | `trade-analytics.ts L390-396` | `BREAKEVEN_THRESHOLD = 1.00` |
-| 1.14 | Production-grade signal parameters | `guardrails.yaml` | `risk_per_trade: 0.005`, `max_open: 2`, `equity: 10000`, `max_exposure: 0.30` |
-| 1.15 | Position-monitor exit race condition | `position-monitor.ts` | Exit lock pattern at lines 52, 106, 217, 360-410 |
-| 1.16 | Advanced backtest slippage tracking | `advanced-backtest-engine.ts L540-559` | Consistent slippage subtraction |
-| 1.17 | Signal arbiter strength normalization | `signal-arbiter.ts` | Per-strategy normalization |
+### Phase 3: Backtest Validation — DONE
+Ran comprehensive backtests across all 8 strategy/asset combinations at 4 fee tiers. Key finding: only Trend Follow ETH and Momentum ETH are profitable, and only at low fees (Hyperliquid 0.05% or Coinbase perps 0.03%). See Section 12 for full verdict.
 
 ---
 
-## 5. Phase 2: Database & Infrastructure — COMPLETED (10/10)
+## 5. Phase 4 Work (Current) — Exchange Abstraction + Coinbase Perps
 
-### Batch A: Database Migrations (applied directly to Supabase, NOT in repo migration files)
+Phase 4 was split into sub-phases, each implemented via numbered CURSOR_TASKS:
 
-| # | Fix | Verification |
-|---|-----|-------------|
-| 2.1 | `bars` table created | Table exists with `UNIQUE(symbol, time, exchange)`, indexes on `symbol_time` and `exchange` |
-| 2.2 | `exchange_id` added to trading tables | `positions`, `orders`, `fills`, `trade_log` all have `exchange_id TEXT DEFAULT 'coinbase'`; `signals` has `routed_exchange` |
-| 2.3 | Missing FK indexes added | Indexes on `fills(order_leg_id)`, `order_legs(user_id)`, `journal_entries(position_id, order_id, signal_id)`, `trade_outcomes(strategy, regime)` |
-| 2.4 | Unique constraints added | `signals` dedup on `(user_id, symbol, strategy, decided_at)`, `fills` dedup on `(order_id, trade_id, filled_at)` |
-| 2.5 | Numeric precision fixed | `trade_outcomes.fees` and `realized_pnl` upgraded to `NUMERIC(20,8)` |
+### Phase 4A — Exchange Abstraction Layer (TASK_001) ✅ VERIFIED
+Created `IExchangeAdapter` interface, `ExchangeRegistry`, refactored `OrderManager` to use adapter interface instead of direct Coinbase coupling. Wrapped existing `CoinbaseExchange` as `CoinbaseAdapter`.
 
-**IMPORTANT:** These migrations were applied directly to the live Supabase DB but do NOT exist as SQL files in `supabase/migrations/`. Migration files should be created for version control before Phase 4.
+### Phase 4B — Coinbase Perpetual Futures Integration (TASK_002 A→D) ✅ ALL VERIFIED
 
-### Batch B: Server Hardening (in commit `c92e753`)
+**TASK_002A:** Extended `CoinbaseAdapter` into `CoinbasePerpsAdapter` subclass with position tracking, funding rate queries, leverage management, portfolio margin summary, and perps product detection.
 
-| # | Fix | File Location |
-|---|-----|---------------|
-| 2.6 | Zod input validation on all config endpoints | `server.ts` Lines 21-110 (11 schemas, 14 `safeParse()` calls) |
-| 2.7 | Rate limiting | `server.ts` Lines 130-137 (`100 req/60s` via `express-rate-limit`) |
-| 2.8 | parseInt radix fixed | `server.ts` (all 5 parseInt calls have radix 10) |
-| 2.9 | WebSocket connection cap | `server.ts` Line 139 (`MAX_WS_CLIENTS = 50`), Lines 507-511 (close with 1013) |
-| 2.10 | pnpm standardization | `pnpm-workspace.yaml` created, Dockerfiles updated to use corepack |
+**TASK_002B:** Updated `guardrails.yaml` with full perps configuration section (risk_per_trade: 1.5%, default_leverage: 3, max_leverage: 10, liquidation_buffer: 20%, funding rate limits) and `perps_symbols` section with per-symbol configs for ETH-PERP-INTX and BTC-PERP-INTX including strategy_overrides. Updated `loadGuardrails.ts` Zod schema to parse all perps fields.
 
----
+**TASK_002C:** Built `PerpsRiskMonitor` module — real-time liquidation distance tracking, funding rate monitoring, leverage warnings, margin utilization alerts. Emits events: `perps:liquidation_warning`, `perps:leverage_warning`, `perps:funding_alert`, `perps:margin_warning`.
 
-## 6. Phase 3: Backtest Validation — COMPLETED
+**TASK_002D:** Wired perps into server.ts startup flow — `CoinbasePerpsAdapter` instantiation, `PerpsRiskMonitor` setup, `effectiveRiskPerTrade` computation (uses `perps.risk_per_trade` for perps symbols, `account.risk_per_trade` for spot), `reduce_only` flag support, `computeOrderSize` override for leveraged position sizing.
 
-### Phase 3.0: Infrastructure Fixes (Cursor, commit `94646fa`)
+### Phase 4C — Perps Override Wiring (TASK_003A) ✅ VERIFIED (17/17)
 
-| # | Fix | File |
-|---|-----|------|
-| 3.0a | Walk-forward marked `@deprecated`, throws error | `advanced-backtest-engine.ts` Lines 868-877 |
-| 3.0b | `loadDataFromAPI()` wired to HistoricalDataLoader | `advanced-backtest-engine.ts` Lines 277-293 |
-| 3.0c | Backtest endpoint uses real data (with `?synthetic=true` fallback) | `server.ts` Lines 3010-3035 |
-| 3.0d | Paper trading P&L tracking with cost-basis accounting | `paper-trading-simulator.ts` Lines 618-632 |
-| 3.0e | Position sizing accounts for allocated capital from open positions | `backtest-engine.ts` Lines 424-442 |
-| 3.0f | OHLCV validation function added | `data-loader.ts` Lines 35-67 |
+Fixed a critical gap: `perps_symbols` strategy overrides were loaded by Zod schema but NEVER applied at runtime. Three fixes:
+1. Wired `guardrails.perps_symbols` into `signalProcessor.loadPerSymbolOverridesFromGuardrails()` (server.ts lines 1259-1273)
+2. Wired `perps_symbols` notional limits into `evaluateRiskThresholds()` (evaluate-risk.ts lines 442-471)
+3. Wired per-symbol leverage into adapter initialization (server.ts lines 953-967)
 
-### Phase 3.1-3.6: Statistical Analysis (Cowork)
+### Phase 4D — Perps Market Data & Paper Trading (TASK_003B) ✅ VERIFIED (19/19)
 
-This is the analysis I (Cowork) ran independently using Python backtesting engine replicating the 4 strategies with production parameters against the cached Supabase data.
-
-**Steps completed:**
-
-1. **3.1 — Historical Data Fetch:** 86,888 candles fetched from Coinbase public API and cached in Supabase `bars` table (BTC 15m, ETH 15m, SOL 15m, plus BTC 1H resampled).
-
-2. **3.2 — Per-Strategy Backtests:** All 8 strategy/asset combinations tested at Coinbase fees. ALL FAILED. Key discovery: original regime detector was broken on 15m data (98.4% classified as "ranging" because thresholds were calibrated for daily bars). Fixed by switching to ADX-based regime detection: ADX > 40 = strong_trend (26.9%), ADX 20-40 = weak_trend (58.4%), ADX < 20 = ranging (14.7%).
-
-3. **3.3 — Parameter Optimization:** Grid search across 1,120+ parameter combinations for the two viable strategies:
-   - **Trend Follow ETH best config:** EMA(12/15), Stop 2.5x ATR, TP 5.0x ATR → 130 trades, +$1,864, PF=1.38, Sharpe=2.44
-   - **Momentum ETH best config:** RSI(10) Long>55 Short<40, MACD(8/21/5), Stop 2.0x ATR, TP 4.0x ATR → 81 trades, +$1,261, PF=1.41, Sharpe=2.58
-
-4. **3.4 — Walk-Forward Validation:** Quarterly splits:
-   - Trend Follow ETH: **All 4 quarters profitable** (Q1: +$475, Q2: +$403, Q3: +$525, Q4: +$353) — strong consistency
-   - Momentum ETH: **Only 2 of 4 quarters convincing** (Q1: +$83 marginal, Q2: +$1,016 outlier, Q3: +$452, Q4: -$297 loss)
-
-5. **3.5 — Fee Sensitivity Analysis:** Tested all 8 strategy/asset combos across 4 fee tiers (Coinbase 0.60%, Kraken 0.26%, Hyperliquid 0.05%, Zero). The zero-fee test isolates signal edge from fee impact.
-
-6. **3.6 — Monte Carlo Confidence Intervals (10,000 simulations):**
-   - **Trend Follow ETH:** Median +18.5%, P(loss)=4.0%, P(loss>10%)=0.3%, 95th pctl MDD=11.5%, Half Kelly=6.0%
-   - **Momentum ETH:** Median +12.5%, P(loss)=7.9%, P(loss>10%)=0.5%, 95th pctl MDD=10.1%, Half Kelly=6.5%
-
-7. **Cross-Asset Robustness:** ETH-optimized params tested on BTC. Trend Follow BTC: -$290 (does NOT transfer). Momentum BTC: +$35 (flat). These are ETH-specific edges.
+Enables perps symbols to participate in the paper trading loop:
+1. **Hoisted `perpsAdapter` to module scope** (server.ts line 259) so signal handler closure can access it
+2. **Dynamic products list** from guardrails (server.ts lines 875-894) — replaced hardcoded `['BTC-USD', 'ETH-USD', 'SOL-USD']` with `Object.keys(guardrails.per_symbol)` for spot and `Object.keys(guardrails.perps_symbols)` for perps
+3. **Spot→perps candle proxy** (server.ts lines 407-411) — Coinbase WS ticker channel does NOT support INTX product IDs, so BTC-USD candles are mirrored to BTC-PERP-INTX (standard approach — perps track spot index via funding rate)
+4. **Warmup mirroring** (server.ts lines 1696-1704) — copies spot candle history to perps symbols after warmup completes
+5. **`getCandleBuffer()` getter** added to SignalProcessor (signal-processor.ts line 430) for warmup data access
+6. **Module-scoped state variables** (server.ts lines 258-260): `perpsRiskMonitor`, `perpsAdapter`, `activeSpotToPerpsMap`
 
 ---
 
-## 7. Phase 3 Backtest Verdict (Critical Findings)
+## 6. CURRENT BLOCKER — Bot Won't Start
 
-### Fee Sensitivity Matrix
+When Luke tried to start the paper trading bot after TASK_003B, it crashed with a **404 error** from the Coinbase API.
 
-| Strategy | Coinbase (0.60%) | Kraken (0.26%) | Hyperliquid (0.05%) | Zero Fees |
-|---|---|---|---|---|
-| VWAP MR (BTC) | No trades | No trades | No trades | No trades |
-| VWAP MR (ETH) | $3 (1 trade) | $23 (1 trade) | $35 (1 trade) | $38 |
-| Breakout (BTC 1H) | -$2,260 | -$1,147 | -$330 | **-$119** |
-| Breakout (BTC 15m) | -$1,441 | -$835 | -$427 | **-$326** |
-| **Trend Follow (ETH)** | -$836 | +$251 | **+$1,024** | +$1,221 |
-| Trend Follow (BTC) | -$513 | -$199 | +$3 | +$52 |
-| **Momentum (ETH)** | -$1,732 | -$653 | **+$127** | +$327 |
-| Momentum (BTC) | -$760 | -$415 | -$191 | **-$137** |
+### Error Chain
+```
+POST /api/engine/start
+  → tradingEngine = new TradingEngine(...) ← succeeds
+  → perpsAdapter = new CoinbasePerpsAdapter(logger)
+  → await perpsAdapter.initialize(credentials)
+    → await super.initialize(credentials) ← succeeds
+    → await this.refreshPerpsProducts()
+      → restClient.getPerpsProducts()
+        → GET /api/v3/brokerage/products?product_type=FUTURE → 404
+        → fallback GET /products → returns empty (no PERP products in spot list)
+        → OR: error propagates up → CRASH
+  → Engine startup aborted, 500 returned
+```
 
-### Per-Strategy Verdicts
+### Root Cause: Two Bugs
 
-| Strategy | Verdict | Reason |
-|---|---|---|
-| **VWAP Mean Reversion** | KILL | Zero/1 trade across 12 months. ADX ranging regime too short for signals to fire. |
-| **Donchian Breakout** | KILL | Negative-EV even at zero fees. Signal itself has no edge. |
-| **EMA Trend Follow (ETH)** | GO (Conditional) | +18.6% on Hyperliquid, all 4 quarters profitable, 4% P(loss). Requires Hyperliquid, ETH-only, quarter-Kelly sizing, 30-day paper minimum. |
-| **RSI/MACD Momentum (ETH)** | Paper Only | +12.6% on Hyperliquid but Q4 was losing quarter, 7.9% P(loss). Paper trade 60 days, require 2 consecutive profitable months before live. |
+**Bug 1: `refreshPerpsProducts()` 404 crashes startup.**
+The Coinbase INTX API endpoint returns 404 — likely because the API key doesn't have INTX/perpetual futures entitlements. But in paper mode, we don't need real perps products from the API at all. The spot→perps candle proxy handles signal generation, PaperSimulator handles any product_id string, and `isPerpsSymbol()` already has a string-matching fallback (`symbol.includes('-PERP-')`). The product cache is only used for `getMarketInfo()` which can fall back to the parent adapter.
 
-### Optimized Parameters for Viable Strategies
+**Bug 2: Engine state not cleaned up on startup crash.**
+At server.ts line 951, `tradingEngine = new TradingEngine(...)` succeeds and sets the module variable. Then line 960 `await perpsAdapter.initialize(credentials)` throws the 404. The catch block at line 1718 logs and returns 500, but `tradingEngine` stays non-null. Next startup attempt hits `if (tradingEngine)` at line 854 → returns "Trading engine already running." User has to manually call the stop endpoint to clear ghost state.
 
-**Trend Follow ETH (PRIMARY):**
-- EMA Fast: 12, EMA Slow: 15
-- Stop Loss: 2.5x ATR
-- Take Profit: 5.0x ATR
-- Risk per trade: 0.5%
-- Max open positions: 2
-- Max exposure: 30%
-- Position sizing: Quarter-Kelly (3.0% of bankroll)
-- Exchange: Hyperliquid ONLY (fee < 0.10% required)
-- Asset: ETH-USD ONLY (does not transfer to BTC)
+### Secondary Issues (Not Blocking)
 
-**Momentum ETH (SECONDARY — paper only):**
-- RSI Period: 10, Long threshold: >55, Short threshold: <40
-- MACD: Fast 8, Slow 21, Signal 5
-- Stop Loss: 2.0x ATR
-- Take Profit: 4.0x ATR
-- Same risk/sizing parameters as above
-
-### ADX Regime Detection (Critical Fix)
-
-The original regime detector used return-magnitude thresholds (0.15 for strong_trend, 0.05 for weak_trend) calibrated for daily-scale moves. On 15m data, a 15% move in 50 bars (~12.5 hours) is astronomically rare — so 98.4% of bars were classified as "ranging." This broke VWAP MR (it fired constantly) and starved trend strategies of signals.
-
-**Fixed approach:** ADX-based classification:
-- ADX > 40 → `strong_trend` (26.9% of bars)
-- ADX 20-40 → `weak_trend` (58.4% of bars)
-- ADX < 20 → `ranging` (14.7% of bars)
-
-**NOTE:** This fix was only applied in the Python backtesting engine. The production TypeScript regime detector in `regime-filter.ts` may still use the old approach. This needs to be verified and potentially updated as part of Phase 4 work.
+**Supabase 429 rate limiting:** Frontend hooks (`useSessionStats`, `useEquityCurve`) poll Supabase too aggressively, getting 429 Too Many Requests every 5 seconds. Needs increased polling interval or exponential backoff. This is a Lovable frontend fix, not a backend issue.
 
 ---
 
-## 8. Revised Implementation Plan (Phase 4+)
+## 7. TASK_004 Is Ready — Immediate Next Step
 
-The Phase 3 findings fundamentally change the roadmap. The original plan had Kraken as Phase 5 and Hyperliquid as Phase 6. Now Hyperliquid is the critical path because it's the ONLY venue where strategies are profitable.
+**File:** `CURSOR_TASKS/TASK_004_startup_resilience.md`
+**Verify:** `node CURSOR_TASKS/verify/verify_004.js`
+**Status:** PENDING — Ready for Cursor to execute
 
-### Revised Phase Sequencing
+TASK_004 fixes both bugs with three surgical changes across three files:
 
-| Phase | Description | Priority | Status |
-|---|---|---|---|
-| 0 | Emergency security fixes | P0 | COMPLETED |
-| 1 | Critical trading bug fixes (17 issues) | P0 | COMPLETED |
-| 2 | Database & infrastructure (10 issues) | P0 | COMPLETED |
-| 3 | Backtest validation & analysis | P0 | COMPLETED |
-| **4** | **Hyperliquid adapter (REST + WebSocket)** | **P0 — Critical path** | **NEXT** |
-| **5** | **Paper trading on Hyperliquid (Trend Follow ETH)** | **P0** | Pending |
-| 6 | Kraken adapter (backup venue) | P1 | Pending |
-| 7 | Live deployment with quarter-Kelly sizing | P1 | Pending |
-| 8 | Momentum ETH promotion (if paper validates) | P2 | Pending |
-| 9 | Frontend monitoring fixes | P2 | Pending |
-| 10 | Multi-asset expansion (SOL, etc.) | P3 | Pending |
+**1. `coinbase-perps-adapter.ts`** — Wrap `refreshPerpsProducts()` call in `initialize()` with try-catch (non-fatal). Also add inner try-catch in `refreshPerpsProducts()` itself. The adapter initializes with 0 products and relies on string-matching fallback.
 
-### Phase 4 Details: Hyperliquid Adapter
+**2. `rest-client.ts`** — Double-wrap `getPerpsProducts()` fallback so it returns `[]` instead of throwing when both the v3 endpoint AND the spot products fallback fail.
 
-This is the immediate next work. From the original IMPLEMENTATION_PLAN.md:
+**3. `server.ts`** — Add state cleanup in the engine start catch block: null out `tradingEngine`, `perpsAdapter`, `perpsRiskMonitor`, reset `activeSpotToPerpsMap`, set `engineRunningGauge` to 0. This prevents ghost state on startup failure.
 
-**4.1 — Create IExchangeAdapter interface** (`atlas/apps/core-node/src/exchanges/exchange-adapter.ts`)
-- Standard interface for all exchange adapters
-- Capabilities struct (supportsShort, supportsPerps, fees, etc.)
+**NOTE:** As of this handoff, Cursor has already implemented the `coinbase-perps-adapter.ts` and `rest-client.ts` changes (the file modifications are visible). The `server.ts` state cleanup may or may not be done yet — verify by reading the catch block around line 1718. If it only has the original error logging without cleanup, Cursor still needs to do that part.
 
-**4.2 — Create ExchangeRegistry** (`atlas/apps/core-node/src/exchanges/exchange-registry.ts`)
-- Multi-exchange management
-
-**4.3 — Refactor OrderManager** to remove Coinbase coupling
-- Replace `import { CoinbaseExchange }` with `IExchangeAdapter`
-- Constructor takes interface, not concrete class
-
-**4.4 — Refactor adapter-factory.ts** for multi-exchange
-
-**4.5 — Refactor server.ts** for multi-exchange
-- Create adapters per exchange via ExchangeRegistry
-- Tag tickers with exchangeId
-- Route signals to correct exchange
-
-**4.6 — Wrap CoinbaseExchange as IExchangeAdapter**
-
-Then the Hyperliquid-specific work (originally Phase 6, now part of Phase 4):
-
-**6.1 — Perpetuals risk module** (`atlas/apps/core-node/src/trading/risk/perps-risk.ts`)
-- maxLeverage: 3x cap
-- marginType: cross/isolated
-- liquidationBuffer: 15% above liquidation
-- Margin alert thresholds
-
-**6.2 — Hyperliquid REST client** (`atlas/apps/core-node/src/exchanges/hyperliquid/http/hl-rest.ts`)
-- EIP-712 typed data signing (requires ethers.js v6)
-- Info endpoint: `POST https://api.hyperliquid.xyz/info`
-- Exchange endpoint: `POST https://api.hyperliquid.xyz/exchange`
-
-**6.3 — Hyperliquid WebSocket client** (`atlas/apps/core-node/src/exchanges/hyperliquid/ws/hl-ws.ts`)
-- URL: `wss://api.hyperliquid.xyz/ws`
-- Channels: allMids, l2Book, trades, userEvents
-
-**6.4 — Hyperliquid adapter**
-- Capabilities: supportsShort=true, supportsPerps=true, maxLeverage=50 (config-capped to 3), makerFee=0.0002, takerFee=0.0005
-
-**6.5 — Extend PositionTracker for perps**
-- Add: exchangeId, isPerp, leverage, marginUsed, liquidationPrice, cumulativeFunding
-- Update calculatePnL: totalPnL = realizedPnL + unrealizedPnL - cumulativeFunding
-
-**6.6 — Extend PositionMonitor for perps exits**
-- New exit types: liquidation_buffer, funding_rate, margin_call
-
-**6.7 — Paper mode + ethers.js dependency**
-
-**6.8 — Integration tests**
-
-### What was killed from original plan:
-- **Coinbase optimization is dead.** No strategy is profitable on Coinbase. Don't waste engineering time there.
-- **VWAP MR and Breakout strategies should be hard-disabled**, not just config-toggled.
-- **Original Phase 9 capital rollout needs rewrite** — it assumed Kraken VWAP MR first, but now it's Hyperliquid Trend Follow ETH first.
+**To execute:** Tell Cursor: `Read and execute CURSOR_TASKS/TASK_004_startup_resilience.md` then run `node CURSOR_TASKS/verify/verify_004.js`
 
 ---
 
-## 9. Key Files Reference
+## 8. Key Files Reference (Phase 4 State)
 
-### Core Backend Files
+### Core Backend (Modified in Phase 4)
 
-| File | Purpose | Key Lines/Details |
-|---|---|---|
-| `atlas/apps/core-node/src/api/server.ts` | Main API server | Lines 21-110: Zod schemas; L130-137: rate limiter; L139: WS cap; L507-511: WS close; L1899-1917: Zod safeParse; L3010-3035: backtest endpoint with real data |
-| `atlas/apps/core-node/src/strategies/regime-filter.ts` | Regime detection | L118-128: DEFAULT_CONFIG (fixed in Phase 1.1) |
-| `atlas/apps/core-node/src/trading/risk-engine.ts` | Risk checks | 28 `Number.isFinite()` calls (Phase 1.11) |
-| `atlas/apps/core-node/src/trading/position-monitor.ts` | Position exit logic | Exit lock pattern at L52, 106, 217, 360-410 (Phase 1.15) |
-| `atlas/apps/core-node/src/trading/order-manager.ts` | Order execution | Fill lock mutex (Phase 1.9), TWAP timer cleanup (Phase 1.12) |
-| `atlas/apps/core-node/src/trading/paper-trading-simulator.ts` | Paper trading | L618-632: Realized P&L with cost-basis (Phase 3.0d) |
-| `atlas/apps/core-node/src/backtesting/backtest-engine.ts` | Backtest core | L345-347: Fixed P&L; L424-442: Position sizing with allocated capital |
-| `atlas/apps/core-node/src/backtesting/advanced-backtest-engine.ts` | Advanced backtest | L868-877: Walk-forward deprecated; L277-293: API data loading |
-| `atlas/apps/core-node/src/backtesting/data-loader.ts` | Data loading | L35-67: validateCandle + filterValidCandles; L102-146: loadCandles cascade (Supabase → Coinbase REST → synthetic) |
-| `atlas/config/guardrails.yaml` | Trading parameters | Production values from Phase 1.14 |
+| File | Key Changes | Critical Lines |
+|------|-------------|----------------|
+| `atlas/apps/core-node/src/api/server.ts` | Module-scoped perps state, dynamic products, candle proxy, warmup mirroring, strategy override loading, leverage init, perps risk monitor setup | L258-260: module vars; L407-411: candle proxy; L875-894: dynamic products; L951-974: perps adapter + risk monitor init; L1259-1273: override loading; L1696-1704: warmup mirroring; L1718-1728: catch block (NEEDS STATE CLEANUP) |
+| `atlas/apps/core-node/src/exchanges/coinbase-perps-adapter.ts` | CoinbasePerpsAdapter subclass with graceful init | L51-61: initialize with try-catch; L69-87: refreshPerpsProducts with inner try-catch; L90-92: isPerpsSymbol with string fallback |
+| `atlas/apps/core-node/src/exchanges/coinbase/rest-client.ts` | Perps REST endpoints, double-wrapped fallback | L299-338: getPerpsProducts with nested try-catch; L336-344: getIntxPositions; L362-370: getIntxPortfolio; L376-384: getFundingRate; L390-402: setLeverage |
+| `atlas/apps/core-node/src/exchanges/coinbase-adapter.ts` | Base adapter wrapping CoinbaseExchange | Implements IExchangeAdapter interface |
+| `atlas/apps/core-node/src/exchanges/types.ts` | IExchangeAdapter, IPerpsAdapter, AdapterPosition, etc. | All exchange abstraction types |
+| `atlas/apps/core-node/src/exchanges/exchange-registry.ts` | Multi-exchange registry | Register/get adapters by ID |
+| `atlas/apps/core-node/src/trading/risk/perps-risk-monitor.ts` | Real-time perps risk monitoring | Liquidation, leverage, funding, margin events |
+| `atlas/apps/core-node/src/trading/risk/evaluate-risk.ts` | Extended for perps_symbols | L442-471: perps_symbols type + merge loop for notional/daily loss limits |
+| `atlas/apps/core-node/src/strategies/signal-processor.ts` | getCandleBuffer getter added | L430-433: public getCandleBuffer(symbol) |
+| `atlas/apps/core-node/src/trading/trading-engine.ts` | effectiveRiskPerTrade, reduce_only, computeOrderSize override | Modified in TASK_002D |
 
-### Project-Level Files
+### Configuration
 
 | File | Purpose |
-|---|---|
-| `IMPLEMENTATION_PLAN.md` | Master plan — 80 issues across 10 phases (original, pre-backtest-verdict) |
-| `PHASE3_BACKTEST_VERDICT.md` | Phase 3 analysis results and revised roadmap |
-| `COWORK_HANDOFF.md` | This file — complete context transfer |
-| `pnpm-workspace.yaml` | Monorepo config (`packages: ['atlas/apps/*']`) |
-| `.env` | Local secrets (should be in .gitignore) |
-| `env.example` | Template for .env |
+|------|---------|
+| `atlas/config/guardrails.yaml` | Master trading config — includes `perps:` section (L109-126) and `perps_symbols:` section (L129-165) with ETH-PERP-INTX and BTC-PERP-INTX configs |
+| `atlas/config/paper.local.yaml` | Paper mode startup config — may still have old hardcoded `symbols:` array that conflicts with new dynamic products from guardrails |
+| `atlas/apps/core-node/.cursorrules` | Cursor AI instructions — updated in TASK_002D with perps context |
 
-### Git History (relevant commits)
+### Task Files
 
-```
-94646fa  Phase 3.0: Fix backtest infrastructure (6 fixes)
-c92e753  Phase 1 & 2: trading fixes, server hardening, pnpm standardization
-751527d  docs: add comprehensive system overview
-```
+| File | Status | Checks |
+|------|--------|--------|
+| `CURSOR_TASKS/TASK_000_regime_detector_confidence_fix.md` | ✅ VERIFIED | — |
+| `CURSOR_TASKS/TASK_001_phase4a_exchange_abstraction.md` | ✅ VERIFIED | — |
+| `CURSOR_TASKS/TASK_002A_coinbase_perps_adapter.md` | ✅ VERIFIED | — |
+| `CURSOR_TASKS/TASK_002B_guardrails_perps_update.md` | ✅ VERIFIED | — |
+| `CURSOR_TASKS/TASK_002C_perps_risk_module.md` | ✅ VERIFIED | — |
+| `CURSOR_TASKS/TASK_002D_strategy_perps_wiring.md` | ✅ VERIFIED | — |
+| `CURSOR_TASKS/TASK_003A_perps_override_wiring.md` | ✅ VERIFIED | 17/17 |
+| `CURSOR_TASKS/TASK_003B_perps_market_data_and_routing.md` | ✅ VERIFIED | 19/19 |
+| `CURSOR_TASKS/TASK_004_startup_resilience.md` | PENDING | 16 checks |
+
+---
+
+## 9. Architecture Decisions Made in Phase 4
+
+### Spot→Perps Candle Proxy
+Coinbase Advanced Trade WebSocket ticker channel does NOT support INTX perpetual product IDs. Standard industry approach: mirror spot candles (BTC-USD) to perps symbols (BTC-PERP-INTX) since perps track the spot index price via funding rate mechanism. The mapping is built dynamically from guardrails config using base currency matching (BTC-PERP-INTX → BTC → BTC-USD).
+
+### Dynamic Products List
+Replaced hardcoded `['BTC-USD', 'ETH-USD', 'SOL-USD']` with `Object.keys(guardrails.per_symbol)` for spot and `Object.keys(guardrails.perps_symbols)` for perps. Products are now config-driven.
+
+### Module-Scoped Perps State
+`perpsAdapter`, `perpsRiskMonitor`, and `activeSpotToPerpsMap` are module-scoped variables in server.ts (not function-scoped inside the route handler) so the signal handler closure and candle proxy callback can access them.
+
+### effectiveRiskPerTrade
+When evaluating risk for an order, the system uses `perps.risk_per_trade` (1.5%) for perps symbols and `account.risk_per_trade` (0.5%) for spot symbols. This allows leveraged positions to use more aggressive sizing while keeping spot conservative.
+
+### Paper Mode Order Flow for Perps
+`tradingEngine.createOrder()` → RiskEngine check → PaperSimulator. The PaperSimulator handles any product_id string, so perps symbols (BTC-PERP-INTX) work without explicit routing changes in paper mode. The order just needs a valid price and size.
+
+### Strategy Override Sharing
+Both `guardrails.per_symbol` and `guardrails.perps_symbols` have compatible structure (`Record<string, { strategy_overrides?: ... }>`), so `signalProcessor.loadPerSymbolOverridesFromGuardrails()` is called twice — once for spot, once for perps — with the same function.
 
 ---
 
 ## 10. Known Issues & Technical Debt
 
-### Must Fix Before Phase 4
+### Critical (Blocking)
 
-1. **DB migrations not in repo:** Phase 2 Batch A migrations (2.1-2.5) were applied directly to Supabase but don't exist as SQL files in `supabase/migrations/`. Create migration files for version control.
+1. **Coinbase INTX 404 — TASK_004 fixes this.** The API key likely lacks INTX entitlements. The fix makes the product fetch non-fatal so paper trading works without live INTX API access.
 
-2. **Regime detector in production code may not match backtested version:** The Python backtesting engine used ADX-based regime detection (ADX > 40 = strong_trend, 20-40 = weak_trend, < 20 = ranging). The TypeScript `regime-filter.ts` may still use the old return-magnitude approach. Verify and align.
+2. **Engine state ghost on crash — TASK_004 fixes this.** Startup failure leaves `tradingEngine` non-null, blocking subsequent start attempts.
 
-3. **Strategy parameters in production code may not match optimized values:** The backtest found optimal params of EMA(12/15) with Stop 2.5x ATR, TP 5.0x ATR. Verify `guardrails.yaml` and strategy implementations match.
+### High Priority
 
-### Lower Priority Technical Debt
+3. **`paper.local.yaml` may conflict with dynamic products.** The old config file has `symbols: [BTC-USD, ETH-USD]` which might override or conflict with the new dynamic products built from guardrails. After TASK_004, verify that startup uses guardrails-based products and isn't limited by paper.local.yaml.
 
-| Issue | Severity | File |
+4. **Supabase 429 rate limiting from frontend.** `useSessionStats` and `useEquityCurve` hooks poll aggressively. Needs increased polling interval or exponential backoff. This is a Lovable frontend fix.
+
+5. **DB migrations not in repo.** Phase 2 Batch A migrations (2.1-2.5) were applied directly to Supabase but don't exist as SQL files in `supabase/migrations/`.
+
+6. **Regime detector in production may not match backtested version.** Python backtests used ADX-based classification (ADX > 40 = strong_trend). TypeScript `regime-filter.ts` may still use old return-magnitude thresholds. Needs verification and alignment.
+
+### Medium Priority
+
+7. **Perps-specific frontend monitoring not built yet.** The existing Lovable UI can see perps trades in the order table and trade log (same WebSocket broadcasts), but perps-specific data (leverage indicator, liquidation distance, funding rate, perps P&L breakdown) needs new WS broadcasts from backend + new Lovable components. This is TASK_003C territory (not yet created).
+
+8. **Leverage initialization calls `perpsAdapter.setLeverage()` which hits the INTX API.** In paper mode, these calls will fail silently (already has `.catch()`), but leverage won't actually be set on the exchange. The `leverageCache` in the adapter won't be populated. This is fine for paper trading but needs fixing for live.
+
+9. **RLS policies `USING(true)` overly permissive** in Supabase migrations.
+
+10. **K8s deployment placeholders** (`YOUR_ORG`) in `deploy/k8s/*.yaml`.
+
+---
+
+## 11. What Comes After TASK_004
+
+Once TASK_004 passes and the bot starts successfully in paper mode:
+
+### Immediate (Same Session)
+
+1. **Start paper trading** — `pnpm api` then POST to start endpoint. Watch logs for candle proxy working, signals generating for both spot and perps symbols.
+
+2. **Verify perps signals appearing** — Check that BTC-PERP-INTX and ETH-PERP-INTX are receiving mirrored candles and generating signals via the trend_follow and momentum strategies.
+
+3. **Monitor for a few minutes** — Confirm no crashes, check the localhost:8080 dashboard for trade activity.
+
+### Next Tasks to Create
+
+4. **TASK_003C — Perps risk data WebSocket broadcasts.** Add new broadcast events for funding rate, leverage status, liquidation warnings so the Lovable frontend can display perps-specific monitoring data.
+
+5. **Lovable UI work** — Build perps monitoring panel (leverage indicator, funding rate, liquidation distance, perps-specific P&L). Can reference the WS broadcast types from TASK_003C.
+
+6. **Supabase polling fix** — Increase frontend polling intervals to avoid 429s.
+
+### Longer Term
+
+7. **Hyperliquid adapter** — The Phase 3 backtest proved Hyperliquid (0.05% fees) is the most profitable venue. Coinbase perps (0.03% fees) is the stepping stone. The exchange abstraction layer (TASK_001) was designed to support multiple exchanges. Hyperliquid adapter would register alongside coinbase-perps.
+
+8. **Live trading preparation** — After paper validation period (minimum 30 days for Trend Follow, 60 days for Momentum), begin live deployment with quarter-Kelly sizing.
+
+---
+
+## 12. Strategy & Backtest Verdicts (Phase 3 Summary)
+
+### Fee Sensitivity Matrix (Annual Returns on $10K)
+
+| Strategy | Coinbase 0.60% | Kraken 0.26% | Hyperliquid 0.05% | CB Perps 0.03% |
+|---|---|---|---|---|
+| VWAP MR (ETH) | $3 (1 trade) | $23 | $35 | ~$37 |
+| Breakout (BTC) | -$2,260 | -$1,147 | -$330 | ~-$280 |
+| **Trend Follow (ETH)** | -$836 | +$251 | **+$1,024** | **~+$1,100** |
+| **Momentum (ETH)** | -$1,732 | -$653 | **+$127** | **~+$180** |
+
+### Strategy Verdicts
+
+| Strategy | Verdict | Reason |
 |---|---|---|
-| RLS policies `USING(true)` overly permissive | MEDIUM | Supabase migrations |
-| `auth.users` FK constraints were dropped | MEDIUM | migration 20251212 |
-| K8s deployment placeholders (YOUR_ORG) | HIGH | `deploy/k8s/*.yaml` |
-| No CI/CD pipeline | MEDIUM | Missing |
-| No docker-compose for local dev | LOW | Missing |
-| HTML meta description says "Lovable" | LOW | `index.html` |
-| ESLint disables unused-vars | LOW | `eslint.config.js` |
-| TypeScript strictness mismatch (FE lax) | MEDIUM | tsconfig files |
+| VWAP Mean Reversion | KILL | Zero/1 trade across 12 months |
+| Donchian Breakout | KILL | Negative-EV even at zero fees |
+| **EMA Trend Follow (ETH)** | GO | +18.6% on low fees, all 4 quarters profitable, 4% P(loss) |
+| **RSI/MACD Momentum (ETH)** | Paper Only | +12.6% but inconsistent (Q4 losing quarter), 7.9% P(loss) |
 
-### Complete Issue Registry
+### Optimized Parameters (in guardrails.yaml perps_symbols section)
 
-The full 80-issue registry is in `IMPLEMENTATION_PLAN.md` with severity, file, and line numbers for every issue. Phases 0-3 (issues 1-48) are resolved. Issues 49-80 remain for Phases 4-9.
+**Trend Follow ETH:** EMA(12/15), Stop 2.5x ATR, TP 5.0x ATR
+**Momentum ETH:** RSI(10) Long>55 Short<40, MACD(8/21/5), Stop 2.0x ATR, TP 4.0x ATR
 
 ---
 
-## 11. Tools & Model Preferences
+## 13. How to Continue
 
-- **Cursor primary model:** Opus 4.6 Max (Sonnet 4.6 as fallback when hitting usage cap)
-- **Claude Code extension in Cursor:** NOT recommended (redundant with Cursor's built-in AI)
-- **Cowork role:** Backtest analysis, fee sensitivity, Monte Carlo, strategy validation, architecture review, prompt generation for Cursor
-- **Cursor role:** All code changes, tests, adapters, configs, migrations
-- **Production parameters:** $10K equity, 0.5% risk/trade, max 2 open positions, 30% max exposure, $1.00 breakeven threshold
+### Step 1: Execute TASK_004
+Tell Cursor: `Read and execute CURSOR_TASKS/TASK_004_startup_resilience.md`
+Run: `node CURSOR_TASKS/verify/verify_004.js`
+Expected: 16/16 checks pass.
 
----
+**Check first:** The `coinbase-perps-adapter.ts` and `rest-client.ts` changes may already be done (they were visible as file modifications before this handoff). The `server.ts` state cleanup in the catch block is the part that may still be pending. Read the catch block around line 1718 of server.ts to check.
 
-## 12. How to Continue
-
-### Immediate Next Steps
-
-1. **Verify production code alignment:** Check that `regime-filter.ts` uses ADX-based classification and that strategy parameters in `guardrails.yaml` match the optimized values from Phase 3.
-
-2. **Create migration files:** Write SQL migration files for Phase 2 Batch A changes (2.1-2.5) and commit them to `supabase/migrations/`.
-
-3. **Begin Phase 4:** Start with the exchange abstraction layer (4.1-4.6), then build the Hyperliquid adapter (6.1-6.8). The Cursor prompt for this work should reference `IMPLEMENTATION_PLAN.md` sections 4.1-4.6 and 6.1-6.8.
-
-4. **Strategy concentration:** When building the Hyperliquid adapter, only wire up Trend Follow and Momentum strategies. VWAP MR and Breakout are dead — add hard kill switches.
-
-### Cursor Prompt Template for Phase 4
-
-When ready to start Phase 4 in Cursor, use this as the base prompt:
-
+### Step 2: Start Paper Trading
+```bash
+cd atlas/apps/core-node
+pnpm api
 ```
-Reference IMPLEMENTATION_PLAN.md sections 4.1-4.6 and 6.1-6.8. We're combining the exchange abstraction layer and Hyperliquid adapter into a single phase because Phase 3 backtest analysis proved Hyperliquid is the only viable exchange (see PHASE3_BACKTEST_VERDICT.md).
+Then POST to `http://localhost:8080/api/engine/start` with body `{ "mode": "paper" }`.
 
-Priority order:
-1. Create IExchangeAdapter interface and ExchangeRegistry (4.1-4.2)
-2. Refactor OrderManager to remove Coinbase coupling (4.3)
-3. Wrap existing CoinbaseExchange as adapter (4.6)
-4. Build Hyperliquid REST client with EIP-712 signing (6.2)
-5. Build Hyperliquid WebSocket client (6.3)
-6. Build Hyperliquid adapter implementing IExchangeAdapter (6.4)
-7. Add perpetuals risk module (6.1)
-8. Extend PositionTracker and PositionMonitor for perps (6.5-6.6)
-9. Integration tests (6.8)
+### Step 3: Verify Perps Working
+Watch logs for:
+- "CoinbasePerpsAdapter initialized with 0 perps products" (expected — INTX not enabled)
+- "Mirrored X warmup candles from BTC-USD to BTC-PERP-INTX"
+- "Mirrored X warmup candles from ETH-USD to ETH-PERP-INTX"
+- Signals generating for PERP symbols
 
-Key constraints:
-- Hyperliquid uses EIP-712 typed data signing (ethers.js v6)
-- Cap leverage at 3x regardless of exchange max
-- Maker fee: 0.02%, Taker fee: 0.05%
-- Only wire Trend Follow and Momentum strategies (VWAP MR and Breakout are KILLED)
-- ETH-USD only for now
-```
+### Step 4: Create Next Tasks
+If paper trading is running, create TASK_003C for perps WS broadcasts, then move to Lovable UI work for perps monitoring.
 
-### Data Available in Supabase
-
-All 86,888 candles remain in the `bars` table and can be queried for any future analysis. The Python backtesting scripts that generated the Phase 3 analysis are NOT in the repo (they ran in the Cowork session), but the methodology is documented in this file and `PHASE3_BACKTEST_VERDICT.md`.
+### Tools & Preferences
+- Cursor primary model: Opus 4.6 Max (Sonnet 4.6 as fallback)
+- Cowork role: Architecture, task specs, verification, strategic decisions
+- Cursor role: All code changes
+- Production parameters: $10K equity, 0.5% risk/trade (1.5% for perps), max 2 open positions, 30% max exposure
+- Luke's style: Direct communication, no fluff, structured outputs, high-level architecture before execution
 
 ---
 
-*This handoff was generated on March 8, 2026 from a Cowork session that ran across multiple conversations covering Phases 0-3 of the Apex Automata implementation plan.*
+*This handoff was generated on March 10, 2026 from a Windows Cowork session covering Phases 0-4D of Apex Automata. The previous handoff (March 8) covered only Phases 0-3. This version supersedes it entirely.*

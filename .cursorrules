@@ -1,0 +1,111 @@
+# Apex Automata (AtlasBot v2) — Cursor Rules
+# Last updated: 2026-03-09
+
+## Project Overview
+Apex Automata is a professional algorithmic cryptocurrency trading system.
+- **Stack**: Node.js/TypeScript backend, React/Vite frontend, Supabase (PostgreSQL), pnpm monorepo
+- **Active strategies**: Trend Follow ETH, Momentum ETH (all others KILLED per Phase 3 backtest)
+- **Target exchange**: Hyperliquid (0.05% fees) — Coinbase (0.60% fees) proven negative-EV
+- **Codebase**: ~80,000 lines across ~350 files
+
+## Architecture
+```
+atlas/
+  apps/
+    core-node/src/
+      api/              # Express REST API + WebSocket server
+      core/             # Logger, config loader, event bus
+      exchanges/        # Exchange adapters (coinbase/, types to come)
+        coinbase/       # CoinbaseExchange, REST client, WebSocket, types, reconciliation
+      strategies/       # Regime detector, signal processor, strategy plugins
+        plugins/        # Strategy registry + builtin strategies
+          builtin/      # trend-follow, momentum, vwap-mr (KILLED), breakout (KILLED)
+      trading/          # OrderManager, PositionTracker, RiskEngine, TradingEngine
+      indicators/       # Technical indicator pipeline
+  config/
+    guardrails.yaml     # Risk limits, per-symbol overrides, disabled strategies
+supabase/
+  migrations/           # Idempotent SQL migration files
+```
+
+## Critical Conventions
+
+### TypeScript
+- Strict mode enabled (`"strict": true` in tsconfig)
+- All new files MUST have JSDoc comments on public methods
+- Use `EventEmitter` pattern for inter-component communication
+- Logger via `import { Logger } from '../core/logger'`
+- Config via `import { ConfigLoader } from '../core/config-loader'`
+- Decimal values as strings for financial precision (never floating point for money)
+
+### Naming
+- Files: `kebab-case.ts` (e.g., `order-manager.ts`, `regime-detector.ts`)
+- Classes: `PascalCase` (e.g., `OrderManager`, `CoinbaseExchange`)
+- Interfaces: `PascalCase` with `I` prefix for adapters (e.g., `IExchangeAdapter`)
+- Types: `PascalCase` (e.g., `OrderRequest`, `MarketRegime`)
+- Config keys in YAML: `snake_case` (e.g., `max_notional_usd`)
+
+### Error Handling
+- Never swallow errors silently — always `this.logger.error()` before re-throwing or returning
+- Use try/catch at API boundaries, let errors propagate in internal modules
+- Circuit breaker pattern for external API calls (see rest-client.ts)
+
+### Strategy System
+- All strategies extend base plugin interface from `strategy-registry.ts`
+- Parameters read via `this.getConfig<T>(key, default, symbol)` for per-symbol overrides
+- Regime detector uses `adx_primary` mode (pure ADX thresholds: 40/20/20)
+- Disabled strategies: `vwap_mr`, `breakout` (gated at config, signal-processor, registry)
+
+### Exchange Abstraction (Phase 4 — In Progress)
+- `IExchangeAdapter` interface in `src/exchanges/types.ts`
+- `ExchangeRegistry` manages adapter instances
+- `CoinbaseAdapter` wraps existing `CoinbaseExchange` (DO NOT rewrite coinbase internals)
+- OrderManager accepts optional adapter; falls back to direct Coinbase calls for backward compat
+- All new exchange code goes in `src/exchanges/` directory
+
+### Perpetual Futures
+- CoinbasePerpsAdapter extends CoinbaseAdapter for perps trading
+- Registered as 'coinbase-perps' alongside 'coinbase' (spot) in ExchangeRegistry
+- IPerpsAdapter interface: getFundingRate, setLeverage, getPortfolioSummary
+- isPerpsAdapter() type guard for runtime capability check
+- PerpsRiskMonitor: liquidation proximity, funding rate, leverage enforcement
+- Perps symbols follow pattern: XXX-PERP-INTX (e.g., BTC-PERP-INTX, ETH-PERP-INTX)
+- allow_short: true — strategies generate both long and short signals
+- Perps risk_per_trade: 0.015 (vs 0.005 for spot)
+- Perps fees: 0% maker / 0.03% taker
+
+### Database
+- Supabase PostgreSQL with RLS enabled
+- Financial columns: `NUMERIC(20,8)` precision
+- All migrations idempotent (`IF NOT EXISTS` guards)
+- Migration naming: `YYYYMMDD_phaseXY_description.sql`
+
+### Testing
+- Vitest for unit tests
+- Known failing tests (pre-existing, not regressions):
+  - coinbase-resilience, trading-engine-lifecycle, websocket-reconnect
+  - websocket-unified, position-tracker-fifo, risk-engine
+- ZERO new test failures allowed — run `pnpm test` after changes
+
+### Guardrails Config
+- `atlas/config/guardrails.yaml` is the single source of truth for:
+  - Account risk limits
+  - Per-symbol position limits and strategy overrides
+  - Disabled strategies list
+  - Execution parameters
+  - Circuit breaker thresholds
+
+## What NOT to Do
+- Do NOT modify existing Coinbase client internals (rest-client.ts, websocket.ts, etc.)
+- Do NOT delete killed strategy files (they're marked @deprecated, kept for reference)
+- Do NOT use floating point for financial calculations
+- Do NOT add new npm dependencies without explicit approval
+- Do NOT change the Logger or ConfigLoader patterns
+- Do NOT hard-code exchange-specific logic in OrderManager or TradingEngine
+
+## Task Execution Protocol
+1. Read the full task file before starting
+2. Implement exactly what's specified — no scope creep
+3. Add JSDoc comments to all public methods
+4. Ensure no new TypeScript errors (`pnpm tsc --noEmit`)
+5. Report what was created/modified with file paths and line numbers
