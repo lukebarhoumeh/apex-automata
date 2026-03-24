@@ -1,4 +1,6 @@
 node_modules/
+# node-gyp native addon output (machine-specific)
+apps/core-node/build/
 .pnpm-store/
 .DS_Store
 .env.local
