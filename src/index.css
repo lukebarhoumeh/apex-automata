@@ -2,85 +2,107 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Definition of the design system. All colors, gradients, fonts, etc should be defined here. 
-All colors MUST be HSL.
+/* Apex Automata — Obsidian theme (dark-only)
+   Canonical hex in DESIGN_TOKENS.md; converted to HSL here so shadcn/ui
+   components (which consume hsl(var(--x))) reskin uniformly.
 */
 
 @layer base {
   :root {
-    --background: 220 15% 95%;
-    --foreground: 220 13% 13%;
-    --card: 0 0% 100%;
-    --card-foreground: 220 13% 13%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 220 13% 13%;
-    --primary: 189 94% 43%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 220 13% 91%;
-    --secondary-foreground: 220 13% 13%;
-    --muted: 220 13% 91%;
-    --muted-foreground: 220 9% 46%;
-    --accent: 189 94% 43%;
-    --accent-foreground: 0 0% 100%;
-    --destructive: 0 84% 60%;
+    /* Obsidian surfaces */
+    --background: 220 20% 4%;   /* #06080c  bg-0 */
+    --foreground: 220 20% 93%;  /* #e8ecf2  fg-0 */
+    --card: 220 22% 6%;         /* #0a0d14  bg-1 */
+    --card-foreground: 220 20% 93%;
+    --popover: 220 22% 6%;
+    --popover-foreground: 220 20% 93%;
+
+    /* Secondary / muted / input surfaces */
+    --secondary: 219 30% 9%;         /* #0f131c  bg-2 */
+    --secondary-foreground: 220 20% 93%;
+    --muted: 219 30% 9%;
+    --muted-foreground: 220 14% 47%; /* #6a7588  fg-2 */
+    --input: 222 29% 18%;            /* line-2 */
+    --border: 222 29% 15%;           /* #1a2030 line */
+
+    /* Semantic */
+    --destructive: 355 100% 68%;      /* #ff5a6a down */
     --destructive-foreground: 0 0% 100%;
-    --success: 142 76% 36%;
+    --success: 148 63% 54%;           /* #39d98a up */
     --success-foreground: 0 0% 100%;
-    --warning: 38 92% 50%;
-    --warning-foreground: 0 0% 100%;
-    --border: 220 13% 87%;
-    --input: 220 13% 87%;
-    --ring: 189 94% 43%;
-    --radius: 0.5rem;
-    --chart-1: 189 94% 43%;
-    --chart-2: 142 76% 36%;
-    --chart-3: 38 92% 50%;
-    --chart-4: 0 84% 60%;
-    --chart-5: 263 70% 50%;
+    --warning: 37 100% 57%;           /* #ffb020 warn */
+    --warning-foreground: 0 0% 0%;
+
+    /* Shape */
+    --radius: 0.625rem;               /* 10px per panel radius */
+
+    /* Charts (match up/accent/warn/down/info) */
+    --chart-1: 217 91% 60%;  /* accent */
+    --chart-2: 148 63% 54%;  /* up     */
+    --chart-3: 37 100% 57%;  /* warn   */
+    --chart-4: 355 100% 68%; /* down   */
+    --chart-5: 218 100% 74%; /* info   */
+
+    /* Sidebar (shadcn's sidebar tokens — align to panel surface) */
+    --sidebar-background: 220 22% 6%;
+    --sidebar-foreground: 220 20% 93%;
+    --sidebar-primary: 217 91% 60%;
+    --sidebar-primary-foreground: 218 100% 96%;
+    --sidebar-accent: 220 28% 12%;
+    --sidebar-accent-foreground: 220 20% 93%;
+    --sidebar-border: 222 29% 15%;
+    --sidebar-ring: 217 91% 60%;
+
+    /* Accent — electric (default). See [data-accent=...] below for alternatives. */
+    --accent: 217 91% 60%;        /* #3b82f6 */
+    --accent-2: 213 94% 68%;      /* #60a5fa */
+    --accent-ink: 218 100% 96%;   /* #eaf1ff */
+    --accent-glow: 217 91% 60% / 0.35;
+    --accent-soft: 217 91% 60% / 0.12;
+    --accent-foreground: 218 100% 96%;
+
+    /* Shadcn primary === brand accent */
+    --primary: 217 91% 60%;
+    --primary-foreground: 218 100% 96%;
+
+    --ring: 217 91% 60%;
   }
 
-  .dark {
-    --background: 225 15% 8%;
-    --foreground: 210 40% 98%;
-    --card: 224 20% 12%;
-    --card-foreground: 210 40% 98%;
-    --popover: 224 20% 12%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 189 94% 50%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 220 15% 18%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 220 15% 18%;
-    --muted-foreground: 215 20% 60%;
-    --accent: 189 94% 50%;
-    --accent-foreground: 0 0% 100%;
-    --destructive: 0 85% 55%;
-    --destructive-foreground: 0 0% 100%;
-    --success: 142 71% 45%;
-    --success-foreground: 0 0% 100%;
-    --warning: 38 92% 50%;
-    --warning-foreground: 0 0% 0%;
-    --border: 220 20% 20%;
-    --input: 220 20% 20%;
-    --ring: 189 94% 50%;
-    --chart-1: 189 94% 50%;
-    --chart-2: 142 71% 45%;
-    --chart-3: 38 92% 50%;
-    --chart-4: 0 85% 55%;
-    --chart-5: 263 70% 50%;
-    
-    --glow-primary: 189 94% 50%;
-    --glow-success: 142 71% 45%;
-    --glow-destructive: 0 85% 55%;
-    --glow-warning: 38 92% 50%;
-    
-    --gradient-primary: linear-gradient(135deg, hsl(189 94% 40%), hsl(189 94% 60%));
-    --gradient-success: linear-gradient(135deg, hsl(142 71% 35%), hsl(142 71% 55%));
-    --gradient-premium: linear-gradient(135deg, hsl(189 94% 50%), hsl(263 70% 50%));
-    
-    --shadow-glow-sm: 0 0 10px -2px hsl(var(--glow-primary) / 0.2);
-    --shadow-glow-md: 0 0 20px -5px hsl(var(--glow-primary) / 0.3);
-    --shadow-glow-lg: 0 0 40px -10px hsl(var(--glow-primary) / 0.4);
+  [data-accent="emerald"] {
+    --accent: 160 84% 39%;        /* #10b981 */
+    --accent-2: 158 64% 52%;      /* #34d399 */
+    --accent-ink: 151 81% 94%;
+    --accent-glow: 160 84% 39% / 0.35;
+    --accent-soft: 160 84% 39% / 0.12;
+    --primary: 160 84% 39%;
+    --ring: 160 84% 39%;
+    --sidebar-primary: 160 84% 39%;
+    --sidebar-ring: 160 84% 39%;
+    --chart-1: 160 84% 39%;
+  }
+  [data-accent="amber"] {
+    --accent: 26 100% 56%;        /* #ff8a1f */
+    --accent-2: 33 100% 64%;      /* #ffb24a */
+    --accent-ink: 30 100% 96%;
+    --accent-glow: 26 100% 56% / 0.35;
+    --accent-soft: 26 100% 56% / 0.12;
+    --primary: 26 100% 56%;
+    --ring: 26 100% 56%;
+    --sidebar-primary: 26 100% 56%;
+    --sidebar-ring: 26 100% 56%;
+    --chart-1: 26 100% 56%;
+  }
+  [data-accent="violet"] {
+    --accent: 258 90% 66%;        /* #8b5cf6 */
+    --accent-2: 255 92% 76%;      /* #a78bfa */
+    --accent-ink: 258 100% 96%;
+    --accent-glow: 258 90% 66% / 0.35;
+    --accent-soft: 258 90% 66% / 0.12;
+    --primary: 258 90% 66%;
+    --ring: 258 90% 66%;
+    --sidebar-primary: 258 90% 66%;
+    --sidebar-ring: 258 90% 66%;
+    --chart-1: 258 90% 66%;
   }
 }
 
@@ -89,79 +111,102 @@ All colors MUST be HSL.
     @apply border-border;
   }
 
+  html, body, #root {
+    height: 100%;
+  }
+
   body {
-    @apply bg-background text-foreground;
-    font-feature-settings: "cv02", "cv03", "cv04", "cv11", "tnum";
+    @apply bg-background text-foreground font-sans;
+    font-feature-settings: "cv11", "ss01", "ss03", "tnum";
     font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
-  
-  .card-glow {
-    box-shadow: var(--shadow-glow-md);
-    transition: box-shadow 0.3s ease;
+
+  .mono {
+    font-family: "Geist Mono", ui-monospace, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
   }
-  
-  .card-glow:hover {
-    box-shadow: var(--shadow-glow-lg);
+
+  .serif-ital {
+    font-family: "Instrument Serif", ui-serif, Georgia, serif;
+    font-style: italic;
   }
-  
-  .profit-glow {
-    text-shadow: 0 0 20px hsl(var(--glow-success) / 0.4);
-    animation: profit-pulse 2s ease-in-out infinite;
+
+  /* Scrollbar — Obsidian */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
   }
-  
-  .loss-glow {
-    text-shadow: 0 0 20px hsl(var(--glow-destructive) / 0.4);
+  ::-webkit-scrollbar-track {
+    background: transparent;
   }
-  
-  .terminal-grid {
-    background-image: 
-      linear-gradient(to right, hsl(var(--border)) 1px, transparent 1px),
-      linear-gradient(to bottom, hsl(var(--border)) 1px, transparent 1px);
+  ::-webkit-scrollbar-thumb {
+    background: #151a25;
+    border: 2px solid #06080c;
+    border-radius: 10px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #1d2431;
+  }
+
+  /* Focus ring — accent, 2px offset 2px per design ground-rules */
+  :focus-visible {
+    outline: 2px solid hsl(var(--accent));
+    outline-offset: 2px;
+  }
+}
+
+/* Apex helpers used by primitives + pages */
+@layer components {
+  .dot-live {
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background: #39d98a;
+    box-shadow: 0 0 0 3px rgba(57, 217, 138, 0.2);
+    animation: live-pulse 1.6s ease-in-out infinite;
+  }
+
+  .kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    font-family: "Geist Mono", ui-monospace, monospace;
+    font-size: 10px;
+    font-weight: 500;
+    color: hsl(var(--muted-foreground));
+    background: #0f131c;
+    border: 1px solid #222a3b;
+    border-bottom-width: 2px;
+    border-radius: 4px;
+  }
+
+  .label {
+    font-family: "Geist Mono", ui-monospace, monospace;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: #6a7588;
+  }
+
+  .gridbg {
+    background-image:
+      linear-gradient(to right, #1a2030 1px, transparent 1px),
+      linear-gradient(to bottom, #1a2030 1px, transparent 1px);
     background-size: 40px 40px;
-    opacity: 0.1;
+    opacity: 0.35;
   }
-  
-  .gradient-border {
-    position: relative;
-    background: hsl(var(--card));
-    background-clip: padding-box;
-    border: 2px solid transparent;
-  }
-  
-  .gradient-border::before {
-    content: '';
-    position: absolute;
-    inset: 0;
-    z-index: -1;
-    margin: -2px;
-    border-radius: inherit;
-    background: var(--gradient-primary);
-  }
-  
-  @keyframes profit-pulse {
-    0%, 100% {
-      text-shadow: 0 0 20px hsl(var(--glow-success) / 0.4);
-    }
-    50% {
-      text-shadow: 0 0 30px hsl(var(--glow-success) / 0.6);
-    }
-  }
-  
-  @keyframes data-stream {
-    0% {
-      opacity: 0;
-      transform: translateY(-10px);
-    }
-    50% {
-      opacity: 1;
-    }
-    100% {
-      opacity: 0;
-      transform: translateY(10px);
-    }
-  }
-  
-  .data-stream {
-    animation: data-stream 2s ease-in-out infinite;
+}
+
+/* Legacy Lovable helpers — retained but unused; removable later. */
+@layer base {
+  .card-glow {
+    box-shadow: 0 0 20px -5px hsl(var(--accent) / 0.2);
   }
 }
