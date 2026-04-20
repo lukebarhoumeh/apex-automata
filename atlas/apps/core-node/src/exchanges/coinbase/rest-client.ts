@@ -218,8 +218,31 @@ export class CoinbaseRestClient {
   }
 
   public async getOrder(orderId: string): Promise<CoinbaseOrder> {
-    const response = await this.client.get<CoinbaseOrder>(`/orders/${orderId}`);
-    return response.data;
+    try {
+      const response = await this.client.get(`/api/v3/brokerage/orders/historical/${orderId}`);
+      const o = response.data?.order || response.data;
+      return {
+        id: o.order_id || o.id || orderId,
+        product_id: o.product_id,
+        side: (o.side || '').toLowerCase() as 'buy' | 'sell',
+        type: (o.order_type || o.type || 'market').toLowerCase(),
+        size: o.filled_size || o.base_size || '0',
+        price: o.average_filled_price || o.limit_price || '0',
+        status: o.status ? o.status.toLowerCase() : 'pending',
+        created_at: o.created_time || o.created_at || '',
+        done_at: o.last_fill_time || '',
+        fill_fees: o.total_fees || o.fee || '0',
+        filled_size: o.filled_size || '0',
+        executed_value: o.filled_value || '0',
+        settled: o.status === 'FILLED',
+        post_only: false,
+      };
+    } catch (error: any) {
+      if (error?.response?.status === 404 || error?.response?.status === 401) {
+        throw new Error(`Order ${orderId} not found`);
+      }
+      throw error;
+    }
   }
 
   public async getOrders(
@@ -228,12 +251,37 @@ export class CoinbaseRestClient {
     limit?: number
   ): Promise<CoinbaseOrder[]> {
     const params: any = {};
-    if (status) params.status = status;
     if (productId) params.product_id = productId;
     if (limit) params.limit = limit;
+    if (status && status.length > 0) {
+      params.order_status = status.map(s => s.toUpperCase());
+    }
 
-    const response = await this.client.get<CoinbaseOrder[]>('/orders', { params });
-    return response.data;
+    try {
+      const response = await this.client.get('/api/v3/brokerage/orders/historical', { params });
+      const orders = response.data?.orders || response.data || [];
+      return Array.isArray(orders) ? orders.map((o: any) => ({
+        id: o.order_id || o.id,
+        product_id: o.product_id,
+        side: (o.side || '').toLowerCase() as 'buy' | 'sell',
+        type: (o.order_type || o.type || 'market').toLowerCase(),
+        size: o.filled_size || o.base_size || '0',
+        price: o.average_filled_price || o.limit_price || '0',
+        status: o.status ? o.status.toLowerCase() : 'pending',
+        created_at: o.created_time || o.created_at || '',
+        done_at: o.last_fill_time || '',
+        fill_fees: o.total_fees || o.fee || '0',
+        filled_size: o.filled_size || '0',
+        executed_value: o.filled_value || '0',
+        settled: o.status === 'FILLED',
+        post_only: false,
+      })) : [];
+    } catch (error: any) {
+      if (error?.response?.status === 404 || error?.response?.status === 401) {
+        return [];
+      }
+      throw error;
+    }
   }
 
   // Fills endpoints

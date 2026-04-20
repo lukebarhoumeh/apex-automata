@@ -442,14 +442,22 @@ export class PaperTradingSimulator extends EventEmitter {
         };
       }
     } else {
-      // Check base currency balance
-      const available = this.getBalance(baseCurrency);
-      
-      if (available < size) {
-        return { 
-          valid: false, 
-          reason: `Insufficient ${baseCurrency} balance. Required: ${size}, Available: ${available}` 
-        };
+      const baseBalance = this.getBalance(baseCurrency);
+
+      if (baseBalance >= size) {
+        // Closing a long position — we hold enough of the base asset
+      } else {
+        // Short sell: check quote currency (USD) for collateral
+        const notional = size * price;
+        const requiredCollateral = notional * (1 + this.config.takerFee);
+        const quoteAvailable = this.getBalance(quoteCurrency);
+
+        if (quoteAvailable < requiredCollateral) {
+          return {
+            valid: false,
+            reason: `Insufficient ${quoteCurrency} collateral for short. Required: ${requiredCollateral.toFixed(2)}, Available: ${quoteAvailable.toFixed(2)}`
+          };
+        }
       }
     }
 

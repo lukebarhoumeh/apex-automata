@@ -503,15 +503,14 @@ export class CoinbaseWebSocket extends EventEmitter implements ICoinbaseWsClient
         this.emit('ws:stalled', pongAge);
         this.emit('health_degraded', 'heartbeat_timeout');
         this.forceReconnect();
-      } else if (this.isConnected && messageAge > RECONNECT_CONFIG.heartbeatTimeoutMs * 2) {
-        // Even longer without any message - definitely dead
-        this.logger.warn('coinbase_ws_stalled_detected', {
-          reason: 'no_messages',
+      } else if (this.isConnected && messageAge > RECONNECT_CONFIG.heartbeatTimeoutMs * 4) {
+        // 3+ minutes without ANY message — log but don't reconnect.
+        // Ticker gaps >90s are normal for low-volume pairs on Coinbase.
+        // The pong-based check above is the authoritative liveness signal.
+        this.logger.debug('coinbase_ws_no_recent_messages', {
           lastMessageAge: messageAge,
         });
-        this.emit('ws:stalled', messageAge);
         this.emit('health_degraded', 'no_messages');
-        this.forceReconnect();
       }
     }, 5000);
   }

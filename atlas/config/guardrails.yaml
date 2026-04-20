@@ -215,3 +215,44 @@ go_live_criteria:
   max_error_count_per_day: 0
   manual_approval_required: true
 
+# Hyperliquid Perpetual Futures Configuration
+# Applies when trading via 'hyperliquid' adapter
+hyperliquid:
+  testnet: true
+  risk_per_trade: 0.03
+  default_leverage: 3
+  max_leverage: 5
+  maker_fee: 0.0002
+  taker_fee: 0.0005
+  funding_check_interval_sec: 300
+
+# Per-symbol Hyperliquid configuration
+hyperliquid_symbols:
+  ETH-USD:
+    max_notional_usd: 3000
+    max_daily_loss_usd: 200
+    strategy_overrides:
+      trend_follow:
+        emaFast: 12
+        emaSlow: 15
+        stopAtr: 2.5
+        takeProfitAtr: 5.0
+      momentum:
+        rsiPeriod: 10
+        rsiOversold: 40
+        rsiOverbought: 55
+        macdFast: 8
+        macdSlow: 21
+        macdSignal: 5
+        stopAtr: 2.0
+        takeProfitAtr: 4.0
+  BTC-USD:
+    max_notional_usd: 3000
+    max_daily_loss_usd: 200
+    strategy_overrides:
+      trend_follow:
+        emaFast: 12
+        emaSlow: 26
+        stopAtr: 2.0
+        takeProfitAtr: 4.0
+

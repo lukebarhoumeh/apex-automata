@@ -177,12 +177,14 @@ export class TrendFollowStrategy extends BaseStrategy {
     const crossoverLookback = this.getConfig<number>('crossoverLookback', 10, symbol);
     const minStrength = this.getConfig<number>('minStrength', 0.5, symbol);
 
-    // Use dynamic indicator names based on config
-    const fastEmaKey = `ema${emaFast}`;
-    const slowEmaKey = `ema${emaSlow}`;
-    
-    const fastEma = context.indicators[fastEmaKey] || context.indicators.ema9;
-    const slowEma = context.indicators[slowEmaKey] || context.indicators.ema21;
+    const fastEma = context.indicators[`ema${emaFast}`]
+      || context.indicators[`ema_${emaFast}`]
+      || context.indicators.ema12
+      || context.indicators.emaFast;
+    const slowEma = context.indicators[`ema${emaSlow}`]
+      || context.indicators[`ema_${emaSlow}`]
+      || context.indicators.ema15
+      || context.indicators.emaSlow;
     const atr = context.indicators.atr;
     const adx = context.indicators.adx;
 
@@ -363,20 +365,29 @@ export class TrendFollowStrategy extends BaseStrategy {
   validateContext(context: MarketContext): { valid: boolean; reason?: string } {
     const emaFast = this.getConfig<number>('emaFast', 12);
     const emaSlow = this.getConfig<number>('emaSlow', 15);
-    const fastEma = context.indicators[`ema${emaFast}`] || context.indicators.ema12;
-    const slowEma = context.indicators[`ema${emaSlow}`] || context.indicators.ema15;
+    const fastEma = context.indicators[`ema${emaFast}`]
+      || context.indicators[`ema_${emaFast}`]
+      || context.indicators.ema12
+      || context.indicators.emaFast;
+    const slowEma = context.indicators[`ema${emaSlow}`]
+      || context.indicators[`ema_${emaSlow}`]
+      || context.indicators.ema15
+      || context.indicators.emaSlow;
     const atr = context.indicators.atr;
 
-    if (!fastEma || fastEma.length < 25) {
-      return { valid: false, reason: 'Insufficient fast EMA data (need 25+ candles)' };
+    const minFastData = emaFast + 5;
+    const minSlowData = emaSlow + 5;
+
+    if (!fastEma || fastEma.length < minFastData) {
+      return { valid: false, reason: `Insufficient fast EMA data (need ${minFastData}+, have ${fastEma?.length || 0})` };
     }
 
-    if (!slowEma || slowEma.length < 25) {
-      return { valid: false, reason: 'Insufficient slow EMA data (need 25+ candles)' };
+    if (!slowEma || slowEma.length < minSlowData) {
+      return { valid: false, reason: `Insufficient slow EMA data (need ${minSlowData}+, have ${slowEma?.length || 0})` };
     }
 
     if (!atr || atr.length < 15) {
-      return { valid: false, reason: 'Insufficient ATR data (need 15+ candles)' };
+      return { valid: false, reason: `Insufficient ATR data (need 15+, have ${atr?.length || 0})` };
     }
 
     return { valid: true };

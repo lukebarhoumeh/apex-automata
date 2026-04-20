@@ -978,8 +978,13 @@ app.post('/api/engine/start', async (req, res) => {
         logger
       );
       perpsRiskMonitor.setAdapter(perpsAdapter);
-      perpsRiskMonitor.start();
-      logger.info('Perps risk monitor started');
+
+      if (mode === 'live') {
+        perpsRiskMonitor.start();
+        logger.info('Perps risk monitor started (live mode)');
+      } else {
+        logger.info('Perps risk monitor created but NOT polling (paper mode — no INTX credentials)');
+      }
 
       // Apply per-symbol leverage from perps_symbols config
       if (guardrails.perps_symbols) {
@@ -1168,25 +1173,27 @@ app.post('/api/engine/start', async (req, res) => {
 
     // Initialize signal processor
     const strategyGuard = guardrails.strategy;
+    const disabledStrategies = guardrails.disabled_strategies || [];
     const signalConfig = {
       supabaseUrl: env.SUPABASE_URL || '',
       supabaseKey: env.SUPABASE_SERVICE_KEY || '',
+      disabledStrategies,
       strategies: {
         breakout: {
-          enabled: true,
+          enabled: !disabledStrategies.includes('breakout'),
           period: strategyGuard.donchian_len,
           atrPeriod: strategyGuard.atr_len_15m,
           atrMultiplier: strategyGuard.stop_init_atr,
           volumeThreshold: 1.1
         },
         vwapMeanReversion: {
-          enabled: true,
+          enabled: !disabledStrategies.includes('vwap_mr'),
           deviationEntry: 2,
           deviationExit: 0.5,
           minVolume: 1000
         },
         momentum: {
-          enabled: strategyGuard.mode.includes('momentum'),
+          enabled: strategyGuard.mode.includes('momentum') && !disabledStrategies.includes('momentum'),
           rsiPeriod: 14,
           rsiOverbought: 70,
           rsiOversold: 30,
@@ -1202,6 +1209,10 @@ app.post('/api/engine/start', async (req, res) => {
     };
 
     signalProcessor = new SignalProcessor(signalConfig, logger);
+
+    if (disabledStrategies.length > 0) {
+      logger.info('Disabled strategies from guardrails:', { disabledStrategies });
+    }
 
     // Set up data loader from exchange for historical data
     // Uses Coinbase public REST endpoint (no auth required) for fast warmup

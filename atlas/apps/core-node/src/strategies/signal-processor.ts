@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
 import { TechnicalIndicators, OHLCV } from '../indicators/technical';
+import { ValidatedIndicators } from '../indicators/validated-indicators';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { v4 as uuidv4 } from 'uuid';
 import { RegimeDetector, RegimeDetectorConfig, RegimeState, MarketRegime } from './regime-detector';
@@ -390,7 +391,7 @@ export class SignalProcessor extends EventEmitter {
     
     // Calculate 10-period EMA on hourly
     const closes = hourlyCandles.map(c => c.close);
-    const ema = TechnicalIndicators.EMA(closes, 10);
+    const ema = ValidatedIndicators.EMA(closes, 10);
     
     if (ema.length < 2) {
       return true;
@@ -486,35 +487,34 @@ export class SignalProcessor extends EventEmitter {
     const breakoutCfg = this.config.strategies.breakout;
     const donchianPeriod = breakoutCfg?.period ?? 20;
     const atrPeriod = breakoutCfg?.atrPeriod ?? 14;
-    indicators.sma20 = TechnicalIndicators.SMA(closes, 20);
-    indicators.sma50 = TechnicalIndicators.SMA(closes, 50);
-    indicators.ema9 = TechnicalIndicators.EMA(closes, 9);   // For trend-follow strategy
-    indicators.ema12 = TechnicalIndicators.EMA(closes, 12);
-    indicators.ema21 = TechnicalIndicators.EMA(closes, 21); // For trend-follow strategy
-    indicators.ema26 = TechnicalIndicators.EMA(closes, 26);
-    indicators.rsi = TechnicalIndicators.RSI(closes, 14);
-    
-    const macd = TechnicalIndicators.MACD(closes);
+    indicators.sma20 = ValidatedIndicators.SMA(closes, 20);
+    indicators.sma50 = ValidatedIndicators.SMA(closes, 50);
+    indicators.ema9 = ValidatedIndicators.EMA(closes, 9);
+    indicators.ema12 = ValidatedIndicators.EMA(closes, 12);
+    indicators.ema21 = ValidatedIndicators.EMA(closes, 21);
+    indicators.ema26 = ValidatedIndicators.EMA(closes, 26);
+    indicators.rsi = ValidatedIndicators.RSI(closes, 14);
+
+    const macd = ValidatedIndicators.MACD(closes);
     indicators.macd = macd.macd;
     indicators.macdSignal = macd.signal;
     indicators.macdHistogram = macd.histogram;
 
-    const bb = TechnicalIndicators.BollingerBands(closes, 20, 2);
+    const bb = ValidatedIndicators.BollingerBands(closes, 20, 2);
     indicators.bbUpper = bb.upper;
     indicators.bbMiddle = bb.middle;
     indicators.bbLower = bb.lower;
 
     indicators.vwap = TechnicalIndicators.VWAP(candles);
-    indicators.atr = TechnicalIndicators.ATR(candles, atrPeriod);
+    indicators.atr = ValidatedIndicators.ATR(candles, atrPeriod);
 
     const donchian = TechnicalIndicators.DonchianChannels(candles, donchianPeriod);
     indicators.donchianUpper = donchian.upper;
     indicators.donchianLower = donchian.lower;
     indicators.donchianMiddle = donchian.middle;
 
-    // Calculate volume average
     const volumes = candles.map(c => c.volume);
-    indicators.volumeSMA = TechnicalIndicators.SMA(volumes, 20);
+    indicators.volumeSMA = ValidatedIndicators.SMA(volumes, 20);
 
     this.indicators.set(symbol, indicators);
 

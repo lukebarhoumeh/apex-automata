@@ -32,6 +32,7 @@ export type PerSymbolLimit = z.infer<typeof PerSymbolLimitSchema>;
 export type StrategyOverrides = z.infer<typeof StrategyOverridesSchema>;
 
 const GuardrailsSchema = z.object({
+  disabled_strategies: z.array(z.string()).optional().default([]),
   account: z.object({
     equity_usd: z.number().positive(),
     risk_per_trade: z.number().positive(),

@@ -20,17 +20,25 @@
 | 003A | Wire perps_symbols strategy overrides + notional limits | ✅ VERIFIED |
 | 003B | Perps market data proxy + order routing | ✅ VERIFIED |
 | 004 | Startup resilience — non-fatal perps init + state cleanup | PENDING |
+| 005 | Runtime bug fixes — 6 paper mode critical bugs | PENDING |
+| 006 | trading-signals indicator swap — replace hand-rolled math | PENDING |
+| 007 | Hyperliquid exchange adapter via nomeida/hyperliquid SDK | PARKED (Week 4+) |
+| 008 | TWAP execution hardening — anti-signaling randomization | PARKED (Week 4+) |
+| 009 | CCXT multi-exchange evaluation & expansion layer | PARKED (Month 2+) |
 
-## Current Phase: 4D — Perps Paper Trading Enablement
+## Current Phase: 4D → 5A — Bug Fixes + Open-Source Integration
 
-**TASK_004** is a critical bugfix blocking paper trading startup.
+**Critical path:** TASK_004 → TASK_005 → TASK_006 → Paper Validation → TASK_007
 
-Three surgical fixes:
-- Makes `refreshPerpsProducts()` non-fatal (INTX 404 no longer crashes startup)
-- Adds state cleanup in engine start catch block (no more "already running" ghost state)
-- Double-wraps REST client fallback (returns empty array instead of throwing)
+**TASK_005** fixes 6 runtime bugs blocking paper trading (order 404 spam, trend_follow zero signals, disabled strategies still firing, shorts blocked in paper, WS stall detection, INTX 401 spam).
 
-After 004, the system can paper trade both spot and perps simultaneously.
+**TASK_006** swaps hand-rolled indicator math in `indicators/technical.ts` with the `trading-signals` library (already installed, zero imports). This is a stabilization move — eliminates potential calculation bugs before live trading.
+
+**TASK_007** (PARKED) builds the Hyperliquid adapter — the only venue where surviving strategies are profitable. Begins after 2-4 weeks of validated paper trading.
+
+**TASK_008** (PARKED) hardens TWAP execution with anti-signaling randomization (Gaussian sizes, Poisson scheduling, volume participation). Pattern-mined from crypto-chassis/ccapi, no library install.
+
+**TASK_009** (PARKED) evaluates CCXT for rapid multi-exchange expansion. Decision document only — no production code until evaluation recommends proceeding.
 
 ## Completed Phases
 
