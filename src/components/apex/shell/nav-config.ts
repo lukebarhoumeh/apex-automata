@@ -14,13 +14,15 @@ import {
 export interface NavEntry {
   id: string;
   label: string;
+  /** Overrides `label` when shown in the top-bar breadcrumb. */
+  breadcrumb?: string;
   path: string;
   icon: LucideIcon;
   kbd: string;
 }
 
 export const NAV: readonly NavEntry[] = [
-  { id: "dashboard", label: "Dashboard", path: "/", icon: LayoutGrid, kbd: "D" },
+  { id: "dashboard", label: "Dashboard", breadcrumb: "Overview", path: "/", icon: LayoutGrid, kbd: "D" },
   { id: "orders", label: "Orders", path: "/orders", icon: ListOrdered, kbd: "O" },
   { id: "signals", label: "Signals", path: "/signals", icon: TrendingUp, kbd: "S" },
   { id: "risk", label: "Risk", path: "/risk", icon: Shield, kbd: "R" },
@@ -32,5 +34,5 @@ export const NAV: readonly NavEntry[] = [
 ];
 
 export const TITLE_BY_PATH: Record<string, string> = Object.fromEntries(
-  NAV.map((n) => [n.path, n.label]),
+  NAV.map((n) => [n.path, n.breadcrumb ?? n.label]),
 );

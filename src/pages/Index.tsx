@@ -1,8 +1,64 @@
-export default function Index() {
+import { useState } from "react";
+import { HeroStatePanel } from "@/components/apex/dashboard/HeroStatePanel";
+import { KpiRow } from "@/components/apex/dashboard/KpiRow";
+import { EquityChartPanel } from "@/components/apex/dashboard/EquityChartPanel";
+import { StrategyCards } from "@/components/apex/dashboard/StrategyCards";
+import { LiveSignalFeed } from "@/components/apex/dashboard/LiveSignalFeed";
+import { PositionsTable } from "@/components/apex/dashboard/PositionsTable";
+import { RegimeCard } from "@/components/apex/dashboard/RegimeCard";
+import {
+  useDashboardKpis,
+  useEquityCurve,
+  useMarketRegime,
+  useOpenPositions,
+  useSessionStats,
+  useSignalFeed,
+  useStrategyStatus,
+} from "@/hooks/apex/useDashboardData";
+import type { EquityRange } from "@/types/equity";
+
+export default function Dashboard() {
+  const [range, setRange] = useState<EquityRange>("ALL");
+
+  const session = useSessionStats();
+  const equity = useEquityCurve(range);
+  const positions = useOpenPositions();
+  const strategies = useStrategyStatus();
+  const feed = useSignalFeed();
+  const regime = useMarketRegime();
+  const { data: kpis } = useDashboardKpis();
+
+  if (!session.data || !equity.data || !positions.data || !strategies.data || !feed.data || !regime.data) {
+    return null;
+  }
+
   return (
-    <div className="p-10">
-      <h1 className="font-serif italic text-5xl text-fg-0 tracking-tight">Dashboard</h1>
-      <p className="mt-3 text-fg-2 text-sm">Phase 1 — implementation pending.</p>
+    <div className="flex flex-col gap-4 p-6">
+      <HeroStatePanel
+        session={session.data}
+        regime={regime.data}
+        intradayEquity={equity.data}
+      />
+
+      <KpiRow tiles={kpis} />
+
+      <div className="grid gap-4" style={{ gridTemplateColumns: "minmax(0, 2fr) minmax(0, 1fr)" }}>
+        <div className="flex flex-col gap-4">
+          <EquityChartPanel
+            data={equity.data}
+            range={range}
+            onChangeRange={setRange}
+          />
+          <StrategyCards strategies={strategies.data} />
+        </div>
+
+        <LiveSignalFeed initialEvents={feed.data} />
+      </div>
+
+      <div className="grid gap-4" style={{ gridTemplateColumns: "minmax(0, 1fr) 300px" }}>
+        <PositionsTable positions={positions.data} />
+        <RegimeCard regime={regime.data} />
+      </div>
     </div>
   );
 }
