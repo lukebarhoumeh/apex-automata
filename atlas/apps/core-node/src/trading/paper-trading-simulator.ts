@@ -421,7 +421,11 @@ export class PaperTradingSimulator extends EventEmitter {
    * Validate order
    */
   private validateOrder(request: OrderRequest): { valid: boolean; reason?: string } {
-    const [baseCurrency, quoteCurrency] = request.product_id.split('-');
+    // Product IDs are either 2-part spot (BTC-USD) or 3-part perp (BTC-PERP-INTX).
+    // Perps settle in USD-denominated collateral regardless of venue tag.
+    const parts = request.product_id.split('-');
+    const baseCurrency = parts[0];
+    const quoteCurrency = parts.length >= 3 ? 'USD' : parts[1];
     const size = request.size ? parseFloat(request.size) : 0;
     if (!Number.isFinite(size) || size <= 0) {
       return { valid: false, reason: 'Order size must be greater than zero' };
@@ -596,7 +600,10 @@ export class PaperTradingSimulator extends EventEmitter {
    * Realized P&L is computed using average cost basis (same approach as position-tracker.ts).
    */
   private updateBalances(order: SimulatedOrder, fill: Fill): void {
-    const [baseCurrency, quoteCurrency] = order.productId.split('-');
+    // Keep parsing identical to validateOrder so perp fills hit the USD wallet, not a fake 'PERP' bucket.
+    const parts = order.productId.split('-');
+    const baseCurrency = parts[0];
+    const quoteCurrency = parts.length >= 3 ? 'USD' : parts[1];
     if (!baseCurrency || !quoteCurrency) {
       this.logger.warn('Unable to update balances: invalid product id', { productId: order.productId });
       return;
