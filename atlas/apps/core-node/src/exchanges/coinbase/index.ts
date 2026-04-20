@@ -282,7 +282,8 @@ export class CoinbaseExchange extends EventEmitter {
     // Test REST API connection only if credentials are provided
     // In paper mode we don't require authenticated REST access
     const hasCredentials = Boolean(this.config?.apiKey && this.config?.apiSecret);
-    if (hasCredentials) {
+    const isPaperMode = process.env.EXECUTION_MODE === 'paper';
+    if (hasCredentials && !isPaperMode) {
       try {
         await this.restClient.getAccounts();
         this.logger.info('REST API connection verified');
@@ -290,6 +291,8 @@ export class CoinbaseExchange extends EventEmitter {
         this.logger.error('Failed to connect to REST API with provided credentials:', error);
         // Do not throw here to allow market-data-only operation (e.g., paper mode)
       }
+    } else if (isPaperMode) {
+      this.logger.info('Paper mode - skipping authenticated Coinbase REST calls');
     } else {
       this.logger.info('No Coinbase REST credentials provided - proceeding with market data only');
     }
@@ -297,8 +300,8 @@ export class CoinbaseExchange extends EventEmitter {
     // Connect WebSocket (public market data)
     this.wsClient.connect();
 
-    // Start order polling only if we have credentials
-    if (hasCredentials) {
+    // Start order polling only for live trading — paper mode has no real orders to reconcile
+    if (hasCredentials && !isPaperMode) {
       this.startOrderPolling();
     }
   }
