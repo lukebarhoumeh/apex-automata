@@ -23,7 +23,7 @@ export interface NavEntry {
 
 export const NAV: readonly NavEntry[] = [
   { id: "dashboard", label: "Dashboard", breadcrumb: "Overview", path: "/", icon: LayoutGrid, kbd: "D" },
-  { id: "orders", label: "Orders", path: "/orders", icon: ListOrdered, kbd: "O" },
+  { id: "orders", label: "Orders", breadcrumb: "Orders & Positions", path: "/orders", icon: ListOrdered, kbd: "O" },
   { id: "signals", label: "Signals", path: "/signals", icon: TrendingUp, kbd: "S" },
   { id: "risk", label: "Risk", path: "/risk", icon: Shield, kbd: "R" },
   { id: "model", label: "Model", path: "/model", icon: Brain, kbd: "M" },

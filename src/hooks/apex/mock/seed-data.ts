@@ -5,6 +5,7 @@ import type { SignalRecord, FeedEvent } from "@/types/signals";
 import type { StrategyCardData } from "@/types/strategy";
 import type { MarketRegime } from "@/types/regime";
 import type { SessionStats } from "@/types/session";
+import type { OrderRecord, FillRecord } from "@/types/orders";
 
 export const SESSION_SEED: SessionStats = {
   openedAt: "09:00:00",
@@ -176,3 +177,23 @@ export function equityForRange(range: "1D" | "1W" | "1M" | "ALL"): EquityPoint[]
   if (range === "1M") return FULL_EQUITY.slice(n - 120);
   return FULL_EQUITY;
 }
+
+export const ORDERS_SEED: readonly OrderRecord[] = [
+  { id: "o108", ts: "10:48:03", sym: "SOL-USD",  side: "SELL", type: "LMT", qty: 42,    px: 184.90,    fillAvg: 184.88,    status: "FILLED",    strat: "vwap_mr",  venue: "Coinbase" },
+  { id: "o107", ts: "10:32:18", sym: "BTC-USD",  side: "BUY",  type: "MKT", qty: 0.12,  px: null,      fillAvg: 67_388.20, status: "FILLED",    strat: "breakout", venue: "Coinbase" },
+  { id: "o106", ts: "10:12:47", sym: "ETH-USD",  side: "BUY",  type: "LMT", qty: 3.21,  px: 3_261.00,  fillAvg: 3_260.88,  status: "FILLED",    strat: "vwap_mr",  venue: "Coinbase" },
+  { id: "o105", ts: "10:04:31", sym: "ARB-USD",  side: "BUY",  type: "LMT", qty: 820,   px: 1.082,     fillAvg: null,      status: "CANCELLED", strat: "breakout", venue: "Coinbase" },
+  { id: "o104", ts: "09:34:12", sym: "BTC-USD",  side: "BUY",  type: "LMT", qty: 0.30,  px: 66_840,    fillAvg: 66_839.10, status: "FILLED",    strat: "breakout", venue: "Coinbase" },
+  { id: "o103", ts: "09:30:02", sym: "LINK-USD", side: "BUY",  type: "LMT", qty: 120,   px: 17.10,     fillAvg: null,      status: "REJECTED",  strat: "breakout", venue: "Coinbase", reason: "Spread percentile > 98 — venue rejected order" },
+  { id: "o102", ts: "09:18:55", sym: "ETH-USD",  side: "SELL", type: "MKT", qty: 2.00,  px: null,      fillAvg: 3_278.44,  status: "FILLED",    strat: "vwap_mr",  venue: "Coinbase" },
+  { id: "o101", ts: "09:02:11", sym: "BTC-USD",  side: "SELL", type: "MKT", qty: 0.18,  px: null,      fillAvg: 67_512.00, status: "FILLED",    strat: "breakout", venue: "Coinbase" },
+];
+
+export const FILLS_SEED: readonly FillRecord[] = [
+  { id: "fill-1", ts: "10:48:03.214", sym: "SOL-USD", side: "SELL", qty: 42,   px: 184.88,   fee: 1.55, slip: -0.02 },
+  { id: "fill-2", ts: "10:32:18.102", sym: "BTC-USD", side: "BUY",  qty: 0.12, px: 67_388.20, fee: 4.04, slip:  0.80 },
+  { id: "fill-3", ts: "10:12:47.840", sym: "ETH-USD", side: "BUY",  qty: 3.21, px: 3_260.88,  fee: 3.14, slip: -0.12 },
+  { id: "fill-4", ts: "09:34:12.901", sym: "BTC-USD", side: "BUY",  qty: 0.30, px: 66_839.10, fee: 8.02, slip: -0.90 },
+  { id: "fill-5", ts: "09:18:55.032", sym: "ETH-USD", side: "SELL", qty: 2.00, px: 3_278.44,  fee: 3.93, slip:  0.04 },
+  { id: "fill-6", ts: "09:02:11.500", sym: "BTC-USD", side: "SELL", qty: 0.18, px: 67_512.00, fee: 4.86, slip:  0.20 },
+];
