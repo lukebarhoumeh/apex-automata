@@ -8,6 +8,8 @@ const API_URL = import.meta.env.VITE_RUNTIME_API_URL || 'http://localhost:3001';
 export interface RuntimeStatus {
   engineRunning: boolean;
   mode: 'paper' | 'live' | null;
+  sessionId?: string | null;
+  sessionStartedAt?: number | null;
   paused: boolean;
   dailyStopHit: boolean;
   killSwitch: {

@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { AuthProvider } from "@/contexts/AuthContext";
 import { RuntimeWsProvider } from "@/runtime/ws";
 import { UnifiedEventProvider } from "@/runtime/event-bus";
+import { ActiveSessionProvider } from "@/runtime/session";
 import { WsDebugPanel } from "@/components/debug/WsDebugPanel";
 import { AppShell } from "@/components/apex/shell/AppShell";
 import Index from "./pages/Index";
@@ -21,23 +22,25 @@ const App = () => {
       <AuthProvider>
         <RuntimeWsProvider showNotifications={false}>
           <UnifiedEventProvider>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route path="/" element={<Index />} />
-                <Route path="/orders" element={<Orders />} />
-                <Route path="/signals" element={<Signals />} />
-                <Route path="/risk" element={<Risk />} />
-                <Route path="/model" element={<Model />} />
-                <Route path="/backtest" element={<Backtest />} />
-                <Route path="/journal" element={<Journal />} />
-                <Route path="/alerts" element={<Alerts />} />
-                <Route path="/settings" element={<Settings />} />
-                <Route path="*" element={<NotFound />} />
-              </Route>
-            </Routes>
+            <ActiveSessionProvider>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route path="/" element={<Index />} />
+                  <Route path="/orders" element={<Orders />} />
+                  <Route path="/signals" element={<Signals />} />
+                  <Route path="/risk" element={<Risk />} />
+                  <Route path="/model" element={<Model />} />
+                  <Route path="/backtest" element={<Backtest />} />
+                  <Route path="/journal" element={<Journal />} />
+                  <Route path="/alerts" element={<Alerts />} />
+                  <Route path="/settings" element={<Settings />} />
+                  <Route path="*" element={<NotFound />} />
+                </Route>
+              </Routes>
 
-            {/* Debug Panel — only visible when VITE_DEBUG_WS=1 */}
-            <WsDebugPanel />
+              {/* Debug Panel — only visible when VITE_DEBUG_WS=1 */}
+              <WsDebugPanel />
+            </ActiveSessionProvider>
           </UnifiedEventProvider>
         </RuntimeWsProvider>
       </AuthProvider>
