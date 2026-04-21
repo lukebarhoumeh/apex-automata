@@ -59,6 +59,7 @@ export function applyEventToCache(
   switch (type as BusEventType) {
     // ============ Positions ============
     case 'position:opened':
+      queryClient.invalidateQueries({ queryKey: ['apex', 'positions'] });
       return patchOrInvalidate(queryClient, ['positions'], (data: CachedPosition[] | undefined) => {
         if (!data || !payload) return undefined;
         const position = payload as CachedPosition;
@@ -68,8 +69,9 @@ export function applyEventToCache(
         }
         return [position, ...data];
       });
-      
+
     case 'position:updated':
+      queryClient.invalidateQueries({ queryKey: ['apex', 'positions'] });
       return patchOrInvalidate(queryClient, ['positions'], (data: CachedPosition[] | undefined) => {
         if (!data || !payload) return undefined;
         const position = payload as CachedPosition;
@@ -84,8 +86,9 @@ export function applyEventToCache(
           return p;
         });
       });
-      
+
     case 'position:closed':
+      queryClient.invalidateQueries({ queryKey: ['apex', 'positions'] });
       return patchOrInvalidate(queryClient, ['positions'], (data: CachedPosition[] | undefined) => {
         if (!data || !payload) return undefined;
         const position = payload as CachedPosition;
@@ -135,6 +138,9 @@ export function applyEventToCache(
     // ============ Signals ============
     case 'signal':
     case 'signal:filtered':
+      queryClient.invalidateQueries({ queryKey: ['apex', 'signal-records'] });
+      queryClient.invalidateQueries({ queryKey: ['apex', 'feed'] });
+      queryClient.invalidateQueries({ queryKey: ['apex', 'strategy-status'] });
       return patchOrInvalidate(queryClient, ['signals'], (data: CachedSignal[] | undefined) => {
         if (!data || !payload) return undefined;
         const signal = payload as CachedSignal;
@@ -158,6 +164,9 @@ export function applyEventToCache(
     case 'pnl:snapshot':
       // Store the snapshot directly - this is THE source of truth for P&L
       queryClient.setQueryData(['pnl-snapshot'], payload);
+      // Refresh session stats and equity curve (both derive from PnL)
+      queryClient.invalidateQueries({ queryKey: ['apex', 'session-stats'] });
+      queryClient.invalidateQueries({ queryKey: ['apex', 'equity'] });
       // Do NOT invalidate calculated-metrics here - it derives from snapshot
       // The usePnLSnapshot hook will trigger re-renders automatically
       return true;
@@ -176,6 +185,7 @@ export function applyEventToCache(
     case 'regime:update':
     case 'regime:changed':
       queryClient.setQueryData(['regime-state'], payload);
+      queryClient.invalidateQueries({ queryKey: ['apex', 'regime'] });
       return true;
       
     // ============ Warmup ============
