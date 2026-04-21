@@ -69,9 +69,13 @@ deploy/               → Docker + Kubernetes + Prometheus/Grafana
 - **Path alias**: `@/*` → `./src/*` (frontend only)
 
 ## Active Strategies
-- **Trend Follow ETH** — Active
-- **Momentum ETH** — Active
-- VWAP MR, Breakout — KILLED (Phase 3 backtest). Files kept as @deprecated reference, DO NOT delete.
+Controlled by `atlas/config/guardrails.yaml`:
+- **Momentum** (RSI/MACD) — enabled. Runs on spot BTC-USD/ETH-USD/SOL-USD and perps ETH-PERP-INTX/BTC-PERP-INTX. Produces most signals in current paper runs.
+- **Trend Follow** (EMA crossover + MTF alignment) — enabled, but selective. Only fires when EMA12 crosses EMA15 AND price is on the correct side of both EMAs AND regime.trendDirection agrees. In weak_trend/ranging markets it can stay silent for hours — this is by design, not a bug.
+- **VWAP MR, Breakout** — in `disabled_strategies: [vwap_mr, breakout]` per Phase 3 backtest verdict. Plugin files kept as `@deprecated` reference (DO NOT delete). Signals still get generated + written to Supabase with `allowed: false` for auditability; they never reach order routing.
+
+## Meta-filter
+The current meta-filter is **rule-based**, not ML: cold-streak cooldown (10 losses → 5 min pause), time-of-day filter (lo-liq 04–07 UTC, preferred 13–17 UTC), strength/volume filters available but disabled. `signals.meta_prob` column will be NULL for now — the `/model` page's ML metrics (ROC AUC, SHAP, calibration) are aspirational mocks, see its on-page banner.
 
 ## Exchange Status
 - **Hyperliquid** — Target (0.05% fees)
