@@ -210,6 +210,12 @@ const runtimeState = {
   restartCount: 0,
   lastRestartReason: null as string | null,
   lastRestartAt: null as number | null,
+  // Active trading session (persists a trading_sessions row for the lifetime
+  // of the engine). Cleared on engine stop.
+  sessionId: null as string | null,
+  sessionStartedAt: null as number | null,
+  sessionMode: null as 'paper' | 'live' | null,
+  sessionInitialEquity: null as number | null,
 };
 
 let engineOperationInProgress = false;
@@ -250,6 +256,104 @@ const supabase = createClient(
   env.SUPABASE_URL || '',
   env.SUPABASE_SERVICE_KEY || ''
 );
+
+/**
+ * Opens a new trading_sessions row when the engine starts and populates
+ * runtimeState.session* fields. The session_id also gets broadcast over
+ * WS so the frontend can reset per-session caches on a clean start.
+ */
+async function openTradingSession(params: {
+  mode: 'paper' | 'live';
+  initialEquity: number;
+}): Promise<string> {
+  const sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const startedAt = Date.now();
+
+  runtimeState.sessionId = sessionId;
+  runtimeState.sessionStartedAt = startedAt;
+  runtimeState.sessionMode = params.mode;
+  runtimeState.sessionInitialEquity = params.initialEquity;
+
+  try {
+    const { error } = await supabase.from('trading_sessions').insert({
+      session_id: sessionId,
+      user_id: USER_ID,
+      mode: params.mode,
+      started_at: new Date(startedAt).toISOString(),
+      initial_equity: params.initialEquity,
+    });
+    if (error) {
+      logger.error('Failed to persist trading_sessions row', { error: error.message, sessionId });
+    } else {
+      logger.info('Trading session opened', { sessionId, mode: params.mode, initialEquity: params.initialEquity });
+    }
+  } catch (err) {
+    logger.error('Exception inserting trading_sessions row', { error: String(err), sessionId });
+  }
+
+  broadcast({
+    type: 'SessionStarted',
+    payload: {
+      sessionId,
+      mode: params.mode,
+      startedAt,
+      initialEquity: params.initialEquity,
+    },
+  });
+
+  return sessionId;
+}
+
+/**
+ * Closes the active trading_sessions row on engine stop by stamping
+ * end_time + final_equity. Best-effort — no throw on failure.
+ */
+async function closeTradingSession(params: {
+  finalEquity?: number | null;
+}): Promise<void> {
+  const { sessionId, sessionStartedAt, sessionInitialEquity } = runtimeState;
+  if (!sessionId) return;
+
+  const endedAt = Date.now();
+  const finalEquity = params.finalEquity ?? sessionInitialEquity ?? null;
+  const totalPnl =
+    finalEquity !== null && sessionInitialEquity !== null
+      ? finalEquity - sessionInitialEquity
+      : null;
+
+  try {
+    const { error } = await supabase
+      .from('trading_sessions')
+      .update({
+        ended_at: new Date(endedAt).toISOString(),
+        final_equity: finalEquity,
+        total_pnl: totalPnl,
+      })
+      .eq('session_id', sessionId);
+    if (error) {
+      logger.error('Failed to close trading_sessions row', { error: error.message, sessionId });
+    } else {
+      logger.info('Trading session closed', {
+        sessionId,
+        durationMs: sessionStartedAt ? endedAt - sessionStartedAt : null,
+        finalEquity,
+        totalPnl,
+      });
+    }
+  } catch (err) {
+    logger.error('Exception closing trading_sessions row', { error: String(err), sessionId });
+  }
+
+  broadcast({
+    type: 'SessionEnded',
+    payload: { sessionId, endedAt, finalEquity, totalPnl },
+  });
+
+  runtimeState.sessionId = null;
+  runtimeState.sessionStartedAt = null;
+  runtimeState.sessionMode = null;
+  runtimeState.sessionInitialEquity = null;
+}
 
 // Trading engine instance
 let tradingEngine: TradingEngine | null = null;
@@ -657,6 +761,8 @@ app.get('/api/status', (req, res) => {
   res.json({
     engineRunning: isEngineRunning,
     mode: isEngineRunning ? tradingEngine!.getConfig().mode : null,
+    sessionId: runtimeState.sessionId,
+    sessionStartedAt: runtimeState.sessionStartedAt,
     paused: runtimeState.paused,
     dailyStopHit: runtimeState.dailyStopHit,
     killSwitch: supervisorState.killSwitch.active ? supervisorState.killSwitch : runtimeState.killSwitch,
@@ -1685,10 +1791,16 @@ app.post('/api/engine/start', async (req, res) => {
 
     // Start the engine
     await tradingEngine.start('api_request');
-    
+
     // Update supervisor state
     supervisor.setDesiredState('running', mode as any);
     supervisor.setActualState('running', 'engine_started');
+
+    // Persist a trading_sessions row so the UI can scope this run's state.
+    const sessionId = await openTradingSession({
+      mode: mode as 'paper' | 'live',
+      initialEquity: engineGuardrails.account.equity_usd,
+    });
     
     // Load historical data for warmup (don't await - do in background)
     const activeSymbols = tradingEngine.getActiveSymbols();
@@ -1721,6 +1833,8 @@ app.post('/api/engine/start', async (req, res) => {
     res.json({
       success: true,
       message: `Trading engine started in ${mode} mode`,
+      sessionId,
+      sessionStartedAt: runtimeState.sessionStartedAt,
       activeSymbols,
       perpsSymbols: perpsSymbols,
       spotToPerpsMapping: Object.fromEntries(activeSpotToPerpsMap),
@@ -1751,6 +1865,9 @@ app.post('/api/engine/start', async (req, res) => {
         signalProcessor = null;
       }
       engineRunningGauge.set(0);
+      // If the session row was opened before the failure, mark it closed
+      // so the UI doesn't think the run is still live.
+      await closeTradingSession({ finalEquity: null });
       logger.info('Cleaned up partial engine state after startup failure');
     } catch (cleanupErr) {
       logger.error('Error during startup failure cleanup:', cleanupErr);
@@ -1923,7 +2040,12 @@ app.post('/api/engine/stop', async (req, res) => {
 
     // Update supervisor state first
     supervisor.setDesiredState('stopped');
-    
+
+    // Snapshot final equity BEFORE tearing the engine down so we can stamp
+    // it on the trading_sessions row.
+    const snapshot = buildPnLSnapshot();
+    const finalEquity: number | null = typeof snapshot?.equity === 'number' ? snapshot.equity : null;
+
     await tradingEngine.stop('api_request');
     if (perpsRiskMonitor) {
       perpsRiskMonitor.stop();
@@ -1934,12 +2056,15 @@ app.post('/api/engine/stop', async (req, res) => {
     perpsRiskMonitor = null;
     perpsAdapter = null;
     activeSpotToPerpsMap = new Map();
-    
+
     // Update supervisor actual state
     supervisor.setActualState('stopped', 'api_stop_request');
-    
+
     // Update metrics
     engineRunningGauge.set(0);
+
+    // Close the trading_sessions row (best-effort, does not block response)
+    await closeTradingSession({ finalEquity });
 
     res.json({ success: true, message: 'Trading engine stopped' });
 
