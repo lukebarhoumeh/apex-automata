@@ -9,6 +9,7 @@ import type { OrderRecord, FillRecord } from "@/types/orders";
 import type { RiskData } from "@/types/risk";
 import type { ModelData } from "@/types/model";
 import type { BacktestData } from "@/types/backtest";
+import type { JournalEntry } from "@/types/journal";
 
 export const SESSION_SEED: SessionStats = {
   openedAt: "09:00:00",
@@ -429,3 +430,54 @@ export const BACKTEST_SEED: BacktestData = {
     { bucket: ">3R",      n:  8 },
   ],
 };
+
+export const JOURNAL_SEED: readonly JournalEntry[] = [
+  {
+    id: "j-142", sym: "BTC-USD", side: "LONG", date: "2026-04-14", time: "09:42 UTC",
+    r: 2.1, pnl: 1_840, outcome: "WIN", tags: ["breakout", "hi-conf", "ADX>30"],
+    entry: 65_420, exit: 66_980, stop: 64_900, target: 67_200,
+    thesis: "Clean 20-period Donchian break after 36h compression. Volume z +2.4σ, meta p=0.78. ADX confirming trend.",
+    lessons: "Held full target. Good discipline — trail triggered 40bp above entry, no early exit temptation.",
+    seed: 11,
+  },
+  {
+    id: "j-141", sym: "ETH-USD", side: "LONG", date: "2026-04-13", time: "14:12 UTC",
+    r: -0.9, pnl: -510, outcome: "LOSS", tags: ["vwap_mr", "chop", "low-conf"],
+    entry: 3_180, exit: 3_140, stop: 3_135, target: 3_260,
+    thesis: "VWAP mean-reversion on -2.1σ. Meta p=0.62 (borderline, below preferred 0.65).",
+    lessons: "Bad environment — ADX rising meant trend, not mean-revert. Should tighten regime gating on MR strategy.",
+    seed: 22,
+  },
+  {
+    id: "j-140", sym: "SOL-USD", side: "LONG", date: "2026-04-12", time: "11:08 UTC",
+    r: 1.6, pnl: 1_210, outcome: "WIN", tags: ["breakout", "correlated-move"],
+    entry: 178.40, exit: 186.20, stop: 174.10, target: 188.50,
+    thesis: "SOL lagging BTC breakout by ~20min. Took entry as confluence with BTC above prior range.",
+    lessons: "Correlated-move setup working well. Exited slightly early — next time let trail handle it.",
+    seed: 33,
+  },
+  {
+    id: "j-139", sym: "LINK-USD", side: "SHORT", date: "2026-04-11", time: "20:51 UTC",
+    r: 0.8, pnl: 420, outcome: "WIN", tags: ["vwap_mr", "overnight"],
+    entry: 17.80, exit: 17.40, stop: 18.05, target: 17.20,
+    thesis: "+2.8σ extension into resistance, overnight session. Meta p=0.69.",
+    lessons: "Overnight MR working. Spread was 2x normal — factor that into sizing next time.",
+    seed: 44,
+  },
+  {
+    id: "j-138", sym: "AVAX-USD", side: "LONG", date: "2026-04-10", time: "16:04 UTC",
+    r: -0.5, pnl: -240, outcome: "LOSS", tags: ["breakout", "false-break"],
+    entry: 39.20, exit: 38.70, stop: 38.65, target: 41.00,
+    thesis: "Range breakout but volume was weak (+0.8σ, below threshold).",
+    lessons: "Strategy should have filtered this. Volume z threshold is too low — raise to 1.5σ.",
+    seed: 55,
+  },
+  {
+    id: "j-137", sym: "BTC-USD", side: "SHORT", date: "2026-04-09", time: "02:30 UTC",
+    r: 2.8, pnl: 2_310, outcome: "WIN", tags: ["breakout", "asian-session"],
+    entry: 68_420, exit: 66_100, stop: 68_800, target: 66_000,
+    thesis: "Breakdown from consolidation. Asian session liquidity thin, fast move.",
+    lessons: "Best trade of week. Target hit almost exactly. Trust the system.",
+    seed: 66,
+  },
+];
