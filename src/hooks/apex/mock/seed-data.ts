@@ -10,6 +10,7 @@ import type { RiskData } from "@/types/risk";
 import type { ModelData } from "@/types/model";
 import type { BacktestData } from "@/types/backtest";
 import type { JournalEntry } from "@/types/journal";
+import type { AlertRule, AlertFiredEvent } from "@/types/alerts";
 
 export const SESSION_SEED: SessionStats = {
   openedAt: "09:00:00",
@@ -480,4 +481,44 @@ export const JOURNAL_SEED: readonly JournalEntry[] = [
     lessons: "Best trade of week. Target hit almost exactly. Trust the system.",
     seed: 66,
   },
+];
+
+export const ALERT_RULES_SEED: readonly AlertRule[] = [
+  {
+    id: "r-01", name: "Large drawdown", enabled: true,
+    when: { source: "portfolio", metric: "drawdown", op: ">", value: 3.0, unit: "%" },
+    then: [{ kind: "pause", target: "engine" }, { kind: "notify", channel: "slack" }],
+    fired: 0, lastFired: "—",
+  },
+  {
+    id: "r-02", name: "Venue latency spike", enabled: true,
+    when: { source: "system", metric: "broker_latency_ms", op: ">", value: 500, unit: "ms" },
+    then: [{ kind: "notify", channel: "pagerduty" }],
+    fired: 3, lastFired: "2h ago",
+  },
+  {
+    id: "r-03", name: "Meta model drift", enabled: true,
+    when: { source: "model", metric: "roc_auc_7d", op: "<", value: 0.70, unit: "" },
+    then: [{ kind: "notify", channel: "email" }, { kind: "flag", target: "retrain" }],
+    fired: 0, lastFired: "—",
+  },
+  {
+    id: "r-04", name: "Consecutive losses", enabled: true,
+    when: { source: "portfolio", metric: "consec_losses", op: ">=", value: 3, unit: "" },
+    then: [{ kind: "pause", target: "strategy" }, { kind: "notify", channel: "slack" }],
+    fired: 1, lastFired: "yesterday",
+  },
+  {
+    id: "r-05", name: "Symbol exposure breach", enabled: false,
+    when: { source: "risk", metric: "symbol_exposure_pct", op: ">", value: 80, unit: "%" },
+    then: [{ kind: "block", target: "new_orders" }, { kind: "notify", channel: "slack" }],
+    fired: 0, lastFired: "—",
+  },
+];
+
+export const ALERT_FIRED_SEED: readonly AlertFiredEvent[] = [
+  { ts: "12:14:08",  rule: "Venue latency spike", detail: "broker_latency_ms = 612ms > 500ms", level: "warn" },
+  { ts: "09:02:55",  rule: "Venue latency spike", detail: "broker_latency_ms = 544ms > 500ms", level: "warn" },
+  { ts: "yday 21:48", rule: "Consecutive losses",  detail: "consec = 3; strategy paused",       level: "danger" },
+  { ts: "yday 14:11", rule: "Venue latency spike", detail: "broker_latency_ms = 721ms",         level: "warn" },
 ];
