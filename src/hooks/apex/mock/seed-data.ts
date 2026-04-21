@@ -6,6 +6,7 @@ import type { StrategyCardData, StrategyConfig, MetaModelInfo } from "@/types/st
 import type { MarketRegime } from "@/types/regime";
 import type { SessionStats } from "@/types/session";
 import type { OrderRecord, FillRecord } from "@/types/orders";
+import type { RiskData } from "@/types/risk";
 
 export const SESSION_SEED: SessionStats = {
   openedAt: "09:00:00",
@@ -236,3 +237,67 @@ export const STRATEGY_CONFIG_SEED: readonly StrategyConfig[] = [
     stats: { winRate: 0.612, avgR: 0.82, trades: 63, lastR: [1.1, 0.8, -1, 1.3, 0.9, -1, 1.2, 0.7, -1, 1.1, 1.4, 0.6] },
   },
 ];
+
+export const RISK_SEED: RiskData = {
+  portfolio: {
+    equity: 124_382.11,
+    exposure: 38_220.00,
+    heat: 1.82, heatCap: 3.0,
+    dd: 2.1, ddCap: 8.0,
+    var95: 1_840, var99: 3_120,
+    expectedShortfall: 4_280,
+    consecLosses: 1, consecCap: 5,
+    netBeta: 0.72,
+  },
+  symbolCaps: [
+    { s: "BTC-USD",  used: 14_200, cap: 30_000, pct: 47.3 },
+    { s: "ETH-USD",  used:  9_800, cap: 20_000, pct: 49.0 },
+    { s: "SOL-USD",  used:  6_420, cap: 10_000, pct: 64.2 },
+    { s: "AVAX-USD", used:  3_100, cap: 10_000, pct: 31.0 },
+    { s: "LINK-USD", used:  2_700, cap:  8_000, pct: 33.8 },
+    { s: "ARB-USD",  used:  2_000, cap:  8_000, pct: 25.0 },
+  ],
+  radar: [
+    { k: "Concentration", v: 54 },
+    { k: "Volatility",    v: 68 },
+    { k: "Drawdown",      v: 26 },
+    { k: "Correlation",   v: 72 },
+    { k: "Leverage",      v: 18 },
+    { k: "Liquidity",     v: 35 },
+  ],
+  corr: [
+    [1.00, 0.86, 0.79, 0.72, 0.63, 0.68],
+    [0.86, 1.00, 0.82, 0.77, 0.69, 0.74],
+    [0.79, 0.82, 1.00, 0.88, 0.64, 0.72],
+    [0.72, 0.77, 0.88, 1.00, 0.61, 0.70],
+    [0.63, 0.69, 0.64, 0.61, 1.00, 0.58],
+    [0.68, 0.74, 0.72, 0.70, 0.58, 1.00],
+  ],
+  corrLabels: ["BTC", "ETH", "SOL", "AVAX", "LINK", "ARB"],
+  tree: {
+    label: "Portfolio", value: 38_220, children: [
+      { label: "Crypto · Spot", value: 34_500, children: [
+        { label: "Majors", value: 24_000, children: [
+          { label: "BTC-USD", value: 14_200 },
+          { label: "ETH-USD", value:  9_800 },
+        ]},
+        { label: "L1 Alts", value: 9_520, children: [
+          { label: "SOL-USD",  value: 6_420 },
+          { label: "AVAX-USD", value: 3_100 },
+        ]},
+        { label: "L2/Oracle", value: 4_700, children: [
+          { label: "LINK-USD", value: 2_700 },
+          { label: "ARB-USD",  value: 2_000 },
+        ]},
+      ]},
+      { label: "Reserves · Cash", value: 86_162 },
+    ],
+  },
+  killLadder: [
+    { lvl: 1, at: "DD > 3%",          action: "Reduce new size 50%",  tripped: false },
+    { lvl: 2, at: "DD > 5%",          action: "No new entries",        tripped: false },
+    { lvl: 3, at: "3 consec losses",  action: "Pause strategy",        tripped: false },
+    { lvl: 4, at: "DD > 8%",          action: "Flatten all positions", tripped: false },
+    { lvl: 5, at: "Venue rejects x5", action: "Cold shutdown + page",  tripped: false },
+  ],
+};
