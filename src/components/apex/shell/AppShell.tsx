@@ -36,10 +36,7 @@ export function AppShell() {
     <div className="min-h-screen bg-obsidian-0 text-fg-0">
       <AppSidebar />
       <div className="ml-[224px] flex min-h-screen flex-col">
-        <TopBar
-          onOpenPalette={openPalette}
-          onKillSwitch={handleKillSwitch}
-        />
+        <TopBar onOpenPalette={openPalette} />
         <TickerTape items={tickerItems} />
         <main className="flex-1 overflow-x-hidden">
           <Outlet />
