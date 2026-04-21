@@ -1,8 +1,28 @@
+import { MetaModelHero } from "@/components/apex/signals/MetaModelHero";
+import { StrategyConfigCard } from "@/components/apex/signals/StrategyConfigCard";
+import { SignalStreamPanel } from "@/components/apex/signals/SignalStreamPanel";
+import {
+  useMetaModel,
+  useSignalStream,
+  useStrategyConfigs,
+} from "@/hooks/apex/useSignalsData";
+
 export default function Signals() {
+  const meta = useMetaModel();
+  const signals = useSignalStream();
+  const strategies = useStrategyConfigs();
+
+  if (!meta.data || !signals.data || !strategies.data) return null;
+
   return (
-    <div className="p-10">
-      <h1 className="font-serif italic text-5xl text-fg-0 tracking-tight">Signals</h1>
-      <p className="mt-3 text-fg-2 text-sm">Phase 1 — implementation pending.</p>
+    <div className="flex flex-col gap-4 p-6">
+      <MetaModelHero meta={meta.data} signals={signals.data} />
+      <div className="grid gap-4 md:grid-cols-2">
+        {strategies.data.map((s) => (
+          <StrategyConfigCard key={s.id} strat={s} />
+        ))}
+      </div>
+      <SignalStreamPanel signals={signals.data} threshold={meta.data.threshold} />
     </div>
   );
 }

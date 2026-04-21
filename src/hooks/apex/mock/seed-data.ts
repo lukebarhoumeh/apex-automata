@@ -2,7 +2,7 @@ import { mulberry32, makeSeries } from "./rng";
 import type { EquityPoint } from "@/types/equity";
 import type { Position } from "@/types/positions";
 import type { SignalRecord, FeedEvent } from "@/types/signals";
-import type { StrategyCardData } from "@/types/strategy";
+import type { StrategyCardData, StrategyConfig, MetaModelInfo } from "@/types/strategy";
 import type { MarketRegime } from "@/types/regime";
 import type { SessionStats } from "@/types/session";
 import type { OrderRecord, FillRecord } from "@/types/orders";
@@ -196,4 +196,43 @@ export const FILLS_SEED: readonly FillRecord[] = [
   { id: "fill-4", ts: "09:34:12.901", sym: "BTC-USD", side: "BUY",  qty: 0.30, px: 66_839.10, fee: 8.02, slip: -0.90 },
   { id: "fill-5", ts: "09:18:55.032", sym: "ETH-USD", side: "SELL", qty: 2.00, px: 3_278.44,  fee: 3.93, slip:  0.04 },
   { id: "fill-6", ts: "09:02:11.500", sym: "BTC-USD", side: "SELL", qty: 0.18, px: 67_512.00, fee: 4.86, slip:  0.20 },
+];
+
+export const META_MODEL_SEED: MetaModelInfo = {
+  name: "xgb_v2.4 · 128 features",
+  features: 128,
+  rocAuc: 0.784,
+  precision: 0.642,
+  recall: 0.718,
+  f1: 0.678,
+  threshold: 0.65,
+  trainedOn: 47_331,
+};
+
+export const STRATEGY_CONFIG_SEED: readonly StrategyConfig[] = [
+  {
+    id: "breakout",
+    name: "Breakout + Volume",
+    desc: "20-period Donchian breakout gated by ADX and volume",
+    kind: "trend",
+    enabled: true,
+    params: [
+      { key: "adxMin",    label: "ADX minimum",     val: 25, min: 15, max: 40, step: 1, format: (v) => `${v}` },
+      { key: "donchianN", label: "Donchian period", val: 20, min: 10, max: 40, step: 1, format: (v) => `${v}` },
+      { key: "atrPctile", label: "ATR pctile min",  val: 60, min: 30, max: 90, step: 5, format: (v) => `${v}` },
+    ],
+    stats: { winRate: 0.564, avgR: 1.42, trades: 48, lastR: [0.8, -1, 1.4, 2.1, -1, 0.9, 1.6, -1, 0.7, 2.2, 1.1, -1] },
+  },
+  {
+    id: "vwap_mr",
+    name: "VWAP Mean Reversion",
+    desc: "Fade extreme deviations from VWAP in low-ADX regimes",
+    kind: "revert",
+    enabled: true,
+    params: [
+      { key: "zAbsMin", label: "|Z| minimum", val: 2.0, min: 1.5, max: 3.0, step: 0.1, format: (v) => `${v.toFixed(1)}σ` },
+      { key: "adxMax",  label: "ADX maximum", val: 25,  min: 15,  max: 35,  step: 1,   format: (v) => `${v}` },
+    ],
+    stats: { winRate: 0.612, avgR: 0.82, trades: 63, lastR: [1.1, 0.8, -1, 1.3, 0.9, -1, 1.2, 0.7, -1, 1.1, 1.4, 0.6] },
+  },
 ];
