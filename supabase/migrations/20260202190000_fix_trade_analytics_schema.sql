@@ -1,4 +1,10 @@
--- Ensure trade analytics tables/columns exist for clean runs.
+-- Idempotent hardening for trade analytics tables.
+--
+-- NOTE (2026-04-21 reconciliation): the live `trading_sessions` table uses
+-- `started_at` / `ended_at` (not `start_time` / `end_time`). The prior version
+-- of this file declared the wrong column names — rewritten to match reality.
+-- This file was never applied against cloud Supabase; it exists so fresh
+-- dev instances (`supabase db reset`) produce the same schema the cloud has.
 
 -- Trade log table (idempotent)
 CREATE TABLE IF NOT EXISTS public.trade_log (
@@ -25,44 +31,48 @@ CREATE TABLE IF NOT EXISTS public.trade_log (
   exit_order_id TEXT,
   max_favorable_excursion DOUBLE PRECISION,
   max_adverse_excursion DOUBLE PRECISION,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  CONSTRAINT fk_trade_log_user FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Trading sessions table (idempotent)
+-- Trading sessions table (idempotent) — columns match live schema.
 CREATE TABLE IF NOT EXISTS public.trading_sessions (
   session_id TEXT PRIMARY KEY,
   user_id UUID NOT NULL,
   mode TEXT NOT NULL CHECK (mode IN ('paper', 'live')),
-  start_time TIMESTAMPTZ NOT NULL,
-  end_time TIMESTAMPTZ,
-  initial_equity DOUBLE PRECISION NOT NULL,
-  final_equity DOUBLE PRECISION,
-  total_pnl DOUBLE PRECISION DEFAULT 0,
-  gross_profit DOUBLE PRECISION DEFAULT 0,
-  gross_loss DOUBLE PRECISION DEFAULT 0,
-  total_trades INTEGER DEFAULT 0,
-  winning_trades INTEGER DEFAULT 0,
-  losing_trades INTEGER DEFAULT 0,
-  win_rate DOUBLE PRECISION,
-  profit_factor DOUBLE PRECISION,
-  avg_win DOUBLE PRECISION,
-  avg_loss DOUBLE PRECISION,
-  expectancy DOUBLE PRECISION,
-  max_drawdown DOUBLE PRECISION,
-  max_drawdown_pct DOUBLE PRECISION,
-  sharpe_estimate DOUBLE PRECISION,
-  avg_duration_seconds DOUBLE PRECISION,
-  avg_slippage_bps DOUBLE PRECISION,
+  started_at TIMESTAMPTZ,
+  ended_at TIMESTAMPTZ,
+  initial_equity NUMERIC,
+  final_equity NUMERIC,
+  total_trades INTEGER,
+  total_pnl NUMERIC,
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  CONSTRAINT fk_trading_sessions_user FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Ensure missing columns exist if table already created elsewhere
-ALTER TABLE public.trading_sessions
-  ADD COLUMN IF NOT EXISTS avg_duration_seconds DOUBLE PRECISION;
-ALTER TABLE public.trading_sessions
-  ADD COLUMN IF NOT EXISTS avg_slippage_bps DOUBLE PRECISION;
+-- Back-compat: if a dev instance was ever built from the prior version of this
+-- file (which used start_time / end_time), rename those columns in place.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'trading_sessions' AND column_name = 'start_time'
+  ) AND NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'trading_sessions' AND column_name = 'started_at'
+  ) THEN
+    ALTER TABLE public.trading_sessions RENAME COLUMN start_time TO started_at;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'trading_sessions' AND column_name = 'end_time'
+  ) AND NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'trading_sessions' AND column_name = 'ended_at'
+  ) THEN
+    ALTER TABLE public.trading_sessions RENAME COLUMN end_time TO ended_at;
+  END IF;
+END $$;
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_trade_log_user_session ON public.trade_log(user_id, session_id);
@@ -70,14 +80,13 @@ CREATE INDEX IF NOT EXISTS idx_trade_log_symbol ON public.trade_log(symbol);
 CREATE INDEX IF NOT EXISTS idx_trade_log_entry_time ON public.trade_log(entry_time DESC);
 CREATE INDEX IF NOT EXISTS idx_trade_log_outcome ON public.trade_log(outcome) WHERE outcome IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON public.trading_sessions(user_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_start_time ON public.trading_sessions(start_time DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON public.trading_sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_mode ON public.trading_sessions(mode);
 
 -- RLS
 ALTER TABLE public.trade_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.trading_sessions ENABLE ROW LEVEL SECURITY;
 
--- Policies
 DROP POLICY IF EXISTS trade_log_user_policy ON public.trade_log;
 CREATE POLICY trade_log_user_policy ON public.trade_log
   FOR ALL USING (auth.uid() = user_id);
@@ -94,7 +103,7 @@ DROP POLICY IF EXISTS trading_sessions_service_policy ON public.trading_sessions
 CREATE POLICY trading_sessions_service_policy ON public.trading_sessions
   FOR ALL TO service_role USING (true);
 
--- Daily summary view
+-- Daily summary view (unchanged)
 CREATE OR REPLACE VIEW public.daily_trade_summary AS
 SELECT
   user_id,

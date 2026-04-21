@@ -761,31 +761,19 @@ export class TradeAnalytics extends EventEmitter {
     try {
       const stats = this.getSessionStats();
       
+      // Columns mirror the live `trading_sessions` schema
+      // (started_at/ended_at, not start_time/end_time; no gross_profit /
+      // winning_trades / etc.). The richer session stats live in memory.
       const record = {
         session_id: this.sessionId,
         user_id: this.config.userId,
         mode: this.config.mode,
-        start_time: stats.startTime.toISOString(),
-        end_time: new Date().toISOString(),
+        started_at: stats.startTime.toISOString(),
+        ended_at: new Date().toISOString(),
         initial_equity: this.config.initialEquity,
         final_equity: this.currentEquity,
-        total_pnl: stats.totalPnl,
-        gross_profit: stats.grossProfit,
-        gross_loss: stats.grossLoss,
         total_trades: stats.totalTrades,
-        winning_trades: stats.winningTrades,
-        losing_trades: stats.losingTrades,
-        win_rate: stats.winRate,
-        profit_factor: Number.isFinite(stats.profitFactor) ? stats.profitFactor : null,
-        avg_win: stats.avgWin,
-        avg_loss: stats.avgLoss,
-        expectancy: stats.expectancy,
-        max_drawdown: stats.maxDrawdown,
-        max_drawdown_pct: stats.maxDrawdownPct,
-        sharpe_estimate: stats.sharpeEstimate,
-        avg_duration_seconds: stats.avgDuration,
-        avg_slippage_bps: stats.avgSlippageBps,
-        created_at: new Date().toISOString(),
+        total_pnl: stats.totalPnl,
       };
       
       const { error } = await this.supabase
