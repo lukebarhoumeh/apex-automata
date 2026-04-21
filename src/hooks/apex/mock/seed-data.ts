@@ -11,6 +11,7 @@ import type { ModelData } from "@/types/model";
 import type { BacktestData } from "@/types/backtest";
 import type { JournalEntry } from "@/types/journal";
 import type { AlertRule, AlertFiredEvent } from "@/types/alerts";
+import type { SettingsData } from "@/types/settings";
 
 export const SESSION_SEED: SessionStats = {
   openedAt: "09:00:00",
@@ -522,3 +523,35 @@ export const ALERT_FIRED_SEED: readonly AlertFiredEvent[] = [
   { ts: "yday 21:48", rule: "Consecutive losses",  detail: "consec = 3; strategy paused",       level: "danger" },
   { ts: "yday 14:11", rule: "Venue latency spike", detail: "broker_latency_ms = 721ms",         level: "warn" },
 ];
+
+export const SETTINGS_SEED: SettingsData = {
+  account: {
+    name: "Jordan Decker",
+    email: "jordan@apexautomata.io",
+    plan: "Pro · annual",
+    seat: "Seat 1 of 3",
+  },
+  venues: [
+    { name: "Coinbase Advanced", kind: "Spot · Crypto", status: "connected", latency: 112, key: "cb_live_...aF3x" },
+    { name: "Kraken",            kind: "Spot · Crypto", status: "connected", latency:  94, key: "kr_live_...9C2q" },
+    { name: "Binance.US",        kind: "Spot · Crypto", status: "disabled",  latency: null, key: null },
+    { name: "Alpaca",            kind: "Equities",      status: "disabled",  latency: null, key: null },
+  ],
+  notifications: [
+    { channel: "Slack",     enabled: true,  target: "#trading-alerts" },
+    { channel: "Email",     enabled: true,  target: "jordan@apexautomata.io" },
+    { channel: "PagerDuty", enabled: true,  target: "Apex · Primary" },
+    { channel: "SMS",       enabled: false, target: "+1 •••-•••-4281" },
+    { channel: "Webhook",   enabled: false, target: "https://…/apex/hook" },
+  ],
+  riskLimits: {
+    maxPortfolioHeatPct: 3.0,
+    maxDrawdownPct: 8.0,
+    maxPositionPct: 30.0,
+    maxConsecLosses: 5,
+    maxDailyLoss: 2_500,
+    allowShort: true,
+    allowOvernight: true,
+    killSwitchArmed: true,
+  },
+};
