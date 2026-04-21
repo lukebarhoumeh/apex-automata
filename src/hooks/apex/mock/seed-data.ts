@@ -8,6 +8,7 @@ import type { SessionStats } from "@/types/session";
 import type { OrderRecord, FillRecord } from "@/types/orders";
 import type { RiskData } from "@/types/risk";
 import type { ModelData } from "@/types/model";
+import type { BacktestData } from "@/types/backtest";
 
 export const SESSION_SEED: SessionStats = {
   openedAt: "09:00:00",
@@ -355,5 +356,76 @@ export const MODEL_SEED: ModelData = {
     { v: "v2.2", date: "2026-01-14", auc: 0.741, prec: 0.597, trades: 38_290, note: "SHAP-driven pruning" },
     { v: "v2.1", date: "2025-11-22", auc: 0.725, prec: 0.581, trades: 35_140, note: "added orderbook features" },
     { v: "v2.0", date: "2025-09-08", auc: 0.701, prec: 0.554, trades: 30_122, note: "first XGBoost baseline" },
+  ],
+};
+
+function buildBacktestEquity() {
+  const rnd = mulberry32(99);
+  let v = 100_000;
+  let peak = v;
+  const out: { i: number; v: number; peak: number; dd: number }[] = [];
+  for (let i = 0; i < 90; i++) {
+    const drift = 250 + (i > 40 ? 120 : 0);
+    const shock = (rnd() - 0.46) * 1_400;
+    v = Math.max(92_000, v + drift + shock);
+    peak = Math.max(peak, v);
+    const dd = ((v - peak) / peak) * 100;
+    out.push({ i, v, peak, dd });
+  }
+  return out;
+}
+
+export const BACKTEST_SEED: BacktestData = {
+  preset: "Breakout · BTC/ETH/SOL · 90d",
+  config: {
+    strategy: "Breakout · 20/55 Donchian",
+    symbols: ["BTC-USD", "ETH-USD", "SOL-USD"],
+    from: "2026-01-15",
+    to: "2026-04-15",
+    initialCapital: 100_000,
+    riskPerTrade: 0.5,
+    metaThreshold: 0.65,
+    slippageBps: 2.0,
+    feeBps: 10.0,
+  },
+  results: {
+    finalEquity: 124_382,
+    totalReturn: 24.38,
+    cagr: 128.4,
+    sharpe: 2.14,
+    sortino: 3.08,
+    maxDD: 6.2,
+    winRate: 0.584,
+    trades: 142,
+    avgR: 0.42,
+    profitFactor: 1.87,
+    avgHoldHrs: 8.4,
+    turnover: 18.2,
+  },
+  equity: buildBacktestEquity(),
+  monthlyReturns: [
+    { m: "Jan", r:  4.2 },
+    { m: "Feb", r: -1.8 },
+    { m: "Mar", r:  9.1 },
+    { m: "Apr", r: 11.4 },
+  ],
+  trades: [
+    { id: "bt-1", sym: "BTC-USD", side: "LONG",  entry: 62_140, exit: 65_890, r:  1.82, pnl:  1_640, dur:  "6h 12m", date: "2026-03-28" },
+    { id: "bt-2", sym: "ETH-USD", side: "LONG",  entry:  3_120, exit:  3_080, r: -0.65, pnl:   -310, dur:  "4h 05m", date: "2026-03-26" },
+    { id: "bt-3", sym: "SOL-USD", side: "LONG",  entry:    168, exit:    182, r:  2.10, pnl:  2_210, dur: "11h 40m", date: "2026-03-22" },
+    { id: "bt-4", sym: "BTC-USD", side: "SHORT", entry: 66_400, exit: 66_800, r: -0.35, pnl:   -470, dur:  "1h 22m", date: "2026-03-19" },
+    { id: "bt-5", sym: "ETH-USD", side: "LONG",  entry:  3_042, exit:  3_240, r:  2.44, pnl:  2_610, dur: "18h 08m", date: "2026-03-15" },
+    { id: "bt-6", sym: "SOL-USD", side: "LONG",  entry:    151, exit:    147, r: -0.82, pnl:   -440, dur:  "3h 10m", date: "2026-03-12" },
+    { id: "bt-7", sym: "BTC-USD", side: "LONG",  entry: 59_800, exit: 62_100, r:  1.64, pnl:  1_420, dur:  "9h 30m", date: "2026-03-08" },
+    { id: "bt-8", sym: "ETH-USD", side: "LONG",  entry:  2_980, exit:  2_960, r: -0.41, pnl:   -220, dur:  "2h 14m", date: "2026-03-04" },
+  ],
+  rDist: [
+    { bucket: "<-2R",     n:  4 },
+    { bucket: "-2 to -1", n: 18 },
+    { bucket: "-1 to 0",  n: 37 },
+    { bucket: "0 to 1",   n: 28 },
+    { bucket: "1 to 2",   n: 31 },
+    { bucket: "2 to 3",   n: 16 },
+    { bucket: ">3R",      n:  8 },
   ],
 };
