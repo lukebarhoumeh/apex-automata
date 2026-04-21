@@ -7,6 +7,7 @@ import type { MarketRegime } from "@/types/regime";
 import type { SessionStats } from "@/types/session";
 import type { OrderRecord, FillRecord } from "@/types/orders";
 import type { RiskData } from "@/types/risk";
+import type { ModelData } from "@/types/model";
 
 export const SESSION_SEED: SessionStats = {
   openedAt: "09:00:00",
@@ -299,5 +300,60 @@ export const RISK_SEED: RiskData = {
     { lvl: 3, at: "3 consec losses",  action: "Pause strategy",        tripped: false },
     { lvl: 4, at: "DD > 8%",          action: "Flatten all positions", tripped: false },
     { lvl: 5, at: "Venue rejects x5", action: "Cold shutdown + page",  tripped: false },
+  ],
+};
+
+export const MODEL_SEED: ModelData = {
+  meta: {
+    name: "xgb_v2.4",
+    arch: "XGBoost · 400 trees · depth 6",
+    features: 128,
+    params: "1.2M",
+    file: "xgb_v2.4.onnx",
+    size: "3.4 MB",
+    rocAuc: 0.784,
+    precision: 0.642,
+    recall: 0.718,
+    f1: 0.678,
+    brier: 0.198,
+    trainedOn: 47_331,
+    trainedAt: "2026-04-11 14:32 UTC",
+  },
+  shap: [
+    { k: "regime_adx_15m",      v:  0.124, sign:  1, desc: "ADX > 30 on 15m" },
+    { k: "breakout_width_20",   v:  0.088, sign:  1, desc: "Donchian 20 compressed" },
+    { k: "volume_z_5m",         v:  0.072, sign:  1, desc: "Vol z-score +2.1σ" },
+    { k: "vwap_distance",       v:  0.041, sign:  1, desc: "0.3% above VWAP" },
+    { k: "spread_pctile",       v:  0.032, sign:  1, desc: "Tight spread (2nd pct)" },
+    { k: "hour_of_day",         v: -0.018, sign: -1, desc: "US close approaching" },
+    { k: "realized_vol_24h",    v: -0.024, sign: -1, desc: "RV slightly elevated" },
+    { k: "correlation_btc_eth", v: -0.041, sign: -1, desc: "High BTC-ETH corr" },
+  ],
+  infer: [
+    { ts: "14:22:04", sym: "BTC-USD",  p: 0.71, state: "ACCEPTED", top: "regime_adx · volume_z" },
+    { ts: "14:21:38", sym: "ETH-USD",  p: 0.58, state: "REJECTED", top: "vwap_dist · hour_of_day" },
+    { ts: "14:20:51", sym: "SOL-USD",  p: 0.67, state: "ACCEPTED", top: "breakout_width · volume_z" },
+    { ts: "14:19:22", sym: "LINK-USD", p: 0.49, state: "REJECTED", top: "spread_pctile · rv_24h" },
+    { ts: "14:18:07", sym: "AVAX-USD", p: 0.62, state: "REJECTED", top: "rv_24h · hour_of_day" },
+    { ts: "14:17:44", sym: "ARB-USD",  p: 0.74, state: "ACCEPTED", top: "breakout_width · regime_adx" },
+  ],
+  cm: { tp: 6820, fp: 3810, fn: 2680, tn: 33921 },
+  calibration: [
+    { bin: 0.10, pred: 0.10, obs: 0.08 },
+    { bin: 0.20, pred: 0.20, obs: 0.19 },
+    { bin: 0.30, pred: 0.30, obs: 0.28 },
+    { bin: 0.40, pred: 0.40, obs: 0.37 },
+    { bin: 0.50, pred: 0.50, obs: 0.49 },
+    { bin: 0.60, pred: 0.60, obs: 0.58 },
+    { bin: 0.70, pred: 0.70, obs: 0.69 },
+    { bin: 0.80, pred: 0.80, obs: 0.82 },
+    { bin: 0.90, pred: 0.90, obs: 0.91 },
+  ],
+  runs: [
+    { v: "v2.4", date: "2026-04-11", auc: 0.784, prec: 0.642, trades: 47_331, note: "current · expanded features", live: true },
+    { v: "v2.3", date: "2026-03-02", auc: 0.762, prec: 0.618, trades: 42_104, note: "regime-aware threshold" },
+    { v: "v2.2", date: "2026-01-14", auc: 0.741, prec: 0.597, trades: 38_290, note: "SHAP-driven pruning" },
+    { v: "v2.1", date: "2025-11-22", auc: 0.725, prec: 0.581, trades: 35_140, note: "added orderbook features" },
+    { v: "v2.0", date: "2025-09-08", auc: 0.701, prec: 0.554, trades: 30_122, note: "first XGBoost baseline" },
   ],
 };
