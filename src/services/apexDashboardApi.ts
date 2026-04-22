@@ -1,9 +1,13 @@
 /**
  * Typed fetchers for the apex dashboard hooks.
  *
- * Backend endpoints return 400 when the engine is not running; we surface
- * those as "empty" results rather than throwing so the UI can show a clean
- * pre-session state instead of an error banner.
+ * Semantics:
+ * - `status === 400` → backend says "engine not running" (intentional empty).
+ *   We map this to `null` data so hooks render a clean pre-session state.
+ * - `status === 429/5xx` or a network error → transient. We THROW so that
+ *   React Query keeps the last-good data cached instead of replacing it
+ *   with an empty array. That's what prevents Dashboard panels (strategy
+ *   cards, signal feed, etc.) from flickering when the rate limiter trips.
  */
 
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
@@ -11,14 +15,19 @@ const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
 type FetchJsonResult<T> = { ok: true; data: T } | { ok: false };
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<FetchJsonResult<T>> {
+  let res: Response;
   try {
-    const res = await fetch(`${API_URL}${path}`, init);
-    if (!res.ok) return { ok: false };
-    const data = (await res.json()) as T;
-    return { ok: true, data };
-  } catch {
-    return { ok: false };
+    res = await fetch(`${API_URL}${path}`, init);
+  } catch (err) {
+    // Network error — transient, let React Query keep its cache
+    throw new Error(`network error: ${path}`);
   }
+  if (res.status === 400) return { ok: false }; // intentional "engine not running" empty
+  if (res.status === 429) throw new Error(`rate-limited: ${path}`);
+  if (res.status >= 500) throw new Error(`server error ${res.status}: ${path}`);
+  if (!res.ok) return { ok: false };
+  const data = (await res.json()) as T;
+  return { ok: true, data };
 }
 
 // ============================================================
@@ -130,4 +139,29 @@ export interface BackendStrategiesPayload {
 export async function fetchStrategies(): Promise<readonly BackendStrategy[]> {
   const res = await fetchJson<BackendStrategiesPayload>("/api/strategies");
   return res.ok ? res.data.strategies : [];
+}
+
+// ============================================================
+// Runtime status (for live active-markets count, etc.)
+// ============================================================
+
+export interface BackendRuntimeStatus {
+  engineRunning: boolean;
+  mode: "paper" | "live" | null;
+  sessionId: string | null;
+  activeSymbols?: readonly string[];
+  candlesBuffered?: Record<string, number>;
+}
+
+export async function fetchRuntimeStatus(): Promise<BackendRuntimeStatus | null> {
+  const res = await fetchJson<BackendRuntimeStatus>("/api/status");
+  return res.ok ? res.data : null;
+}
+
+/** Union of spot + perps currently streaming candles. 0 when engine stopped. */
+export function countActiveMarkets(status: BackendRuntimeStatus | null): number {
+  if (!status) return 0;
+  const buffered = status.candlesBuffered ? Object.keys(status.candlesBuffered).length : 0;
+  if (buffered > 0) return buffered;
+  return status.activeSymbols?.length ?? 0;
 }

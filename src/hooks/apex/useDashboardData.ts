@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import type { SessionStats } from "@/types/session";
 import type { Position } from "@/types/positions";
 import type { SignalRecord, FeedEvent, SignalState, SignalSide } from "@/types/signals";
@@ -8,8 +8,10 @@ import type { EquityPoint, EquityRange } from "@/types/equity";
 import type { KpiTile } from "@/types/kpi";
 import { supabase } from "@/integrations/supabase/client";
 import {
+  countActiveMarkets,
   fetchEquityCurve,
   fetchRegimeStatus,
+  fetchRuntimeStatus,
   fetchSessionAnalytics,
   fetchStrategies,
   type BackendRegimeEntry,
@@ -45,7 +47,10 @@ function formatUptime(startIso: string | undefined | null): string {
 // Session stats: map /api/analytics/session → SessionStats
 // ============================================================
 
-function mapSessionStats(raw: BackendSessionStats | null): SessionStats {
+function mapSessionStats(
+  raw: BackendSessionStats | null,
+  markets: number,
+): SessionStats {
   if (!raw) {
     return {
       openedAt: "—",
@@ -66,7 +71,7 @@ function mapSessionStats(raw: BackendSessionStats | null): SessionStats {
       uptime: "—",
       mode: "paper",
       engineVersion: "v2.4.1",
-      markets: 0,
+      markets,
       metaThreshold: 0.65,
     };
   }
@@ -90,7 +95,7 @@ function mapSessionStats(raw: BackendSessionStats | null): SessionStats {
     uptime: formatUptime(raw.startTime),
     mode: raw.mode,
     engineVersion: "v2.4.1",
-    markets: 3,
+    markets,
     metaThreshold: 0.65,
   };
 }
@@ -98,9 +103,19 @@ function mapSessionStats(raw: BackendSessionStats | null): SessionStats {
 export function useSessionStats() {
   return useQuery<SessionStats>({
     queryKey: ["apex", "session-stats"],
-    queryFn: async () => mapSessionStats(await fetchSessionAnalytics()),
+    queryFn: async () => {
+      // Session analytics + runtime status fetched in parallel so the
+      // "scanning N markets" hero number reflects real active symbols
+      // (spot + perps) instead of a hardcoded constant.
+      const [raw, status] = await Promise.all([
+        fetchSessionAnalytics(),
+        fetchRuntimeStatus(),
+      ]);
+      return mapSessionStats(raw, countActiveMarkets(status));
+    },
     staleTime: 5_000,
     refetchInterval: 15_000,
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -137,6 +152,7 @@ export function useEquityCurve(range: EquityRange) {
     },
     staleTime: 10_000,
     refetchInterval: 30_000,
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -206,11 +222,14 @@ export function useOpenPositions() {
         .is("closed_at", null)
         .order("opened_at", { ascending: false })
         .limit(50);
-      if (error) return [];
+      // Throw on transient errors so React Query keeps the last-good list
+      // instead of clearing the positions table while a refetch stumbles.
+      if (error) throw new Error(`positions fetch: ${error.message}`);
       return (data as PositionRow[] | null)?.map(mapPosition) ?? [];
     },
     staleTime: 2_000,
     refetchInterval: 20_000,
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -237,6 +256,7 @@ export function useStrategyStatus() {
     queryFn: async () => (await fetchStrategies()).map(mapStrategy),
     staleTime: 10_000,
     refetchInterval: 30_000,
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -292,7 +312,7 @@ async function fetchRecentSignals(limit: number): Promise<SignalRecord[]> {
     .select("id,symbol,strategy,decided_at,side,score,confidence,meta_prob,allowed,reason")
     .order("decided_at", { ascending: false })
     .limit(limit);
-  if (error) return [];
+  if (error) throw new Error(`signals fetch: ${error.message}`);
   return (data as SignalRow[] | null)?.map(mapSignalRecord) ?? [];
 }
 
@@ -302,6 +322,7 @@ export function useSignalRecords() {
     queryFn: async () => fetchRecentSignals(20),
     staleTime: 2_000,
     refetchInterval: 15_000,
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -311,6 +332,7 @@ export function useSignalFeed() {
     queryFn: async () => (await fetchRecentSignals(25)).map(recordToFeedEvent),
     staleTime: 2_000,
     refetchInterval: 15_000,
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -390,6 +412,7 @@ export function useMarketRegime() {
     },
     staleTime: 5_000,
     refetchInterval: 20_000,
+    placeholderData: keepPreviousData,
   });
 }
 

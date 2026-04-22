@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import type {
   OrderRecord,
   OrderSide,
@@ -111,11 +111,12 @@ export function useOrders() {
         .select("id,external_order_id,symbol,side,type,status,price,quantity,strategy,created_at,updated_at")
         .order("created_at", { ascending: false })
         .limit(100);
-      if (error) return [];
+      if (error) throw new Error(`orders fetch: ${error.message}`);
       return (data as OrderRow[] | null)?.map(mapOrder) ?? [];
     },
     staleTime: 2_000,
     refetchInterval: 15_000,
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -156,7 +157,7 @@ export function useFills() {
         .select("id,order_id,price,quantity,fee_amount,slippage_bps,filled_at,orders!inner(symbol,side)")
         .order("filled_at", { ascending: false })
         .limit(50);
-      if (error) return [];
+      if (error) throw new Error(`fills fetch: ${error.message}`);
       // Supabase joins return the embedded table as an object (for !inner with
       // a single FK) or an array; normalize to object form for mapFill.
       const rows = (data as unknown as (Omit<FillRow, "orders"> & { orders: FillRow["orders"] | FillRow["orders"][] })[] | null) ?? [];
@@ -169,6 +170,7 @@ export function useFills() {
     },
     staleTime: 2_000,
     refetchInterval: 15_000,
+    placeholderData: keepPreviousData,
   });
 }
 

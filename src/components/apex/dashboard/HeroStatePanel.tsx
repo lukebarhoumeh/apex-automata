@@ -1,9 +1,8 @@
-import { useEffect, useState } from "react";
 import { Play, Pause, ExternalLink, Zap } from "lucide-react";
 import { Pill } from "@/components/apex/Pill";
 import { Sparkline } from "@/components/apex/Sparkline";
 import { HeatBar } from "@/components/apex/HeatBar";
-import { fmt, fmtMoney } from "@/components/apex/format";
+import { fmt } from "@/components/apex/format";
 import { cn } from "@/lib/utils";
 import type { SessionStats } from "@/types/session";
 import type { MarketRegime } from "@/types/regime";
@@ -22,16 +21,10 @@ const MODE_COPY: Record<SessionStats["mode"], { label: string; tone: "accent" | 
 };
 
 export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePanelProps) {
-  // Gentle live jitter on P&L — matches the design's 1.1s tick cadence.
-  const [pnl, setPnl] = useState(session.pnl);
-  const [unreal, setUnreal] = useState(session.unrealized);
-  useEffect(() => {
-    const id = window.setInterval(() => {
-      setPnl((p) => p + (Math.random() - 0.45) * 12);
-      setUnreal((u) => u + (Math.random() - 0.48) * 7);
-    }, 1100);
-    return () => window.clearInterval(id);
-  }, []);
+  // Session P&L now reads straight from the backend; no fake drift.
+  // Mock-era animation (random-walk tick every 1.1s) removed 2026-04-22.
+  const pnl = session.pnl;
+  const unreal = session.unrealized;
 
   const mode = MODE_COPY[session.mode];
   const sparkData = intradayEquity.slice(-60).map((p) => p.v);

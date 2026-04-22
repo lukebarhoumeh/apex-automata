@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import type {
   ExposureNode,
   KillLadderRow,
@@ -11,13 +11,17 @@ import type {
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
 
 async function fetchJsonOrNull<T>(path: string): Promise<T | null> {
+  let res: Response;
   try {
-    const res = await fetch(`${API_URL}${path}`);
-    if (!res.ok) return null;
-    return (await res.json()) as T;
+    res = await fetch(`${API_URL}${path}`);
   } catch {
-    return null;
+    throw new Error(`network error: ${path}`);
   }
+  if (res.status === 400) return null; // intentional empty — engine not running
+  if (res.status === 429) throw new Error(`rate-limited: ${path}`);
+  if (res.status >= 500) throw new Error(`server error ${res.status}: ${path}`);
+  if (!res.ok) return null;
+  return (await res.json()) as T;
 }
 
 interface BackendRiskStatus {
@@ -242,5 +246,6 @@ export function useRiskData() {
     },
     staleTime: 3_000,
     refetchInterval: 8_000,
+    placeholderData: keepPreviousData,
   });
 }

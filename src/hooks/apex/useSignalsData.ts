@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import type { SignalRecord, SignalSide, SignalState } from "@/types/signals";
 import type {
   StrategyConfig,
@@ -10,13 +10,19 @@ import { supabase } from "@/integrations/supabase/client";
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
 
 async function fetchJsonOrNull<T>(path: string): Promise<T | null> {
+  let res: Response;
   try {
-    const res = await fetch(`${API_URL}${path}`);
-    if (!res.ok) return null;
-    return (await res.json()) as T;
+    res = await fetch(`${API_URL}${path}`);
   } catch {
-    return null;
+    throw new Error(`network error: ${path}`);
   }
+  // 400 → engine not running (intentional empty). 429/5xx → transient, throw
+  // so React Query keeps the last-good data instead of wiping panels.
+  if (res.status === 400) return null;
+  if (res.status === 429) throw new Error(`rate-limited: ${path}`);
+  if (res.status >= 500) throw new Error(`server error ${res.status}: ${path}`);
+  if (!res.ok) return null;
+  return (await res.json()) as T;
 }
 
 function num(v: unknown): number {
@@ -81,11 +87,12 @@ export function useSignalStream() {
         )
         .order("decided_at", { ascending: false })
         .limit(60);
-      if (error) return [];
+      if (error) throw new Error(`signal-stream fetch: ${error.message}`);
       return (data as SignalRow[] | null)?.map(mapSignalRecord) ?? [];
     },
     staleTime: 2_000,
     refetchInterval: 10_000,
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -177,6 +184,7 @@ export function useStrategyConfigs() {
     },
     staleTime: 10_000,
     refetchInterval: 30_000,
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -222,5 +230,6 @@ export function useMetaModel() {
     },
     staleTime: 30_000,
     refetchInterval: 60_000,
+    placeholderData: keepPreviousData,
   });
 }
