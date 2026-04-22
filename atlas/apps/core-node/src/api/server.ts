@@ -5,6 +5,7 @@ import { WebSocketServer } from 'ws';
 import { createLogger } from '../core/logger';
 import { TradingEngine, TradingEngineConfig, EngineState } from '../trading/trading-engine';
 import { SignalProcessor } from '../strategies/signal-processor';
+import { SignalArbitrator } from '../strategies/signal-arbitrator';
 import { createClient } from '@supabase/supabase-js';
 import path from 'path';
 import { loadAndValidateEnv } from '../core/env';
@@ -274,6 +275,35 @@ async function openTradingSession(params: {
   runtimeState.sessionMode = params.mode;
   runtimeState.sessionInitialEquity = params.initialEquity;
 
+  // Drop any dedup state carried over from a prior session; new positions,
+  // new clock for the 60s windows.
+  signalArbitrator.reset();
+
+  // Cleanup orphans from a prior killed/crashed session before this one opens.
+  // PositionTracker doesn't recover state across restarts, so anything left
+  // with closed_at IS NULL belongs to a dead tracker and would otherwise
+  // bleed into useOpenPositions on the dashboard. Mark them session_end with
+  // realized_pnl_usd=0 — the engine never realized any P&L on them anyway,
+  // and we have no reliable exit price to reconstruct.
+  try {
+    const { error: orphanErr, count } = await supabase
+      .from('positions')
+      .update({
+        closed_at: new Date(startedAt).toISOString(),
+        exit_reason: 'session_end',
+        realized_pnl_usd: 0,
+      }, { count: 'exact' })
+      .eq('user_id', USER_ID)
+      .is('closed_at', null);
+    if (orphanErr) {
+      logger.warn('Orphan position cleanup failed (non-fatal)', { error: orphanErr.message });
+    } else if ((count ?? 0) > 0) {
+      logger.info('Closed orphan positions from prior session', { count: count ?? 0 });
+    }
+  } catch (err) {
+    logger.warn('Orphan position cleanup threw (non-fatal)', { error: String(err) });
+  }
+
   try {
     const { error } = await supabase.from('trading_sessions').insert({
       session_id: sessionId,
@@ -358,6 +388,9 @@ async function closeTradingSession(params: {
 // Trading engine instance
 let tradingEngine: TradingEngine | null = null;
 let signalProcessor: SignalProcessor | null = null;
+// Coherence layer: per-symbol direction lock + cross-venue netting + intra-window dedup.
+// Long-lived module-level singleton; reset() is called on engine stop.
+const signalArbitrator = new SignalArbitrator(logger);
 let tradeOutcomeCollector: TradeOutcomeCollector | null = null;
 let perpsRiskMonitor: PerpsRiskMonitor | null = null;
 let perpsAdapter: CoinbasePerpsAdapter | null = null;
@@ -1679,6 +1712,20 @@ app.post('/api/engine/start', async (req, res) => {
           if (exit) {
             logger.info('Exited long position from sell signal', { orderId: exit.id, symbol: signal.symbol, size: openPosition.size });
           }
+          return;
+        }
+
+        // Coherence layer (P0): per-symbol direction lock + cross-venue netting
+        // (ETH-USD ↔ ETH-PERP-INTX as one bucket) + intra-window dedup. Runs
+        // AFTER the exit-signal short-circuit so that closing-trade routing is
+        // never blocked. Rejected signals were already written to Supabase via
+        // syncSignalToSupabase above, so the audit trail still captures them.
+        const arbiterDecision = signalArbitrator.arbitrate(
+          signal,
+          tradingEngine!.getOpenPositions(),
+        );
+        if (!arbiterDecision.allow) {
+          // Rejection already logged inside the arbitrator with full context
           return;
         }
 
@@ -3648,7 +3695,7 @@ async function syncFillToSupabase(fill: any) {
 // Map exit reason tags to Supabase trade_exit_reason enum values
 function mapExitReason(reason?: string): string | null {
   if (!reason) return null;
-  const validReasons = ['take_profit', 'stop_loss', 'time_stop', 'manual_exit', 'daily_stop', 'kill_switch', 'signal_exit'];
+  const validReasons = ['take_profit', 'stop_loss', 'time_stop', 'manual_exit', 'daily_stop', 'kill_switch', 'signal_exit', 'session_end'];
   if (validReasons.includes(reason)) return reason;
   // Map common tags to valid enum values
   if (reason === 'exit' || reason === 'flatten') return 'manual_exit';
