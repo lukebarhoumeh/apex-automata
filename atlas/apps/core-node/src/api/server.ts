@@ -6,6 +6,7 @@ import { createLogger } from '../core/logger';
 import { TradingEngine, TradingEngineConfig, EngineState } from '../trading/trading-engine';
 import { SignalProcessor } from '../strategies/signal-processor';
 import { SignalArbitrator } from '../strategies/signal-arbitrator';
+import { computeRawEntryFillPrice } from '../trading/position-entry-vwap';
 import { createClient } from '@supabase/supabase-js';
 import path from 'path';
 import { loadAndValidateEnv } from '../core/env';
@@ -3709,8 +3710,17 @@ async function syncPositionToSupabase(position: any) {
   try {
     const symbol = position.symbol || position.product;
     const side = position.side as 'long' | 'short' | 'flat' | undefined;
-    const entryPriceRaw = Number(position.averagePrice ?? position.avgPrice ?? position.entry_price ?? 0);
-    const entryPrice = Number.isFinite(entryPriceRaw) ? entryPriceRaw : 0;
+    // Use the raw entry-fill VWAP (not position.averagePrice). averagePrice
+    // rolls in entry fee for cost-basis math (correct for P&L), but writing
+    // it as `entry_price` makes dashboard R/R analytics look wildly broken
+    // — for a SHORT it sits 25 bps below the actual fill, which puts a
+    // correctly-placed take-profit on the WRONG side of `entry_price` in
+    // displayed numbers. See position-entry-vwap.ts for the full story.
+    const entryPriceRaw = computeRawEntryFillPrice(position);
+    const fallbackAvg = Number(position.averagePrice ?? position.avgPrice ?? position.entry_price ?? 0);
+    const entryPrice = Number.isFinite(entryPriceRaw) && entryPriceRaw > 0
+      ? entryPriceRaw
+      : (Number.isFinite(fallbackAvg) ? fallbackAvg : 0);
 
     // Supabase schema expects position_side enum ('long'|'short'); skip invalid/flat snapshots
     if (!symbol || (side !== 'long' && side !== 'short') || entryPrice <= 0) {
