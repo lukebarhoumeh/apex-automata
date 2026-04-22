@@ -46,11 +46,21 @@ export function ActiveSessionProvider({ children }: { children: React.ReactNode 
       return;
     }
 
-    if (current !== previous) {
-      // Wipe every apex:* cache so stale session data doesn't leak across runs.
-      queryClient.invalidateQueries({ queryKey: ["apex"] });
-      lastSessionId.current = current;
-    }
+    if (current === previous) return;
+
+    // Wipe every apex:* cache so stale session data doesn't leak across runs.
+    queryClient.invalidateQueries({ queryKey: ["apex"] });
+    lastSessionId.current = current;
+
+    // Force an active refetch shortly after invalidation so the new session's
+    // state appears immediately rather than waiting for the next polling tick.
+    // The 1s delay gives the backend a window to write the trading_sessions
+    // row and flush initial state. Without this, the dashboard sat empty for
+    // up to a full poll interval after Start Paper.
+    const refetchTimer = window.setTimeout(() => {
+      queryClient.refetchQueries({ queryKey: ["apex"], type: "active" });
+    }, 1000);
+    return () => window.clearTimeout(refetchTimer);
   }, [value.sessionId, queryClient]);
 
   return (

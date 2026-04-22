@@ -131,14 +131,32 @@ server.on('upgrade', (request, socket, head) => {
 app.use(cors());
 app.use(express.json());
 
-const apiLimiter = rateLimit({
+// Bifurcated rate limiting (P2):
+// Reads dominate the dashboard's polling load (every apex hook + ticker tape
+// + monitors hit /api on intervals). A single global limit at 100/min was
+// blanking the UI under normal load. Split:
+//   - Reads (GET/HEAD/OPTIONS): generous 600/min — engine sits behind a
+//     firewall, no abuse vector worth optimizing for.
+//   - Writes (POST/PUT/PATCH/DELETE): strict 30/min — engine start/stop,
+//     killswitch, config mutations should never burst.
+const readLimiter = rateLimit({
   windowMs: 60_000,
-  max: 100,
+  max: 600,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many requests, try again later' },
+  message: { error: 'Too many read requests, try again later' },
 });
-app.use('/api', apiLimiter);
+const writeLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many write requests, try again later' },
+});
+app.use('/api', (req, res, next) => {
+  const isRead = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
+  return (isRead ? readLimiter : writeLimiter)(req, res, next);
+});
 
 const MAX_WS_CLIENTS = 50;
 
