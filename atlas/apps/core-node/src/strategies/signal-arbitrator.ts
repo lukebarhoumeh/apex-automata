@@ -15,7 +15,15 @@ export interface ArbitratorDecision {
 export interface SignalArbitratorOptions {
   /** Drop a duplicate (same strategy+symbol+side) within this many ms. Default 60_000. */
   dedupWindowMs?: number;
-  /** Allow opposing-direction signal IF strength is STRICTLY greater than this. Default 0.8. */
+  /**
+   * Allow opposing-direction signal ONLY IF
+   *   signal.strength > reversalStrengthThreshold
+   *   AND signal.metadata.reversalIntent === true
+   * Default 0.9. Strategies must opt in by setting `reversalIntent: true` in
+   * the signal's metadata to declare a defensible reversal thesis (typically
+   * after a regime-change observation). Without the flag, opposing signals
+   * are blocked regardless of strength.
+   */
   reversalStrengthThreshold?: number;
 }
 
@@ -33,8 +41,13 @@ interface DecisionRecord {
  *     catches the noise, not the edge.
  *  2. Cross-venue netting — group positions by BASE asset (ETH-USD and
  *     ETH-PERP-INTX share base "ETH"). Reject any signal that would create
- *     opposing exposure on the same base, unless it's a high-strength
- *     reversal (signal.strength > reversalStrengthThreshold).
+ *     opposing exposure on the same base, UNLESS the signal is an explicit
+ *     reversal: BOTH `signal.strength > reversalStrengthThreshold` AND
+ *     `signal.metadata.reversalIntent === true`. The strength threshold is
+ *     necessary but not sufficient — strategies must opt in by setting the
+ *     reversalIntent flag (typically tied to a regime-change observation).
+ *     Without the flag, all opposing entries get blocked regardless of how
+ *     confident the signal claims to be.
  *
  * Exit signals (closing existing positions) MUST be routed around this
  * arbitrator by the caller — this layer only protects ENTRY routing.
@@ -49,7 +62,7 @@ export class SignalArbitrator {
     options: SignalArbitratorOptions = {},
   ) {
     this.dedupWindowMs = options.dedupWindowMs ?? 60_000;
-    this.reversalStrengthThreshold = options.reversalStrengthThreshold ?? 0.8;
+    this.reversalStrengthThreshold = options.reversalStrengthThreshold ?? 0.9;
   }
 
   arbitrate(signal: Signal, openPositions: Position[]): ArbitratorDecision {
@@ -83,7 +96,9 @@ export class SignalArbitrator {
     );
 
     if (opposing.length > 0) {
-      const isReversal = signal.strength > this.reversalStrengthThreshold;
+      const reversalIntent = signal.metadata?.reversalIntent === true;
+      const strengthOk = signal.strength > this.reversalStrengthThreshold;
+      const isReversal = reversalIntent && strengthOk;
       if (!isReversal) {
         const decision: ArbitratorDecision = {
           allow: false,
@@ -92,6 +107,7 @@ export class SignalArbitrator {
             baseAsset,
             requiredStrength: this.reversalStrengthThreshold,
             actualStrength: signal.strength,
+            reversalIntentSet: reversalIntent,
             opposing: opposing.map((p) => ({
               symbol: p.symbol,
               side: p.side,
@@ -103,13 +119,14 @@ export class SignalArbitrator {
         return decision;
       }
       // Reversal allowed — note loudly so it shows up in audit
-      this.logger.warn('SignalArbitrator: allowing reversal (strength above threshold)', {
+      this.logger.warn('SignalArbitrator: allowing explicit reversal', {
         signalId: signal.id,
         symbol: signal.symbol,
         strategy: signal.strategy,
         direction: signal.direction,
         strength: signal.strength,
         threshold: this.reversalStrengthThreshold,
+        reversalIntent,
         baseAsset,
         opposing: opposing.map((p) => ({ symbol: p.symbol, side: p.side, size: p.size })),
       });

@@ -93,31 +93,104 @@ describe('SignalArbitrator', () => {
       expect(decision.allow).toBe(true);
     });
 
-    test('allows reversal when strength > threshold (default 0.8)', () => {
+    test('allows reversal when BOTH strength > threshold AND metadata.reversalIntent === true', () => {
       const open = [makePosition({ symbol: 'BTC-USD', side: 'long' })];
-      const sig = makeSignal({ symbol: 'BTC-USD', direction: 'sell', strength: 0.85 });
+      const sig = makeSignal({
+        symbol: 'BTC-USD',
+        direction: 'sell',
+        strength: 0.95,
+        metadata: { indicators: {}, reason: 'regime flip', reversalIntent: true },
+      });
       const decision = arbiter.arbitrate(sig, open);
       expect(decision.allow).toBe(true);
       // Reversal should be loudly logged
       expect(mockLogger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('allowing reversal'),
-        expect.any(Object),
+        expect.stringContaining('allowing explicit reversal'),
+        expect.objectContaining({ reversalIntent: true }),
       );
     });
 
-    test('rejects reversal when strength == threshold (strict greater-than)', () => {
+    test('regression: rejects opposing signal even at strength 0.99 if reversalIntent flag missing', () => {
+      // Lifted from the live verification on sess_1776886953034_nc1yrw:
+      // momentum fired ETH-USD BUY at strength=0.9952 while an ETH-PERP-INTX
+      // SHORT was already open. Pre-tightening (Option A), the 0.8 strength
+      // threshold alone let it through and we ended the session with
+      // opposing exposure on the same base — exactly the case P0 was meant
+      // to prevent. With Option A, no reversalIntent → rejected.
+      const open = [makePosition({ symbol: 'ETH-PERP-INTX', side: 'short' })];
+      const sig = makeSignal({
+        symbol: 'ETH-USD',
+        direction: 'buy',
+        strength: 0.9952,
+        // no reversalIntent flag set
+      });
+      const decision = arbiter.arbitrate(sig, open);
+      expect(decision.allow).toBe(false);
+      expect(decision.reason).toBe('cross_venue_opposing_position');
+      expect(decision.context?.reversalIntentSet).toBe(false);
+    });
+
+    test('rejects reversal when strength == threshold (strict greater-than) even with reversalIntent set', () => {
       const open = [makePosition({ symbol: 'BTC-USD', side: 'long' })];
-      const sig = makeSignal({ symbol: 'BTC-USD', direction: 'sell', strength: 0.8 });
+      const sig = makeSignal({
+        symbol: 'BTC-USD',
+        direction: 'sell',
+        strength: 0.9, // == default threshold, must be STRICTLY greater
+        metadata: { indicators: {}, reason: 'test', reversalIntent: true },
+      });
       const decision = arbiter.arbitrate(sig, open);
       expect(decision.allow).toBe(false);
     });
 
-    test('honors a custom reversalStrengthThreshold', () => {
+    test('rejects reversal when reversalIntent missing, even with strength above threshold', () => {
+      const open = [makePosition({ symbol: 'BTC-USD', side: 'long' })];
+      const sig = makeSignal({
+        symbol: 'BTC-USD',
+        direction: 'sell',
+        strength: 0.95,
+        metadata: { indicators: {}, reason: 'high-strength but no flag' },
+      });
+      const decision = arbiter.arbitrate(sig, open);
+      expect(decision.allow).toBe(false);
+      expect(decision.reason).toBe('cross_venue_opposing_position');
+    });
+
+    test('rejects reversal when reversalIntent set but strength too low', () => {
+      const open = [makePosition({ symbol: 'BTC-USD', side: 'long' })];
+      const sig = makeSignal({
+        symbol: 'BTC-USD',
+        direction: 'sell',
+        strength: 0.5,
+        metadata: { indicators: {}, reason: 'flag set but weak signal', reversalIntent: true },
+      });
+      const decision = arbiter.arbitrate(sig, open);
+      expect(decision.allow).toBe(false);
+      expect(decision.reason).toBe('cross_venue_opposing_position');
+    });
+
+    test('honors a custom reversalStrengthThreshold (with reversalIntent flag)', () => {
       arbiter = new SignalArbitrator(mockLogger as any, { reversalStrengthThreshold: 0.5 });
       const open = [makePosition({ symbol: 'BTC-USD', side: 'long' })];
-      const sig = makeSignal({ symbol: 'BTC-USD', direction: 'sell', strength: 0.6 });
+      const sig = makeSignal({
+        symbol: 'BTC-USD',
+        direction: 'sell',
+        strength: 0.6,
+        metadata: { indicators: {}, reason: 'test', reversalIntent: true },
+      });
       const decision = arbiter.arbitrate(sig, open);
       expect(decision.allow).toBe(true);
+    });
+
+    test('reversalIntent === "true" (string) does NOT count — must be the boolean true', () => {
+      const open = [makePosition({ symbol: 'BTC-USD', side: 'long' })];
+      const sig = makeSignal({
+        symbol: 'BTC-USD',
+        direction: 'sell',
+        strength: 0.95,
+        metadata: { indicators: {}, reason: 'test', reversalIntent: 'true' as unknown as boolean },
+      });
+      const decision = arbiter.arbitrate(sig, open);
+      expect(decision.allow).toBe(false);
     });
 
     test('ignores flat positions when computing opposition', () => {
