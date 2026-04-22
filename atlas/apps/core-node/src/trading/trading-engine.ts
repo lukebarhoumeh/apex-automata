@@ -485,6 +485,16 @@ export class TradingEngine extends EventEmitter {
   }
 
   /**
+   * Position monitor accessor. Used by server.ts to feed mirrored perps
+   * prices into the stop/take-profit checker — Coinbase WS only pushes
+   * spot tickers, so perps positions would otherwise never have their
+   * exit conditions evaluated and stops would silently never trigger.
+   */
+  public getPositionMonitor(): PositionMonitor | null {
+    return this.positionMonitor;
+  }
+
+  /**
    * Get engine health info for supervisor
    */
   public getHealthInfo(): {

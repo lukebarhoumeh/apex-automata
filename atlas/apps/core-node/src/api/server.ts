@@ -1194,16 +1194,23 @@ app.post('/api/engine/start', async (req, res) => {
         time: ticker.time,
       });
 
-      // Mirror spot price → perps price in the paper simulator so limit
-      // orders sitting on a *-PERP-INTX symbol can actually cross.
-      // Coinbase WS only subscribes to spot channels in paper mode; perps
-      // candles are already mirrored from spot for the signal processor
-      // (see processTickerForCandles). We do the same for the sim so
-      // checkLimitOrders() evaluates perps limits against fresh price data.
+      // Mirror spot price → perps across every downstream consumer that
+      // depends on a tick stream. Coinbase WS only subscribes to spot
+      // channels in paper mode; perps candles are already mirrored from
+      // spot for the signal processor (see processTickerForCandles above).
+      // We replicate the same spot→perps bridge for:
+      //   1. paperSimulator  — so resting limit orders on *-PERP-INTX can
+      //      cross a price and fire checkLimitOrders() fills.
+      //   2. positionMonitor — so open perps positions have their stops +
+      //      take-profits evaluated against fresh price data; otherwise
+      //      stops silently never trigger and losses run unbounded.
+      //   3. positionTracker — so unrealized P&L + exposure reflect the
+      //      live perps mark instead of staying frozen at entry.
       const perpsSymbol = activeSpotToPerpsMap.get(ticker.product_id);
-      const paperSim = tradingEngine?.getPaperSimulator?.();
-      if (perpsSymbol && paperSim) {
-        paperSim.updateMarketPrice(perpsSymbol, price);
+      if (perpsSymbol && tradingEngine) {
+        tradingEngine.getPaperSimulator?.()?.updateMarketPrice(perpsSymbol, price);
+        tradingEngine.getPositionMonitor?.()?.updatePrice(perpsSymbol, price);
+        tradingEngine.getPositionTrackerInstance?.()?.updateMarketPrice(perpsSymbol, price);
       }
     });
 
