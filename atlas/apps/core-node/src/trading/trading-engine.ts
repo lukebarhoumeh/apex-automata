@@ -10,6 +10,7 @@ import { PaperTradingSimulator, PaperTradingConfig } from './paper-trading-simul
 import { PositionMonitor, PositionMonitorConfig } from './position-monitor';
 import { TradeAnalytics, TradeAnalyticsConfig, SessionStats, TradeRecord } from './trade-analytics';
 import { GuardrailConfig } from '../config/loadGuardrails';
+import { reanchorStopAndTakeProfit } from './reanchor-stop-tp';
 import { v4 as uuidv4 } from 'uuid';
 import { 
   IExecutionAdapter, 
@@ -1177,11 +1178,25 @@ export class TradingEngine extends EventEmitter {
   private async handleFill(fill: Fill): Promise<void> {
     // Try to associate fills with their originating managed order (for stop/target + strategy metadata)
     const managedOrder = this.orderManager?.getOrderByExchangeOrderId(fill.order_id);
+
+    // Re-anchor signal-time stop/TP onto the actual fill price. Strategies
+    // emit absolute prices anchored to signal.price; orders fill elsewhere
+    // (limit offset, paper-sim slippage, drift between signal and fill).
+    // Without re-anchoring, R/R degrades and TP can land on the wrong side
+    // of entry. No-ops on exit fills (no intendedEntryPrice in metadata).
+    const fillPrice = parseFloat(fill.price);
+    const { stopPrice, takeProfit } = reanchorStopAndTakeProfit({
+      fillPrice,
+      intendedEntryPrice: managedOrder?.metadata?.intendedEntryPrice,
+      stopPrice: managedOrder?.metadata?.stopPrice,
+      takeProfit: managedOrder?.metadata?.takeProfit,
+    });
+
     await this.positionTracker!.processFill(fill, {
       strategy: managedOrder?.strategy,
       signalId: managedOrder?.metadata?.signalId,
-      stopPrice: managedOrder?.metadata?.stopPrice,
-      takeProfit: managedOrder?.metadata?.takeProfit,
+      stopPrice,
+      takeProfit,
       tag: managedOrder?.metadata?.tag,
     });
     
