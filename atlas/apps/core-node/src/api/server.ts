@@ -1211,6 +1211,12 @@ app.post('/api/engine/start', async (req, res) => {
         tradingEngine.getPaperSimulator?.()?.updateMarketPrice(perpsSymbol, price);
         tradingEngine.getPositionMonitor?.()?.updatePrice(perpsSymbol, price);
         tradingEngine.getPositionTrackerInstance?.()?.updateMarketPrice(perpsSymbol, price);
+        // AND the engine's own marketPrices map — risk engine's checkOrder
+        // reads currentPrice from it via createOrder (trading-engine.ts
+        // line 1197). Without this, exit market orders on perps get
+        // rejected with "Non-finite order values, currentPrice=0" and the
+        // stop-loss detection fires every second but can never close.
+        tradingEngine.setMarketPrice(perpsSymbol, price);
       }
     });
 

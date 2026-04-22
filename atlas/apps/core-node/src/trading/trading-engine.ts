@@ -495,6 +495,19 @@ export class TradingEngine extends EventEmitter {
   }
 
   /**
+   * Externally set a market price for a symbol on the engine's own map.
+   * Needed for the spot→perps mirror: createOrder looks up currentPrice
+   * via `this.marketPrices.get(product_id)`, and if it's 0 for a perps
+   * symbol the risk engine rejects the exit market order with
+   * `currentPrice=0` → stops can never close positions. Does NOT emit
+   * events or recurse through handleTicker.
+   */
+  public setMarketPrice(symbol: string, price: number): void {
+    if (!Number.isFinite(price) || price <= 0) return;
+    this.marketPrices.set(symbol, price);
+  }
+
+  /**
    * Get engine health info for supervisor
    */
   public getHealthInfo(): {
