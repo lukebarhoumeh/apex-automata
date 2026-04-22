@@ -1528,6 +1528,19 @@ app.post('/api/engine/start', async (req, res) => {
     // Listen for signals and create orders
     signalProcessor.on('signal:generated', async (signal) => {
       try {
+        // Defense-in-depth: even if signal-processor.ts's disabled-strategy
+        // filter were ever bypassed by a future bug or a new code path, the
+        // server-level handler is the final chokepoint before orders are
+        // created. Reject here too.
+        const killed = guardrails.disabled_strategies ?? [];
+        if (killed.includes(signal.strategy)) {
+          logger.warn(
+            `SECURITY: disabled strategy "${signal.strategy}" reached signal:generated handler — rejected`,
+            { signalId: signal.id, symbol: signal.symbol },
+          );
+          return;
+        }
+
         logger.info('Signal generated', signal);
         broadcast({ type: 'Signal', payload: signal });
 
@@ -3520,18 +3533,40 @@ async function syncOrderToSupabase(order: any) {
 
   const normalizeStrategy = (strategy?: string) => {
     const candidate = (strategy || '').toLowerCase();
-    const validStrategies = ['breakout', 'vwap_mr', 'obi_scalper'];
+    // Must stay in sync with public.strategy_name enum in Supabase.
+    // Last confirmed 2026-04-22: breakout, vwap_mr, obi_scalper, momentum,
+    // trend_follow. Any addition here needs a matching ALTER TYPE migration.
+    const validStrategies = [
+      'breakout',
+      'vwap_mr',
+      'obi_scalper',
+      'momentum',
+      'trend_follow',
+    ];
     if (validStrategies.includes(candidate)) {
       return candidate;
     }
     if (candidate === 'vwapmeanreversion') {
       return 'vwap_mr';
     }
+    // DO NOT default to a real strategy — that mislabeled every momentum /
+    // trend_follow order as "breakout" for months. System-originated orders
+    // (flatten, position exit) get tagged "breakout" historically; we keep
+    // that for legacy compatibility but log when it triggers so it can be
+    // audited.
+    logger.warn('Unknown strategy tagged on order — falling back to breakout', {
+      received: strategy,
+      orderId: order.id,
+    });
     return 'breakout';
   };
 
   const sizeValue = Number(order.size ?? order.quantity ?? 0);
   const normalizedQuantity = Number.isFinite(sizeValue) ? sizeValue : 0;
+
+  // Trace back the originating signal id if the engine threaded it through
+  // metadata. This populates orders.signal_id so the UI can join to signals.
+  const signalId = order.metadata?.signalId ?? order.signalId ?? null;
 
   try {
     const { error } = await supabase
@@ -3540,6 +3575,7 @@ async function syncOrderToSupabase(order: any) {
         id: order.id,
         user_id: USER_ID,
         external_order_id: order.exchangeOrderId,
+        signal_id: signalId,
         symbol: order.productId || order.product || order.symbol,
         side: ((order.side || 'buy').toLowerCase() === 'sell' ? 'sell' : 'buy') as 'buy' | 'sell',
         type: mapOrderType(order.type) as any,
