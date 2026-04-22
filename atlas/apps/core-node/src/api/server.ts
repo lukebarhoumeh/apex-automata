@@ -1182,7 +1182,7 @@ app.post('/api/engine/start', async (req, res) => {
       };
 
       broadcast({ type: 'TickerUpdate', payload: normalizedTicker });
-      
+
       // Update Supabase (for frontend queries)
       updateSupabasePrice(ticker.product_id, normalizedTicker.price);
 
@@ -1193,6 +1193,18 @@ app.post('/api/engine/start', async (req, res) => {
         last_size: (ticker as any).last_size,
         time: ticker.time,
       });
+
+      // Mirror spot price → perps price in the paper simulator so limit
+      // orders sitting on a *-PERP-INTX symbol can actually cross.
+      // Coinbase WS only subscribes to spot channels in paper mode; perps
+      // candles are already mirrored from spot for the signal processor
+      // (see processTickerForCandles). We do the same for the sim so
+      // checkLimitOrders() evaluates perps limits against fresh price data.
+      const perpsSymbol = activeSpotToPerpsMap.get(ticker.product_id);
+      const paperSim = tradingEngine?.getPaperSimulator?.();
+      if (perpsSymbol && paperSim) {
+        paperSim.updateMarketPrice(perpsSymbol, price);
+      }
     });
 
     tradingEngine.on('order:created', async (order) => {

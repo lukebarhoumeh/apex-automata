@@ -476,6 +476,15 @@ export class TradingEngine extends EventEmitter {
   }
 
   /**
+   * Paper simulator accessor (paper mode only). Returns null when running
+   * live. Used by server.ts to mirror spot→perps ticks into the simulator
+   * so limit orders on perps symbols can cross a real price.
+   */
+  public getPaperSimulator(): PaperTradingSimulator | null {
+    return this.paperSimulator;
+  }
+
+  /**
    * Get engine health info for supervisor
    */
   public getHealthInfo(): {
