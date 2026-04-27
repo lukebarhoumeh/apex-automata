@@ -1,4 +1,7 @@
 import path from 'node:path';
+import dotenv from 'dotenv';
+// .env lives at the repo root; pnpm sets cwd to atlas/apps/core-node.
+dotenv.config({ path: path.resolve(process.cwd(), '../../../.env') });
 import yargs from 'yargs/yargs';
 import { hideBin } from 'yargs/helpers';
 import { createLogger } from '../core/logger';
@@ -29,11 +32,6 @@ async function main() {
       describe: 'Initial capital',
       default: 10000,
     })
-    .option('data-path', {
-      type: 'string',
-      describe: 'Path to historical data',
-      default: path.resolve(process.cwd(), '../../var/historical_data'),
-    })
     .option('results-path', {
       type: 'string',
       describe: 'Path to save results',
@@ -43,6 +41,16 @@ async function main() {
       type: 'string',
       describe: 'Strategy to test (breakout, vwap, momentum, all)',
       default: 'all',
+    })
+    .option('commission', {
+      type: 'number',
+      describe: 'Commission rate (e.g., 0.006 for 0.60% Coinbase Advanced Trade taker, 0.0005 for Hyperliquid)',
+      default: 0.006,
+    })
+    .option('slippage', {
+      type: 'number',
+      describe: 'Slippage rate (e.g., 0.0005 for 5 bps)',
+      default: 0.0005,
     })
     .option('optimize', {
       type: 'boolean',
@@ -54,6 +62,13 @@ async function main() {
 
   const logger = createLogger(path.join(process.cwd(), '../../var/logs/backtest.jsonl'));
 
+  const SUPABASE_URL = process.env.SUPABASE_URL || '';
+  const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY — backtest reads candles from public.bars');
+    process.exit(1);
+  }
+
   logger.info('Starting backtest', {
     startDate: argv.startDate,
     endDate: argv.endDate,
@@ -61,10 +76,10 @@ async function main() {
     strategy: argv.strategy,
   });
 
-  // Configure backtest runner
   const runnerConfig: BacktestRunnerConfig = {
-    dataPath: String(argv.dataPath),
     resultsPath: String(argv.resultsPath),
+    supabaseUrl: SUPABASE_URL,
+    supabaseKey: SUPABASE_SERVICE_KEY,
   };
 
   const runner = new BacktestRunner(runnerConfig, logger);
@@ -74,8 +89,8 @@ async function main() {
     startDate: new Date(String(argv.startDate)),
     endDate: new Date(String(argv.endDate)),
     initialCapital: Number(argv.initialCapital),
-    commission: 0.0035, // 0.35% (Coinbase Advanced Trade maker fee)
-    slippage: 0.0005, // 0.05%
+    commission: Number(argv.commission),
+    slippage: Number(argv.slippage),
     products: argv.products as string[],
     signals: {
       breakout: {

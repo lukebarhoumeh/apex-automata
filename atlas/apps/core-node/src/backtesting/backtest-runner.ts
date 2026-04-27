@@ -1,17 +1,17 @@
 import { Logger } from '../core/logger';
 import { BacktestEngine, BacktestConfig, BacktestResult } from './backtest-engine';
-import { OHLCV } from '../indicators/technical';
-import { CoinbaseExchange } from '../exchanges/coinbase';
+import { HistoricalDataLoader } from './data-loader';
 import fs from 'fs/promises';
 import path from 'path';
 
 export interface BacktestRunnerConfig {
-  dataPath: string; // Path to historical data directory
-  resultsPath: string; // Path to save backtest results
+  resultsPath: string;
+  supabaseUrl: string;
+  supabaseKey: string;
   coinbaseConfig?: {
     apiKey: string;
     apiSecret: string;
-    apiPassphrase: string;
+    apiPassphrase?: string;
     environment: 'production' | 'sandbox';
   };
 }
@@ -19,20 +19,19 @@ export interface BacktestRunnerConfig {
 export class BacktestRunner {
   private config: BacktestRunnerConfig;
   private logger: Logger;
-  private exchange?: CoinbaseExchange;
+  private dataLoader: HistoricalDataLoader;
 
   constructor(config: BacktestRunnerConfig, logger: Logger) {
     this.config = config;
     this.logger = logger;
-
-    // Initialize exchange if config provided (for downloading data)
-    if (config.coinbaseConfig) {
-      this.exchange = new CoinbaseExchange({
-        ...config.coinbaseConfig,
-        wsUrl: 'wss://ws-feed.exchange.coinbase.com', // Not used for historical data
-        restUrl: 'https://api.exchange.coinbase.com'
-      }, logger);
-    }
+    this.dataLoader = new HistoricalDataLoader(
+      {
+        supabaseUrl: config.supabaseUrl,
+        supabaseKey: config.supabaseKey,
+        coinbaseConfig: config.coinbaseConfig,
+      },
+      logger,
+    );
   }
 
   /**
@@ -45,164 +44,12 @@ export class BacktestRunner {
       products: config.products
     });
 
-    // Create backtest engine
     const engine = new BacktestEngine(config, this.logger);
-
-    // Load historical data
-    await engine.loadHistoricalData(this.loadHistoricalData.bind(this));
-
-    // Run backtest
+    await engine.loadHistoricalData(this.dataLoader.createDataProvider());
     const result = await engine.run();
-
-    // Save results
     await this.saveResults(result);
 
     return result;
-  }
-
-  /**
-   * Load historical data from local cache or download from exchange
-   */
-  private async loadHistoricalData(product: string, startDate: Date, endDate: Date): Promise<OHLCV[]> {
-    // Try to load from local cache first
-    const cachedData = await this.loadCachedData(product, startDate, endDate);
-    if (cachedData && cachedData.length > 0) {
-      this.logger.info(`Loaded ${cachedData.length} candles from cache for ${product}`);
-      return cachedData;
-    }
-
-    // Download from exchange if not cached
-    if (this.exchange) {
-      this.logger.info(`Downloading historical data for ${product}`);
-      const data = await this.downloadHistoricalData(product, startDate, endDate);
-      
-      // Cache the data
-      await this.cacheData(product, data);
-      
-      return data;
-    }
-
-    throw new Error(`No historical data available for ${product}`);
-  }
-
-  /**
-   * Load cached data from disk
-   */
-  private async loadCachedData(product: string, startDate: Date, endDate: Date): Promise<OHLCV[] | null> {
-    try {
-      const filename = `${product.replace('/', '_')}_1m.json`;
-      const filepath = path.join(this.config.dataPath, filename);
-      
-      const content = await fs.readFile(filepath, 'utf-8');
-      const allData: OHLCV[] = JSON.parse(content);
-      
-      // Filter by date range
-      const startTime = startDate.getTime();
-      const endTime = endDate.getTime();
-      
-      return allData.filter(candle => {
-        const time = candle.time;
-        return time >= startTime && time <= endTime;
-      });
-    } catch (error) {
-      this.logger.debug(`No cached data found for ${product}`);
-      return null;
-    }
-  }
-
-  /**
-   * Download historical data from exchange
-   */
-  private async downloadHistoricalData(product: string, startDate: Date, endDate: Date): Promise<OHLCV[]> {
-    if (!this.exchange) {
-      throw new Error('Exchange not configured for downloading data');
-    }
-
-    const candles: OHLCV[] = [];
-    const granularity = 60; // 1 minute
-    const maxCandlesPerRequest = 300;
-    
-    let currentEnd = endDate;
-    
-    while (currentEnd > startDate) {
-      const currentStart = new Date(Math.max(
-        startDate.getTime(),
-        currentEnd.getTime() - maxCandlesPerRequest * granularity * 1000
-      ));
-
-      try {
-        const response = await this.exchange.getCandles(product, {
-          start: currentStart.toISOString(),
-          end: currentEnd.toISOString(),
-          granularity
-        });
-
-        // Convert response to OHLCV format
-        for (const candle of response) {
-          candles.unshift({
-            time: candle.time * 1000, // Convert to milliseconds
-            low: candle.low,
-            high: candle.high,
-            open: candle.open,
-            close: candle.close,
-            volume: candle.volume
-          });
-        }
-
-        // Move to next batch
-        currentEnd = new Date(currentStart.getTime() - granularity * 1000);
-        
-        // Rate limiting
-        await new Promise(resolve => setTimeout(resolve, 100));
-        
-      } catch (error) {
-        this.logger.error(`Failed to download data for ${product}:`, error);
-        break;
-      }
-    }
-
-    return candles;
-  }
-
-  /**
-   * Cache data to disk
-   */
-  private async cacheData(product: string, data: OHLCV[]): Promise<void> {
-    try {
-      // Ensure directory exists
-      await fs.mkdir(this.config.dataPath, { recursive: true });
-      
-      const filename = `${product.replace('/', '_')}_1m.json`;
-      const filepath = path.join(this.config.dataPath, filename);
-      
-      // Load existing data if any
-      let existingData: OHLCV[] = [];
-      try {
-        const content = await fs.readFile(filepath, 'utf-8');
-        existingData = JSON.parse(content);
-      } catch (error) {
-        // File doesn't exist yet
-      }
-      
-      // Merge data (remove duplicates)
-      const timeMap = new Map<number, OHLCV>();
-      for (const candle of existingData) {
-        timeMap.set(candle.time, candle);
-      }
-      for (const candle of data) {
-        timeMap.set(candle.time, candle);
-      }
-      
-      // Sort by time
-      const mergedData = Array.from(timeMap.values()).sort((a, b) => a.time - b.time);
-      
-      // Save to file
-      await fs.writeFile(filepath, JSON.stringify(mergedData, null, 2));
-      
-      this.logger.info(`Cached ${mergedData.length} candles for ${product}`);
-    } catch (error) {
-      this.logger.error(`Failed to cache data for ${product}:`, error);
-    }
   }
 
   /**

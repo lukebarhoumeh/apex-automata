@@ -147,6 +147,10 @@ export class HistoricalDataLoader {
 
   /**
    * Load candles from Supabase bars table.
+   *
+   * The bars.time column is BIGINT epoch-seconds (per migration
+   * 20260308_phase2a_create_bars_table.sql). Filters and the returned
+   * OHLCV.time field need to convert between seconds (DB) and millis (engine).
    */
   private async loadFromSupabase(
     product: string,
@@ -159,31 +163,47 @@ export class HistoricalDataLoader {
         end: endDate.toISOString(),
       });
 
-      const { data, error } = await this.supabase
-        .from('bars')
-        .select('time, open, high, low, close, volume')
-        .eq('symbol', product)
-        .gte('time', startDate.toISOString())
-        .lte('time', endDate.toISOString())
-        .order('time', { ascending: true });
+      const startEpochSec = Math.floor(startDate.getTime() / 1000);
+      const endEpochSec = Math.floor(endDate.getTime() / 1000);
 
-      if (error) {
-        if (error.code === '42P01') {
-          this.logger.debug('bars table does not exist');
-          return [];
+      // Supabase JS client defaults to 1000 rows per response. Page via .range
+      // so longer windows (90d × 15m bars × multiple symbols) load fully.
+      const PAGE_SIZE = 1000;
+      const allRows: any[] = [];
+      let offset = 0;
+      while (true) {
+        const { data, error } = await this.supabase
+          .from('bars')
+          .select('time, open, high, low, close, volume')
+          .eq('symbol', product)
+          .gte('time', startEpochSec)
+          .lte('time', endEpochSec)
+          .order('time', { ascending: true })
+          .range(offset, offset + PAGE_SIZE - 1);
+
+        if (error) {
+          if (error.code === '42P01') {
+            this.logger.debug('bars table does not exist');
+            return [];
+          }
+          throw error;
         }
-        throw error;
+
+        if (!data || data.length === 0) break;
+        allRows.push(...data);
+        if (data.length < PAGE_SIZE) break;
+        offset += PAGE_SIZE;
       }
 
-      if (!data || data.length === 0) {
+      if (allRows.length === 0) {
         this.logger.info(`No data found in Supabase for ${product}`);
         return [];
       }
 
-      this.logger.info(`Loaded ${data.length} candles from Supabase for ${product}`);
+      this.logger.info(`Loaded ${allRows.length} candles from Supabase for ${product}`);
 
-      const candles = data.map((row: any) => ({
-        time: new Date(row.time).getTime(),
+      const candles = allRows.map((row: any) => ({
+        time: Number(row.time) * 1000,
         open: parseFloat(row.open),
         high: parseFloat(row.high),
         low: parseFloat(row.low),
@@ -352,9 +372,10 @@ export class HistoricalDataLoader {
     }
 
     try {
+      // bars.time is BIGINT epoch-seconds; OHLCV.time is millis.
       const rows = candles.map(c => ({
         symbol: product,
-        time: new Date(c.time).toISOString(),
+        time: Math.floor(c.time / 1000),
         open: c.open,
         high: c.high,
         low: c.low,

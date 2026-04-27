@@ -130,7 +130,7 @@ interface MultiTimeframeCandles {
 export class SignalProcessor extends EventEmitter {
   private config: SignalProcessorConfig;
   private logger: Logger;
-  private supabase: SupabaseClient;
+  private supabase: SupabaseClient | null;
   private candles: Map<string, OHLCV[]> = new Map();
   private indicators: Map<string, Record<string, number[]>> = new Map();
   private lastSignals: Map<string, Signal> = new Map();
@@ -163,7 +163,11 @@ export class SignalProcessor extends EventEmitter {
     super();
     this.config = config;
     this.logger = logger;
-    this.supabase = createClient(config.supabaseUrl, config.supabaseKey);
+    // Backtest mode passes empty URL/key — only construct the client when
+    // both are present so SignalProcessor can run offline.
+    this.supabase = config.supabaseUrl && config.supabaseKey
+      ? createClient(config.supabaseUrl, config.supabaseKey)
+      : null;
 
     // Initialize regime detection
     this.regimeDetector = new RegimeDetector(config.regimeDetector || {}, logger);
@@ -1114,6 +1118,9 @@ export class SignalProcessor extends EventEmitter {
    * Load historical candles from Supabase bars table.
    */
   private async loadFromSupabase(symbol: string, limit: number): Promise<OHLCV[]> {
+    if (!this.supabase) {
+      return [];
+    }
     try {
       const { data, error } = await this.supabase
         .from('bars')
@@ -1135,9 +1142,10 @@ export class SignalProcessor extends EventEmitter {
         return [];
       }
       
-      // Convert to OHLCV format
+      // bars.time is BIGINT epoch-seconds (migration 20260308_phase2a). The
+      // OHLCV.time field used by indicators/strategies is millis, so convert.
       return data.map((row: any) => ({
-        time: new Date(row.time).getTime(),
+        time: Number(row.time) * 1000,
         open: parseFloat(row.open),
         high: parseFloat(row.high),
         low: parseFloat(row.low),
