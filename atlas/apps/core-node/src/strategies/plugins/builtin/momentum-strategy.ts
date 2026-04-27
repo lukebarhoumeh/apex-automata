@@ -200,7 +200,7 @@ export class MomentumStrategy extends BaseStrategy {
     const prevMacdHist = this.getPrevIndicator(indicators, 'macdHistogram', 1);
     const atr = this.getLatestIndicator(indicators, 'atr');
 
-    if (rsi === undefined || prevRsi === undefined || 
+    if (rsi === undefined || prevRsi === undefined ||
         macdLine === undefined || macdSignalLine === undefined ||
         macdHist === undefined || atr === undefined) {
       return signals;

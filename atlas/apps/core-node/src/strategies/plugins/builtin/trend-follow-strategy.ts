@@ -363,8 +363,11 @@ export class TrendFollowStrategy extends BaseStrategy {
   validateContext(context: MarketContext): { valid: boolean; reason?: string } {
     const emaFast = this.getConfig<number>('emaFast', 12);
     const emaSlow = this.getConfig<number>('emaSlow', 15);
-    const fastEma = context.indicators[`ema${emaFast}`] || context.indicators.ema12;
-    const slowEma = context.indicators[`ema${emaSlow}`] || context.indicators.ema15;
+    // Fallbacks must match analyze() (ema9 / ema21) — the previous fallback to
+    // ema15 was always undefined when the requested key was, leaving slowEma
+    // null and gating every signal at validateContext.
+    const fastEma = context.indicators[`ema${emaFast}`] || context.indicators.ema9;
+    const slowEma = context.indicators[`ema${emaSlow}`] || context.indicators.ema21;
     const atr = context.indicators.atr;
 
     if (!fastEma || fastEma.length < 25) {

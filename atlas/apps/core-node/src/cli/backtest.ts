@@ -92,6 +92,8 @@ async function main() {
     commission: Number(argv.commission),
     slippage: Number(argv.slippage),
     products: argv.products as string[],
+    // Strategy parameters mirror atlas/config/guardrails.yaml so backtest
+    // and live behaviour stay aligned. Update guardrails first, then sync here.
     signals: {
       breakout: {
         enabled: argv.strategy === 'breakout' || argv.strategy === 'all',
@@ -113,12 +115,12 @@ async function main() {
       momentum: {
         enabled: argv.strategy === 'momentum' || argv.strategy === 'all',
         parameters: {
-          rsiPeriod: 14,
-          rsiOverbought: 70,
-          rsiOversold: 30,
-          macdFast: 12,
-          macdSlow: 26,
-          macdSignal: 9,
+          rsiPeriod: 10,
+          rsiOverbought: 55,
+          rsiOversold: 40,
+          macdFast: 8,
+          macdSlow: 21,
+          macdSignal: 5,
         },
       },
     },

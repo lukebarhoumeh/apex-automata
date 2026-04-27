@@ -186,9 +186,12 @@ export abstract class BaseStrategy implements StrategyPlugin {
     indicators?: Record<string, number>;
     metadata?: Record<string, unknown>;
   }): StrategySignal {
+    // Use the candle's time, not wall-clock. In live this is ~now; in backtest
+    // it's the historical bar time, which keeps hold-time math sane.
+    const candleTime = params.context.latestCandle.time;
     const signal: StrategySignal = {
       id: uuidv4(),
-      timestamp: new Date(),
+      timestamp: candleTime ? new Date(candleTime) : new Date(),
       symbol: params.context.symbol,
       strategy: this.id,
       direction: params.direction,

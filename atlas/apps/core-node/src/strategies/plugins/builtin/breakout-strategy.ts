@@ -179,9 +179,6 @@ export class BreakoutStrategy extends BaseStrategy {
     const stopDistance = currentATR * atrMultiplier;
     const targetDistance = stopDistance * targetMultiplier;
 
-    // AGGRESSIVE DEBUG: Log every evaluation
-    console.log(`[BREAKOUT ${symbol}] close=${latestCandle.close.toFixed(2)} upper=${prevUpper.toFixed(2)} lower=${prevLower.toFixed(2)} gap_up=${(latestCandle.close - prevUpper).toFixed(2)} gap_down=${(prevLower - latestCandle.close).toFixed(2)}`);
-
     // Check for bullish breakout (price closes above previous high)
     if (latestCandle.close > prevUpper) {
       const signal = this.createSignal({

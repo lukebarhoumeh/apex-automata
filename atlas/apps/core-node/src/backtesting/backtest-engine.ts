@@ -438,7 +438,11 @@ export class BacktestEngine extends EventEmitter {
       this.config.risk.maxPositionSize
     );
 
-    return Math.floor(maxPositionValue / signal.price);
+    // Crypto is fractional (8 decimals). Math.floor() to whole units used to
+    // zero out every BTC/ETH order ($5k budget / $85k BTC = 0.0588 → 0).
+    const decimals = 8;
+    const factor = Math.pow(10, decimals);
+    return Math.floor((maxPositionValue / signal.price) * factor) / factor;
   }
 
   private calculateCurrentEquity(): number {

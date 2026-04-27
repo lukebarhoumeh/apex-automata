@@ -495,6 +495,7 @@ export class SignalProcessor extends EventEmitter {
     indicators.sma50 = ValidatedIndicators.SMA(closes, 50);
     indicators.ema9 = ValidatedIndicators.EMA(closes, 9);
     indicators.ema12 = ValidatedIndicators.EMA(closes, 12);
+    indicators.ema15 = ValidatedIndicators.EMA(closes, 15);
     indicators.ema21 = ValidatedIndicators.EMA(closes, 21);
     indicators.ema26 = ValidatedIndicators.EMA(closes, 26);
     indicators.rsi = ValidatedIndicators.RSI(closes, 14);
