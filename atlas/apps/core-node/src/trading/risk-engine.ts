@@ -252,8 +252,10 @@ export class RiskEngine extends EventEmitter {
     });
     
     this.startMetricsUpdate();
-    this.loadDailyStartEquity();
-    this.loadRiskState();
+    // Sequence the loaders so loadRiskState's weekly-equity reset wins over
+    // loadDailyStartEquity's; otherwise the unawaited fire-and-forget order
+    // races and leaves weeklyStartEquity in an unpredictable state.
+    void this.loadDailyStartEquity().then(() => this.loadRiskState());
   }
   
   private isSoftLaunchActive(): boolean {
@@ -403,41 +405,52 @@ export class RiskEngine extends EventEmitter {
           this.metrics.maxDrawdown = 0;
           this.metrics.consecutiveLosses = 0;
           this.metrics.dailyPnL = 0;
+          // Without this, the 7-day-ago account_metrics load below pulls a
+          // stale equity (e.g. $50k from a prior session) while currentEquity
+          // is the new paper $10k, and the weekly-loss check trips immediately.
+          // For an ephemeral paper restart there's no meaningful "weekly"
+          // history, so anchor the tracker to the current session.
+          this.weeklyStartEquity = this.accountEquity;
+          this.weeklyStartTimestamp = Date.now();
         }
       }
-      
-      // Load account metrics for today to get weekly tracking
-      let acctQuery = this.supabase
-        .from('account_metrics')
-        .select('*')
-        .eq('date', todayStr)
-        .limit(1);
-      if (this.userId) {
-        acctQuery = acctQuery.eq('user_id', this.userId);
-      }
-      const { data: accountMetrics, error: accountError } = await acctQuery.maybeSingle();
-      
-      if (accountError && !['PGRST116', 'PGRST205', '42P01'].includes(accountError.code)) {
-        this.logger.warn('Failed to load account metrics state:', accountError);
-      } else if (accountMetrics) {
-        // Calculate weekly start from 7 days ago
-        const weekStart = new Date();
-        weekStart.setDate(weekStart.getDate() - 7);
-        weekStart.setHours(0, 0, 0, 0);
-        
-        let weekQuery = this.supabase
+
+      // Load account metrics for today to get weekly tracking. Skip when
+      // ignorePersistedKillSwitch is set — the reset block above already
+      // anchored the weekly tracker to current equity for a clean session.
+      if (!this.config.ignorePersistedKillSwitch) {
+        let acctQuery = this.supabase
           .from('account_metrics')
-          .select('total_equity')
-          .eq('date', weekStart.toISOString().split('T')[0])
+          .select('*')
+          .eq('date', todayStr)
           .limit(1);
         if (this.userId) {
-          weekQuery = weekQuery.eq('user_id', this.userId);
+          acctQuery = acctQuery.eq('user_id', this.userId);
         }
-        const { data: weekStartMetrics } = await weekQuery.maybeSingle();
-        
-        if (weekStartMetrics) {
-          this.weeklyStartEquity = weekStartMetrics.total_equity;
-          this.logger.debug('Restored weekly start equity:', this.weeklyStartEquity);
+        const { data: accountMetrics, error: accountError } = await acctQuery.maybeSingle();
+
+        if (accountError && !['PGRST116', 'PGRST205', '42P01'].includes(accountError.code)) {
+          this.logger.warn('Failed to load account metrics state:', accountError);
+        } else if (accountMetrics) {
+          // Calculate weekly start from 7 days ago
+          const weekStart = new Date();
+          weekStart.setDate(weekStart.getDate() - 7);
+          weekStart.setHours(0, 0, 0, 0);
+
+          let weekQuery = this.supabase
+            .from('account_metrics')
+            .select('total_equity')
+            .eq('date', weekStart.toISOString().split('T')[0])
+            .limit(1);
+          if (this.userId) {
+            weekQuery = weekQuery.eq('user_id', this.userId);
+          }
+          const { data: weekStartMetrics } = await weekQuery.maybeSingle();
+
+          if (weekStartMetrics) {
+            this.weeklyStartEquity = weekStartMetrics.total_equity;
+            this.logger.debug('Restored weekly start equity:', this.weeklyStartEquity);
+          }
         }
       }
       
