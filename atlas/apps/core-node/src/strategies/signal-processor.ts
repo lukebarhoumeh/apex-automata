@@ -1363,6 +1363,30 @@ export class SignalProcessor extends EventEmitter {
   }
 
   /**
+   * Snapshot of the latest indicator value per series for a symbol.
+   *
+   * The internal `indicators` map stores full series (Record<string, number[]>);
+   * this returns a flat Record<string, number> of the most recent value per
+   * indicator. Used by the ML trade-outcome collector to capture a complete
+   * feature vector at signal time — strategies' own metadata.indicators is
+   * sparse (each strategy only attaches its own inputs), but the registry-
+   * computed indicators (rsi, macd, bb*, donchian*, atr, ema9/12/15/21/26,
+   * volumeSMA, vwap, sma20/50) are always present once warmup completes.
+   */
+  public getLatestIndicators(symbol: string): Record<string, number> {
+    const series = this.indicators.get(symbol);
+    if (!series) return {};
+    const latest: Record<string, number> = {};
+    for (const [key, values] of Object.entries(series)) {
+      if (values.length > 0) {
+        const v = values[values.length - 1];
+        if (Number.isFinite(v)) latest[key] = v;
+      }
+    }
+    return latest;
+  }
+
+  /**
    * Get all registered strategy plugins
    */
   public getRegisteredStrategies(): StrategyPlugin[] {

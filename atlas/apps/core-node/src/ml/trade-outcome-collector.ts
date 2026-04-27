@@ -11,9 +11,33 @@
 
 import { EventEmitter } from 'events';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { Counter } from 'prom-client';
 import { Logger } from '../core/logger';
 import { Position } from '../trading/position-tracker';
 import { RegimeState } from '../strategies/regime-detector';
+
+const tradeOutcomesRecordedCounter = new Counter({
+  name: 'atlas_trade_outcomes_recorded_total',
+  help: 'Total trade_outcomes rows successfully written',
+  labelNames: ['strategy', 'outcome'],
+});
+
+const tradeOutcomesDroppedCounter = new Counter({
+  name: 'atlas_trade_outcomes_dropped_total',
+  help: 'Closed positions whose outcome was not persisted, with reason',
+  labelNames: ['reason'],
+});
+
+const signalContextsCapturedCounter = new Counter({
+  name: 'atlas_signal_contexts_captured_total',
+  help: 'Signal contexts captured at signal:generated time',
+  labelNames: ['strategy'],
+});
+
+const signalContextsExpiredCounter = new Counter({
+  name: 'atlas_signal_contexts_expired_total',
+  help: 'Signal contexts that aged past contextTtlMs without a close',
+});
 
 /**
  * Signal context captured at entry time.
@@ -221,6 +245,7 @@ export class TradeOutcomeCollector extends EventEmitter {
     symbolSet.add(signal.id);
     this.pendingSignalIdsBySymbol.set(signal.symbol, symbolSet);
     this.stats.signalsCaptured++;
+    signalContextsCapturedCounter.inc({ strategy: signal.strategy });
 
     this.logger.debug('[TradeOutcomeCollector] Signal context captured', {
       signalId: signal.id,
@@ -238,13 +263,21 @@ export class TradeOutcomeCollector extends EventEmitter {
     if (!this.config.enabled) return;
 
     const context = this.getContextForPosition(position);
-    
+
     if (!context) {
-      this.logger.debug('[TradeOutcomeCollector] No signal context found for closed position', {
+      // Log warn (not debug) so empty trade_outcomes is observable in default
+      // log levels. The diagnostic fields tell us exactly which path failed
+      // when investigating: signalId-set-but-not-in-map vs symbol-fallback-empty.
+      const pendingForSymbol = this.pendingSignalIdsBySymbol.get(position.symbol);
+      this.logger.warn('[TradeOutcomeCollector] No signal context found for closed position', {
         symbol: position.symbol,
         positionId: position.id,
-        signalId: position.signalId,
+        positionSignalId: position.signalId,
+        pendingForSymbolCount: pendingForSymbol?.size ?? 0,
+        pendingTotalCount: this.pendingSignals.size,
       });
+      const reason = position.signalId ? 'signalid_not_in_pending' : 'no_pending_for_symbol';
+      tradeOutcomesDroppedCounter.inc({ reason });
       return;
     }
 
@@ -384,6 +417,7 @@ export class TradeOutcomeCollector extends EventEmitter {
       this.logger.debug('[TradeOutcomeCollector] No Supabase client - skipping write', {
         signalId: record.signal_id,
       });
+      tradeOutcomesDroppedCounter.inc({ reason: 'no_supabase_client' });
       return;
     }
 
@@ -396,12 +430,17 @@ export class TradeOutcomeCollector extends EventEmitter {
 
       if (error) {
         this.stats.outcomesFailed++;
+        tradeOutcomesDroppedCounter.inc({ reason: 'supabase_insert_error' });
         this.logger.error('[TradeOutcomeCollector] Failed to write outcome', {
           signalId: record.signal_id,
           error: error.message,
         });
       } else {
         this.stats.outcomesSuccessful++;
+        tradeOutcomesRecordedCounter.inc({
+          strategy: record.strategy,
+          outcome: record.outcome_label ?? 'unknown',
+        });
         this.logger.info('[TradeOutcomeCollector] Outcome recorded', {
           signalId: record.signal_id,
           symbol: record.symbol,
@@ -436,6 +475,7 @@ export class TradeOutcomeCollector extends EventEmitter {
     for (const signalId of expiredSignalIds) {
       this.removePendingContext(signalId);
       this.stats.signalsExpired++;
+      signalContextsExpiredCounter.inc();
     }
 
     if (expiredSignalIds.length > 0) {
@@ -491,7 +531,12 @@ export class TradeOutcomeCollector extends EventEmitter {
 
   private getContextForPosition(position: Position): SignalContext | undefined {
     if (position.signalId) {
-      return this.pendingSignals.get(position.signalId);
+      const direct = this.pendingSignals.get(position.signalId);
+      if (direct) return direct;
+      // SignalId on the position but the context was already consumed (or
+      // expired) — fall through to the symbol-scoped match so we still log
+      // an outcome record. This is rare but happens if recordOutcome is
+      // invoked twice for the same position (e.g. duplicate fill events).
     }
 
     const ids = this.pendingSignalIdsBySymbol.get(position.symbol);
@@ -499,16 +544,61 @@ export class TradeOutcomeCollector extends EventEmitter {
       return undefined;
     }
 
-    if (ids.size > 1) {
-      this.logger.warn('[TradeOutcomeCollector] Multiple pending contexts for symbol without signalId', {
-        symbol: position.symbol,
-        count: ids.size,
-      });
-      return undefined;
+    if (ids.size === 1) {
+      const [onlyId] = ids;
+      return this.pendingSignals.get(onlyId);
     }
 
-    const [onlyId] = ids;
-    return this.pendingSignals.get(onlyId);
+    // Multiple pending contexts for this symbol. Pick the best match using
+    // direction + entry timestamp:
+    //   1. Direction must match (long position ← buy signal, short ← sell).
+    //   2. Among directional matches, prefer the one whose timestamp is
+    //      latest but still ≤ position.openTime — that's the entry signal.
+    //   3. If no signal predates the open (clock skew, paper sim), fall back
+    //      to the closest-in-time directional match.
+    const positionDirection: 'buy' | 'sell' | null =
+      position.side === 'long' ? 'buy' : position.side === 'short' ? 'sell' : null;
+    const openTimeMs = position.openTime?.getTime?.() ?? Date.now();
+
+    let bestPreOpen: SignalContext | undefined;
+    let bestAnyDir: SignalContext | undefined;
+    let bestAnyDirDistance = Number.POSITIVE_INFINITY;
+
+    for (const id of ids) {
+      const ctx = this.pendingSignals.get(id);
+      if (!ctx) continue;
+      if (positionDirection && ctx.direction !== positionDirection) continue;
+      const ctxMs = ctx.timestamp.getTime();
+      if (ctxMs <= openTimeMs) {
+        if (!bestPreOpen || ctxMs > bestPreOpen.timestamp.getTime()) {
+          bestPreOpen = ctx;
+        }
+      }
+      const distance = Math.abs(ctxMs - openTimeMs);
+      if (distance < bestAnyDirDistance) {
+        bestAnyDir = ctx;
+        bestAnyDirDistance = distance;
+      }
+    }
+
+    if (bestPreOpen) {
+      return bestPreOpen;
+    }
+    if (bestAnyDir) {
+      this.logger.debug('[TradeOutcomeCollector] No pre-open directional match; using closest', {
+        symbol: position.symbol,
+        candidates: ids.size,
+        positionDirection,
+      });
+      return bestAnyDir;
+    }
+
+    this.logger.warn('[TradeOutcomeCollector] Multiple pending contexts but no directional match', {
+      symbol: position.symbol,
+      count: ids.size,
+      positionDirection,
+    });
+    return undefined;
   }
 
   private removePendingContext(signalId: string): void {

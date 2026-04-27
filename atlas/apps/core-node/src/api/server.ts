@@ -1301,14 +1301,23 @@ app.post('/api/engine/start', async (req, res) => {
       try {
         broadcast({ type: 'PositionUpdate', payload: position });
         await syncPositionToSupabase(position);
-        
-        // Record outcome for ML training when position is closed
-        if (position.side === 'flat' && tradeOutcomeCollector?.isEnabled()) {
+
+        // Record outcome for ML training when position is closed.
+        //
+        // We previously gated on `position.side === 'flat'`, but
+        // position-tracker.ts:229-232 explicitly preserves the last non-flat
+        // side on close (because Supabase's position_side enum doesn't allow
+        // 'flat'). That meant this branch never fired and trade_outcomes
+        // never got rows — see docs/EXECUTION_PLAN_2026-04-27.md Phase 1.
+        // closedAt is set in the same close path (line 223) and is the
+        // unambiguous "this position is done" signal.
+        if (position.closedAt && tradeOutcomeCollector?.isEnabled()) {
           try {
-            await tradeOutcomeCollector.recordOutcome(position);
+            await tradeOutcomeCollector.recordOutcome(position, position.exitReason);
           } catch (error) {
             logger.error('Failed to record trade outcome', {
               positionId: position.id,
+              signalId: position.signalId,
               error: error instanceof Error ? error.message : String(error),
             });
           }
@@ -1621,11 +1630,20 @@ app.post('/api/engine/start', async (req, res) => {
         logger.info('Signal generated', signal);
         broadcast({ type: 'Signal', payload: signal });
 
-        // Capture signal context for ML training
+        // Capture signal context for ML training. Build a full indicator
+        // feature vector by merging the signal-processor's complete latest-
+        // values snapshot with whatever strategy-specific values the
+        // strategy attached to its own metadata. Strategies put their own
+        // inputs in metadata.indicators (sparse — momentum has rsi/macd*,
+        // trend_follow has fastEma/slowEma/atr/adx), but for ML training we
+        // want a *consistent* feature vector across strategies. The
+        // registry-computed snapshot covers that gap.
         if (tradeOutcomeCollector?.isEnabled()) {
           const regimeState = signalProcessor!.getRegimeState(signal.symbol);
-          const indicators = signal.metadata?.indicators as Record<string, number> || {};
-          
+          const fullIndicators = signalProcessor!.getLatestIndicators(signal.symbol);
+          const strategyIndicators = (signal.metadata?.indicators as Record<string, number>) || {};
+          const indicators = { ...fullIndicators, ...strategyIndicators };
+
           tradeOutcomeCollector.captureSignalContext(
             {
               id: signal.id,
