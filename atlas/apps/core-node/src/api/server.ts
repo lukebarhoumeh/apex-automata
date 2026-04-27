@@ -3625,14 +3625,16 @@ async function syncOrderToSupabase(order: any) {
   const normalizeStrategy = (strategy?: string) => {
     const candidate = (strategy || '').toLowerCase();
     // Must stay in sync with public.strategy_name enum in Supabase.
-    // Last confirmed 2026-04-22: breakout, vwap_mr, obi_scalper, momentum,
-    // trend_follow. Any addition here needs a matching ALTER TYPE migration.
+    // Last confirmed 2026-04-27: breakout, vwap_mr, obi_scalper, momentum,
+    // trend_follow, system. Any addition here needs a matching ALTER TYPE
+    // migration.
     const validStrategies = [
       'breakout',
       'vwap_mr',
       'obi_scalper',
       'momentum',
       'trend_follow',
+      'system',
     ];
     if (validStrategies.includes(candidate)) {
       return candidate;
@@ -3641,10 +3643,9 @@ async function syncOrderToSupabase(order: any) {
       return 'vwap_mr';
     }
     // DO NOT default to a real strategy — that mislabeled every momentum /
-    // trend_follow order as "breakout" for months. System-originated orders
-    // (flatten, position exit) get tagged "breakout" historically; we keep
-    // that for legacy compatibility but log when it triggers so it can be
-    // audited.
+    // trend_follow order as "breakout" for months. Now that 'system' is in
+    // the enum, flatten/exit orders normalize cleanly. Anything still hitting
+    // this fallback is a genuine unknown and worth auditing.
     logger.warn('Unknown strategy tagged on order — falling back to breakout', {
       received: strategy,
       orderId: order.id,

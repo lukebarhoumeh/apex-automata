@@ -1446,7 +1446,13 @@ export type Database = {
         | "stop"
         | "take_profit"
       position_side: "long" | "short"
-      strategy_name: "breakout" | "vwap_mr" | "obi_scalper" | "momentum"
+      strategy_name:
+        | "breakout"
+        | "vwap_mr"
+        | "obi_scalper"
+        | "momentum"
+        | "trend_follow"
+        | "system"
       trade_exit_reason:
         | "take_profit"
         | "stop_loss"
@@ -1454,6 +1460,7 @@ export type Database = {
         | "manual_exit"
         | "daily_stop"
         | "kill_switch"
+        | "session_end"
     }
     CompositeTypes: {
       [_ in never]: never
@@ -1604,7 +1611,14 @@ export const Constants = {
         "take_profit",
       ],
       position_side: ["long", "short"],
-      strategy_name: ["breakout", "vwap_mr", "obi_scalper", "momentum"],
+      strategy_name: [
+        "breakout",
+        "vwap_mr",
+        "obi_scalper",
+        "momentum",
+        "trend_follow",
+        "system",
+      ],
       trade_exit_reason: [
         "take_profit",
         "stop_loss",
@@ -1612,6 +1626,7 @@ export const Constants = {
         "manual_exit",
         "daily_stop",
         "kill_switch",
+        "session_end",
       ],
     },
   },
