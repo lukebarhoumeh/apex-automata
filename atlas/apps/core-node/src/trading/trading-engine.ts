@@ -786,7 +786,13 @@ export class TradingEngine extends EventEmitter {
       killSwitches: {
         enabled: true,
         dailyLossLimit: maxDailyLossUsd,
-        consecutiveLossLimit: 5,     // 5 losses in a row
+        // Bumped 5 → 8 (Phase 2.7): with the current churn-heavy mix
+        // (momentum + trend_follow on 5 symbols, 1m candles, ~30 trades/day)
+        // a 5-in-a-row losing streak hits inside an hour during normal
+        // variance. Multi-day data-collection runs were getting halted by
+        // ordinary noise. 8 is loose enough to survive normal streaks but
+        // still catches a genuinely broken strategy.
+        consecutiveLossLimit: parseInt(process.env.CONSECUTIVE_LOSS_LIMIT || '8', 10),
         errorRateLimit,              // Step 6: Parity by default
         latencyLimit: guardrails.circuit_breakers.data_gap_sec * 1000
       },

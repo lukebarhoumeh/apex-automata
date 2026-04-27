@@ -3512,9 +3512,13 @@ app.post('/api/backtest/run', async (req, res) => {
 // Helper functions to sync with Supabase
 
 async function notifyAlertChannels(alert: { severity: string; title: string; message: string }) {
+  // No real transports wired yet — telegram/email are placeholders. Logging at
+  // info level meant every kill-switch trip / daily-stop / risk event fanned
+  // out into N log lines per configured channel, drowning real signals during
+  // long runs. Demoted to debug; bring back to info once a real transport is
+  // configured (and gate by severity).
   for (const channel of guardrails.ui.alert_channels) {
-    // Placeholder: integrate real transports (telegram/email/etc.)
-    logger.info(`[Alert:${channel}] ${alert.title}`, { severity: alert.severity, message: alert.message });
+    logger.debug(`[Alert:${channel}] ${alert.title}`, { severity: alert.severity, message: alert.message });
   }
 }
 
