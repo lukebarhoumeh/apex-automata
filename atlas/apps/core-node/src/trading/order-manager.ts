@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
+import { createClient } from '@supabase/supabase-js';
 import { Logger } from '../core/logger';
 import { CoinbaseExchange, CoinbaseOrder, OrderRequest, Fill } from '../exchanges/coinbase';
 import { IExchangeAdapter, AdapterOrderResult } from '../exchanges/types';
@@ -621,6 +622,120 @@ export class OrderManager extends EventEmitter {
   
   public getOrderByExchangeOrderId(exchangeOrderId: string): ManagedOrder | undefined {
     return this.resolveManagedOrderByExchangeId(exchangeOrderId);
+  }
+
+  /**
+   * Rehydrate active (open / pending / partially_filled) orders from Supabase.
+   * Called by TradingEngine on startup so PM2/start.cjs restarts don't lose
+   * track of in-flight orders.
+   *
+   * - Supabase column shape (per syncOrderToSupabase): id, external_order_id,
+   *   symbol, side, type, status (working|new|partially_filled|filled|...),
+   *   price, quantity, strategy, created_at, updated_at.
+   * - We hydrate everything that isn't terminal so cancel paths still work.
+   * - Idempotent: clears the active set first.
+   * - Failure throws so the engine can log it as a hydration failure branch.
+   */
+  public async hydrateOpenOrders(
+    userId: string,
+    creds: { supabaseUrl: string; supabaseKey: string }
+  ): Promise<number> {
+    if (!userId) {
+      this.logger.warn('hydrateOpenOrders called with empty userId — skipping');
+      return 0;
+    }
+    if (!creds?.supabaseUrl || !creds?.supabaseKey) {
+      this.logger.warn('hydrateOpenOrders called without supabase credentials — skipping');
+      return 0;
+    }
+
+    const supabase = createClient(creds.supabaseUrl, creds.supabaseKey);
+
+    // syncOrderToSupabase maps engine status -> 'working' | 'new' | 'partially_filled' | 'filled' | 'canceled' | 'rejected' | 'expired'.
+    // Anything not terminal is in-flight from the engine's perspective.
+    const activeStatuses = ['working', 'new', 'partially_filled'];
+
+    const { data, error } = await supabase
+      .from('orders')
+      .select('id, external_order_id, symbol, side, type, status, price, quantity, strategy, created_at, updated_at, meta_prob')
+      .eq('user_id', userId)
+      .in('status', activeStatuses);
+
+    if (error) {
+      throw new Error(`orders hydrate query failed: ${error.message}`);
+    }
+
+    // Reset both maps so a stale in-memory order can't shadow a re-hydrated one.
+    this.orders.clear();
+    this.exchangeIdToManagedId.clear();
+
+    let hydrated = 0;
+    for (const row of data ?? []) {
+      try {
+        const size = Number(row.quantity ?? 0);
+        if (!Number.isFinite(size) || size <= 0) {
+          this.logger.warn('Skipping malformed open order during hydrate', {
+            id: row.id,
+            symbol: row.symbol,
+            quantity: row.quantity,
+          });
+          continue;
+        }
+        // Map Supabase status back to engine status. We pick conservative
+        // values that keep the order in getActiveOrders() so cancel paths
+        // still work without forcing a fill.
+        const supabaseStatus = String(row.status ?? '').toLowerCase();
+        let engineStatus = 'open';
+        if (supabaseStatus === 'new') engineStatus = 'pending';
+        else if (supabaseStatus === 'partially_filled') engineStatus = 'partially_filled';
+        else engineStatus = 'open';
+
+        const side: ManagedOrder['side'] = row.side === 'sell' ? 'sell' : 'buy';
+        const type: ManagedOrder['type'] = ['limit', 'market', 'stop', 'twap'].includes(row.type) ? row.type : 'limit';
+
+        const managed: ManagedOrder = {
+          id: row.id,
+          clientOrderId: row.id,
+          exchangeOrderId: row.external_order_id ?? undefined,
+          product: row.symbol,
+          productId: row.symbol,
+          side,
+          type,
+          size,
+          price: row.price !== null && row.price !== undefined ? Number(row.price) : undefined,
+          status: engineStatus,
+          filledSize: 0,
+          executedValue: 0,
+          fee: 0,
+          createdAt: row.created_at ? new Date(row.created_at) : new Date(),
+          updatedAt: row.updated_at ? new Date(row.updated_at) : new Date(),
+          fills: [],
+          strategy: row.strategy ?? undefined,
+          metadata: { hydratedFromSupabase: true, metaProb: row.meta_prob ?? undefined },
+        };
+
+        this.orders.set(managed.id, managed);
+        if (managed.exchangeOrderId) {
+          this.exchangeIdToManagedId.set(managed.exchangeOrderId, managed.id);
+        }
+        hydrated++;
+      } catch (err) {
+        this.logger.error('Failed to materialize hydrated order', {
+          id: row?.id,
+          symbol: row?.symbol,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    this.logger.info('OrderManager hydrated open orders', {
+      userId,
+      rowsReturned: data?.length ?? 0,
+      hydrated,
+      activeStatuses,
+    });
+
+    return hydrated;
   }
 
   // Track paper trading order
