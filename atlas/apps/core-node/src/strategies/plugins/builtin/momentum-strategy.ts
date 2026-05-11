@@ -1,17 +1,32 @@
 /**
  * Momentum Strategy Plugin
- * 
+ *
  * Generates signals based on RSI and MACD momentum indicators.
  * Looks for oversold/overbought conditions with MACD confirmation.
- * 
- * Entry Conditions:
- * - RSI crosses into oversold (<30) or overbought (>70) territory
- * - MACD histogram confirms direction
- * - Optional: MACD crossover confirmation
- * 
- * Exit:
- * - RSI returns to neutral zone
- * - MACD histogram reversal
+ *
+ * Entry Conditions (industry-standard thresholds, see strategy-tuning fix):
+ * - SELL: RSI crosses UP through the overbought line (default 70).
+ *         Cross UP means: previous bar's RSI was strictly < 70 AND current
+ *         bar's RSI is >= 70.
+ * - BUY:  RSI crosses DOWN through the oversold line (default 30).
+ *         Cross DOWN means: previous bar's RSI was strictly > 30 AND current
+ *         bar's RSI is <= 30.
+ * - MACD histogram optionally confirms direction (off by default).
+ *
+ * Exit (managed by RiskEngine / OrderManager, not this plugin):
+ * - ATR-based stop and take-profit on entry.
+ *
+ * History — strategy-tuning (Bug B, 2026-05):
+ *   Defaults previously drifted to 40/60 in the schema and 40/55 in the
+ *   `generateSignals` inline fallbacks ("AGGRESSIVE: Lowered from 70 to
+ *   trigger more sell signals"). The result was that an RSI of 56.5 on
+ *   ETH-USD logged as "RSI overbought at 56.5 with neutral MACD" and emitted
+ *   a SELL — RSI 56.5 is NOT overbought by any textbook definition. We have
+ *   restored the canonical 30/70 thresholds, both in the schema and in the
+ *   inline `getConfig` fallbacks, and rolled back the corresponding
+ *   `momentum:` overrides in `guardrails.yaml`. Ops can still tune per
+ *   symbol via `per_symbol.<symbol>.strategy_overrides.momentum`, but the
+ *   strategy will never emit on RSI 50→60 by default.
  */
 
 import { BaseStrategy } from '../base-strategy';
@@ -51,18 +66,20 @@ export class MomentumStrategy extends BaseStrategy {
       {
         key: 'rsiOverbought',
         name: 'RSI Overbought',
-        description: 'RSI level considered overbought (sell signal)',
+        description:
+          'RSI level considered overbought (sell signal). Industry standard is 70; lowering this dramatically increases false positives in trending markets — see strategy-tuning fix.',
         type: 'number',
-        default: 60,  // AGGRESSIVE: Lowered from 70 to trigger more sell signals
+        default: 70,
         min: 55,
         max: 90,
       },
       {
         key: 'rsiOversold',
         name: 'RSI Oversold',
-        description: 'RSI level considered oversold (buy signal)',
+        description:
+          'RSI level considered oversold (buy signal). Industry standard is 30; raising this dramatically increases false positives in trending markets — see strategy-tuning fix.',
         type: 'number',
-        default: 40,  // AGGRESSIVE: Raised from 30 to trigger more buy signals
+        default: 30,
         min: 10,
         max: 45,
       },
@@ -179,9 +196,12 @@ export class MomentumStrategy extends BaseStrategy {
     const signals: StrategySignal[] = [];
     const { symbol } = context;
 
-    // Get config (with per-symbol overrides from guardrails.yaml)
-    const rsiOversold = this.getConfig<number>('rsiOversold', 40, symbol);
-    const rsiOverbought = this.getConfig<number>('rsiOverbought', 55, symbol);
+    // Get config (with per-symbol overrides from guardrails.yaml).
+    // Inline defaults are deliberately kept identical to the schema defaults
+    // (30 / 70). Pre-fix these were 40 / 55 which silently shadowed the
+    // schema in the unlikely event a caller bypassed `initializeWithConfig`.
+    const rsiOversold = this.getConfig<number>('rsiOversold', 30, symbol);
+    const rsiOverbought = this.getConfig<number>('rsiOverbought', 70, symbol);
     const requireMacdConfirm = this.getConfig<boolean>('requireMacdConfirm', false, symbol);
     const requireMacdCrossover = this.getConfig<boolean>('requireMacdCrossover', false, symbol);
     const stopAtr = this.getConfig<number>('stopAtr', 2.0, symbol);
