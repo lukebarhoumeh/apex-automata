@@ -2064,12 +2064,18 @@ app.post('/api/engine/start', async (req, res) => {
     ).then(() => {
       logger.info('All symbol warmup attempts completed');
 
-      // Mirror warmup candles from spot to perps symbols
+      // Mirror warmup candles from spot to perps symbols. We MUST use
+      // addHistoricalCandle (skipSignals=true) here — addCandle is the live
+      // ticker path and will fire checkSignals() once the perp's candle buffer
+      // crosses the 50-bar warmup threshold. That bug routed 150+ historical
+      // candles through the strategy → arbiter → risk → OrderManager pipeline
+      // at boot, generating phantom entry + flatten orders for perps symbols
+      // (Bug 1 / fix/order-lifecycle-hygiene).
       for (const [spotSym, perpsSym] of activeSpotToPerpsMap.entries()) {
         const spotCandles = signalProcessor!.getCandleBuffer(spotSym);
         if (spotCandles && spotCandles.length > 0) {
           for (const candle of spotCandles) {
-            signalProcessor!.addCandle(perpsSym, candle);
+            signalProcessor!.addHistoricalCandle(perpsSym, candle);
           }
           logger.info(`Mirrored ${spotCandles.length} warmup candles from ${spotSym} to ${perpsSym}`);
         }
@@ -2419,7 +2425,13 @@ app.post('/api/control/resume', (req, res) => {
   res.json({ ok: true });
 });
 
-// Control: close-all - close all open positions
+// Control: close-all - cancel all working orders, then close all open positions.
+//
+// Order matters: working limit orders MUST be cancelled FIRST. Otherwise they
+// continue to occupy risk-engine slots (Max open orders: 4) even after every
+// position has been flattened. Pre-fix this endpoint only closed positions,
+// leaving phantom limit orders behind that blocked the next trading session.
+// See fix/order-lifecycle-hygiene Bug 2.
 app.post('/api/control/close-all', async (req, res) => {
   const { reason, confirm } = req.body || {};
   if (confirm !== 'CLOSE ALL') {
@@ -2429,12 +2441,48 @@ app.post('/api/control/close-all', async (req, res) => {
   logger.warn('Close-all requested', { reason });
   
   if (!tradingEngine) {
-    return res.json({ ok: true, submitted: 0 });
+    return res.json({ ok: true, ordersCancelled: 0, positionsClosed: 0 });
   }
   
   try {
+    // Step 1: cancel every pending/working/open order BEFORE flattening
+    // positions. Cancelling after positions close still leaves the orders in
+    // the OrderManager's active set, where they consume risk-engine slots.
+    const activeOrders = tradingEngine.getActiveOrders();
+    let ordersCancelled = 0;
+    
+    for (const order of activeOrders) {
+      try {
+        const cancelled = await tradingEngine.cancelOrder(order.id);
+        if (cancelled) {
+          ordersCancelled++;
+          logger.info('Close-all: cancelled order', {
+            orderId: order.id,
+            symbol: order.productId || order.product,
+            side: order.side,
+            type: order.type,
+            status: order.status,
+          });
+        } else {
+          logger.warn('Close-all: cancelOrder returned false', {
+            orderId: order.id,
+            symbol: order.productId || order.product,
+          });
+        }
+      } catch (err) {
+        logger.warn('Close-all: failed to cancel order (continuing)', {
+          orderId: order.id,
+          symbol: order.productId || order.product,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    
+    // Step 2: flatten every open position. Use a market order so we exit
+    // immediately rather than parking new limit orders that would re-block
+    // the slot we just freed.
     const positions = tradingEngine.getOpenPositions();
-    let submitted = 0;
+    let positionsClosed = 0;
     
     for (const position of positions) {
       const side: 'buy' | 'sell' = position.side === 'long' ? 'sell' : 'buy';
@@ -2445,14 +2493,35 @@ app.post('/api/control/close-all', async (req, res) => {
         size: Math.abs(position.size).toString()
       };
       
-      const order = await tradingEngine.createOrder(closeOrder);
-      if (order) {
-        submitted++;
-        logger.info(`Closing position ${position.symbol}`, { orderId: order.id });
+      try {
+        const order = await tradingEngine.createOrder(closeOrder, {
+          strategy: 'system',
+          metadata: {
+            tag: 'flatten',
+            reason: reason ?? 'close_all_endpoint',
+            positionId: position.id,
+          },
+        });
+        if (order) {
+          positionsClosed++;
+          logger.info('Close-all: closing position', {
+            positionId: position.id,
+            symbol: position.symbol,
+            side: position.side,
+            size: position.size,
+            orderId: order.id,
+          });
+        }
+      } catch (err) {
+        logger.error('Close-all: failed to flatten position (continuing)', {
+          positionId: position.id,
+          symbol: position.symbol,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
     
-    res.json({ ok: true, submitted });
+    res.json({ ok: true, ordersCancelled, positionsClosed });
   } catch (error) {
     logger.error('Failed to close all positions:', error);
     res.status(500).json({ ok: false, error: 'Failed to close positions' });
@@ -3857,14 +3926,17 @@ async function syncOrderToSupabase(order: any) {
       return 'vwap_mr';
     }
     // DO NOT default to a real strategy — that mislabeled every momentum /
-    // trend_follow order as "breakout" for months. Now that 'system' is in
-    // the enum, flatten/exit orders normalize cleanly. Anything still hitting
-    // this fallback is a genuine unknown and worth auditing.
-    logger.warn('Unknown strategy tagged on order — falling back to breakout', {
+    // trend_follow order as "breakout" for months. `breakout` is in
+    // `disabled_strategies` and tagging flatten/exit orders with it pollutes
+    // the audit trail with synthetic activity for a strategy that's supposed
+    // to be silent. `system` is the dedicated neutral tag for engine-
+    // originated orders (flatten, exit, close-all). Anything still hitting
+    // this fallback is a genuine unknown worth auditing.
+    logger.warn('Unknown strategy tagged on order — falling back to system', {
       received: strategy,
       orderId: order.id,
     });
-    return 'breakout';
+    return 'system';
   };
 
   const sizeValue = Number(order.size ?? order.quantity ?? 0);
