@@ -26,7 +26,17 @@ const PerpsSymbolLimitSchema = z.object({
   strategy_overrides: StrategyOverridesSchema,
 });
 
+// Per-symbol Hyperliquid configuration (perpetual DEX)
+const HyperliquidSymbolLimitSchema = z.object({
+  max_notional_usd: z.number().nonnegative(),
+  max_daily_loss_usd: z.number().nonnegative(),
+  default_leverage: z.number().int().min(1).max(50).optional(),
+  max_leverage: z.number().int().min(1).max(50).optional(),
+  strategy_overrides: StrategyOverridesSchema,
+});
+
 export type PerpsSymbolLimit = z.infer<typeof PerpsSymbolLimitSchema>;
+export type HyperliquidSymbolLimit = z.infer<typeof HyperliquidSymbolLimitSchema>;
 
 export type PerSymbolLimit = z.infer<typeof PerSymbolLimitSchema>;
 export type StrategyOverrides = z.infer<typeof StrategyOverridesSchema>;
@@ -74,6 +84,21 @@ const GuardrailsSchema = z.object({
     nano_contract_size: z.number().positive(),
   }).optional(),
   perps_symbols: z.record(z.string(), PerpsSymbolLimitSchema).optional(),
+  // Hyperliquid (perpetual DEX). Default `enabled: false` is the kill switch — even if
+  // the block exists in YAML, the adapter stays inert until BOTH this flag AND the
+  // `HYPERLIQUID_ENABLED=true` env var are set. The adapter is registered either way
+  // so callers can introspect the registry, but `.initialize()` only runs when enabled.
+  hyperliquid: z.object({
+    enabled: z.boolean().default(false),
+    testnet: z.boolean().default(true),
+    risk_per_trade: z.number().positive().optional(),
+    default_leverage: z.number().int().min(1).max(50).optional(),
+    max_leverage: z.number().int().min(1).max(50).optional(),
+    maker_fee: z.number().min(0).optional(),
+    taker_fee: z.number().min(0).optional(),
+    funding_check_interval_sec: z.number().int().positive().optional(),
+  }).optional(),
+  hyperliquid_symbols: z.record(z.string(), HyperliquidSymbolLimitSchema).optional(),
   execution: z.object({
     order_type: z.string(),
     price_offset_ticks: z.number().int().nonnegative(),

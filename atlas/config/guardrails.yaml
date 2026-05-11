@@ -216,9 +216,23 @@ go_live_criteria:
   manual_approval_required: true
 
 # Hyperliquid Perpetual Futures Configuration
-# Applies when trading via 'hyperliquid' adapter
+# Applies when trading via the 'hyperliquid' adapter (atlas/apps/core-node/src/exchanges/hyperliquid).
+#
+# KILL SWITCH — TWO LOCKS, BOTH MUST BE OPEN:
+#   1. `enabled: true` here in this YAML block
+#   2. `HYPERLIQUID_ENABLED=true` in the process env
+#
+# Default is `enabled: false` so the adapter stays inert (registered but never
+# initialized) on every startup until both locks are explicitly opened. No live
+# HL orders can be placed by the engine until signal routing is wired in a
+# separate PR — right now this block only governs whether the adapter connects.
+#
+# Credentials (HYPERLIQUID_PRIVATE_KEY, HYPERLIQUID_WALLET_ADDRESS) come from
+# env only and are never logged. testnet: true keeps everything on Hyperliquid's
+# testnet endpoints.
 hyperliquid:
-  testnet: true
+  enabled: false       # KILL SWITCH — must be true AND HYPERLIQUID_ENABLED=true to activate
+  testnet: true        # mainnet=false; only flip after credentials + routing are verified
   risk_per_trade: 0.03
   default_leverage: 3
   max_leverage: 5

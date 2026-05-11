@@ -19,6 +19,9 @@ import { MetricsTracker } from '../trading/metrics-tracker';
 import { SecretManager } from '../config/secrets';
 import { CoinbaseExchange } from '../exchanges/coinbase';
 import { CoinbasePerpsAdapter } from '../exchanges/coinbase-perps-adapter';
+import { ExchangeRegistry } from '../exchanges/exchange-registry';
+import { HyperliquidAdapter } from '../exchanges/hyperliquid';
+import { initHyperliquidAdapter } from '../exchanges/hyperliquid-init';
 import { PerpsRiskMonitor } from '../trading/perps';
 import { TradeOutcomeCollector } from '../ml/trade-outcome-collector';
 import { EngineSupervisor, SupervisorState, RestartReason } from '../runtime/engine-supervisor';
@@ -413,6 +416,11 @@ const signalArbitrator = new SignalArbitrator(logger);
 let tradeOutcomeCollector: TradeOutcomeCollector | null = null;
 let perpsRiskMonitor: PerpsRiskMonitor | null = null;
 let perpsAdapter: CoinbasePerpsAdapter | null = null;
+// ExchangeRegistry — single source of truth for all exchange adapters during a
+// running engine session. Constructed on engine start, torn down on engine stop.
+// HL adapter is registered here (kill-switch gated); see exchanges/hyperliquid-init.ts.
+let exchangeRegistry: ExchangeRegistry | null = null;
+let hyperliquidAdapter: HyperliquidAdapter | null = null;
 let activeSpotToPerpsMap: Map<string, string> = new Map();
 
 // Engine Supervisor for 24/7 resilience
@@ -1108,6 +1116,12 @@ app.post('/api/engine/start', async (req, res) => {
     // Create trading engine
     tradingEngine = new TradingEngine(engineConfig, logger);
 
+    // Build the ExchangeRegistry for this engine session. All exchange adapters
+    // are registered here; downstream code can resolve adapters by id without
+    // caring how they were constructed. Tear-down happens in the stop/cleanup
+    // paths and also on startup-failure cleanup.
+    exchangeRegistry = new ExchangeRegistry(logger);
+
     // Register perps adapter and start risk monitor
     perpsAdapter = new CoinbasePerpsAdapter(logger);
     const perpsCredentials = {
@@ -1116,7 +1130,24 @@ app.post('/api/engine/start', async (req, res) => {
       environment: resolvedMarketDataEnv,
     };
     await perpsAdapter.initialize(perpsCredentials);
+    exchangeRegistry.register(perpsAdapter);
     logger.info('Coinbase Perps adapter registered');
+
+    // Hyperliquid adapter — kill-switch gated (guardrails.hyperliquid.enabled
+    // AND HYPERLIQUID_ENABLED=true). Always non-fatal: HL init failures are
+    // logged but do NOT abort engine startup. See exchanges/hyperliquid-init.ts.
+    const hlInit = await initHyperliquidAdapter({
+      logger,
+      registry: exchangeRegistry,
+      guardrails: engineGuardrails,
+      env,
+    });
+    hyperliquidAdapter = hlInit.adapter;
+    logger.info('Hyperliquid adapter init complete', {
+      enabled: hlInit.enabled,
+      initialized: hlInit.initialized,
+      status: hlInit.status,
+    });
 
     const perpsConfig = engineGuardrails.perps;
     perpsRiskMonitor = null;
@@ -1982,6 +2013,15 @@ app.post('/api/engine/start', async (req, res) => {
         tradingEngine = null;
       }
       perpsAdapter = null;
+      if (exchangeRegistry) {
+        try {
+          await exchangeRegistry.shutdown();
+        } catch (regErr) {
+          logger.warn('Error tearing down ExchangeRegistry on startup failure:', regErr);
+        }
+        exchangeRegistry = null;
+      }
+      hyperliquidAdapter = null;
       activeSpotToPerpsMap = new Map();
       if (signalProcessor) {
         signalProcessor = null;
@@ -2173,10 +2213,19 @@ app.post('/api/engine/stop', async (req, res) => {
       perpsRiskMonitor.stop();
       perpsRiskMonitor.removeAllListeners();
     }
+    if (exchangeRegistry) {
+      try {
+        await exchangeRegistry.shutdown();
+      } catch (regErr) {
+        logger.warn('Error tearing down ExchangeRegistry on stop:', regErr);
+      }
+    }
     tradingEngine = null;
     signalProcessor = null;
     perpsRiskMonitor = null;
     perpsAdapter = null;
+    exchangeRegistry = null;
+    hyperliquidAdapter = null;
     activeSpotToPerpsMap = new Map();
 
     // Update supervisor actual state
