@@ -85,11 +85,29 @@ export interface FlattenResult {
   error?: string;
 }
 
+/**
+ * One open lot of a position. The tracker holds a FIFO queue of these per
+ * symbol so that closes consume the oldest entries first — matching the
+ * `pnlCalculationMethod: 'fifo'` config and the compliance.tax_method ('FIFO')
+ * guardrail. Each lot retains the *unallocated* portion of its entry fee so
+ * partial closes can charge a proportional slice and leave the remainder on
+ * the still-open lot.
+ */
+interface Lot {
+  size: number;
+  price: number;
+  fee: number;
+}
+
 export class PositionTracker extends EventEmitter {
   private config: PositionTrackerConfig;
   private logger: Logger;
   private supabase: SupabaseClient;
   private positions: Map<string, Position> = new Map();
+  // FIFO lot ledger per symbol. Direction is encoded by Position.side; all
+  // lots for a symbol share that side. Kept private (never exposed via
+  // Position) so the public API surface stays unchanged.
+  private lots: Map<string, Lot[]> = new Map();
   private marketPrices: Map<string, number> = new Map();
   private updateTimer: NodeJS.Timeout | null = null;
   // Accumulator to preserve realized P&L after positions are closed and removed from memory.
@@ -143,6 +161,7 @@ export class PositionTracker extends EventEmitter {
 
     // Idempotent reset — never silently merge stale in-memory state with DB.
     this.positions.clear();
+    this.lots.clear();
 
     let hydrated = 0;
     for (const row of data ?? []) {
@@ -185,6 +204,11 @@ export class PositionTracker extends EventEmitter {
           metadata: { hydratedFromSupabase: true, openedAtIso: openedAt.toISOString() },
         };
         this.positions.set(row.symbol, position);
+        // Seed the FIFO ledger with a single synthetic lot reflecting the
+        // hydrated cost basis. Subsequent fills are accounted FIFO from here.
+        // Entry fee is 0 because the original fee is already baked into the
+        // persisted realized_pnl_usd / entry_price snapshot.
+        this.lots.set(row.symbol, [{ size, price: avgPrice, fee: 0 }]);
         hydrated++;
       } catch (err) {
         this.logger.error('Failed to materialize hydrated position', {
@@ -332,6 +356,7 @@ export class PositionTracker extends EventEmitter {
       this.emit('position:closed', position);
       // Remove closed positions so a new trade creates a fresh position (new id/openTime)
       this.positions.delete(symbol);
+      this.lots.delete(symbol);
     } else if (position.trades.length === 1) {
       this.emit('position:opened', position);
     } else {
@@ -358,113 +383,163 @@ export class PositionTracker extends EventEmitter {
     };
   }
 
+  /**
+   * Apply a fill to the FIFO lot ledger and update the public Position
+   * snapshot to match.
+   *
+   * Matching rules:
+   *  - A trade in the same direction as existing lots opens a new lot.
+   *  - A trade in the opposite direction consumes oldest lots first (FIFO).
+   *    Each consumed slice produces realized PnL using *that lot's* original
+   *    entry price, charged with: (a) the proportional remainder of the
+   *    lot's entry fee, and (b) the proportional slice of the closing
+   *    trade's fee.
+   *  - If the closing trade exhausts all open lots and still has size left,
+   *    the remainder opens a single new lot in the opposite direction with
+   *    the residual closing fee booked as that new lot's entry fee.
+   *
+   * `Position.averagePrice` is the fee-adjusted weighted average of remaining
+   * lots so existing callers (UI, persistence, analytics) keep working
+   * without any schema change.
+   */
   private updatePositionWithTrade(position: Position, trade: Trade): void {
-    const previousSide = position.side;
-    const previousSize = position.size;
-    const previousAvgPrice = position.averagePrice;
-    
-    const size = Number.isFinite(trade.size) ? trade.size : 0;
-    const price = Number.isFinite(trade.price) ? trade.price : 0;
-    const fee = Number.isFinite(trade.fee) ? trade.fee : 0;
-    
-    if (size <= 0 || price <= 0) {
+    const tradeSize = Number.isFinite(trade.size) ? trade.size : 0;
+    const tradePrice = Number.isFinite(trade.price) ? trade.price : 0;
+    const tradeFee = Number.isFinite(trade.fee) ? Math.abs(trade.fee) : 0;
+
+    if (tradeSize <= 0 || tradePrice <= 0) {
       this.logger.warn('Ignoring trade with non-positive size/price', {
         symbol: position.symbol,
-        size,
-        price,
-        fee,
+        size: tradeSize,
+        price: tradePrice,
+        fee: tradeFee,
         orderId: trade.orderId,
       });
       return;
     }
-    
-    const allocateFee = (portionSize: number): number => {
-      if (fee === 0 || portionSize <= 0) return 0;
-      return fee * (portionSize / size);
-    };
 
-    // Opening from flat
-    if (previousSide === 'flat' || previousSize === 0) {
-      position.side = trade.side === 'buy' ? 'long' : 'short';
-      position.size = size;
-      const absFee = Math.abs(fee);
-      position.averagePrice = position.side === 'long'
-        ? ((size * price) + absFee) / size
-        : ((size * price) - absFee) / size;
-    } else if (previousSide === 'long') {
-      if (trade.side === 'buy') {
-        // Add to long
-        const newSize = previousSize + size;
-        const totalCost = (previousSize * previousAvgPrice) + (size * price) + Math.abs(fee);
-        position.averagePrice = totalCost / newSize;
-        position.size = newSize;
-        position.side = 'long';
-      } else {
-        // Sell reduces long or flips to short
-        const closingSize = Math.min(previousSize, size);
-        const feeClose = Math.abs(allocateFee(closingSize));
-        const realizedPnL = closingSize * (price - previousAvgPrice) - feeClose;
-        trade.realizedPnL = realizedPnL;
-        position.realizedPnL += realizedPnL;
+    const lots = this.getLots(position.symbol);
+    const tradeSide: 'long' | 'short' = trade.side === 'buy' ? 'long' : 'short';
 
-        const remainingLong = previousSize - closingSize;
-        const flipSize = size - closingSize;
-        const feeOpen = Math.abs(fee) - feeClose;
+    // Determine current ledger direction. Lots are always uniform; if there
+    // are no lots, we're flat regardless of position.side.
+    const ledgerSide: 'long' | 'short' | 'flat' =
+      lots.length === 0 ? 'flat' : (position.side === 'short' ? 'short' : 'long');
 
-        if (flipSize > 0) {
-          position.side = 'short';
-          position.size = flipSize;
-          position.averagePrice = ((flipSize * price) - Math.abs(feeOpen)) / flipSize;
-        } else {
-          position.size = remainingLong;
-          position.side = position.size === 0 ? 'flat' : 'long';
-          position.averagePrice = previousAvgPrice;
+    // newSide tracks what the position's direction is after this trade.
+    let newSide: 'long' | 'short' | 'flat';
+
+    if (ledgerSide === 'flat' || ledgerSide === tradeSide) {
+      // Opening or adding to existing direction → push a new lot.
+      lots.push({ size: tradeSize, price: tradePrice, fee: tradeFee });
+      newSide = tradeSide;
+    } else {
+      // Closing/reducing/flipping direction → FIFO-consume opposing lots.
+      let remaining = tradeSize;
+      let totalRealized = 0;
+
+      // Snapshot the original trade fee for proportional allocation across
+      // the consumed slices. Whatever's left after fully consuming all lots
+      // becomes the entry fee for the flip lot.
+      const closeFeePerUnit = tradeSize > 0 ? tradeFee / tradeSize : 0;
+      let allocatedCloseFee = 0;
+
+      while (remaining > 0 && lots.length > 0) {
+        const lot = lots[0];
+        const consumed = Math.min(lot.size, remaining);
+
+        // Proportional allocation of *this lot's* remaining entry fee
+        // and the closing trade's fee for this slice.
+        const lotFeeShare = lot.size > 0 ? lot.fee * (consumed / lot.size) : 0;
+        const closeFeeShare = closeFeePerUnit * consumed;
+        allocatedCloseFee += closeFeeShare;
+
+        const grossPnl = ledgerSide === 'long'
+          ? consumed * (tradePrice - lot.price)
+          : consumed * (lot.price - tradePrice);
+
+        totalRealized += grossPnl - lotFeeShare - closeFeeShare;
+
+        lot.size -= consumed;
+        lot.fee -= lotFeeShare;
+        remaining -= consumed;
+
+        if (lot.size <= 0) {
+          lots.shift();
         }
       }
-    } else if (previousSide === 'short') {
-      if (trade.side === 'sell') {
-        // Add to short
-        const newSize = previousSize + size;
-        const totalProceeds = (previousSize * previousAvgPrice) + (size * price) - Math.abs(fee);
-        position.averagePrice = totalProceeds / newSize;
-        position.size = newSize;
-        position.side = 'short';
+
+      trade.realizedPnL = totalRealized;
+      position.realizedPnL += totalRealized;
+
+      if (remaining > 0) {
+        // Trade overshot all lots → flip side, open one lot with the
+        // residual closing fee as its entry fee.
+        const flipFee = Math.max(0, tradeFee - allocatedCloseFee);
+        lots.push({ size: remaining, price: tradePrice, fee: flipFee });
+        newSide = tradeSide;
+      } else if (lots.length === 0) {
+        newSide = 'flat';
       } else {
-        // Buy reduces short or flips to long
-        const closingSize = Math.min(previousSize, size);
-        const feeClose = Math.abs(allocateFee(closingSize));
-        const realizedPnL = closingSize * (previousAvgPrice - price) - feeClose;
-        trade.realizedPnL = realizedPnL;
-        position.realizedPnL += realizedPnL;
-
-        const remainingShort = previousSize - closingSize;
-        const flipSize = size - closingSize;
-        const feeOpen = Math.abs(fee) - feeClose;
-
-        if (flipSize > 0) {
-          position.side = 'long';
-          position.size = flipSize;
-          position.averagePrice = ((flipSize * price) + Math.abs(feeOpen)) / flipSize;
-        } else {
-          position.size = remainingShort;
-          position.side = position.size === 0 ? 'flat' : 'short';
-          position.averagePrice = previousAvgPrice;
-        }
+        newSide = ledgerSide;
       }
     }
 
-    // Update position metadata
+    // Recompute the public Position fields from the lot ledger.
+    this.syncPositionFromLots(position, lots, newSide);
+
+    // Trade-level bookkeeping (unchanged from prior behavior).
     position.trades.push(trade);
     position.lastUpdateTime = new Date();
     position.maxSize = Math.max(position.maxSize, Math.abs(position.size));
-    
+
     if (!Number.isFinite(position.averagePrice) || position.averagePrice < 0) {
-      position.averagePrice = Number.isFinite(price) ? price : 0;
+      position.averagePrice = tradePrice;
+    }
+    if (!Number.isFinite(position.size) || position.size < 0) {
+      position.size = 0;
+    }
+  }
+
+  /**
+   * Get (or lazily create) the FIFO lot queue for a symbol.
+   */
+  private getLots(symbol: string): Lot[] {
+    let lots = this.lots.get(symbol);
+    if (!lots) {
+      lots = [];
+      this.lots.set(symbol, lots);
+    }
+    return lots;
+  }
+
+  /**
+   * Mirror lot ledger state onto the public Position snapshot:
+   *  - size = sum of remaining lot sizes
+   *  - side = explicit new direction (or 'flat' if empty)
+   *  - averagePrice = fee-adjusted weighted average across remaining lots
+   *    (long: cost basis = price + fee/size; short: proceeds = price − fee/size)
+   *
+   * The fee-adjusted convention preserves the contract of existing
+   * position-tracker tests (e.g. flip avgPrice = entry_price ± fee/size).
+   */
+  private syncPositionFromLots(position: Position, lots: Lot[], newSide: 'long' | 'short' | 'flat'): void {
+    if (lots.length === 0 || newSide === 'flat') {
+      position.size = 0;
+      position.side = 'flat';
+      position.averagePrice = 0;
+      return;
     }
 
-    if (!Number.isFinite(position.size) || position.size < 0) {
-      position.size = Math.max(0, Number.isFinite(position.size) ? position.size : 0);
+    let totalSize = 0;
+    let basis = 0;
+    for (const lot of lots) {
+      totalSize += lot.size;
+      basis += lot.size * lot.price + (newSide === 'short' ? -lot.fee : lot.fee);
     }
+    position.side = newSide;
+    position.size = totalSize;
+    position.averagePrice = totalSize > 0 ? basis / totalSize : 0;
   }
 
   private calculatePnL(position: Position): void {
@@ -694,6 +769,7 @@ export class PositionTracker extends EventEmitter {
           }
           this.emit('position:closed', position);
           this.positions.delete(position.symbol);
+          this.lots.delete(position.symbol);
           result.success = true;
         }
       } catch (error) {

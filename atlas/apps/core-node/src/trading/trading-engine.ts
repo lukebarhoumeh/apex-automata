@@ -109,6 +109,12 @@ export class TradingEngine extends EventEmitter {
   private secretManager: SecretManager;
   private paperSimulator: PaperTradingSimulator | null = null;
   private isRunning = false;
+  // Tracks whether `start()` is genuinely in flight (between entering the
+  // body and resolving). The `engineState === 'starting'` flag alone isn't
+  // enough because tests and recovery paths can set engineState directly,
+  // which would otherwise make `stop()` busy-wait on a phantom start that
+  // never completes.
+  private startInFlight = false;
   private marketPrices: Map<string, number> = new Map();
   private guardrails: GuardrailConfig;
   
@@ -196,6 +202,7 @@ export class TradingEngine extends EventEmitter {
       return;
     }
 
+    this.startInFlight = true;
     this.setEngineState('starting', reason);
     this.startCount++;
     this.lastStartReason = reason;
@@ -289,6 +296,8 @@ export class TradingEngine extends EventEmitter {
       this.logger.error('Failed to start trading engine:', error);
       this.emit('engine:error', error as Error);
       throw error;
+    } finally {
+      this.startInFlight = false;
     }
   }
 
@@ -387,11 +396,19 @@ export class TradingEngine extends EventEmitter {
       return;
     }
 
-    // Prevent stop during start
+    // Prevent stop during a genuinely in-flight start. If state is
+    // 'starting' but no start() call is actually running (e.g. a recovery
+    // path or test set the state directly), short-circuit to 'stopped'
+    // instead of busy-waiting on a phantom start that will never complete.
     if (this.engineState === 'starting') {
-      this.logger.warn('Cannot stop engine while starting, waiting...');
-      // Wait a bit for start to complete
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      if (this.startInFlight) {
+        this.logger.warn('Cannot stop engine while starting, waiting...');
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } else {
+        this.logger.warn('Engine state is "starting" but no start in flight; resetting to stopped');
+        this.setEngineState('stopped', 'phantom_starting_state');
+        return;
+      }
     }
 
     // Prevent double-stop
