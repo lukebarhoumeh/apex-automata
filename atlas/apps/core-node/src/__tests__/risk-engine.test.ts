@@ -299,6 +299,11 @@ describe('RiskEngine', () => {
     });
     
     test('should trigger kill switch when daily loss limit is exceeded (no auto-flatten)', () => {
+      // Spy on the position tracker's flatten path so we can assert the
+      // kill-switch state transition does NOT auto-close positions
+      // (flattening is config-driven, not automatic).
+      const closeSpy = vi.spyOn(positionTracker, 'closeAllPositions').mockResolvedValue([]);
+
       // Force a loss beyond killSwitches.dailyLossLimit ($80)
       (riskEngine as any).metrics.dailyPnL = -100;
       (riskEngine as any).checkKillSwitches();
