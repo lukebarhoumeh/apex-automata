@@ -74,11 +74,11 @@ async function main() {
 
   const logger = createLogger(path.join(process.cwd(), '../../var/logs/backtest.jsonl'));
 
-  // Load the same guardrails.yaml the live engine reads. Backtest-engine
-  // honours `disabled_strategies`, per-symbol overrides, and account sizing
-  // out of this single source of truth — no separate backtest config block
-  // means backtest behaviour can't drift from production silently.
-  const guardrails = loadGuardrails(path.resolve(process.cwd(), '../..'));
+  // NOTE (merge): `guardrails` is already loaded at the top of main()
+  // for the FeeModel default-commission lookup. Reusing that single
+  // instance — both backtest-engine (disabled_strategies, per-symbol
+  // overrides, account sizing) and FeeModel read from the same source
+  // of truth so backtest behaviour can't drift from paper/live.
 
   const SUPABASE_URL = process.env.SUPABASE_URL || '';
   const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
