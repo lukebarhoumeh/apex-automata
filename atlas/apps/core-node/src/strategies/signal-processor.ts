@@ -517,6 +517,24 @@ export class SignalProcessor extends EventEmitter {
     this.addCandleInternal(symbol, candle, false);
   }
 
+  /**
+   * Add a historical candle WITHOUT generating signals.
+   *
+   * The engine does not trade during warmup. This method is the canonical
+   * entry point for any historical replay / cross-symbol mirror path where
+   * we want to populate indicators + multi-timeframe buffers + mark warmup
+   * complete, but MUST NOT route the resulting signals to the order pipeline.
+   *
+   * Why this exists: callers like the spot→perps mirror loop at server-side
+   * startup were using addCandle() (which assumes live data), causing
+   * historical candles to drive checkSignals() once the warmup threshold was
+   * crossed. That fired phantom entry orders for perps symbols within ~0.5s
+   * of "warmup complete" — see fix/order-lifecycle-hygiene, Bug 1.
+   */
+  public addHistoricalCandle(symbol: string, candle: OHLCV): void {
+    this.addCandleInternal(symbol, candle, true);
+  }
+
   private updateIndicators(symbol: string): void {
     const candles = this.candles.get(symbol);
     if (!candles || candles.length < 50) {
