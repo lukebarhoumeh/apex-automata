@@ -5,7 +5,8 @@ import { WebSocketServer } from 'ws';
 import { createLogger } from '../core/logger';
 import { TradingEngine, TradingEngineConfig, EngineState } from '../trading/trading-engine';
 import { SignalProcessor } from '../strategies/signal-processor';
-import { SignalArbitrator } from '../strategies/signal-arbitrator';
+import { SignalArbitrator, extractBaseAsset } from '../strategies/signal-arbitrator';
+import { recordSignalFiltered } from '../strategies/signal-filter-telemetry';
 import { computeRawEntryFillPrice } from '../trading/position-entry-vwap';
 import { createClient } from '@supabase/supabase-js';
 import path from 'path';
@@ -1397,6 +1398,12 @@ app.post('/api/engine/start', async (req, res) => {
     // Initialize signal processor
     const strategyGuard = guardrails.strategy;
     const disabledStrategies = guardrails.disabled_strategies || [];
+    // Momentum runtime constants live in guardrails.yaml's `momentum:` block
+    // (or per-symbol overrides). Plugin configSchema in
+    // strategies/plugins/builtin/momentum-strategy.ts is the source of
+    // truth for any key the YAML omits — this server forwards an empty
+    // object when no overrides are set.
+    const momentumYaml = guardrails.momentum ?? {};
     const signalConfig = {
       supabaseUrl: env.SUPABASE_URL || '',
       supabaseKey: env.SUPABASE_SERVICE_KEY || '',
@@ -1417,12 +1424,7 @@ app.post('/api/engine/start', async (req, res) => {
         },
         momentum: {
           enabled: strategyGuard.mode.includes('momentum') && !disabledStrategies.includes('momentum'),
-          rsiPeriod: 14,
-          rsiOverbought: 70,
-          rsiOversold: 30,
-          macdFast: 12,
-          macdSlow: 26,
-          macdSignal: 9
+          ...momentumYaml,
         }
       },
       metaLabeling: {
@@ -1783,37 +1785,69 @@ app.post('/api/engine/start', async (req, res) => {
           return;
         }
 
+        // Reversal-intent decoration (audit fix #2). The cross-venue
+        // arbitrator blocks opposing-direction entries unless a signal
+        // declares an explicit reversal thesis via
+        // `metadata.reversalIntent === true`. Strategies don't have
+        // position visibility, so the router (this handler) does the
+        // detection: when momentum or trend_follow emits a signal whose
+        // direction opposes an existing same-base position, we mark it as
+        // a reversal. Both strategies trigger on regime-change-like
+        // indicators (RSI flips, EMA crossovers), so the flag is
+        // semantically honest. The arbitrator's strength threshold still
+        // gates weak reversals.
+        const openPositions = tradingEngine!.getOpenPositions();
+        const REVERSAL_INTENT_STRATEGIES = new Set(['momentum', 'trend_follow']);
+        if (REVERSAL_INTENT_STRATEGIES.has(signal.strategy)) {
+          const desiredSide = signal.direction === 'buy' ? 'long' : 'short';
+          const baseAsset = extractBaseAsset(signal.symbol);
+          const opposes = openPositions.some(
+            (p) =>
+              p.size > 0 &&
+              (p.side === 'long' || p.side === 'short') &&
+              p.side !== desiredSide &&
+              extractBaseAsset(p.symbol) === baseAsset,
+          );
+          if (opposes) {
+            signal.metadata = {
+              ...signal.metadata,
+              reversalIntent: true,
+              reversalIntentSource: 'router_position_opposition',
+            };
+          }
+        }
+
         // Coherence layer (P0): per-symbol direction lock + cross-venue netting
         // (ETH-USD ↔ ETH-PERP-INTX as one bucket) + intra-window dedup. Runs
         // AFTER the exit-signal short-circuit so that closing-trade routing is
         // never blocked. Rejected signals were already written to Supabase via
         // syncSignalToSupabase above, so the audit trail still captures them.
-        const arbiterDecision = signalArbitrator.arbitrate(
-          signal,
-          tradingEngine!.getOpenPositions(),
-        );
+        const arbiterDecision = signalArbitrator.arbitrate(signal, openPositions);
         if (!arbiterDecision.allow) {
-          // Rejection already logged inside the arbitrator with full context
+          // Rejection already logged + counted inside the arbitrator
           return;
         }
 
-        // Time filter guardrail
+        // Time filter guardrail (audit fix #6). `allowed_hours_utc` is a
+        // LIST of allowed UTC hours, not a [start, end] range. The previous
+        // range semantics turned the default `[0, 23]` into a 24h no-op.
+        // List semantics: `[13, 14, 15, 16, 17]` => only allow signals
+        // during those five hours. Empty/unspecified = filter is a no-op
+        // (the schema enforces non-empty when configured).
         if (guardrails.filters.time_filter_enabled) {
           const hour = signalTime.getUTCHours();
           const hours = guardrails.filters.allowed_hours_utc;
-          let withinWindow = true;
-          if (hours.length === 2) {
-            const [start, end] = hours;
-            if (start <= end) {
-              withinWindow = hour >= start && hour <= end;
-            } else {
-              withinWindow = hour >= start || hour <= end;
-            }
-          } else {
-            withinWindow = hours.includes(hour);
-          }
-          if (!withinWindow) {
-            logger.info('Signal filtered by trading hours guardrail', { hour, allowed: hours });
+          if (!hours.includes(hour)) {
+            recordSignalFiltered(logger, {
+              stage: 'time',
+              reason: 'hour_not_allowed',
+              symbol: signal.symbol,
+              strategy: signal.strategy,
+              signalId: signal.id,
+              direction: signal.direction,
+              strength: signal.strength,
+              context: { hour, allowedHours: hours },
+            });
             return;
           }
         }
@@ -1825,7 +1859,17 @@ app.post('/api/engine/start', async (req, res) => {
         if (typeof atrValue === 'number' && atrValue > 0) {
           const atrPct = atrValue / entryPrice;
           if (atrPct < atrMin || atrPct > atrMax) {
-            logger.info('Signal filtered by ATR guardrail', { atrPct, atrMin, atrMax, symbol: signal.symbol });
+            const reason = atrPct < atrMin ? 'atr_below_min' : 'atr_above_max';
+            recordSignalFiltered(logger, {
+              stage: 'atr_vol',
+              reason,
+              symbol: signal.symbol,
+              strategy: signal.strategy,
+              signalId: signal.id,
+              direction: signal.direction,
+              strength: signal.strength,
+              context: { atrPct, atrMin, atrMax },
+            });
             return;
           }
         }

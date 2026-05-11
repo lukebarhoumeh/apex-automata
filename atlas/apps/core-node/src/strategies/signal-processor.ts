@@ -67,12 +67,20 @@ export interface VWAPConfig {
 
 export interface MomentumConfig {
   enabled: boolean;
-  rsiPeriod: number;
-  rsiOverbought: number;
-  rsiOversold: number;
-  macdFast: number;
-  macdSlow: number;
-  macdSignal: number;
+  // Plugin parameters are optional here — the plugin file
+  // (strategies/plugins/builtin/momentum-strategy.ts) is the source of
+  // truth for defaults via configSchema. The legacy non-plugin path uses
+  // the fallbacks below if a value isn't supplied.
+  rsiPeriod?: number;
+  rsiOverbought?: number;
+  rsiOversold?: number;
+  macdFast?: number;
+  macdSlow?: number;
+  macdSignal?: number;
+  requireMacdConfirm?: boolean;
+  requireMacdCrossover?: boolean;
+  stopAtr?: number;
+  takeProfitAtr?: number;
 }
 
 export interface Signal {
@@ -203,9 +211,19 @@ export class SignalProcessor extends EventEmitter {
       this.emit('signal:meta_filtered', signal, { qualityScore: score, rulesEvaluated: rules } as MetaFilterResult, 'Meta filter blocked');
     });
 
-    // Initialize strategy registry
+    // Initialize strategy registry.
+    // Forward `disabledStrategies` from the top-level signal-processor config
+    // into the registry config so the registry skips registration entirely
+    // for killed plugins (saves CPU on every bar, avoids signal-table noise).
+    // An explicit `strategyRegistry.disabledStrategies` still wins if set.
     this.usePluginStrategies = config.usePluginStrategies ?? true;
-    this.strategyRegistry = new StrategyRegistry(config.strategyRegistry || {}, logger);
+    const registryConfig: Partial<StrategyRegistryConfig> = {
+      ...(config.strategyRegistry || {}),
+    };
+    if (registryConfig.disabledStrategies === undefined && config.disabledStrategies?.length) {
+      registryConfig.disabledStrategies = [...config.disabledStrategies];
+    }
+    this.strategyRegistry = new StrategyRegistry(registryConfig, logger);
 
     // Register built-in strategies
     this.initializeBuiltinStrategies();
@@ -256,24 +274,45 @@ export class SignalProcessor extends EventEmitter {
     }
     
     if (this.config.strategies.momentum) {
-      configs.momentum = {
-        enabled: this.config.strategies.momentum.enabled,
-        rsiPeriod: this.config.strategies.momentum.rsiPeriod,
-        rsiOverbought: this.config.strategies.momentum.rsiOverbought,
-        rsiOversold: this.config.strategies.momentum.rsiOversold,
-        macdFast: this.config.strategies.momentum.macdFast,
-        macdSlow: this.config.strategies.momentum.macdSlow,
-        macdSignal: this.config.strategies.momentum.macdSignal,
-      };
+      // Forward only defined fields — undefined values would shadow the
+      // plugin's configSchema defaults (the source of truth, per
+      // momentum-strategy.ts). Server passes `enabled` and any explicit
+      // overrides loaded from guardrails.yaml's `momentum:` block.
+      const m = this.config.strategies.momentum;
+      const momentumCfg: Record<string, unknown> = { enabled: m.enabled };
+      const passthrough: (keyof MomentumConfig)[] = [
+        'rsiPeriod', 'rsiOverbought', 'rsiOversold',
+        'macdFast', 'macdSlow', 'macdSignal',
+        'requireMacdConfirm', 'requireMacdCrossover',
+        'stopAtr', 'takeProfitAtr',
+      ];
+      for (const key of passthrough) {
+        if (m[key] !== undefined) momentumCfg[key] = m[key];
+      }
+      configs.momentum = momentumCfg;
     }
 
-    // Create and register built-in strategies
+    // Create and register built-in strategies. Plugins listed in
+    // `disabledStrategies` are refused at the registry level (logged once),
+    // so they never run on bar updates and never emit signals.
     const builtinStrategies = createBuiltinStrategies(configs);
+    const disabled = this.config.disabledStrategies || [];
+    let registered = 0;
+    const skipped: string[] = [];
     for (const strategy of builtinStrategies) {
-      this.strategyRegistry.register(strategy);
+      if (disabled.includes(strategy.id)) {
+        skipped.push(strategy.id);
+        continue;
+      }
+      if (this.strategyRegistry.register(strategy)) {
+        registered++;
+      }
     }
 
-    this.logger.info(`Initialized ${builtinStrategies.length} built-in strategies`);
+    this.logger.info(
+      `Initialized ${registered} built-in strategies` +
+      (skipped.length ? ` (skipped disabled: ${skipped.join(', ')})` : '')
+    );
   }
   
   /**
@@ -848,6 +887,10 @@ export class SignalProcessor extends EventEmitter {
     latestCandle: OHLCV
   ): void {
     const config = this.config.strategies.momentum;
+    // Plugin defaults — keep in sync with momentum-strategy.ts configSchema.
+    // This legacy code path only runs when usePluginStrategies === false.
+    const rsiOversold = config.rsiOversold ?? 40;
+    const rsiOverbought = config.rsiOverbought ?? 60;
     const rsi = indicators.rsi;
     const macdHistogram = indicators.macdHistogram;
     const ema12 = indicators.ema12;
@@ -865,8 +908,8 @@ export class SignalProcessor extends EventEmitter {
     let signal: Signal | null = null;
 
     // Bullish momentum
-    if (currentRSI > config.rsiOversold && 
-        previousRSI <= config.rsiOversold &&
+    if (currentRSI > rsiOversold &&
+        previousRSI <= rsiOversold &&
         currentMACD > previousMACD &&
         ema12[ema12.length - 1] > ema26[ema26.length - 1]) {
       
@@ -876,7 +919,7 @@ export class SignalProcessor extends EventEmitter {
         symbol,
         strategy: 'momentum',
         direction: 'buy',
-        strength: (currentRSI - config.rsiOversold) / (50 - config.rsiOversold),
+        strength: (currentRSI - rsiOversold) / (50 - rsiOversold),
         price: latestCandle.close,
         stopLoss: latestCandle.close * 0.98, // 2% stop
         takeProfit: latestCandle.close * 1.03, // 3% target
@@ -890,8 +933,8 @@ export class SignalProcessor extends EventEmitter {
       };
     }
     // Bearish momentum
-    else if (currentRSI < config.rsiOverbought && 
-             previousRSI >= config.rsiOverbought &&
+    else if (currentRSI < rsiOverbought &&
+             previousRSI >= rsiOverbought &&
              currentMACD < previousMACD &&
              ema12[ema12.length - 1] < ema26[ema26.length - 1]) {
       
@@ -901,7 +944,7 @@ export class SignalProcessor extends EventEmitter {
         symbol,
         strategy: 'momentum',
         direction: 'sell',
-        strength: (config.rsiOverbought - currentRSI) / (config.rsiOverbought - 50),
+        strength: (rsiOverbought - currentRSI) / (rsiOverbought - 50),
         price: latestCandle.close,
         stopLoss: latestCandle.close * 1.02, // 2% stop
         takeProfit: latestCandle.close * 0.97, // 3% target

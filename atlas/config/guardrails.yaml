@@ -104,6 +104,24 @@ strategy:
   allow_short: true
   trade_cooldown_min: 15
 
+# Momentum strategy (RSI/MACD) — single source of truth for the
+# plugin's runtime parameters. The plugin file
+# (atlas/apps/core-node/src/strategies/plugins/builtin/momentum-strategy.ts)
+# defines the canonical defaults via configSchema; this block lets ops
+# override them without redeploying. Per-symbol overrides under
+# `per_symbol.<symbol>.strategy_overrides.momentum` still take precedence.
+momentum:
+  rsiPeriod: 14
+  rsiOversold: 40         # plugin default (was 30 hard-coded in api/server.ts)
+  rsiOverbought: 60       # plugin default (was 70 hard-coded in api/server.ts)
+  macdFast: 12
+  macdSlow: 26
+  macdSignal: 9
+  requireMacdConfirm: false
+  requireMacdCrossover: false
+  stopAtr: 2.0
+  takeProfitAtr: 4.0
+
 # Perpetual Futures Configuration
 # Applies only when trading via 'coinbase-perps' adapter
 perps:
@@ -188,10 +206,16 @@ filters:
   atr_volatility_min: 0.0005
   atr_volatility_max: 0.05
   funding_bias_enabled: true
-  time_filter_enabled: true
+  # Time-of-day filter is OFF by default. The previous default
+  # (time_filter_enabled: true with allowed_hours_utc: [0, 23]) was a no-op
+  # because the gate interpreted [start, end] as a 24h range. The gate has
+  # been rewritten to treat allowed_hours_utc as a literal list of allowed
+  # UTC hours (so [13, 14, 15, 16, 17] would only allow signals during
+  # those five hours). Set time_filter_enabled to true and provide a
+  # specific list to restrict trading to chosen hours.
+  time_filter_enabled: false
   allowed_hours_utc:
     - 0
-    - 23
 
 compliance:
   tax_method: FIFO

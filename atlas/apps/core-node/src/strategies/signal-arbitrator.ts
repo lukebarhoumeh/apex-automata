@@ -1,6 +1,7 @@
 import type { Logger } from '../core/logger';
 import type { Position } from '../trading/position-tracker';
 import type { Signal } from './signal-processor';
+import { recordSignalFiltered, type SignalFilterStage } from './signal-filter-telemetry';
 
 export type ArbitratorRejectionReason =
   | 'intra_window_dedup'
@@ -168,6 +169,22 @@ export class SignalArbitrator {
       direction: signal.direction,
       strength: signal.strength,
       ...decision.context,
+    });
+
+    // Per-stage telemetry. The arbitrator owns the cross-venue netting
+    // and the intra-window dedup checks; both bucket under the
+    // `cross_venue` stage label so a single PromQL query can answer
+    // "how many signals did the arbitrator drop in the last hour?".
+    const stage: SignalFilterStage = 'cross_venue';
+    recordSignalFiltered(this.logger, {
+      stage,
+      reason: decision.reason ?? 'unknown',
+      symbol: signal.symbol,
+      strategy: signal.strategy,
+      signalId: signal.id,
+      direction: signal.direction,
+      strength: signal.strength,
+      context: decision.context,
     });
   }
 }
