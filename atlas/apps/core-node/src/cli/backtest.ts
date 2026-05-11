@@ -7,8 +7,17 @@ import { hideBin } from 'yargs/helpers';
 import { createLogger } from '../core/logger';
 import { BacktestRunner, BacktestRunnerConfig } from '../backtesting/backtest-runner';
 import { BacktestConfig } from '../backtesting/backtest-engine';
+import { loadGuardrails } from '../config/loadGuardrails';
+import { FeeModel } from '../core/fee-model';
 
 async function main() {
+  // Single source of truth for fees — backtest must match paper/live or
+  // comparisons are meaningless. CLI flag overrides only when explicitly set.
+  const atlasRoot = path.resolve(process.cwd(), '../..');
+  const guardrails = loadGuardrails(atlasRoot);
+  const feeModel = FeeModel.fromGuardrails(guardrails);
+  const defaultCommission = feeModel.getFeeRate('coinbase', 'spot', 'taker');
+
   const argv = await yargs(hideBin(process.argv))
     .scriptName('atlas-backtest')
     .usage('$0 [options]')
@@ -44,8 +53,11 @@ async function main() {
     })
     .option('commission', {
       type: 'number',
-      describe: 'Commission rate (e.g., 0.006 for 0.60% Coinbase Advanced Trade taker, 0.0005 for Hyperliquid)',
-      default: 0.006,
+      describe:
+        'Commission rate override (decimal, e.g. 0.004 = 40 bps). ' +
+        'Default comes from guardrails.yaml -> fees.coinbase.spot.taker_bps so ' +
+        'backtest matches paper/live; only override for sensitivity analysis.',
+      default: defaultCommission,
     })
     .option('slippage', {
       type: 'number',

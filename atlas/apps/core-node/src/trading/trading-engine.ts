@@ -10,6 +10,7 @@ import { PaperTradingSimulator, PaperTradingConfig } from './paper-trading-simul
 import { PositionMonitor, PositionMonitorConfig } from './position-monitor';
 import { TradeAnalytics, TradeAnalyticsConfig, SessionStats, TradeRecord } from './trade-analytics';
 import { GuardrailConfig } from '../config/loadGuardrails';
+import { FeeModel } from '../core/fee-model';
 import { reanchorStopAndTakeProfit } from './reanchor-stop-tp';
 import { v4 as uuidv4 } from 'uuid';
 import { 
@@ -151,6 +152,9 @@ export class TradingEngine extends EventEmitter {
       marketDataEnv: config.runtime?.marketDataEnv || 'production',
       executionEnv: config.runtime?.executionEnv || config.exchange.environment,
       paperInitialEquityUsd: config.runtime?.paperInitialEquityUsd || config.guardrails.account.equity_usd,
+      // FeeModel is the single source of truth — wired here so paper/live
+      // adapters build their default product specs from guardrails.yaml.
+      feeModel: FeeModel.fromGuardrails(config.guardrails),
     });
 
     this.logger.info('Runtime config initialized', {
@@ -934,14 +938,17 @@ export class TradingEngine extends EventEmitter {
   }
 
   private initializePaperSimulator(): void {
+    // Fees come from guardrails.yaml -> fees.coinbase.spot via FeeModel so
+    // paper, live, and backtest stay directly comparable. Do NOT hardcode here.
+    const feeModel = FeeModel.fromGuardrails(this.guardrails);
     const config: PaperTradingConfig = {
       initialBalances: new Map([
         ['USD', this.guardrails.account.equity_usd],
         ['BTC', 0],
         ['ETH', 0]
       ]),
-      makerFee: 0.0025, // 0.25% — Coinbase Advanced $10k-$50k tier
-      takerFee: 0.004,  // 0.40% — Coinbase Advanced $10k-$50k tier
+      makerFee: feeModel.getFeeRate('coinbase', 'spot', 'maker'),
+      takerFee: feeModel.getFeeRate('coinbase', 'spot', 'taker'),
       slippage: 0.001,  // 0.1%
       latencyMs: 100    // 100ms simulated latency
     };

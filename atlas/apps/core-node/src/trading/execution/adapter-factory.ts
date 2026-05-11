@@ -6,6 +6,7 @@
  */
 
 import { Logger } from '../../core/logger';
+import { FeeModel } from '../../core/fee-model';
 import { CoinbaseExchange } from '../../exchanges/coinbase';
 import {
   IExecutionAdapter,
@@ -15,7 +16,7 @@ import {
   EnvironmentConfig,
   DEFAULT_ENV_CONFIG,
   ProductSpec,
-  DEFAULT_PRODUCT_SPECS,
+  buildDefaultProductSpecs,
 } from './execution-adapter';
 import { CoinbaseLiveExecutionAdapter, CoinbaseLiveAdapterConfig } from './coinbase-live-adapter';
 import { PaperExecutionAdapter, PaperAdapterConfig } from './paper-adapter';
@@ -41,6 +42,12 @@ export interface RuntimeConfig {
   paperInitialEquityUsd: number;
   /** Product specifications */
   productSpecs?: Record<string, ProductSpec>;
+  /**
+   * Fee model — single source of truth for maker/taker fees. Required when
+   * productSpecs is not supplied, since the default specs no longer carry
+   * hardcoded fee values (see execution-adapter.ts -> buildDefaultProductSpecs).
+   */
+  feeModel?: FeeModel;
   /** Paper adapter config overrides */
   paperConfig?: Partial<PaperAdapterConfig>;
 }
@@ -71,12 +78,22 @@ export function createAdapters(
   exchange: CoinbaseExchange,
   logger: Logger
 ): AdapterSet {
-  const productSpecs = config.productSpecs || DEFAULT_PRODUCT_SPECS;
+  // Resolve product specs once. Fees come from FeeModel (guardrails.yaml);
+  // there is intentionally no static fallback for fee values.
+  let productSpecs = config.productSpecs;
+  if (!productSpecs) {
+    if (!config.feeModel) {
+      throw new Error(
+        'createAdapters: RuntimeConfig.feeModel is required when productSpecs is not supplied. ' +
+          'Pass FeeModel.fromGuardrails(guardrails) so fees come from guardrails.yaml.',
+      );
+    }
+    productSpecs = buildDefaultProductSpecs(config.feeModel);
+  }
 
   if (config.executionMode === 'live') {
-    // Live mode
     logger.info('Creating live execution adapter and account provider');
-    
+
     const executionAdapter = new CoinbaseLiveExecutionAdapter({
       logger,
       exchange,
@@ -90,7 +107,6 @@ export function createAdapters(
 
     return { executionAdapter, accountProvider };
   } else {
-    // Paper mode
     logger.info('Creating paper execution adapter and account provider', {
       initialEquityUsd: config.paperInitialEquityUsd,
       marketDataEnv: config.marketDataEnv,
