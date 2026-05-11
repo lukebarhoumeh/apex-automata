@@ -305,10 +305,12 @@ describe('CoinbaseWebSocket - Unified Implementation', () => {
       // Initially not stalled
       let health = wsClient.getHealth();
       expect(health.isStalled).toBe(false);
-      
-      // Advance time past stall threshold
-      vi.advanceTimersByTime(60000);
-      
+
+      // Advance just past the 45s stall threshold but before the next 5s
+      // heartbeat-timeout tick at 50s — that tick would call forceReconnect
+      // (cleanupConnection sets isConnected=false, masking isStalled).
+      vi.advanceTimersByTime(46000);
+
       health = wsClient.getHealth();
       expect(health.isStalled).toBe(true);
     });

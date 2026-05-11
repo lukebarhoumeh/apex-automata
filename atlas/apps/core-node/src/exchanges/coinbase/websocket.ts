@@ -395,11 +395,18 @@ export class CoinbaseWebSocket extends EventEmitter implements ICoinbaseWsClient
 
     // Log with different levels based on attempt count
     if (this.reconnectAttempts <= 3) {
-      this.logger.info(`Scheduling reconnect in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts})`);
+      this.logger.info(
+        `Scheduling reconnect in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts})`,
+        { attempt: this.reconnectAttempts, delayMs: Math.round(delay) }
+      );
     } else if (this.reconnectAttempts <= 10) {
       this.logger.warn(`Reconnect attempt ${this.reconnectAttempts} in ${Math.round(delay)}ms`, {
         subscriptions: this.subscriptionManager.getDesired(),
       });
+      // Notify supervisor at the 10-attempt mark; subsequent emits handled below at every 10th.
+      if (this.reconnectAttempts === 10) {
+        this.emit('reconnect_failed', this.reconnectAttempts);
+      }
     } else {
       // Log every 10th attempt at error level after 10 failures
       if (this.reconnectAttempts % 10 === 0) {
