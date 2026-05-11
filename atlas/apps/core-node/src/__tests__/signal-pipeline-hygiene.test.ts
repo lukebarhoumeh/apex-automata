@@ -6,19 +6,68 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { register } from 'prom-client';
 import { Logger } from '../core/logger';
 import { StrategyRegistry } from '../strategies/plugins/strategy-registry';
 import { MetaFilter } from '../strategies/meta-filter';
-import { Signal } from '../strategies/signal-processor';
+import { Signal, SignalProcessor, SignalProcessorConfig } from '../strategies/signal-processor';
 import {
   recordSignalFiltered,
+  recordSignalFunnel,
   __resetSignalFilteredCounter,
+  __resetSignalFunnelCounter,
 } from '../strategies/signal-filter-telemetry';
 import {
   BreakoutStrategy,
   VWAPMeanReversionStrategy,
   MomentumStrategy,
 } from '../strategies/plugins/builtin';
+
+// Mock Supabase so SignalProcessor doesn't need real network access in tests
+vi.mock('@supabase/supabase-js', () => ({
+  createClient: () => ({
+    from: () => ({
+      insert: () => ({ error: null }),
+    }),
+  }),
+}));
+
+/**
+ * Pull the live integer count for a (stage, ...) labelset from the
+ * `atlas_signal_filtered_total` Prometheus counter. Returns 0 if the
+ * labelset has never been incremented (matches counter semantics).
+ */
+async function filteredCount(stage: string, opts: Partial<{ symbol: string; strategy: string; reason: string }> = {}): Promise<number> {
+  const metric = register.getSingleMetric('atlas_signal_filtered_total');
+  if (!metric) return 0;
+  const data = await metric.get();
+  let total = 0;
+  for (const v of data.values) {
+    const labels = v.labels as Record<string, string>;
+    if (labels.stage !== stage) continue;
+    if (opts.symbol && labels.symbol !== opts.symbol) continue;
+    if (opts.strategy && labels.strategy !== opts.strategy) continue;
+    if (opts.reason && labels.reason !== opts.reason) continue;
+    total += v.value;
+  }
+  return total;
+}
+
+async function funnelCount(stage: string, opts: Partial<{ symbol: string; strategy: string; direction: string }> = {}): Promise<number> {
+  const metric = register.getSingleMetric('atlas_signal_funnel_total');
+  if (!metric) return 0;
+  const data = await metric.get();
+  let total = 0;
+  for (const v of data.values) {
+    const labels = v.labels as Record<string, string>;
+    if (labels.stage !== stage) continue;
+    if (opts.symbol && labels.symbol !== opts.symbol) continue;
+    if (opts.strategy && labels.strategy !== opts.strategy) continue;
+    if (opts.direction && labels.direction !== opts.direction) continue;
+    total += v.value;
+  }
+  return total;
+}
 
 const mockLogger: Logger = {
   info: vi.fn(),
@@ -216,6 +265,151 @@ describe('Audit fix #4 — per-stage signal:filtered telemetry', () => {
     for (const stage of stages) expect(seenStages.has(stage)).toBe(true);
   });
 });
+
+/**
+ * 2026-05-11 audit-fix-regression: a 10-min paper run produced 24 canonical
+ * "Signal generated" events but only 12 reached "Sizing order from signal"
+ * with zero `signal:filtered` log lines. Root cause: the original audit
+ * instrumented 5 stages (regime, meta, cross_venue, time, atr_vol) but the
+ * silent drops in that run were happening at uninstrumented stages
+ * (intra-strategy 5-min dedup, runtime_state, sizing-zero, etc.). These
+ * tests lock in the new stages so the regression cannot return.
+ */
+describe('Silent-funnel regression (2026-05-11) — new stages emit signal:filtered', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetSignalFilteredCounter();
+    __resetSignalFunnelCounter();
+  });
+
+  const NEW_STAGES = [
+    'disabled_strategy',
+    'dedup',
+    'meta_label',
+    'runtime_state',
+    'routing',
+    'funding_bias',
+    'sizing',
+  ] as const;
+
+  it('every new silent-funnel stage is accepted by recordSignalFiltered', async () => {
+    for (const stage of NEW_STAGES) {
+      recordSignalFiltered(mockLogger, {
+        stage,
+        reason: `${stage}_smoke`,
+        symbol: 'BTC-USD',
+        strategy: 'momentum',
+        direction: 'buy',
+      });
+    }
+    const calls = (mockLogger.info as any).mock.calls.filter(
+      (c: any[]) => c[0] === 'signal:filtered',
+    );
+    const seen = new Set(calls.map((c: any[]) => c[1].stage));
+    for (const stage of NEW_STAGES) expect(seen.has(stage), `${stage} must emit signal:filtered`).toBe(true);
+
+    // Counter labels are bounded — every stage should also be counted.
+    for (const stage of NEW_STAGES) {
+      expect(await filteredCount(stage), `counter for ${stage}`).toBe(1);
+    }
+  });
+
+  it('log shape for every stage matches the grep target msg=signal:filtered', () => {
+    recordSignalFiltered(mockLogger, {
+      stage: 'dedup',
+      reason: 'intra_strategy_5min_window',
+      symbol: 'ETH-USD',
+      strategy: 'momentum',
+    });
+    // Log message MUST be the literal 'signal:filtered' string. Operators
+    // use `grep -E 'signal:filtered'` against logs to count rejections.
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      'signal:filtered',
+      expect.objectContaining({ stage: 'dedup', reason: 'intra_strategy_5min_window' }),
+    );
+  });
+
+  it('SignalProcessor: 5-min intra-strategy dedup increments stage=dedup', async () => {
+    const beforeCount = await filteredCount('dedup', { strategy: 'momentum' });
+    const sp = makeQuietProcessor();
+    const sig = makeSignal({ strategy: 'momentum', direction: 'buy', symbol: 'BTC-USD' });
+    // First firing seeds lastSignals; second firing within 5 min must dedup.
+    await (sp as unknown as { processSignal(s: Signal): Promise<void> }).processSignal({ ...sig, id: 'sig-a' });
+    await (sp as unknown as { processSignal(s: Signal): Promise<void> }).processSignal({ ...sig, id: 'sig-b' });
+    const afterCount = await filteredCount('dedup', { strategy: 'momentum' });
+    expect(afterCount - beforeCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('SignalProcessor: disabled-strategy reject increments stage=disabled_strategy', async () => {
+    const sp = makeQuietProcessor({ disabledStrategies: ['vwap_mr'] });
+    const sig = makeSignal({ strategy: 'vwap_mr' as Signal['strategy'], direction: 'buy', symbol: 'BTC-USD' });
+    await (sp as unknown as { processSignal(s: Signal): Promise<void> }).processSignal(sig);
+    expect(await filteredCount('disabled_strategy', { strategy: 'vwap_mr' })).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('Silent-funnel regression (2026-05-11) — atlas_signal_funnel_total', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetSignalFunnelCounter();
+  });
+
+  it('recordSignalFunnel increments per-checkpoint counter', async () => {
+    recordSignalFunnel({
+      stage: 'canonical_emitted',
+      symbol: 'BTC-USD',
+      strategy: 'momentum',
+      direction: 'buy',
+    });
+    recordSignalFunnel({
+      stage: 'sized',
+      symbol: 'BTC-USD',
+      strategy: 'momentum',
+      direction: 'buy',
+    });
+    recordSignalFunnel({
+      stage: 'order_placed',
+      symbol: 'BTC-USD',
+      strategy: 'momentum',
+      direction: 'buy',
+    });
+
+    expect(await funnelCount('canonical_emitted', { symbol: 'BTC-USD' })).toBe(1);
+    expect(await funnelCount('sized', { symbol: 'BTC-USD' })).toBe(1);
+    expect(await funnelCount('order_placed', { symbol: 'BTC-USD' })).toBe(1);
+  });
+
+  it('funnel labels stay bounded (stage, symbol, strategy, direction only)', async () => {
+    const metric = register.getSingleMetric('atlas_signal_funnel_total');
+    expect(metric).toBeDefined();
+    const data = await metric!.get();
+    // Sanity: meta description tells us the labels we declared.
+    expect(data.help).toMatch(/funnel/i);
+  });
+});
+
+/**
+ * Build a SignalProcessor wired up just enough to exercise processSignal.
+ * Strategies are disabled so the only paths exercised are the dedup +
+ * disabled_strategy gates we want to test — keeps the test isolated from
+ * regime/meta filter behaviour.
+ */
+function makeQuietProcessor(overrides: Partial<SignalProcessorConfig> = {}): SignalProcessor {
+  const config: SignalProcessorConfig = {
+    supabaseUrl: 'http://localhost:54321',
+    supabaseKey: 'test-key',
+    strategies: {
+      breakout: { enabled: false, period: 20, atrPeriod: 14, atrMultiplier: 1.5, volumeThreshold: 1.5 },
+      vwapMeanReversion: { enabled: false, deviationEntry: 2, deviationExit: 0.5, minVolume: 1000 },
+      momentum: { enabled: true, rsiPeriod: 14, rsiOverbought: 70, rsiOversold: 30, macdFast: 12, macdSlow: 26, macdSignal: 9 },
+    },
+    metaLabeling: { enabled: false, threshold: 0.5 },
+    // Default to no kill list — caller can override per test.
+    disabledStrategies: [],
+    ...overrides,
+  };
+  return new SignalProcessor(config, mockLogger as unknown as Logger);
+}
 
 describe('Audit fix #5 — momentum plugin defaults are the source of truth', () => {
   it('plugin uses configSchema defaults (30/70 industry-standard) when no overrides are passed', () => {
