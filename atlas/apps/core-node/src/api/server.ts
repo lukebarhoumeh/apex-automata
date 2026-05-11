@@ -3538,7 +3538,7 @@ app.post('/api/backtest/run', async (req, res) => {
     const normalizedSymbols: string[] = Array.isArray(symbols) ? symbols : [symbols];
     const strategyConfig = {
       breakout: {
-        enabled: strategies?.breakout?.enabled ?? true,
+        enabled: strategies?.breakout?.enabled ?? false,
         parameters: strategies?.breakout?.parameters ?? {}
       },
       vwapMeanReversion: {
@@ -3546,12 +3546,54 @@ app.post('/api/backtest/run', async (req, res) => {
         parameters: strategies?.vwapMeanReversion?.parameters ?? {}
       },
       momentum: {
-        enabled: strategies?.momentum?.enabled ?? false,
+        enabled: strategies?.momentum?.enabled ?? true,
         parameters: strategies?.momentum?.parameters ?? {}
+      },
+      // Defect #1: trend_follow now propagates from API into the backtest.
+      // Default ON because guardrails marks momentum + trend_follow as the
+      // surviving strategies post Phase-3 verdict.
+      trendFollow: {
+        enabled: strategies?.trendFollow?.enabled ?? strategies?.trend_follow?.enabled ?? true,
+        parameters: strategies?.trendFollow?.parameters ?? strategies?.trend_follow?.parameters ?? {}
       }
     };
 
-    const riskConfigBacktest = {
+    const initialCapitalNum = Number(initialCapital);
+
+    // Per-symbol overrides + disabled list pulled from guardrails so the API
+    // route honours the same kill list as the live engine. If guardrails
+    // can't load (test envs), fall back to defaults baked into the engine.
+    let perSymbolOverrides: Record<string, Record<string, Record<string, unknown>>> | undefined;
+    let disabledStrategies: string[] | undefined;
+    let accountConfig: { equityUsd: number; riskPerTrade: number; maxPositionExposurePct: number; minNotionalBuffer: number } | undefined;
+    let dynamicRisk: { maxPositionSize: number; maxTotalExposure: number; stopLossPercent: number; takeProfitPercent: number } | undefined;
+    try {
+      const { loadGuardrails } = await import('../config/loadGuardrails');
+      const guardrails = loadGuardrails(path.resolve(process.cwd(), '../..'));
+      perSymbolOverrides = {};
+      for (const [symbol, cfg] of Object.entries(guardrails.per_symbol ?? {})) {
+        if (cfg.strategy_overrides) {
+          perSymbolOverrides[symbol] = cfg.strategy_overrides as Record<string, Record<string, unknown>>;
+        }
+      }
+      disabledStrategies = guardrails.disabled_strategies;
+      accountConfig = {
+        equityUsd: initialCapitalNum,
+        riskPerTrade: guardrails.account.risk_per_trade,
+        maxPositionExposurePct: guardrails.risk.max_position_exposure_pct,
+        minNotionalBuffer: guardrails.account.min_notional_buffer,
+      };
+      dynamicRisk = {
+        maxPositionSize: risk.maxPositionSize ?? initialCapitalNum * guardrails.risk.max_position_exposure_pct,
+        maxTotalExposure: risk.maxTotalExposure ?? initialCapitalNum * guardrails.account.max_account_leverage,
+        stopLossPercent: risk.stopLossPercent ?? 0.02,
+        takeProfitPercent: risk.takeProfitPercent ?? 0.04,
+      };
+    } catch (err) {
+      logger.warn('Could not load guardrails for backtest — using defaults', { error: String(err) });
+    }
+
+    const riskConfigBacktest = dynamicRisk ?? {
       maxPositionSize: risk.maxPositionSize ?? 10000,
       maxTotalExposure: risk.maxTotalExposure ?? 50000,
       stopLossPercent: risk.stopLossPercent ?? 0.02,
@@ -3561,14 +3603,17 @@ app.post('/api/backtest/run', async (req, res) => {
     const backtestConfig = {
       startDate: new Date(startDate),
       endDate: new Date(endDate),
-      initialCapital: Number(initialCapital),
+      initialCapital: initialCapitalNum,
       // Backtest fee MUST match paper/live or the comparison is meaningless.
       // Pull Coinbase spot taker from the single FeeModel source of truth.
       commission: feeModel.getFeeRate('coinbase', 'spot', 'taker'),
-      slippage: 0.0005, // 0.05% slippage
+      slippage: 0.0005, // legacy field — engine uses realism.entrySlippageBps
       products: normalizedSymbols,
       signals: strategyConfig,
-      risk: riskConfigBacktest
+      risk: riskConfigBacktest,
+      account: accountConfig,
+      disabledStrategies,
+      perSymbolOverrides,
     };
 
     // Create backtest engine

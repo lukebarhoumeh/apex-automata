@@ -38,6 +38,21 @@ disabled_strategies:
   - vwap_mr
   - breakout
 
+# Backtest realism model. Read by atlas/apps/core-node/src/backtesting/backtest-engine.ts
+# to make backtest P&L comparable to paper/live behaviour. These knobs are
+# documented in BacktestRealismConfig in the engine itself.
+#
+# - next_bar_fill: signals from candle[t] fill at candle[t+1].open (no look-ahead)
+# - entry_slippage_bps: per-side slippage applied to entry fills
+# - stop_overshoot_bar_range_pct: stop fills move (this fraction × bar range)
+#   beyond the trigger to model gap/wick-through. 0.20 = 20% of bar range.
+# - stop_overshoot_min_bps: floor on overshoot for low-volatility bars
+backtest:
+  next_bar_fill: true
+  entry_slippage_bps: 5
+  stop_overshoot_bar_range_pct: 0.20
+  stop_overshoot_min_bps: 5
+
 risk:
   daily_loss_limit: -0.02
   weekly_loss_limit: -0.05

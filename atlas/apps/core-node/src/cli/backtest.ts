@@ -6,7 +6,7 @@ import yargs from 'yargs/yargs';
 import { hideBin } from 'yargs/helpers';
 import { createLogger } from '../core/logger';
 import { BacktestRunner, BacktestRunnerConfig } from '../backtesting/backtest-runner';
-import { BacktestConfig } from '../backtesting/backtest-engine';
+import { BacktestConfig, PerSymbolStrategyOverrides } from '../backtesting/backtest-engine';
 import { loadGuardrails } from '../config/loadGuardrails';
 import { FeeModel } from '../core/fee-model';
 
@@ -48,7 +48,7 @@ async function main() {
     })
     .option('strategy', {
       type: 'string',
-      describe: 'Strategy to test (breakout, vwap, momentum, all)',
+      describe: 'Strategy to test (breakout, vwap, momentum, trend_follow, all). disabled_strategies in guardrails.yaml override this.',
       default: 'all',
     })
     .option('commission', {
@@ -74,6 +74,12 @@ async function main() {
 
   const logger = createLogger(path.join(process.cwd(), '../../var/logs/backtest.jsonl'));
 
+  // Load the same guardrails.yaml the live engine reads. Backtest-engine
+  // honours `disabled_strategies`, per-symbol overrides, and account sizing
+  // out of this single source of truth — no separate backtest config block
+  // means backtest behaviour can't drift from production silently.
+  const guardrails = loadGuardrails(path.resolve(process.cwd(), '../..'));
+
   const SUPABASE_URL = process.env.SUPABASE_URL || '';
   const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
@@ -96,16 +102,28 @@ async function main() {
 
   const runner = new BacktestRunner(runnerConfig, logger);
 
+  // Build per-symbol overrides snapshot the same way live trading does
+  // (signal-processor.loadPerSymbolOverridesFromGuardrails). Backtest then
+  // forwards this verbatim to the strategy registry.
+  const perSymbolOverrides: PerSymbolStrategyOverrides = {};
+  for (const [symbol, cfg] of Object.entries(guardrails.per_symbol ?? {})) {
+    if (cfg.strategy_overrides) {
+      perSymbolOverrides[symbol] = cfg.strategy_overrides as Record<string, Record<string, unknown>>;
+    }
+  }
+
+  const initialCapital = Number(argv.initialCapital);
+
   // Configure backtest
   const backtestConfig: BacktestConfig = {
     startDate: new Date(String(argv.startDate)),
     endDate: new Date(String(argv.endDate)),
-    initialCapital: Number(argv.initialCapital),
+    initialCapital,
     commission: Number(argv.commission),
     slippage: Number(argv.slippage),
     products: argv.products as string[],
-    // Strategy parameters mirror atlas/config/guardrails.yaml so backtest
-    // and live behaviour stay aligned. Update guardrails first, then sync here.
+    // Strategy parameters mirror atlas/config/guardrails.yaml. trend_follow
+    // is wired here too — defect #1: prior backtests silently dropped it.
     signals: {
       breakout: {
         enabled: argv.strategy === 'breakout' || argv.strategy === 'all',
@@ -135,13 +153,40 @@ async function main() {
           macdSignal: 5,
         },
       },
+      trendFollow: {
+        enabled: argv.strategy === 'trend_follow' || argv.strategy === 'all',
+        parameters: {},
+      },
     },
     risk: {
-      maxPositionSize: 5000, // $5k per position
-      maxTotalExposure: 8000, // $8k total (80% of capital)
-      stopLossPercent: 0.02, // 2%
-      takeProfitPercent: 0.04, // 4%
+      // Hard ceiling on per-position notional. Risk-based sizing is now
+      // primary; this is a guardrail, not the sizing function (defect #5).
+      maxPositionSize: initialCapital * guardrails.risk.max_position_exposure_pct,
+      // Total exposure = equity × max_account_leverage (matches live).
+      maxTotalExposure: initialCapital * guardrails.account.max_account_leverage,
+      stopLossPercent: 0.02, // fallback only; signals carry ATR-based stops
+      takeProfitPercent: 0.04, // fallback only; signals carry ATR-based TPs
     },
+    account: {
+      equityUsd: initialCapital,
+      riskPerTrade: guardrails.account.risk_per_trade,
+      maxPositionExposurePct: guardrails.risk.max_position_exposure_pct,
+      minNotionalBuffer: guardrails.account.min_notional_buffer,
+    },
+    // Defect #2: honour the same kill list live uses.
+    disabledStrategies: guardrails.disabled_strategies,
+    // Defect #1: forward per-symbol parameter overrides so trend_follow on
+    // ETH-USD uses emaFast=12 / emaSlow=15, momentum on ETH uses rsi 10/40/55, etc.
+    perSymbolOverrides,
+    realism: guardrails.backtest
+      ? {
+          nextBarFill: guardrails.backtest.next_bar_fill,
+          entrySlippageBps: guardrails.backtest.entry_slippage_bps,
+          stopOvershootBarRangePct: guardrails.backtest.stop_overshoot_bar_range_pct,
+          stopOvershootMinBps: guardrails.backtest.stop_overshoot_min_bps,
+          sizeDecimals: guardrails.backtest.size_decimals,
+        }
+      : undefined,
   };
 
   try {

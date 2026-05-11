@@ -9,3 +9,4 @@
 
 export * from './types';
 export * from './evaluate-risk';
+export * from './position-sizing';

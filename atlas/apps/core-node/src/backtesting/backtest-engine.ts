@@ -5,36 +5,121 @@ import type { OHLCV } from '../indicators/technical';
 // dead in this file. The signal pipeline owns indicator computation; this
 // engine just consumes signals. Removed to keep call-graph honest.
 import { SignalProcessor, Signal } from '../strategies/signal-processor';
+import { computeRiskBasedSize } from '../trading/risk/position-sizing';
 
 type OrderSide = 'BUY' | 'SELL';
+
+/**
+ * Optional per-strategy parameter override block read from guardrails.yaml.
+ * Backtest-engine forwards this to SignalProcessor so strategies see the
+ * same per-symbol params live trading does (e.g. ETH-USD trend_follow
+ * uses emaFast=12 / emaSlow=15).
+ */
+export type PerSymbolStrategyOverrides = Record<string, Record<string, Record<string, unknown>>>;
+
+/**
+ * Backtest-only realism knobs. Defaults are documented inline; override per
+ * run from guardrails.yaml `backtest:` block or programmatic config. Slippage
+ * is applied symmetrically on entries; stop-fill overshoot is applied
+ * pessimistically (fills WORSE than the trigger to model gap-through risk).
+ */
+export interface BacktestRealismConfig {
+  /**
+   * Whether entries fill on the next bar's open instead of same-bar close.
+   * Default: true. Setting this to false reverts to the (broken) same-bar
+   * behaviour and exists only for legacy comparison.
+   */
+  nextBarFill?: boolean;
+  /**
+   * Per-side slippage applied to entry fills, in basis points (1 bps = 0.01%).
+   * Default 5 bps matches the live `execution.max_slippage_bps` ceiling.
+   * Modeled symmetrically: long entries pay this above the open, shorts
+   * receive this below.
+   */
+  entrySlippageBps?: number;
+  /**
+   * Stop-fill overshoot — fraction of the bar's range that the stop fill
+   * is moved past the trigger to model gap-through / wick-through risk.
+   * Default 0.20 (20% of [bar.high − bar.low] beyond the stop level).
+   * Empirical: backtest-without-overshoot understates max-DD by ~10–20%
+   * vs. paper trading on the same dataset (Phase 3 verdict, March 2026).
+   */
+  stopOvershootBarRangePct?: number;
+  /**
+   * Floor on stop overshoot, in basis points, when the bar range model
+   * yields a smaller value (e.g. low-volatility candle). Default 5 bps so
+   * even calm bars charge realistic adverse-selection on stop-outs.
+   */
+  stopOvershootMinBps?: number;
+  /**
+   * Number of base-unit decimals to round position sizes to before fill.
+   * Default 6 matches RiskEngine.computeOrderSize.
+   */
+  sizeDecimals?: number;
+}
+
+export interface BacktestStrategyToggle {
+  enabled: boolean;
+  parameters: Record<string, unknown>;
+}
 
 export interface BacktestConfig {
   startDate: Date;
   endDate: Date;
   initialCapital: number;
-  commission: number; // Percentage (e.g., 0.002 for 0.2%)
-  slippage: number; // Percentage
+  commission: number; // Decimal fraction (e.g. 0.0005 for 5 bps fee)
+  /**
+   * @deprecated Use `realism.entrySlippageBps`. Kept on the type so older
+   * callers don't break, but the engine now reads bps directly.
+   */
+  slippage: number;
   products: string[];
   signals: {
-    breakout: {
-      enabled: boolean;
-      parameters: any;
-    };
-    vwapMeanReversion: {
-      enabled: boolean;
-      parameters: any;
-    };
-    momentum: {
-      enabled: boolean;
-      parameters: any;
-    };
+    breakout: BacktestStrategyToggle;
+    vwapMeanReversion: BacktestStrategyToggle;
+    momentum: BacktestStrategyToggle;
+    /** Optional. When omitted, trend_follow runs with plugin defaults. */
+    trendFollow?: BacktestStrategyToggle;
   };
   risk: {
+    /**
+     * Hard cap on per-position notional in USD. Acts as a ceiling on top
+     * of the risk-based size — same role as `risk.max_position_exposure_pct`
+     * in live guardrails.
+     */
     maxPositionSize: number;
+    /** Hard cap on aggregate open exposure. */
     maxTotalExposure: number;
+    /**
+     * @deprecated Per-trade stops now come from each strategy signal
+     * (signal.stopLoss). This value is the FALLBACK only if a signal lacks a
+     * stop. Default fallback 2%.
+     */
     stopLossPercent: number;
+    /**
+     * @deprecated Per-trade TPs now come from each strategy signal
+     * (signal.takeProfit). Fallback only.
+     */
     takeProfitPercent: number;
   };
+  /**
+   * Mirrors guardrails.account block. Backtest sizes positions identically
+   * to the live engine (`computeRiskBasedSize`). Defaults pulled from the
+   * legacy 5%/$5k behaviour if absent so old callers don't break, but cli
+   * and api/server should always populate this.
+   */
+  account?: {
+    equityUsd?: number;
+    riskPerTrade?: number;
+    maxPositionExposurePct?: number;
+    minNotionalBuffer?: number;
+  };
+  /** Strategies disabled by Phase-3 verdict. Skipped before signal entry. */
+  disabledStrategies?: string[];
+  /** Per-symbol strategy overrides (forwarded to plugin registry). */
+  perSymbolOverrides?: PerSymbolStrategyOverrides;
+  /** Realism knobs (look-ahead, overshoot, slippage). */
+  realism?: BacktestRealismConfig;
 }
 
 export interface BacktestTrade {
@@ -52,6 +137,12 @@ export interface BacktestTrade {
   pnlPercent?: number;
   exitReason?: 'signal' | 'stop_loss' | 'take_profit' | 'end_of_data';
   signal: Signal;
+  /** Strategy that produced the entry — surfaced in the by-strategy summary. */
+  strategy: string;
+  /** Stop level used for sizing + exit checks. */
+  stopLoss: number;
+  /** Take-profit level used for exits. */
+  takeProfit: number;
 }
 
 export interface BacktestPosition {
@@ -62,6 +153,14 @@ export interface BacktestPosition {
   entryTimestamp: Date;
   unrealizedPnl: number;
   trades: BacktestTrade[];
+}
+
+export interface BacktestStrategyMetrics {
+  trades: number;
+  winningTrades: number;
+  winRate: number;
+  netProfit: number;
+  averageRMultiple: number;
 }
 
 export interface BacktestMetrics {
@@ -85,6 +184,10 @@ export interface BacktestMetrics {
   totalFees: number;
   finalCapital: number;
   returnPercent: number;
+  /** Per-strategy breakdown, used by the deliverable summary table. */
+  byStrategy: Record<string, BacktestStrategyMetrics>;
+  /** Snapshot of which strategies actually ran (post disabled_strategies filter) */
+  activeStrategies: string[];
 }
 
 export interface BacktestResult {
@@ -94,6 +197,28 @@ export interface BacktestResult {
   equityCurve: { timestamp: Date; equity: number; drawdown: number }[];
   dailyReturns: { date: string; returnPercent: number }[];
 }
+
+/**
+ * A signal queued from bar [i] that fills at bar [i+1]'s open. Carries the
+ * stop/TP that came with the signal so we don't have to recalc from
+ * config.risk.* on the wrong bar.
+ */
+interface PendingFill {
+  signal: Signal;
+  stopLoss: number;
+  takeProfit: number;
+  generatedAt: Date;
+}
+
+const DEFAULT_REALISM: Required<BacktestRealismConfig> = {
+  nextBarFill: true,
+  entrySlippageBps: 5,
+  stopOvershootBarRangePct: 0.20,
+  stopOvershootMinBps: 5,
+  sizeDecimals: 6,
+};
+
+const DEFAULT_DISABLED_STRATEGIES = ['vwap_mr', 'breakout'];
 
 export class BacktestEngine extends EventEmitter {
   private config: BacktestConfig;
@@ -108,6 +233,11 @@ export class BacktestEngine extends EventEmitter {
   private dailyReturns: Map<string, number> = new Map();
   private dailyStartEquity: number = 0;
   private currentDay: string = '';
+  private realism: Required<BacktestRealismConfig>;
+  private pendingFills: Map<string, PendingFill> = new Map();
+  private disabledStrategies: Set<string>;
+  private activeStrategies: string[] = [];
+  private tradeIdCounter: number = 0;
 
   constructor(config: BacktestConfig, logger: Logger) {
     super();
@@ -116,13 +246,15 @@ export class BacktestEngine extends EventEmitter {
     this.capital = config.initialCapital;
     this.peakCapital = config.initialCapital;
     this.dailyStartEquity = config.initialCapital;
+    this.realism = { ...DEFAULT_REALISM, ...(config.realism || {}) };
+    this.disabledStrategies = new Set(config.disabledStrategies ?? DEFAULT_DISABLED_STRATEGIES);
   }
 
   public async loadHistoricalData(dataProvider: (product: string, start: Date, end: Date) => Promise<OHLCV[]>): Promise<void> {
     this.logger.info('Loading historical data', {
       products: this.config.products,
       startDate: this.config.startDate,
-      endDate: this.config.endDate
+      endDate: this.config.endDate,
     });
 
     for (const product of this.config.products) {
@@ -133,92 +265,147 @@ export class BacktestEngine extends EventEmitter {
   }
 
   public async run(): Promise<BacktestResult> {
-    this.logger.info('Starting backtest');
+    this.logger.info('Starting backtest', {
+      products: this.config.products,
+      disabledStrategies: Array.from(this.disabledStrategies),
+      realism: this.realism,
+    });
 
-    // Initialize signal processor
     this.initializeSignalProcessor();
-
-    // Process each time step
     await this.processTimeSteps();
-
-    // Close any remaining positions
     this.closeAllPositions('end_of_data');
 
-    // Record final day's return
     if (this.currentDay) {
       const finalEquity = this.calculateCurrentEquity();
       const finalReturn = (finalEquity - this.dailyStartEquity) / this.dailyStartEquity;
       this.dailyReturns.set(this.currentDay, finalReturn);
     }
 
-    // Calculate metrics
     const metrics = this.calculateMetrics();
-
-    // Prepare result
     const result: BacktestResult = {
       config: this.config,
       trades: this.closedTrades,
       metrics,
       equityCurve: this.equityCurve,
-      dailyReturns: this.getDailyReturns()
+      dailyReturns: this.getDailyReturns(),
     };
 
     this.logger.info('Backtest completed', {
       totalTrades: metrics.totalTrades,
       netProfit: metrics.netProfit,
-      returnPercent: metrics.returnPercent
+      returnPercent: metrics.returnPercent,
+      activeStrategies: metrics.activeStrategies,
+      byStrategy: metrics.byStrategy,
     });
 
     return result;
   }
 
   private initializeSignalProcessor(): void {
+    // SignalProcessor's plugin registry instantiates ALL four built-in
+    // strategies via `createBuiltinStrategies`
+    // (atlas/apps/core-node/src/strategies/plugins/builtin/index.ts:60).
+    // That includes trend_follow — defect #1's "never wired" symptom was
+    // really "no trend_follow toggle in BacktestConfig + no per-symbol
+    // overrides loaded." Both are fixed below: we let the plugin registry
+    // own instantiation, then apply trend_follow params via
+    // updateStrategyConfig, then forward per-symbol overrides.
     const signalConfig = {
-      supabaseUrl: '', // Not needed for backtest
-      supabaseKey: '', // Not needed for backtest
+      supabaseUrl: '',
+      supabaseKey: '',
       strategies: {
         breakout: {
           enabled: this.config.signals.breakout.enabled,
-          period: this.config.signals.breakout.parameters.period || 20,
-          atrPeriod: this.config.signals.breakout.parameters.atrPeriod || 14,
-          atrMultiplier: this.config.signals.breakout.parameters.atrMultiplier || 2,
-          volumeThreshold: this.config.signals.breakout.parameters.volumeThreshold || 1.5
+          period: (this.config.signals.breakout.parameters as any).period ?? 20,
+          atrPeriod: (this.config.signals.breakout.parameters as any).atrPeriod ?? 14,
+          atrMultiplier: (this.config.signals.breakout.parameters as any).atrMultiplier ?? 2,
+          volumeThreshold: (this.config.signals.breakout.parameters as any).volumeThreshold ?? 1.5,
         },
         vwapMeanReversion: {
           enabled: this.config.signals.vwapMeanReversion.enabled,
-          deviationEntry: this.config.signals.vwapMeanReversion.parameters.deviationEntry || 2,
-          deviationExit: this.config.signals.vwapMeanReversion.parameters.deviationExit || 0.5,
-          minVolume: this.config.signals.vwapMeanReversion.parameters.minVolume || 1000
+          deviationEntry: (this.config.signals.vwapMeanReversion.parameters as any).deviationEntry ?? 2,
+          deviationExit: (this.config.signals.vwapMeanReversion.parameters as any).deviationExit ?? 0.5,
+          minVolume: (this.config.signals.vwapMeanReversion.parameters as any).minVolume ?? 1000,
         },
         momentum: {
           enabled: this.config.signals.momentum.enabled,
-          rsiPeriod: this.config.signals.momentum.parameters.rsiPeriod || 14,
-          rsiOverbought: this.config.signals.momentum.parameters.rsiOverbought || 70,
-          rsiOversold: this.config.signals.momentum.parameters.rsiOversold || 30,
-          macdFast: this.config.signals.momentum.parameters.macdFast || 12,
-          macdSlow: this.config.signals.momentum.parameters.macdSlow || 26,
-          macdSignal: this.config.signals.momentum.parameters.macdSignal || 9
-        }
+          rsiPeriod: (this.config.signals.momentum.parameters as any).rsiPeriod ?? 14,
+          rsiOverbought: (this.config.signals.momentum.parameters as any).rsiOverbought ?? 70,
+          rsiOversold: (this.config.signals.momentum.parameters as any).rsiOversold ?? 30,
+          macdFast: (this.config.signals.momentum.parameters as any).macdFast ?? 12,
+          macdSlow: (this.config.signals.momentum.parameters as any).macdSlow ?? 26,
+          macdSignal: (this.config.signals.momentum.parameters as any).macdSignal ?? 9,
+        },
       },
       metaLabeling: {
-        enabled: false, // Disable meta-labeling for backtest
-        threshold: 0.5
-      }
-    };
+        enabled: false,
+        threshold: 0.5,
+      },
+      // Defect #2 fix: plumb disabled_strategies through. SignalProcessor
+      // hard-rejects signals whose strategy is in this list before they
+      // reach the order pipeline (signal-processor.ts:942).
+      disabledStrategies: Array.from(this.disabledStrategies),
+      enableArbiter: true,
+      usePluginStrategies: true,
+    } as any;
 
     this.signalProcessor = new SignalProcessor(signalConfig, this.logger);
 
-    // Listen for signals
+    // Defect #1 — apply optional global trend_follow params. Per-symbol
+    // overrides (e.g. ETH-USD emaFast=12 / emaSlow=15) flow through
+    // perSymbolOverrides below.
+    const trendFollowToggle = this.config.signals.trendFollow;
+    if (trendFollowToggle) {
+      this.signalProcessor.updateStrategyConfig('trend_follow', {
+        enabled: trendFollowToggle.enabled,
+        ...(trendFollowToggle.parameters || {}),
+      });
+      if (!trendFollowToggle.enabled) {
+        this.signalProcessor.disableStrategy('trend_follow');
+      } else {
+        this.signalProcessor.enableStrategy('trend_follow');
+      }
+    }
+
+    if (this.config.perSymbolOverrides) {
+      // Same code path live trading uses for ETH-USD / BTC-USD overrides.
+      this.signalProcessor.loadPerSymbolOverrides(this.config.perSymbolOverrides);
+    }
+
+    // Snapshot the active strategy set AFTER the disabled filter so the
+    // report can't lie about which strategies actually ran.
+    const enabledPlugins = this.signalProcessor.getEnabledStrategies().map(s => s.id);
+    this.activeStrategies = enabledPlugins.filter(id => !this.disabledStrategies.has(id));
+    this.logger.info('Backtest active strategies', {
+      registered: this.signalProcessor.getRegisteredStrategies().map(s => s.id),
+      enabled: enabledPlugins,
+      disabled: Array.from(this.disabledStrategies),
+      active: this.activeStrategies,
+    });
+
     this.signalProcessor.on('signal:generated', this.handleSignal.bind(this));
   }
 
+  /**
+   * Drive each bar in the canonical order:
+   *
+   *   1. Fill any pending entry from bar [i-1] at this bar's open.
+   *   2. Mark-to-market open positions on this bar's close.
+   *   3. Run stop/TP exits against this bar's high/low (with overshoot).
+   *   4. Feed this bar's close to the signal processor; signals it emits
+   *      enter pendingFills for [i+1].
+   *   5. Record equity at this bar's close.
+   *
+   * Defect #3 fix: a signal computed from bar [i]'s close can never fill
+   * inside bar [i] — the earliest opportunity is bar [i+1]'s open. Without
+   * this, every backtest trade gets a one-bar look-ahead advantage.
+   */
   private async processTimeSteps(): Promise<void> {
     const processor = this.signalProcessor;
     if (!processor) {
       throw new Error('Signal processor not initialized');
     }
 
-    // Find minimum candle count across all products
     let minCandles = Infinity;
     for (const data of this.historicalData.values()) {
       minCandles = Math.min(minCandles, data.length);
@@ -230,127 +417,276 @@ export class BacktestEngine extends EventEmitter {
       return;
     }
 
-    // Process each timestamp
-    for (let i = 50; i < minCandles; i++) { // Start at 50 for indicator warmup
+    for (let i = 50; i < minCandles; i++) {
       const baseCandle = firstSeries[i];
       if (!baseCandle) {
         continue;
       }
       const timestamp = new Date(baseCandle.time);
 
-      // Feed data to signal processor for each product
       for (const [product, data] of this.historicalData.entries()) {
-        const latestCandle = data[i];
-        if (!latestCandle) {
+        const candle = data[i];
+        if (!candle) {
           continue;
         }
 
-        // Update positions with current price
-        this.updatePositions(product, latestCandle.close, timestamp);
+        // Step 1: Fill pending entry queued at bar [i-1]. Look-ahead fix.
+        if (this.realism.nextBarFill) {
+          this.fillPendingAtOpen(product, candle, timestamp);
+        }
 
-        // Check stop loss and take profit
-        this.checkExitConditions(product, latestCandle, timestamp);
+        // Step 2: Mark-to-market on close.
+        this.updatePositions(product, candle.close, timestamp);
 
-        // Add candle to signal processor
-        processor.addCandle(product, latestCandle);
+        // Step 3: Exit checks against this bar's range, with overshoot.
+        this.checkExitConditions(product, candle, timestamp);
+
+        // Step 4: Feed close into the signal pipeline. Any signal it emits
+        // is queued for next bar via handleSignal -> pendingFills.
+        processor.addCandle(product, candle);
       }
 
-      // Record equity curve
       this.recordEquity(timestamp);
     }
   }
 
+  /**
+   * Defect #3: signals must NOT fill on the same bar they were observed on.
+   * `handleSignal` only stages a pending fill — the actual position is
+   * opened when the next bar arrives, in `fillPendingAtOpen`.
+   */
   private handleSignal(signal: Signal): void {
-    // Check if we already have a position
+    // Disabled strategies are filtered upstream by the signal processor;
+    // gate here as defence-in-depth.
+    if (this.disabledStrategies.has(signal.strategy)) {
+      this.logger.debug('Backtest gated signal from disabled strategy', {
+        strategy: signal.strategy,
+        symbol: signal.symbol,
+      });
+      return;
+    }
+
     const position = this.positions.get(signal.symbol);
-    
     if (position) {
-      // Check if signal is opposite direction (exit signal)
-      if ((position.side === 'long' && signal.direction === 'sell') ||
-          (position.side === 'short' && signal.direction === 'buy')) {
+      // Opposite-direction signal closes the position. Exit fills are
+      // modeled at the signal's reference price (close of current bar).
+      const isOppositeOfLong = position.side === 'long' && signal.direction === 'sell';
+      const isOppositeOfShort = position.side === 'short' && signal.direction === 'buy';
+      if (isOppositeOfLong || isOppositeOfShort) {
         this.closePosition(signal.symbol, signal.price, signal.timestamp, 'signal');
       }
+      return;
+    }
+
+    if (this.realism.nextBarFill) {
+      this.pendingFills.set(signal.symbol, {
+        signal,
+        stopLoss: signal.stopLoss,
+        takeProfit: signal.takeProfit,
+        generatedAt: signal.timestamp,
+      });
     } else {
-      // Open new position if risk checks pass
-      this.openPosition(signal);
+      // Legacy same-bar fill mode — kept only for parity testing.
+      this.openPositionAt(signal, signal.price, signal.timestamp);
     }
   }
 
-  private openPosition(signal: Signal): void {
-    // Risk checks
-    const positionSize = this.calculatePositionSize(signal);
-    if (positionSize === 0) {
+  private fillPendingAtOpen(product: string, candle: OHLCV, timestamp: Date): void {
+    const pending = this.pendingFills.get(product);
+    if (!pending) return;
+
+    // Slippage applied symmetrically: long pays UP, short receives DOWN.
+    const slipFactor = this.realism.entrySlippageBps / 10_000;
+    const direction = pending.signal.direction;
+    const fillPrice = direction === 'buy'
+      ? candle.open * (1 + slipFactor)
+      : candle.open * (1 - slipFactor);
+
+    this.openPositionAt(pending.signal, fillPrice, timestamp, pending.stopLoss, pending.takeProfit);
+    this.pendingFills.delete(product);
+  }
+
+  /**
+   * Open a position at a given fill price. Sizing uses the SHARED
+   * `computeRiskBasedSize` helper so backtest and live agree on
+   * risk_per_trade math (defect #5).
+   */
+  private openPositionAt(
+    signal: Signal,
+    fillPrice: number,
+    fillTimestamp: Date,
+    stopLossOverride?: number,
+    takeProfitOverride?: number,
+  ): void {
+    const stopLoss = this.resolveStopLoss(signal, stopLossOverride, fillPrice);
+    const takeProfit = this.resolveTakeProfit(signal, takeProfitOverride, fillPrice);
+
+    const positionSize = this.calculatePositionSize(signal, fillPrice, stopLoss);
+    if (positionSize <= 0) {
+      this.logger.debug('Backtest: position size 0, skipping', {
+        symbol: signal.symbol,
+        strategy: signal.strategy,
+      });
       return;
     }
 
-    // Calculate total exposure
-    let totalExposure = positionSize * signal.price;
+    let totalExposure = positionSize * fillPrice;
     for (const pos of this.positions.values()) {
       totalExposure += pos.size * pos.entryPrice;
     }
-
     if (totalExposure > this.config.risk.maxTotalExposure) {
-      this.logger.debug('Position rejected: exceeds max total exposure');
+      this.logger.debug('Backtest: rejected — exceeds max total exposure', {
+        symbol: signal.symbol,
+        totalExposure,
+        max: this.config.risk.maxTotalExposure,
+      });
       return;
     }
 
-    // Create trade
     const trade: BacktestTrade = {
-      id: `${signal.symbol}_${Date.now()}`,
-      timestamp: signal.timestamp,
+      id: this.nextTradeId(signal.symbol),
+      timestamp: fillTimestamp,
       product: signal.symbol,
       side: signal.direction === 'buy' ? 'BUY' : 'SELL',
-      entryPrice: signal.price * (1 + this.config.slippage * (signal.direction === 'buy' ? 1 : -1)),
+      entryPrice: fillPrice,
       size: positionSize,
-      entryFee: positionSize * signal.price * this.config.commission,
-      signal
+      entryFee: positionSize * fillPrice * this.config.commission,
+      signal,
+      strategy: signal.strategy,
+      stopLoss,
+      takeProfit,
     };
 
     this.capital -= trade.entryFee;
 
-    // Create position
     const position: BacktestPosition = {
       product: signal.symbol,
       side: signal.direction === 'buy' ? 'long' : 'short',
       size: positionSize,
       entryPrice: trade.entryPrice,
-      entryTimestamp: signal.timestamp,
+      entryTimestamp: fillTimestamp,
       unrealizedPnl: 0,
-      trades: [trade]
+      trades: [trade],
     };
 
     this.positions.set(signal.symbol, position);
 
-    this.logger.debug('Opened position', {
+    this.logger.debug('Backtest opened position', {
       product: signal.symbol,
+      strategy: signal.strategy,
       side: position.side,
       size: position.size,
-      price: position.entryPrice
+      entryPrice: position.entryPrice,
+      stopLoss: trade.stopLoss,
+      takeProfit: trade.takeProfit,
     });
   }
 
-  private closePosition(product: string, price: number, timestamp: Date, reason: 'signal' | 'stop_loss' | 'take_profit' | 'end_of_data'): void {
+  private resolveStopLoss(signal: Signal, override: number | undefined, fillPrice: number): number {
+    if (typeof override === 'number' && Number.isFinite(override) && override > 0) {
+      return override;
+    }
+    if (Number.isFinite(signal.stopLoss) && signal.stopLoss > 0) {
+      return signal.stopLoss;
+    }
+    return signal.direction === 'buy'
+      ? fillPrice * (1 - this.config.risk.stopLossPercent)
+      : fillPrice * (1 + this.config.risk.stopLossPercent);
+  }
+
+  private resolveTakeProfit(signal: Signal, override: number | undefined, fillPrice: number): number {
+    if (typeof override === 'number' && Number.isFinite(override) && override > 0) {
+      return override;
+    }
+    if (Number.isFinite(signal.takeProfit) && signal.takeProfit > 0) {
+      return signal.takeProfit;
+    }
+    return signal.direction === 'buy'
+      ? fillPrice * (1 + this.config.risk.takeProfitPercent)
+      : fillPrice * (1 - this.config.risk.takeProfitPercent);
+  }
+
+  /**
+   * Defect #5 fix: replaces the old fixed $5k notional cap with the SAME
+   * risk-based sizing the live engine uses (`computeRiskBasedSize`).
+   *
+   * size = (currentEquity * riskPerTrade) / |entry - stop|, capped by
+   * maxPositionExposureUsd and config.risk.maxPositionSize.
+   */
+  private calculatePositionSize(signal: Signal, entryPrice: number, stopLoss: number): number {
+    const account = this.config.account || {};
+    const riskPerTrade = account.riskPerTrade ?? 0.005;
+    const maxExposurePct = account.maxPositionExposurePct ?? 0.30;
+    const minNotionalBuffer = account.minNotionalBuffer ?? 1.1;
+    const equityForSizing = account.equityUsd ?? this.calculateCurrentEquity();
+
+    const accountExposureCap = equityForSizing * maxExposurePct;
+    const exposureCapUsd = Math.min(accountExposureCap, this.config.risk.maxPositionSize);
+    const minNotionalUsd = equityForSizing * riskPerTrade * minNotionalBuffer;
+
+    const result = computeRiskBasedSize({
+      equity: equityForSizing,
+      riskPerTrade,
+      entryPrice,
+      stopPrice: stopLoss,
+      maxPositionExposureUsd: exposureCapUsd,
+      minNotionalUsd,
+      sizeDecimals: this.realism.sizeDecimals,
+    });
+
+    if (result.size <= 0) {
+      this.logger.debug('Backtest sizing rejected', {
+        symbol: signal.symbol,
+        strategy: signal.strategy,
+        reason: result.rejectedReason,
+        entryPrice,
+        stopLoss,
+        equityForSizing,
+      });
+    }
+
+    return result.size;
+  }
+
+  private nextTradeId(symbol: string): string {
+    // Deterministic — same inputs always produce same ids.
+    this.tradeIdCounter += 1;
+    return `${symbol}_${this.tradeIdCounter}`;
+  }
+
+  private closePosition(
+    product: string,
+    rawExitPrice: number,
+    timestamp: Date,
+    reason: 'signal' | 'stop_loss' | 'take_profit' | 'end_of_data',
+  ): void {
     const position = this.positions.get(product);
     if (!position) return;
 
-    // Calculate exit price with slippage
-    const exitPrice = price * (1 + this.config.slippage * (position.side === 'long' ? -1 : 1));
+    // Slippage on signal/end-of-data exits is symmetric with entries.
+    // Stop-loss / take-profit fills already include the overshoot model
+    // baked in by `checkExitConditions`.
+    let exitPrice = rawExitPrice;
+    if (reason === 'signal' || reason === 'end_of_data') {
+      const slipFactor = this.realism.entrySlippageBps / 10_000;
+      exitPrice = position.side === 'long'
+        ? rawExitPrice * (1 - slipFactor)
+        : rawExitPrice * (1 + slipFactor);
+    }
 
-    // Update trades
     for (const trade of position.trades) {
       trade.exitPrice = exitPrice;
       trade.exitTimestamp = timestamp;
       trade.exitFee = trade.size * exitPrice * this.config.commission;
       trade.exitReason = reason;
-
-      // Calculate PnL
       if (position.side === 'long') {
-        trade.pnl = (exitPrice - trade.entryPrice) * trade.size - trade.entryFee - trade.exitFee;
+        trade.pnl = (exitPrice - trade.entryPrice) * trade.size - trade.entryFee - (trade.exitFee || 0);
       } else {
-        trade.pnl = (trade.entryPrice - exitPrice) * trade.size - trade.entryFee - trade.exitFee;
+        trade.pnl = (trade.entryPrice - exitPrice) * trade.size - trade.entryFee - (trade.exitFee || 0);
       }
-      trade.pnlPercent = trade.pnl / (trade.size * trade.entryPrice);
-
+      trade.pnlPercent = trade.entryPrice > 0
+        ? trade.pnl / (trade.size * trade.entryPrice)
+        : 0;
       this.closedTrades.push(trade);
     }
 
@@ -360,31 +696,28 @@ export class BacktestEngine extends EventEmitter {
     const pnl = (exitPrice - position.entryPrice) * position.size * sideMultiplier;
     this.capital += pnl - exitFee;
 
-    // Remove position
     this.positions.delete(product);
 
-    this.logger.debug('Closed position', {
+    this.logger.debug('Backtest closed position', {
       product,
       exitPrice,
       reason,
-      pnl: firstTrade?.pnl ?? 0
+      pnl: firstTrade?.pnl ?? 0,
     });
   }
 
   private updatePositions(product: string, currentPrice: number, timestamp: Date): void {
     const position = this.positions.get(product);
-    if (!position) return;
-
-    // Calculate unrealized PnL
-    if (position.side === 'long') {
-      position.unrealizedPnl = (currentPrice - position.entryPrice) * position.size;
-    } else {
-      position.unrealizedPnl = (position.entryPrice - currentPrice) * position.size;
+    if (position) {
+      if (position.side === 'long') {
+        position.unrealizedPnl = (currentPrice - position.entryPrice) * position.size;
+      } else {
+        position.unrealizedPnl = (position.entryPrice - currentPrice) * position.size;
+      }
     }
 
     const dateKey = timestamp.toISOString().split('T')[0] ?? '';
     const currentEquity = this.calculateCurrentEquity();
-
     if (!this.currentDay) {
       this.currentDay = dateKey;
       this.dailyStartEquity = currentEquity;
@@ -396,92 +729,89 @@ export class BacktestEngine extends EventEmitter {
     }
   }
 
+  /**
+   * Defect #4 fix: stop fills include an OVERSHOOT factor. Real stops fill
+   * worse than the trigger when price wicks/gaps through, so the model
+   * pessimistically assumes:
+   *
+   *   overshootPx = max(stopOvershootBarRangePct * (high − low),
+   *                     stopLevel * minBps/10000)
+   *
+   * For a long stop, fill = stopLoss − overshootPx. For a short stop, fill
+   * = stopLoss + overshootPx. Take-profit fills stay at the level (filling
+   * BETTER than the level on a wick is unrealistic too, but TP filling at
+   * the level is the conventional pessimistic assumption).
+   */
   private checkExitConditions(product: string, candle: OHLCV, timestamp: Date): void {
     const position = this.positions.get(product);
     if (!position) return;
 
-    const entryPrice = position.entryPrice;
-    
-    // Check stop loss
-    const stopLoss = position.side === 'long'
-      ? entryPrice * (1 - this.config.risk.stopLossPercent)
-      : entryPrice * (1 + this.config.risk.stopLossPercent);
+    const trade = position.trades[0];
+    const stopLoss = trade?.stopLoss ?? this.fallbackStopLoss(position);
+    const takeProfit = trade?.takeProfit ?? this.fallbackTakeProfit(position);
 
-    if ((position.side === 'long' && candle.low <= stopLoss) ||
-        (position.side === 'short' && candle.high >= stopLoss)) {
-      this.closePosition(product, stopLoss, timestamp, 'stop_loss');
+    const longStopHit = position.side === 'long' && candle.low <= stopLoss;
+    const shortStopHit = position.side === 'short' && candle.high >= stopLoss;
+    if (longStopHit || shortStopHit) {
+      const overshoot = this.computeStopOvershoot(candle, stopLoss);
+      const exitPrice = position.side === 'long'
+        ? Math.max(0, stopLoss - overshoot)
+        : stopLoss + overshoot;
+      this.closePosition(product, exitPrice, timestamp, 'stop_loss');
       return;
     }
 
-    // Check take profit
-    const takeProfit = position.side === 'long'
-      ? entryPrice * (1 + this.config.risk.takeProfitPercent)
-      : entryPrice * (1 - this.config.risk.takeProfitPercent);
-
-    if ((position.side === 'long' && candle.high >= takeProfit) ||
-        (position.side === 'short' && candle.low <= takeProfit)) {
+    const longTpHit = position.side === 'long' && candle.high >= takeProfit;
+    const shortTpHit = position.side === 'short' && candle.low <= takeProfit;
+    if (longTpHit || shortTpHit) {
       this.closePosition(product, takeProfit, timestamp, 'take_profit');
     }
   }
 
-  private calculatePositionSize(signal: Signal): number {
-    // Sum notional value of all open positions (allocated capital)
-    let allocatedCapital = 0;
-    for (const pos of this.positions.values()) {
-      allocatedCapital += pos.size * pos.entryPrice;
-    }
+  private fallbackStopLoss(position: BacktestPosition): number {
+    return position.side === 'long'
+      ? position.entryPrice * (1 - this.config.risk.stopLossPercent)
+      : position.entryPrice * (1 + this.config.risk.stopLossPercent);
+  }
 
-    // Size against equity (cash + unrealized P&L), not raw cash
-    const equity = this.calculateCurrentEquity();
-    const availableCapital = equity - allocatedCapital;
-    if (availableCapital <= 0) return 0;
+  private fallbackTakeProfit(position: BacktestPosition): number {
+    return position.side === 'long'
+      ? position.entryPrice * (1 + this.config.risk.takeProfitPercent)
+      : position.entryPrice * (1 - this.config.risk.takeProfitPercent);
+  }
 
-    const maxPositionValue = Math.min(
-      availableCapital * 0.95,
-      this.config.risk.maxPositionSize
-    );
-
-    // Crypto is fractional (8 decimals). Math.floor() to whole units used to
-    // zero out every BTC/ETH order ($5k budget / $85k BTC = 0.0588 → 0).
-    const decimals = 8;
-    const factor = Math.pow(10, decimals);
-    return Math.floor((maxPositionValue / signal.price) * factor) / factor;
+  private computeStopOvershoot(candle: OHLCV, stopLevel: number): number {
+    const barRange = Math.max(0, candle.high - candle.low);
+    const rangeBased = barRange * this.realism.stopOvershootBarRangePct;
+    const minBased = stopLevel * (this.realism.stopOvershootMinBps / 10_000);
+    return Math.max(rangeBased, minBased);
   }
 
   private calculateCurrentEquity(): number {
     let equity = this.capital;
-    
-    // Add unrealized PnL
     for (const position of this.positions.values()) {
       equity += position.unrealizedPnl;
     }
-
     return equity;
   }
 
   private recordEquity(timestamp: Date): void {
     const equity = this.calculateCurrentEquity();
-    
-    // Update peak
     if (equity > this.peakCapital) {
       this.peakCapital = equity;
     }
-
-    // Calculate drawdown
-    const drawdown = (this.peakCapital - equity) / this.peakCapital;
-
+    const drawdown = this.peakCapital > 0
+      ? (this.peakCapital - equity) / this.peakCapital
+      : 0;
     this.equityCurve.push({ timestamp, equity, drawdown });
   }
 
   private closeAllPositions(reason: 'signal' | 'stop_loss' | 'take_profit' | 'end_of_data'): void {
-    for (const [product, position] of this.positions.entries()) {
-      // Get last price
+    for (const [product] of this.positions.entries()) {
       const data = this.historicalData.get(product);
       if (data && data.length > 0) {
         const lastCandle = data[data.length - 1];
-        if (!lastCandle) {
-          continue;
-        }
+        if (!lastCandle) continue;
         this.closePosition(product, lastCandle.close, new Date(lastCandle.time), reason);
       }
     }
@@ -489,25 +819,23 @@ export class BacktestEngine extends EventEmitter {
 
   private calculateMetrics(): BacktestMetrics {
     const trades = this.closedTrades;
-    const winningTrades = trades.filter(t => t.pnl! > 0);
-    const losingTrades = trades.filter(t => t.pnl! <= 0);
+    const winningTrades = trades.filter(t => (t.pnl ?? 0) > 0);
+    const losingTrades = trades.filter(t => (t.pnl ?? 0) <= 0);
 
-    const grossProfit = winningTrades.reduce((sum, t) => sum + t.pnl!, 0);
-    const grossLoss = Math.abs(losingTrades.reduce((sum, t) => sum + t.pnl!, 0));
+    const grossProfit = winningTrades.reduce((sum, t) => sum + (t.pnl ?? 0), 0);
+    const grossLoss = Math.abs(losingTrades.reduce((sum, t) => sum + (t.pnl ?? 0), 0));
     const netProfit = grossProfit - grossLoss;
-    const totalFees = trades.reduce((sum, t) => sum + t.entryFee + (t.exitFee || 0), 0);
+    const totalFees = trades.reduce((sum, t) => sum + t.entryFee + (t.exitFee ?? 0), 0);
 
-    // Calculate average hold time
     let totalHoldTime = 0;
     let validTrades = 0;
     for (const trade of trades) {
       if (trade.exitTimestamp) {
-        totalHoldTime += (trade.exitTimestamp.getTime() - trade.timestamp.getTime()) / 60000; // minutes
+        totalHoldTime += (trade.exitTimestamp.getTime() - trade.timestamp.getTime()) / 60000;
         validTrades++;
       }
     }
 
-    // Calculate Sharpe ratio
     const returns = Array.from(this.dailyReturns.values());
     const avgReturn = returns.length > 0
       ? returns.reduce((a, b) => a + b, 0) / returns.length
@@ -517,14 +845,12 @@ export class BacktestEngine extends EventEmitter {
       : 0;
     const sharpeRatio = stdDev > 0 ? (avgReturn / stdDev) * Math.sqrt(252) : 0;
 
-    // Sortino ratio — downside-only deviation
     const downsideReturns = returns.filter(r => r < 0);
     const downsideDev = downsideReturns.length > 0
       ? Math.sqrt(downsideReturns.reduce((sum, r) => sum + r * r, 0) / downsideReturns.length)
       : 0;
     const sortinoRatio = downsideDev > 0 ? (avgReturn / downsideDev) * Math.sqrt(252) : 0;
 
-    // Max drawdown
     let maxDrawdown = 0;
     let maxDrawdownPercent = 0;
     for (const point of this.equityCurve) {
@@ -535,6 +861,26 @@ export class BacktestEngine extends EventEmitter {
     }
 
     const finalCapital = this.calculateCurrentEquity();
+    const byStrategy: Record<string, BacktestStrategyMetrics> = {};
+    for (const trade of trades) {
+      const key = trade.strategy || 'unknown';
+      if (!byStrategy[key]) {
+        byStrategy[key] = { trades: 0, winningTrades: 0, winRate: 0, netProfit: 0, averageRMultiple: 0 };
+      }
+      const bucket = byStrategy[key];
+      bucket.trades += 1;
+      bucket.netProfit += trade.pnl ?? 0;
+      if ((trade.pnl ?? 0) > 0) bucket.winningTrades += 1;
+      const stopDistance = Math.abs(trade.entryPrice - (trade.stopLoss ?? trade.entryPrice));
+      const riskUsd = stopDistance * trade.size;
+      if (riskUsd > 0) {
+        bucket.averageRMultiple += (trade.pnl ?? 0) / riskUsd;
+      }
+    }
+    for (const bucket of Object.values(byStrategy)) {
+      bucket.winRate = bucket.trades > 0 ? bucket.winningTrades / bucket.trades : 0;
+      bucket.averageRMultiple = bucket.trades > 0 ? bucket.averageRMultiple / bucket.trades : 0;
+    }
 
     return {
       totalTrades: trades.length,
@@ -551,19 +897,21 @@ export class BacktestEngine extends EventEmitter {
       maxDrawdownPercent,
       averageWin: winningTrades.length > 0 ? grossProfit / winningTrades.length : 0,
       averageLoss: losingTrades.length > 0 ? grossLoss / losingTrades.length : 0,
-      largestWin: winningTrades.length > 0 ? Math.max(...winningTrades.map(t => t.pnl!)) : 0,
-      largestLoss: losingTrades.length > 0 ? Math.min(...losingTrades.map(t => t.pnl!)) : 0,
+      largestWin: winningTrades.length > 0 ? Math.max(...winningTrades.map(t => t.pnl ?? 0)) : 0,
+      largestLoss: losingTrades.length > 0 ? Math.min(...losingTrades.map(t => t.pnl ?? 0)) : 0,
       averageHoldTime: validTrades > 0 ? totalHoldTime / validTrades : 0,
       totalFees,
       finalCapital,
-      returnPercent: ((finalCapital - this.config.initialCapital) / this.config.initialCapital) * 100
+      returnPercent: ((finalCapital - this.config.initialCapital) / this.config.initialCapital) * 100,
+      byStrategy,
+      activeStrategies: this.activeStrategies,
     };
   }
 
   private getDailyReturns(): { date: string; returnPercent: number }[] {
     return Array.from(this.dailyReturns.entries()).map(([date, returnPercent]) => ({
       date,
-      returnPercent: returnPercent * 100
+      returnPercent: returnPercent * 100,
     }));
   }
 }

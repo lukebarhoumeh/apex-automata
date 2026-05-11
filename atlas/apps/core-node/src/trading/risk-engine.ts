@@ -20,6 +20,7 @@ import {
   validatePerTradeRisk,
   computeDailyStopThresholdR,
 } from './risk-math';
+import { computeRiskBasedSize } from './risk/position-sizing';
 
 // Prometheus metrics for risk engine reliability
 const riskMetricsWriteFailures = new Counter({
@@ -927,46 +928,37 @@ export class RiskEngine extends EventEmitter {
   }
 
   public computeOrderSize(productId: string, entryPrice: number, stopPrice: number, riskPerTradeOverride?: number): number {
-    if (!Number.isFinite(entryPrice) || entryPrice <= 0) return 0;
-    if (!Number.isFinite(stopPrice) || stopPrice <= 0) return 0;
-
-    const stopDistance = Math.abs(entryPrice - stopPrice);
-    if (!Number.isFinite(stopDistance) || stopDistance === 0) {
-      return 0;
-    }
-
-    // Use dynamic equity for profit compounding — positions scale with accumulated PnL
+    // Delegates to the shared `computeRiskBasedSize` helper so backtest and
+    // live use the exact same formula. Soft-launch multipliers fold into
+    // the inputs here, before the helper sees them.
     const sizingEquity = this.getCurrentEquityForSizing();
-    const riskPerTrade = riskPerTradeOverride ?? this.guardrails.account.risk_per_trade;
-    let riskUsd = sizingEquity * riskPerTrade;
+    const baseRiskPerTrade = riskPerTradeOverride ?? this.guardrails.account.risk_per_trade;
     const soft = this.getSoftLaunch();
-    if (soft) {
-      riskUsd = this.scaleUsd(riskUsd, soft.riskPerTradeMultiplier);
-    }
-    let size = riskUsd / stopDistance;
-    if (!Number.isFinite(size) || size <= 0) {
-      return 0;
-    }
 
-    // Cap by max exposure (with 2% safety margin to avoid rounding issues)
-    const exposureCapUsd = soft ? this.scaleUsd(this.maxPositionExposureUsd, soft.maxPositionSizeMultiplier) : this.maxPositionExposureUsd;
-    const safeExposureCapUsd = exposureCapUsd * 0.98;  // 2% safety margin
-    const maxSizeByExposure = safeExposureCapUsd / entryPrice;
-    if (Number.isFinite(maxSizeByExposure)) {
-      size = Math.min(size, maxSizeByExposure);
-    }
+    const effectiveRiskPerTrade = soft
+      ? baseRiskPerTrade * (soft.riskPerTradeMultiplier ?? 1)
+      : baseRiskPerTrade;
 
-    const notional = size * entryPrice;
-    const minNotionalUsd = soft?.minOrderSizeUsd && Number.isFinite(soft.minOrderSizeUsd) && soft.minOrderSizeUsd > 0
-      ? Math.min(this.minOrderNotionalUsd, soft.minOrderSizeUsd)
-      : this.minOrderNotionalUsd;
-    if (notional < minNotionalUsd) {
-      return 0;
-    }
+    const exposureCapUsd = soft
+      ? this.scaleUsd(this.maxPositionExposureUsd, soft.maxPositionSizeMultiplier)
+      : this.maxPositionExposureUsd;
 
-    // Final sanity gate — never return non-finite values
-    const rounded = parseFloat(size.toFixed(6));
-    return Number.isFinite(rounded) && rounded > 0 ? rounded : 0;
+    const minNotionalUsd =
+      soft?.minOrderSizeUsd && Number.isFinite(soft.minOrderSizeUsd) && soft.minOrderSizeUsd > 0
+        ? Math.min(this.minOrderNotionalUsd, soft.minOrderSizeUsd)
+        : this.minOrderNotionalUsd;
+
+    const result = computeRiskBasedSize({
+      equity: sizingEquity,
+      riskPerTrade: effectiveRiskPerTrade,
+      entryPrice,
+      stopPrice,
+      maxPositionExposureUsd: exposureCapUsd,
+      minNotionalUsd,
+      sizeDecimals: 6,
+    });
+
+    return result.size;
   }
 
   private calculateTotalExposure(): number {

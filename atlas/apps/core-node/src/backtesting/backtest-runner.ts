@@ -87,7 +87,16 @@ export class BacktestRunner {
    */
   private generateReport(result: BacktestResult): string {
     const { config, metrics, trades } = result;
-    
+
+    const realism = config.realism ?? {};
+    const account = config.account ?? {};
+
+    const byStrategyLines = Object.entries(metrics.byStrategy ?? {})
+      .map(([id, m]) =>
+        `${id.padEnd(14)}  trades=${String(m.trades).padStart(4)}  winRate=${(m.winRate * 100).toFixed(1)}%  netPnL=$${m.netProfit.toFixed(2)}  avgR=${m.averageRMultiple.toFixed(2)}`,
+      )
+      .join('\n') || '(no closed trades)';
+
     const report = `
 BACKTEST REPORT
 ===============
@@ -99,7 +108,19 @@ End Date: ${config.endDate.toISOString()}
 Initial Capital: $${config.initialCapital.toFixed(2)}
 Products: ${config.products.join(', ')}
 Commission: ${(config.commission * 100).toFixed(2)}%
-Slippage: ${(config.slippage * 100).toFixed(2)}%
+
+Realism Model:
+--------------
+Next-bar fill: ${realism.nextBarFill ?? true}
+Entry slippage: ${realism.entrySlippageBps ?? 5} bps
+Stop overshoot: ${(realism.stopOvershootBarRangePct ?? 0.20) * 100}% of bar range (min ${realism.stopOvershootMinBps ?? 5} bps)
+
+Sizing Model:
+-------------
+Risk per trade: ${((account.riskPerTrade ?? 0.005) * 100).toFixed(3)}%
+Max position exposure: ${((account.maxPositionExposurePct ?? 0.30) * 100).toFixed(1)}% of equity
+Active strategies: ${(metrics.activeStrategies ?? []).join(', ') || '(none)'}
+Disabled strategies: ${(config.disabledStrategies ?? []).join(', ') || '(none)'}
 
 Performance Metrics:
 -------------------
@@ -118,10 +139,15 @@ Largest Win: $${metrics.largestWin.toFixed(2)}
 Largest Loss: $${metrics.largestLoss.toFixed(2)}
 Average Hold Time: ${metrics.averageHoldTime.toFixed(2)} minutes
 
+By-Strategy Breakdown:
+---------------------
+${byStrategyLines}
+
 Risk Metrics:
 ------------
 Profit Factor: ${metrics.profitFactor.toFixed(2)}
 Sharpe Ratio: ${metrics.sharpeRatio.toFixed(2)}
+Sortino Ratio: ${metrics.sortinoRatio.toFixed(2)}
 Max Drawdown: $${metrics.maxDrawdown.toFixed(2)} (${(metrics.maxDrawdownPercent * 100).toFixed(2)}%)
 
 Costs:
@@ -130,8 +156,8 @@ Total Fees: $${metrics.totalFees.toFixed(2)}
 
 Trade Log (Last 10):
 -------------------
-${trades.slice(-10).map(t => 
-  `${t.timestamp.toISOString()} ${t.product} ${t.side} @ ${t.entryPrice.toFixed(2)} -> ${t.exitPrice?.toFixed(2) || 'OPEN'} | PnL: $${t.pnl?.toFixed(2) || 'N/A'} (${t.pnlPercent ? (t.pnlPercent * 100).toFixed(2) + '%' : 'N/A'})`
+${trades.slice(-10).map(t =>
+  `${t.timestamp.toISOString()} ${t.product} ${t.strategy ?? 'unknown'} ${t.side} @ ${t.entryPrice.toFixed(2)} -> ${t.exitPrice?.toFixed(2) || 'OPEN'} | PnL: $${t.pnl?.toFixed(2) || 'N/A'} (${t.pnlPercent ? (t.pnlPercent * 100).toFixed(2) + '%' : 'N/A'}) [${t.exitReason ?? 'open'}]`,
 ).join('\n')}
 `;
 
