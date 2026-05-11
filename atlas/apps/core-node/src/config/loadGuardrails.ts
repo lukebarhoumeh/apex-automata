@@ -61,8 +61,28 @@ const FeesSchema = z.object({
 
 export type FeesConfig = z.infer<typeof FeesSchema>;
 
+// Momentum strategy parameter overrides — optional top-level block.
+// When present these values are forwarded to the MomentumStrategy plugin
+// instead of values being hard-coded in api/server.ts. Plugin configSchema
+// defaults remain the source of truth for any key omitted here.
+const MomentumConfigSchema = z.object({
+  rsiPeriod: z.number().int().min(2).max(60).optional(),
+  rsiOversold: z.number().min(0).max(100).optional(),
+  rsiOverbought: z.number().min(0).max(100).optional(),
+  macdFast: z.number().int().min(2).max(60).optional(),
+  macdSlow: z.number().int().min(2).max(120).optional(),
+  macdSignal: z.number().int().min(2).max(60).optional(),
+  requireMacdConfirm: z.boolean().optional(),
+  requireMacdCrossover: z.boolean().optional(),
+  stopAtr: z.number().positive().optional(),
+  takeProfitAtr: z.number().positive().optional(),
+}).strict();
+
+export type MomentumConfigOverrides = z.infer<typeof MomentumConfigSchema>;
+
 const GuardrailsSchema = z.object({
   disabled_strategies: z.array(z.string()).optional().default([]),
+  momentum: MomentumConfigSchema.optional(),
   account: z.object({
     equity_usd: z.number().positive(),
     risk_per_trade: z.number().positive(),

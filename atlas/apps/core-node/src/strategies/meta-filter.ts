@@ -16,6 +16,7 @@ import { Logger } from '../core/logger';
 import { Signal } from './signal-processor';
 import { Counter, Gauge, Histogram } from 'prom-client';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { recordSignalFiltered } from './signal-filter-telemetry';
 
 // Prometheus metrics
 const metaFilterReceivedCounter = new Counter({
@@ -336,6 +337,20 @@ export class MetaFilter extends EventEmitter {
         metaFilterBlockedCounter.inc({ symbol: signal.symbol, strategy: signal.strategy, rule: 'cold_streak' });
         this.logDecision(signal, context, false, 0, rulesEvaluated, hourOfDay, dayOfWeek);
 
+        recordSignalFiltered(this.logger, {
+          stage: 'meta',
+          reason: 'cold_streak',
+          symbol: signal.symbol,
+          strategy: signal.strategy,
+          signalId: signal.id,
+          direction: signal.direction,
+          strength: signal.strength,
+          context: {
+            consecutiveLosses: perf.consecutiveLosses,
+            threshold: this.config.coldStreakThreshold,
+          },
+        });
+
         return {
           allowed: false,
           qualityScore: 0,
@@ -406,12 +421,28 @@ export class MetaFilter extends EventEmitter {
       this.emit('signal:passed', signal, qualityScore, rulesEvaluated);
     } else {
       const failedRules = rulesEvaluated.filter(r => !r.passed).map(r => r.rule).join(',');
-      metaFilterBlockedCounter.inc({ 
-        symbol: signal.symbol, 
-        strategy: signal.strategy, 
-        rule: failedRules || 'low_score' 
+      const ruleLabel = failedRules || 'low_score';
+      metaFilterBlockedCounter.inc({
+        symbol: signal.symbol,
+        strategy: signal.strategy,
+        rule: ruleLabel,
       });
       this.emit('signal:blocked', signal, qualityScore, rulesEvaluated);
+
+      recordSignalFiltered(this.logger, {
+        stage: 'meta',
+        reason: ruleLabel,
+        symbol: signal.symbol,
+        strategy: signal.strategy,
+        signalId: signal.id,
+        direction: signal.direction,
+        strength: signal.strength,
+        context: {
+          qualityScore,
+          minQualityScore: this.config.minQualityScore,
+          failedRules: rulesEvaluated.filter(r => !r.passed).map(r => r.rule),
+        },
+      });
     }
 
     // Log decision
@@ -527,8 +558,15 @@ export class MetaFilter extends EventEmitter {
   ): MetaFilterResult['rulesEvaluated'][0] {
     const weight = 0.2;
 
-    // Breakout strategies need volume confirmation
-    const needsVolume = strategy === 'breakout' || strategy === 'momentum';
+    // Strategies that benefit from volume confirmation. Strategy ids must
+    // match what plugins actually emit (`StrategyPlugin.id`), e.g.
+    // 'trend_follow', not 'trend'. A typo here silently no-ops the rule
+    // for the affected strategy — the bug this list previously hid was
+    // trend_follow not getting volume gating at all.
+    const needsVolume =
+      strategy === 'breakout' ||
+      strategy === 'momentum' ||
+      strategy === 'trend_follow';
     
     if (needsVolume && volumeRatio < this.config.minVolumeRatio) {
       return {
@@ -593,7 +631,14 @@ export class MetaFilter extends EventEmitter {
     strategy: string
   ): MetaFilterResult['rulesEvaluated'][0] {
     const weight = 0.2;
-    const isTrendStrategy = strategy === 'breakout' || strategy === 'momentum' || strategy === 'trend';
+    // Strategy ids must match the `StrategyPlugin.id` values emitted by the
+    // plugins. The previous 'trend' literal never matched anything — the
+    // actual id is 'trend_follow'. As a result the MTF-alignment check was
+    // a silent no-op for the only enabled trend strategy.
+    const isTrendStrategy =
+      strategy === 'breakout' ||
+      strategy === 'momentum' ||
+      strategy === 'trend_follow';
 
     if (isTrendStrategy && this.config.requireMTFConfirm) {
       const aligned = Math.abs(mtfAlignment) >= 0.3;

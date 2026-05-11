@@ -13,6 +13,7 @@ import { Logger } from '../core/logger';
 import { Signal } from './signal-processor';
 import { RegimeDetector, MarketRegime, RegimeState } from './regime-detector';
 import { Counter, Gauge, Histogram } from 'prom-client';
+import { recordSignalFiltered } from './signal-filter-telemetry';
 
 // Prometheus metrics
 const signalsReceivedCounter = new Counter({
@@ -236,14 +237,20 @@ export class RegimeFilter extends EventEmitter {
       });
 
       this.emit('signal:filtered', signal, regimeState, 'incompatible_regime');
-      
-      this.logger.info('Signal filtered by regime', {
+
+      recordSignalFiltered(this.logger, {
+        stage: 'regime',
+        reason: 'incompatible_regime',
         symbol: signal.symbol,
         strategy: signal.strategy,
-        strategyType,
-        regime: regimeState.regime,
-        compatibilityScore,
-        reason: 'Regime-strategy mismatch',
+        signalId: signal.id,
+        direction: signal.direction,
+        strength: signal.strength,
+        context: {
+          strategyType,
+          regime: regimeState.regime,
+          compatibilityScore,
+        },
       });
 
       return {
@@ -271,11 +278,18 @@ export class RegimeFilter extends EventEmitter {
 
       this.emit('signal:filtered', signal, regimeState, 'mtf_misalignment');
 
-      this.logger.info('Signal filtered by MTF alignment', {
+      recordSignalFiltered(this.logger, {
+        stage: 'regime',
+        reason: 'mtf_misalignment',
         symbol: signal.symbol,
         strategy: signal.strategy,
-        mtfAlignment: regimeState.mtfAlignment,
-        threshold: this.config.mtfAlignmentThreshold,
+        signalId: signal.id,
+        direction: signal.direction,
+        strength: signal.strength,
+        context: {
+          mtfAlignment: regimeState.mtfAlignment,
+          threshold: this.config.mtfAlignmentThreshold,
+        },
       });
 
       return {
@@ -301,10 +315,18 @@ export class RegimeFilter extends EventEmitter {
 
         this.emit('signal:filtered', signal, regimeState, 'counter_trend');
 
-        this.logger.info('Signal filtered - counter trend', {
+        recordSignalFiltered(this.logger, {
+          stage: 'regime',
+          reason: 'counter_trend',
           symbol: signal.symbol,
+          strategy: signal.strategy,
+          signalId: signal.id,
           direction: signal.direction,
-          trendDirection: regimeState.trendDirection,
+          strength: signal.strength,
+          context: {
+            trendDirection: regimeState.trendDirection,
+            regime: regimeState.regime,
+          },
         });
 
         return {
@@ -341,12 +363,18 @@ export class RegimeFilter extends EventEmitter {
 
         this.emit('signal:filtered', signal, regimeState, 'insufficient_strength');
 
-        this.logger.info('Signal filtered - insufficient strength for regime', {
+        recordSignalFiltered(this.logger, {
+          stage: 'regime',
+          reason: 'insufficient_strength',
           symbol: signal.symbol,
           strategy: signal.strategy,
-          signalStrength: signal.strength,
-          requiredStrength,
-          regime: regimeState.regime,
+          signalId: signal.id,
+          direction: signal.direction,
+          strength: signal.strength,
+          context: {
+            requiredStrength,
+            regime: regimeState.regime,
+          },
         });
 
         return {
