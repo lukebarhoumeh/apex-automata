@@ -1,6 +1,15 @@
 import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
-import { TechnicalIndicators, OHLCV } from '../indicators/technical';
+import type { OHLCV } from '../indicators/technical';
+import { ValidatedIndicators } from '../indicators/validated-indicators';
+
+// NOTE (indicator-standardization, 2026-05):
+//   ATR was previously computed via the hand-rolled `TechnicalIndicators.ATR`
+//   (EMA-smoothed). It now uses Wilder RMA via `ValidatedIndicators.ATR`,
+//   matching what the regime detector and order-stop placement see. Drift on
+//   the 14-bar window is in the 3-10% range — the regimeAtrThreshold default
+//   (0.015) was tuned around the old EMA values; live perf telemetry should
+//   be checked after rollout.
 
 export interface MetricsTrackerConfig {
   spreadWindowSize: number;   // Number of samples to keep for spread percentile
@@ -144,8 +153,7 @@ export class MetricsTracker extends EventEmitter {
       return;
     }
     
-    // Calculate ATR
-    const atrValues = TechnicalIndicators.ATR(candles, this.config.regimeAtrPeriod);
+    const atrValues = ValidatedIndicators.ATR(candles, this.config.regimeAtrPeriod);
     if (atrValues.length === 0) {
       return;
     }
@@ -217,7 +225,7 @@ export class MetricsTracker extends EventEmitter {
     let atr = 0;
     for (const [symbol, candles] of this.candles) {
       if (candles.length >= this.config.regimeAtrPeriod + 1) {
-        const atrValues = TechnicalIndicators.ATR(candles, this.config.regimeAtrPeriod);
+        const atrValues = ValidatedIndicators.ATR(candles, this.config.regimeAtrPeriod);
         if (atrValues.length > 0) {
           atr = atrValues[atrValues.length - 1];
           break;

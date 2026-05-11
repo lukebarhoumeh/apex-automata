@@ -1,6 +1,9 @@
 import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
-import { OHLCV, TechnicalIndicators } from '../indicators/technical';
+import type { OHLCV } from '../indicators/technical';
+// NOTE (indicator-standardization, 2026-05): TechnicalIndicators import was
+// dead in this file. The signal pipeline owns indicator computation; this
+// engine just consumes signals. Removed to keep call-graph honest.
 import { SignalProcessor, Signal } from '../strategies/signal-processor';
 
 type OrderSide = 'BUY' | 'SELL';

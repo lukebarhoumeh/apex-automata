@@ -460,55 +460,53 @@ describe('RegimeFilter', () => {
   });
 });
 
-describe('TechnicalIndicators - ADX', () => {
-  it('should calculate ADX values', async () => {
-    const { TechnicalIndicators } = await import('../indicators/technical');
-    
-    // Generate trending candles
+describe('Indicators consumed by RegimeDetector', () => {
+  // ADX moved to ValidatedIndicators (Wilder RMA) as part of the
+  // indicator-standardization migration; the rest stay on TechnicalIndicators.
+  it('ValidatedIndicators.ADX produces in-range values', async () => {
+    const { ValidatedIndicators } = await import('../indicators/validated-indicators');
+
     const candles = generateCandles(50, 50000, {
       trend: 'up',
       volatility: 'normal',
       consistency: 0.8,
     });
 
-    const result = TechnicalIndicators.ADX(candles, 14);
+    const result = ValidatedIndicators.ADX(candles, 14);
 
     expect(result.adx.length).toBeGreaterThan(0);
     expect(result.plusDI.length).toBeGreaterThan(0);
     expect(result.minusDI.length).toBeGreaterThan(0);
 
-    // ADX values should be between 0 and 100
     result.adx.forEach(value => {
       expect(value).toBeGreaterThanOrEqual(0);
       expect(value).toBeLessThanOrEqual(100);
     });
   });
 
-  it('should calculate Choppiness Index values', async () => {
+  it('TechnicalIndicators.ChoppinessIndex produces in-range values', async () => {
     const { TechnicalIndicators } = await import('../indicators/technical');
-    
+
     const candles = generateCandles(50, 50000);
     const result = TechnicalIndicators.ChoppinessIndex(candles, 14);
 
     expect(result.length).toBeGreaterThan(0);
-    
-    // Choppiness values should be between 0 and 100
+
     result.forEach(value => {
       expect(value).toBeGreaterThanOrEqual(0);
       expect(value).toBeLessThanOrEqual(100);
     });
   });
 
-  it('should calculate Bollinger Band Width', async () => {
+  it('TechnicalIndicators.BollingerBandWidth produces non-negative values', async () => {
     const { TechnicalIndicators } = await import('../indicators/technical');
-    
+
     const candles = generateCandles(50, 50000);
     const closes = candles.map(c => c.close);
     const result = TechnicalIndicators.BollingerBandWidth(closes, 20, 2);
 
     expect(result.length).toBeGreaterThan(0);
-    
-    // BB Width should be positive
+
     result.forEach(value => {
       expect(value).toBeGreaterThanOrEqual(0);
     });

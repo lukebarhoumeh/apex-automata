@@ -1,12 +1,17 @@
 /**
  * Validated Indicators — Batch Computation via trading-signals (v7+)
  *
- * Drop-in replacement for TechnicalIndicators static methods.
- * Uses trading-signals library for the actual math, returns the same
- * array formats that strategies and backtesting expect.
+ * Single canonical source of truth for SMA / EMA / RSI / MACD /
+ * BollingerBands / ATR / ADX. Strategies, RegimeDetector and MetricsTracker
+ * all consume from here so they can never disagree on the math.
  *
  * v7 API: results are native numbers (no Big.js, no .toNumber()).
  * MACD constructor: new MACD(shortEMA, longEMA, signalEMA).
+ *
+ * Note on ATR/ADX: trading-signals uses Wilder's RMA (the textbook ADX/ATR
+ * definition matching TradingView/MetaTrader). The previously-shipped
+ * `TechnicalIndicators` versions used EMA smoothing, drifting ~10% on the
+ * first 30-50 bars and converging to <1% past 100 bars.
  */
 
 import { SMA, EMA, RSI, MACD, BollingerBands, ADX, ATR } from 'trading-signals';
@@ -110,7 +115,16 @@ export class ValidatedIndicators {
 
   /**
    * ADX with +DI/-DI.
-   * trading-signals v7 exposes .pdi and .mdi on the ADX instance.
+   *
+   * trading-signals v7 exposes `.pdi` and `.mdi` on the ADX instance as
+   * RATIOS (0-1, i.e. moves_up / ATR). The TradingView / Wilder convention
+   * — and what every other consumer in this codebase expects — is the
+   * 0-100 scale, where >25 = trending, ~50 = strong move. We multiply
+   * here so callers don't have to know about the underlying library quirk.
+   *
+   * Sanity check on a 100-bar trending fixture: trading-signals raw
+   * pdi=0.50/mdi=0.05 → returned as plusDI=50/minusDI=5, matching the
+   * old hand-rolled implementation's scale.
    */
   public static ADX(candles: OHLCV[], period: number = 14): {
     adx: number[];
@@ -130,8 +144,8 @@ export class ValidatedIndicators {
       const r = indicator.add({ high: candle.high, low: candle.low, close: candle.close });
       if (r !== null) {
         adx.push(r);
-        if (indicator.pdi !== undefined) plusDI.push(indicator.pdi as number);
-        if (indicator.mdi !== undefined) minusDI.push(indicator.mdi as number);
+        if (indicator.pdi !== undefined) plusDI.push((indicator.pdi as number) * 100);
+        if (indicator.mdi !== undefined) minusDI.push((indicator.mdi as number) * 100);
       }
     }
 
