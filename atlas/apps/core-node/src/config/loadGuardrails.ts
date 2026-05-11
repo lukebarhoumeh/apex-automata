@@ -140,7 +140,16 @@ const GuardrailsSchema = z.object({
     min_profitable_days: z.number().int().nonnegative(),
     max_error_count_per_day: z.number().int().nonnegative(),
     manual_approval_required: z.boolean()
-  })
+  }),
+  // Backtest realism model — consumed by BacktestEngine. All keys optional;
+  // engine defaults take over when this block is absent.
+  backtest: z.object({
+    next_bar_fill: z.boolean().optional(),
+    entry_slippage_bps: z.number().nonnegative().optional(),
+    stop_overshoot_bar_range_pct: z.number().min(0).max(1).optional(),
+    stop_overshoot_min_bps: z.number().nonnegative().optional(),
+    size_decimals: z.number().int().min(0).max(10).optional(),
+  }).optional(),
 });
 
 export type GuardrailConfig = z.infer<typeof GuardrailsSchema>;
