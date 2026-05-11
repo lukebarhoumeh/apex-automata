@@ -30,6 +30,15 @@ export const EnvSchema = z.object({
   
   // Live trading safeguard
   CONFIRM_LIVE: z.enum(['YES', 'NO']).default('NO'),
+
+  // Hyperliquid (optional — kill-switch defaults to OFF). The adapter is only
+  // initialized when HYPERLIQUID_ENABLED=true AND guardrails.hyperliquid.enabled=true.
+  // Private key + wallet address are only required for trading; public-data init works
+  // without them (read-only). Never log these values.
+  HYPERLIQUID_ENABLED: z.enum(['true', 'false']).optional(),
+  HYPERLIQUID_TESTNET: z.enum(['true', 'false']).optional(),
+  HYPERLIQUID_PRIVATE_KEY: z.string().optional(),
+  HYPERLIQUID_WALLET_ADDRESS: z.string().optional(),
 });
 
 export type Env = z.infer<typeof EnvSchema>;
