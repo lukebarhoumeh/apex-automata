@@ -15,6 +15,7 @@
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 import { Logger } from '../../core/logger';
+import { FeeModel } from '../../core/fee-model';
 import {
   IExecutionAdapter,
   ExecutionMode,
@@ -24,7 +25,7 @@ import {
   OpenOrder,
   FillRecord,
   ProductSpec,
-  DEFAULT_PRODUCT_SPECS,
+  buildDefaultProductSpecs,
   roundQuantity,
   roundPrice,
   validateOrderAgainstSpec,
@@ -36,6 +37,8 @@ import {
 export interface PaperAdapterConfig {
   /** Logger instance */
   logger: Logger;
+  /** Fee model — required when productSpecs is not supplied so defaults can be built */
+  feeModel?: FeeModel;
   /** Product specifications */
   productSpecs?: Record<string, ProductSpec>;
   /** Simulated latency range [min, max] in ms */
@@ -109,10 +112,20 @@ export class PaperExecutionAdapter extends EventEmitter implements IExecutionAda
   constructor(config: PaperAdapterConfig) {
     super();
     this.logger = config.logger;
+    const resolvedSpecs =
+      config.productSpecs ??
+      (config.feeModel
+        ? buildDefaultProductSpecs(config.feeModel)
+        : (() => {
+            throw new Error(
+              'PaperExecutionAdapter: either `productSpecs` or `feeModel` must be provided ' +
+                'so fees come from guardrails.yaml. Hardcoded fee fallbacks were removed.',
+            );
+          })());
     this.config = {
       ...DEFAULT_PAPER_CONFIG,
       ...config,
-      productSpecs: config.productSpecs || DEFAULT_PRODUCT_SPECS,
+      productSpecs: resolvedSpecs,
     } as Required<PaperAdapterConfig>;
     this.productSpecs = this.config.productSpecs;
 

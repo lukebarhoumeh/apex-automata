@@ -16,7 +16,7 @@ import {
   PlaceOrderRequest,
   BrokerOrderEvent,
   ProductSpec,
-  DEFAULT_PRODUCT_SPECS,
+  buildDefaultProductSpecs,
   validateOrderAgainstSpec,
   roundQuantity,
   roundPrice,
@@ -31,6 +31,8 @@ import {
   createAdapters,
 } from '../trading/execution/adapter-factory';
 import { Logger } from '../core/logger';
+import { FeeModel } from '../core/fee-model';
+import type { FeesConfig } from '../config/loadGuardrails';
 
 // Mock logger
 const mockLogger: Logger = {
@@ -39,6 +41,20 @@ const mockLogger: Logger = {
   error: vi.fn(),
   debug: vi.fn(),
 } as any;
+
+// Test fee fixture — mirrors the production guardrails.yaml -> fees: block so
+// adapters built in tests use realistic (and deterministic) fee numbers.
+const TEST_FEES: FeesConfig = {
+  coinbase: {
+    spot: { maker_bps: 25, taker_bps: 40 },
+    perps_intx: { maker_bps: 0, taker_bps: 5 },
+  },
+  hyperliquid: {
+    perps: { maker_bps: -1.5, taker_bps: 4.5 },
+  },
+};
+const testFeeModel = new FeeModel(TEST_FEES);
+const DEFAULT_PRODUCT_SPECS = buildDefaultProductSpecs(testFeeModel);
 
 describe('Execution Adapter Contract', () => {
   describe('BrokerOrderEvent Shapes', () => {
@@ -49,6 +65,7 @@ describe('Execution Adapter Contract', () => {
       events = [];
       paperAdapter = new PaperExecutionAdapter({
         logger: mockLogger,
+        feeModel: testFeeModel,
         randomSeed: 12345, // Deterministic
       });
       paperAdapter.onEvent((event) => events.push(event));
@@ -262,6 +279,7 @@ describe('Post-Only Behavior', () => {
     events = [];
     adapter = new PaperExecutionAdapter({
       logger: mockLogger,
+      feeModel: testFeeModel,
       randomSeed: 12345,
     });
     adapter.onEvent((event) => events.push(event));
@@ -335,6 +353,7 @@ describe('Mode Switching', () => {
   it('should allow stopping and restarting adapter', async () => {
     const adapter = new PaperExecutionAdapter({
       logger: mockLogger,
+      feeModel: testFeeModel,
     });
 
     await adapter.start();
@@ -352,6 +371,7 @@ describe('Mode Switching', () => {
   it('should clear orders on stop', async () => {
     const adapter = new PaperExecutionAdapter({
       logger: mockLogger,
+      feeModel: testFeeModel,
       randomSeed: 12345,
     });
 
@@ -392,6 +412,7 @@ describe('Deterministic RNG', () => {
     // First run
     const adapter1 = new PaperExecutionAdapter({
       logger: mockLogger,
+      feeModel: testFeeModel,
       randomSeed: 42,
     });
     adapter1.onEvent((e) => events1.push(e));
@@ -409,6 +430,7 @@ describe('Deterministic RNG', () => {
     // Second run with same seed
     const adapter2 = new PaperExecutionAdapter({
       logger: mockLogger,
+      feeModel: testFeeModel,
       randomSeed: 42,
     });
     adapter2.onEvent((e) => events2.push(e));

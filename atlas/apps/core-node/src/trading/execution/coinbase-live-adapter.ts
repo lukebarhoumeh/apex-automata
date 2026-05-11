@@ -9,6 +9,7 @@
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 import { Logger } from '../../core/logger';
+import { FeeModel } from '../../core/fee-model';
 import { CoinbaseExchange } from '../../exchanges/coinbase';
 import { CoinbaseOrder, Fill, OrderRequest } from '../../exchanges/coinbase/types';
 import {
@@ -20,7 +21,7 @@ import {
   OpenOrder,
   FillRecord,
   ProductSpec,
-  DEFAULT_PRODUCT_SPECS,
+  buildDefaultProductSpecs,
   roundQuantity,
   roundPrice,
   validateOrderAgainstSpec,
@@ -34,7 +35,9 @@ export interface CoinbaseLiveAdapterConfig {
   logger: Logger;
   /** Coinbase exchange instance */
   exchange: CoinbaseExchange;
-  /** Product specifications (optional, uses defaults) */
+  /** Fee model — required when productSpecs is not supplied so defaults can be built */
+  feeModel?: FeeModel;
+  /** Product specifications (optional, falls back to defaults built from feeModel) */
   productSpecs?: Record<string, ProductSpec>;
 }
 
@@ -66,7 +69,16 @@ export class CoinbaseLiveExecutionAdapter extends EventEmitter implements IExecu
     super();
     this.logger = config.logger;
     this.exchange = config.exchange;
-    this.productSpecs = config.productSpecs || DEFAULT_PRODUCT_SPECS;
+    if (config.productSpecs) {
+      this.productSpecs = config.productSpecs;
+    } else if (config.feeModel) {
+      this.productSpecs = buildDefaultProductSpecs(config.feeModel);
+    } else {
+      throw new Error(
+        'CoinbaseLiveExecutionAdapter: either `productSpecs` or `feeModel` must be provided ' +
+          'so fees come from guardrails.yaml. Hardcoded fee fallbacks were removed.',
+      );
+    }
   }
 
   /**

@@ -5,6 +5,31 @@ account:
   max_account_leverage: 3.0
   min_notional_buffer: 1.1
 
+# Single source of truth for exchange fee assumptions.
+# Used by backtest / paper / live so all three are directly comparable.
+# Values in basis points (1 bps = 0.01%). Sourced from public 2026 fee
+# schedules — update here when tiers change; do NOT scatter constants in code.
+#
+# Sources:
+#   coinbase.spot          — Coinbase Advanced Trade $10k–$50k volume tier
+#                            (https://www.coinbase.com/advanced-fees)
+#   coinbase.perps_intx    — Coinbase International Exchange perps default tier
+#                            (https://www.coinbase.com/international-exchange-fees)
+#   hyperliquid.perps      — Hyperliquid perps base tier; maker is a rebate
+#                            (https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees)
+fees:
+  coinbase:
+    spot:
+      maker_bps: 25       # 0.25%
+      taker_bps: 40       # 0.40%
+    perps_intx:
+      maker_bps: 0        # 0.00%
+      taker_bps: 5        # 0.05%
+  hyperliquid:
+    perps:
+      maker_bps: -1.5     # rebate (negative = paid to maker)
+      taker_bps: 4.5      # 0.045%
+
 # Strategies permanently disabled based on Phase 3 backtest verdict (March 2026)
 # VWAP MR: Zero/1 trade across 12 months — ADX ranging regime too short
 # Breakout: Negative-EV even at zero fees — signal has no edge

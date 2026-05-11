@@ -5,8 +5,11 @@ import { v4 as uuidv4 } from 'uuid';
 
 export interface PaperTradingConfig {
   initialBalances: Map<string, number>; // currency -> amount (e.g., 'USD' -> 10000, 'BTC' -> 0)
-  makerFee: number; // 0.004 for 0.4%
-  takerFee: number; // 0.006 for 0.6%
+  // Maker/taker rates are DECIMALS (e.g. 0.004 == 0.4%). They MUST be sourced
+  // from FeeModel.getFeeRate(...) — see TradingEngine.initializePaperSimulator.
+  // Do not hardcode fee constants here or at any other call site.
+  makerFee: number;
+  takerFee: number;
   slippage: number; // 0.001 for 0.1% base slippage
   latencyMs: number; // Simulated order latency
   

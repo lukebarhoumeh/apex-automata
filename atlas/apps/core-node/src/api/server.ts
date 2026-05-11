@@ -13,6 +13,7 @@ import { loadAndValidateEnv } from '../core/env';
 import client from 'prom-client';
 import { OHLCV } from '../indicators/technical';
 import { loadGuardrails } from '../config/loadGuardrails';
+import { FeeModel } from '../core/fee-model';
 import { validateSchemaOrFail } from '../config/validateSchema';
 import { OrderRequest } from '../exchanges/coinbase';
 import { MetricsTracker } from '../trading/metrics-tracker';
@@ -255,6 +256,7 @@ let signalsConfig: any = null;
 const atlasRoot = path.resolve(process.cwd(), '../..');
 const env = loadAndValidateEnv(atlasRoot);
 const guardrails = loadGuardrails(atlasRoot);
+const feeModel = FeeModel.fromGuardrails(guardrails);
 
 // Logger
 const logger = createLogger(path.join(atlasRoot, 'var/logs/api-server.jsonl'));
@@ -3516,7 +3518,9 @@ app.post('/api/backtest/run', async (req, res) => {
       startDate: new Date(startDate),
       endDate: new Date(endDate),
       initialCapital: Number(initialCapital),
-      commission: 0.001, // 0.1% commission
+      // Backtest fee MUST match paper/live or the comparison is meaningless.
+      // Pull Coinbase spot taker from the single FeeModel source of truth.
+      commission: feeModel.getFeeRate('coinbase', 'spot', 'taker'),
       slippage: 0.0005, // 0.05% slippage
       products: normalizedSymbols,
       signals: strategyConfig,

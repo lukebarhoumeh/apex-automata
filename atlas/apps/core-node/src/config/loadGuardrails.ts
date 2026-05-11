@@ -41,6 +41,26 @@ export type HyperliquidSymbolLimit = z.infer<typeof HyperliquidSymbolLimitSchema
 export type PerSymbolLimit = z.infer<typeof PerSymbolLimitSchema>;
 export type StrategyOverrides = z.infer<typeof StrategyOverridesSchema>;
 
+// Fee model — single source of truth for fee assumptions across
+// backtest, paper, and live so all three are directly comparable.
+// Negative maker values represent rebates (Hyperliquid). All values in bps.
+const FeeSideSchema = z.object({
+  maker_bps: z.number(),
+  taker_bps: z.number(),
+});
+
+const FeesSchema = z.object({
+  coinbase: z.object({
+    spot: FeeSideSchema,
+    perps_intx: FeeSideSchema,
+  }),
+  hyperliquid: z.object({
+    perps: FeeSideSchema,
+  }),
+});
+
+export type FeesConfig = z.infer<typeof FeesSchema>;
+
 const GuardrailsSchema = z.object({
   disabled_strategies: z.array(z.string()).optional().default([]),
   account: z.object({
@@ -58,6 +78,10 @@ const GuardrailsSchema = z.object({
     funding_cost_tolerance_bps: z.number().nonnegative(),
     slippage_estimate_bps: z.number().nonnegative()
   }),
+  // Required: every code path (backtest, paper, live) reads fees from here.
+  // Startup must fail if absent — silent drift between layers is what we just
+  // fixed (see PHASE3_BACKTEST_VERDICT.md).
+  fees: FeesSchema,
   // Per-symbol risk limits (optional)
   per_symbol: z.record(z.string(), PerSymbolLimitSchema).optional(),
   strategy: z.object({

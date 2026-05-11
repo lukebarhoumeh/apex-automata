@@ -12,6 +12,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { FeeModel } from '../../core/fee-model';
 
 /**
  * Execution mode: paper or live
@@ -261,9 +262,13 @@ export interface ProductSpec {
 }
 
 /**
- * Default BTC-USD product spec
+ * Structural defaults for product specs — everything EXCEPT fees. Fees are
+ * pulled from FeeModel (guardrails.yaml) at build time so backtest, paper,
+ * and live all use one source of truth. See `buildDefaultProductSpecs`.
  */
-export const DEFAULT_BTC_USD_SPEC: ProductSpec = {
+type ProductSpecStructural = Omit<ProductSpec, 'makerFee' | 'takerFee'>;
+
+const BTC_USD_STRUCTURAL: ProductSpecStructural = {
   symbol: 'BTC-USD',
   baseCurrency: 'BTC',
   quoteCurrency: 'USD',
@@ -272,14 +277,9 @@ export const DEFAULT_BTC_USD_SPEC: ProductSpec = {
   lotSize: 0.00000001,
   tickSize: 0.01,
   minNotional: 1,
-  makerFee: 0.004,
-  takerFee: 0.006,
 };
 
-/**
- * Default ETH-USD product spec
- */
-export const DEFAULT_ETH_USD_SPEC: ProductSpec = {
+const ETH_USD_STRUCTURAL: ProductSpecStructural = {
   symbol: 'ETH-USD',
   baseCurrency: 'ETH',
   quoteCurrency: 'USD',
@@ -288,14 +288,9 @@ export const DEFAULT_ETH_USD_SPEC: ProductSpec = {
   lotSize: 0.00000001,
   tickSize: 0.01,
   minNotional: 1,
-  makerFee: 0.004,
-  takerFee: 0.006,
 };
 
-/**
- * Default SOL-USD product spec
- */
-export const DEFAULT_SOL_USD_SPEC: ProductSpec = {
+const SOL_USD_STRUCTURAL: ProductSpecStructural = {
   symbol: 'SOL-USD',
   baseCurrency: 'SOL',
   quoteCurrency: 'USD',
@@ -304,18 +299,32 @@ export const DEFAULT_SOL_USD_SPEC: ProductSpec = {
   lotSize: 0.00000001,
   tickSize: 0.001,
   minNotional: 1,
-  makerFee: 0.004,
-  takerFee: 0.006,
+};
+
+const STRUCTURAL_DEFAULTS: Record<string, ProductSpecStructural> = {
+  'BTC-USD': BTC_USD_STRUCTURAL,
+  'ETH-USD': ETH_USD_STRUCTURAL,
+  'SOL-USD': SOL_USD_STRUCTURAL,
 };
 
 /**
- * Default product specs map
+ * Build the default product spec map with fees pulled from FeeModel.
+ * No code path should hardcode maker/taker fees — they live in guardrails.yaml.
+ *
+ * `market` selects the Coinbase fee bucket (spot vs INTX perps); default is spot.
  */
-export const DEFAULT_PRODUCT_SPECS: Record<string, ProductSpec> = {
-  'BTC-USD': DEFAULT_BTC_USD_SPEC,
-  'ETH-USD': DEFAULT_ETH_USD_SPEC,
-  'SOL-USD': DEFAULT_SOL_USD_SPEC,
-};
+export function buildDefaultProductSpecs(
+  feeModel: FeeModel,
+  market: 'spot' | 'perps' = 'spot',
+): Record<string, ProductSpec> {
+  const makerFee = feeModel.getFeeRate('coinbase', market, 'maker');
+  const takerFee = feeModel.getFeeRate('coinbase', market, 'taker');
+  const out: Record<string, ProductSpec> = {};
+  for (const [symbol, struct] of Object.entries(STRUCTURAL_DEFAULTS)) {
+    out[symbol] = { ...struct, makerFee, takerFee };
+  }
+  return out;
+}
 
 /**
  * Round a value to the specified precision
