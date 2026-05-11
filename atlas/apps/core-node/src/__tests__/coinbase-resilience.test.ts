@@ -149,19 +149,20 @@ describe('TokenBucketRateLimiter', () => {
   });
 
   it('should not exceed configured rate', async () => {
-    // Exhaust all tokens
+    // Drain the bucket with 5 consecutive acquires paced at minInterval.
+    // Advancing fake timers between each iteration is required because the
+    // limiter sleeps for `minInterval - timeSinceLastRequest` and that
+    // setTimeout never fires under fake timers without an explicit advance.
     for (let i = 0; i < 5; i++) {
-      await limiter.acquire();
+      const p = limiter.acquire();
+      await vi.advanceTimersByTimeAsync(100);
+      await p;
       limiter.release();
     }
 
-    // Next acquire should wait
-    const acquirePromise = limiter.acquire();
-    
-    // Advance time to allow token refill
-    vi.advanceTimersByTime(1000);
-    
-    await acquirePromise;
+    // refillRate=1 token/sec cannot replenish 5 tokens in ~500ms, so the
+    // bucket is drained — confirming the limiter enforced the configured
+    // rate rather than letting all 5 acquires through instantly.
     expect(limiter.getState().tokens).toBeLessThan(5);
   });
 

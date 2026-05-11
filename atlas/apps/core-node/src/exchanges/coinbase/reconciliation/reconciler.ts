@@ -176,11 +176,19 @@ export class CoinbaseReconciler extends EventEmitter {
     if (this.config.autoReconcile) {
       this.startOrderReconcileLoop();
       this.startFillReconcileLoop();
-    }
 
-    // Run immediate reconciliation on start
-    this.reconcileOrders();
-    this.reconcileFills();
+      // Run immediate reconciliation on start so we catch up on any state
+      // changes that happened while the reconciler was off. Only fire when
+      // autoReconcile is enabled — when callers opt into manual control we
+      // must not race their explicit reconcileOrders/reconcileFills calls.
+      this.reconcileOrders().catch(() => {
+        // Errors are recorded by handleReconcileError; swallow here so the
+        // fire-and-forget kickoff does not surface as an unhandled rejection.
+      });
+      this.reconcileFills().catch(() => {
+        // See note above for reconcileOrders.
+      });
+    }
   }
 
   /**
