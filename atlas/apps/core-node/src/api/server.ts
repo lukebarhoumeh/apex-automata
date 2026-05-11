@@ -301,29 +301,79 @@ async function openTradingSession(params: {
   // new clock for the 60s windows.
   signalArbitrator.reset();
 
-  // Cleanup orphans from a prior killed/crashed session before this one opens.
-  // PositionTracker doesn't recover state across restarts, so anything left
-  // with closed_at IS NULL belongs to a dead tracker and would otherwise
-  // bleed into useOpenPositions on the dashboard. Mark them session_end with
-  // realized_pnl_usd=0 — the engine never realized any P&L on them anyway,
-  // and we have no reliable exit price to reconstruct.
+  // Reconciliation pass — DO NOT destroy prior position state.
+  //
+  // Previously this routine ran an "orphan-zero" pass: any position with
+  // closed_at IS NULL was force-closed at realized_pnl_usd=0 with
+  // exit_reason='session_end'. That was correct only under the (false)
+  // assumption that PositionTracker had no way to recover state across
+  // restarts. With hydrateOpenPositions wired into TradingEngine.start,
+  // closed_at IS NULL now means "really open" — destroying those rows
+  // erases live P&L and trade history.
+  //
+  // We now:
+  //   1. Read the open-position set from Supabase.
+  //   2. Read the engine's in-memory open-position set (post-hydrate).
+  //   3. Log any mismatch. The reconciler + next ticker/fill will repair
+  //      drift; this pass is observational only.
+  //
+  // Feature flag STARTUP_RECONCILE=false reverts to the destructive
+  // behavior so this can be rolled back without a deploy.
+  const reconcileEnvVal = (process.env.STARTUP_RECONCILE ?? 'true').toLowerCase();
+  const reconcileMode = reconcileEnvVal === 'false' || reconcileEnvVal === '0' ? 'destructive' : 'observational';
   try {
-    const { error: orphanErr, count } = await supabase
+    const { data: dbOpenRows, error: openErr } = await supabase
       .from('positions')
-      .update({
-        closed_at: new Date(startedAt).toISOString(),
-        exit_reason: 'session_end',
-        realized_pnl_usd: 0,
-      }, { count: 'exact' })
+      .select('id, symbol, side, qty_open, opened_at')
       .eq('user_id', USER_ID)
       .is('closed_at', null);
-    if (orphanErr) {
-      logger.warn('Orphan position cleanup failed (non-fatal)', { error: orphanErr.message });
-    } else if ((count ?? 0) > 0) {
-      logger.info('Closed orphan positions from prior session', { count: count ?? 0 });
+
+    if (openErr) {
+      logger.warn('Session reconcile: could not read open positions (non-fatal)', { error: openErr.message });
+    } else if (reconcileMode === 'destructive') {
+      // Legacy behavior, only reachable when STARTUP_RECONCILE is explicitly disabled.
+      const { error: orphanErr, count } = await supabase
+        .from('positions')
+        .update({
+          closed_at: new Date(startedAt).toISOString(),
+          exit_reason: 'session_end',
+          realized_pnl_usd: 0,
+        }, { count: 'exact' })
+        .eq('user_id', USER_ID)
+        .is('closed_at', null);
+      if (orphanErr) {
+        logger.warn('Legacy orphan-zero cleanup failed (non-fatal)', { error: orphanErr.message });
+      } else if ((count ?? 0) > 0) {
+        logger.warn('Legacy orphan-zero cleanup closed positions (STARTUP_RECONCILE=false)', { count: count ?? 0 });
+      }
+    } else {
+      // Observational reconcile — log only.
+      const dbSymbols = new Set((dbOpenRows ?? []).map((r: any) => r.symbol));
+      const enginePositions = tradingEngine?.getOpenPositions?.() ?? [];
+      const engineSymbols = new Set(enginePositions.map((p: any) => p.symbol));
+
+      const inDbNotEngine: string[] = [];
+      for (const s of dbSymbols) {
+        if (!engineSymbols.has(s)) inDbNotEngine.push(s);
+      }
+      const inEngineNotDb: string[] = [];
+      for (const s of engineSymbols) {
+        if (!dbSymbols.has(s)) inEngineNotDb.push(s);
+      }
+
+      logger.info('Session reconcile (observational)', {
+        sessionId,
+        dbOpenCount: dbSymbols.size,
+        engineOpenCount: engineSymbols.size,
+        inDbNotEngine,
+        inEngineNotDb,
+        note: inDbNotEngine.length === 0 && inEngineNotDb.length === 0
+          ? 'state aligned'
+          : 'mismatch — exchange reconciler + next ticker/fill will repair drift',
+      });
     }
   } catch (err) {
-    logger.warn('Orphan position cleanup threw (non-fatal)', { error: String(err) });
+    logger.warn('Session reconcile threw (non-fatal)', { error: String(err) });
   }
 
   try {
@@ -3847,12 +3897,38 @@ async function syncPositionToSupabase(position: any) {
       realized_pnl_usd: Number(position.realizedPnL ?? position.realizedPnl ?? position.realized_pnl_usd ?? 0),
     };
 
+    // Conflict-target selection.
+    //
+    // Legacy: UNIQUE(user_id, symbol) → upserting a NEW position for a symbol
+    //         that already has CLOSED history overwrites the historical row.
+    //         Migration 20260203_step7_persistence_hardening.sql:135.
+    //
+    // After migration 20260511_positions_history_preserve.sql is applied
+    // (partial unique index on (user_id, symbol) WHERE closed_at IS NULL),
+    // the (user_id, symbol) constraint is dropped and we conflict-resolve
+    // on the position's UUID `id` instead — which is stable for the whole
+    // lifecycle of one position, so updates still upsert correctly and
+    // historical rows are never touched.
+    //
+    // POSITIONS_HISTORY_PRESERVE=true gates this — keep at default (false)
+    // until the migration is applied; the user can flip it once Supabase
+    // is updated.
+    const preserveHistory = (process.env.POSITIONS_HISTORY_PRESERVE ?? 'false').toLowerCase() === 'true';
+    const onConflictTarget = preserveHistory ? 'id' : 'user_id,symbol';
+
     const { error } = await supabase
       .from('positions')
-      .upsert(mappedPosition, { onConflict: 'user_id,symbol' });
+      .upsert(mappedPosition, { onConflict: onConflictTarget });
 
     if (error) {
-      logger.error('Failed to sync position to Supabase:', error);
+      logger.error('Failed to sync position to Supabase:', {
+        error: error.message,
+        code: (error as any).code,
+        onConflictTarget,
+        positionId: mappedPosition.id,
+        symbol: mappedPosition.symbol,
+        preserveHistory,
+      });
     }
   } catch (error) {
     logger.error('Error syncing position:', error);
@@ -3962,49 +4038,70 @@ initializeAccountMetrics().catch(err => {
   logger.error('Failed to initialize account metrics on startup:', err);
 });
 
-// Global error handlers for stability - 24/7 resilience
+// Global error handlers — log full context, then exit(1) and let the
+// supervisor (PM2 or start.cjs) restart the process. The previous behavior
+// swallowed uncaught exceptions and unhandled rejections to "keep the
+// server alive", but that defeats the supervisor and pins the bot to
+// corrupt in-process state (most often after a WS reconnect race or a
+// Supabase fetch failure).
+//
+// Best-effort UI broadcast first so the dashboard shows a SystemError
+// before the process dies; the WS will then reconnect to the restarted
+// instance.
 process.on('uncaughtException', (error) => {
-  logger.error('Uncaught Exception - keeping server alive:', {
+  logger.error('Uncaught Exception — exiting for supervisor restart', {
     error: error.message,
     stack: error.stack,
+    name: error.name,
   });
-  
-  // Notify supervisor of error (for potential recovery)
-  if (tradingEngine && !supervisor.isKillSwitchActive()) {
-    tradingEngine.handleFatal(error, 'uncaughtException');
+
+  try {
+    broadcast({
+      type: 'SystemError',
+      payload: {
+        type: 'uncaughtException',
+        message: error.message,
+        timestamp: Date.now(),
+        action: 'process_exit',
+      }
+    });
+  } catch (broadcastErr) {
+    logger.error('Failed to broadcast SystemError before exit', {
+      error: broadcastErr instanceof Error ? broadcastErr.message : String(broadcastErr),
+    });
   }
-  
-  // Broadcast error to UI
-  broadcast({
-    type: 'SystemError',
-    payload: {
-      type: 'uncaughtException',
-      message: error.message,
-      timestamp: Date.now(),
-    }
-  });
-  
-  // Don't exit - try to keep running
+
+  // exit(1) signals an unclean shutdown so PM2/start.cjs restarts us.
+  // Use a short timer so the broadcast actually flushes over the WS
+  // before the event loop dies.
+  setTimeout(() => process.exit(1), 100).unref();
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   const message = reason instanceof Error ? reason.message : String(reason);
-  logger.error('Unhandled Rejection:', {
+  logger.error('Unhandled Rejection — exiting for supervisor restart', {
     reason: message,
     stack: reason instanceof Error ? reason.stack : undefined,
+    name: reason instanceof Error ? reason.name : typeof reason,
   });
-  
-  // Broadcast error to UI
-  broadcast({
-    type: 'SystemError',
-    payload: {
-      type: 'unhandledRejection',
-      message,
-      timestamp: Date.now(),
-    }
-  });
-  
-  // Don't exit - try to keep running
+
+  try {
+    broadcast({
+      type: 'SystemError',
+      payload: {
+        type: 'unhandledRejection',
+        message,
+        timestamp: Date.now(),
+        action: 'process_exit',
+      }
+    });
+  } catch (broadcastErr) {
+    logger.error('Failed to broadcast SystemError before exit', {
+      error: broadcastErr instanceof Error ? broadcastErr.message : String(broadcastErr),
+    });
+  }
+
+  setTimeout(() => process.exit(1), 100).unref();
 });
 
 // Graceful shutdown handler

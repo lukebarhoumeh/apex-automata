@@ -111,6 +111,101 @@ export class PositionTracker extends EventEmitter {
   }
   
   /**
+   * Rehydrate open positions from Supabase. Called by TradingEngine on
+   * startup so the in-memory map matches reality before any ticker/fill
+   * events flow through. Without this, every restart silently abandoned
+   * live positions.
+   *
+   * - Filters by user + closed_at IS NULL (the real "open" signal — the
+   *   `status` column has a default of 'open' but isn't reliably updated
+   *   by syncPositionToSupabase, so closed_at is the source of truth).
+   * - Returns count of positions hydrated. Failure to fetch throws — the
+   *   caller (TradingEngine) handles failure semantics (best-effort).
+   * - Idempotent: clears the map first, so calling twice yields the same
+   *   final state.
+   */
+  public async hydrateOpenPositions(userId: string): Promise<number> {
+    if (!userId) {
+      this.logger.warn('hydrateOpenPositions called with empty userId — skipping');
+      return 0;
+    }
+
+    const { data, error } = await this.supabase
+      .from('positions')
+      .select('id, symbol, side, qty_open, entry_price, opened_at, stop_price_at_entry, take_profit_price, strategy, realized_pnl_usd, exit_reason')
+      .eq('user_id', userId)
+      .is('closed_at', null);
+
+    if (error) {
+      // Bubble up so engine's allSettled treats this as a rejected branch.
+      throw new Error(`positions hydrate query failed: ${error.message}`);
+    }
+
+    // Idempotent reset — never silently merge stale in-memory state with DB.
+    this.positions.clear();
+
+    let hydrated = 0;
+    for (const row of data ?? []) {
+      try {
+        const size = Number(row.qty_open ?? 0);
+        const avgPrice = Number(row.entry_price ?? 0);
+        if (!Number.isFinite(size) || size <= 0 || !Number.isFinite(avgPrice) || avgPrice <= 0) {
+          this.logger.warn('Skipping malformed open position during hydrate', {
+            id: row.id,
+            symbol: row.symbol,
+            qty_open: row.qty_open,
+            entry_price: row.entry_price,
+          });
+          continue;
+        }
+        const side: Position['side'] = row.side === 'short' ? 'short' : 'long';
+        const openedAt = row.opened_at ? new Date(row.opened_at) : new Date();
+        const stop = Number(row.stop_price_at_entry);
+        const tp = Number(row.take_profit_price);
+        const realized = Number(row.realized_pnl_usd ?? 0);
+
+        const position: Position = {
+          id: row.id,
+          symbol: row.symbol,
+          strategy: row.strategy ?? undefined,
+          side,
+          size,
+          averagePrice: avgPrice,
+          marketPrice: avgPrice, // Best estimate until first ticker arrives.
+          unrealizedPnL: 0,
+          realizedPnL: Number.isFinite(realized) ? realized : 0,
+          totalPnL: 0,
+          openTime: openedAt,
+          lastUpdateTime: new Date(),
+          trades: [],
+          maxSize: size,
+          maxDrawdown: 0,
+          stopPrice: Number.isFinite(stop) && stop > 0 ? stop : undefined,
+          takeProfit: Number.isFinite(tp) && tp > 0 ? tp : undefined,
+          metadata: { hydratedFromSupabase: true, openedAtIso: openedAt.toISOString() },
+        };
+        this.positions.set(row.symbol, position);
+        hydrated++;
+      } catch (err) {
+        this.logger.error('Failed to materialize hydrated position', {
+          id: row?.id,
+          symbol: row?.symbol,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    this.logger.info('PositionTracker hydrated open positions', {
+      userId,
+      rowsReturned: data?.length ?? 0,
+      hydrated,
+      symbols: Array.from(this.positions.keys()),
+    });
+
+    return hydrated;
+  }
+
+  /**
    * Set the order creator function for placing flatten orders.
    * Returns the order ID if successful, null if failed.
    */

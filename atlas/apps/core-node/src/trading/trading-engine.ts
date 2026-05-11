@@ -217,8 +217,24 @@ export class TradingEngine extends EventEmitter {
       this.initializePositionMonitor();
       this.initializeTradeAnalytics();
 
+      // Wire Coinbase resilience components (reconciler + gap filler).
+      // These are created here — they survive WS drops because they poll REST.
+      // initializeReconciler needs OrderManager so it goes after initializeOrderManager.
+      this.initializeExchangeResilience();
+
       // Setup event handlers
       this.setupEventHandlers();
+
+      // Optional state hydration from Supabase before any exchange events arrive.
+      // Gated by STARTUP_RECONCILE so a regression can be rolled back without a deploy.
+      // Default: enabled. Set STARTUP_RECONCILE=false to fall back to old in-memory-only behavior.
+      const reconcileEnv = (process.env.STARTUP_RECONCILE ?? 'true').toLowerCase();
+      const startupReconcileEnabled = reconcileEnv !== 'false' && reconcileEnv !== '0';
+      if (startupReconcileEnabled) {
+        await this.hydrateStateFromSupabase();
+      } else {
+        this.logger.warn('Startup state hydration disabled via STARTUP_RECONCILE=false — engine will start with empty position/order state');
+      }
 
       // Connect to exchange
       await this.exchange!.connect();
@@ -228,6 +244,15 @@ export class TradingEngine extends EventEmitter {
 
       // Validate products and subscribe to market data
       await this.validateAndSubscribeToMarketData();
+
+      // Register each active symbol with the gap filler now that the
+      // subscription set is finalized. We use 1m candles because that's the
+      // primary timeframe everything else (signals, indicators) keys off of.
+      this.registerSymbolsWithGapFiller();
+
+      // Start the reconciler + gap-filler polling loops. These keep state
+      // honest across WS drops — neither depends on the WS being up.
+      this.startExchangeResilience();
       
       // Record engine start time for grace period
       this.engineStartTime = Date.now();
@@ -933,6 +958,188 @@ export class TradingEngine extends EventEmitter {
     });
   }
 
+  /**
+   * Initialize the Coinbase reconciler + gap filler.
+   * These were previously dead code — created in CoinbaseExchange but never
+   * activated from the engine. Audit traced "engine kept running on stale
+   * data after a WS drop" to this gap.
+   *
+   * - Reconciler: polls Coinbase REST for open orders + recent fills, detects
+   *   diverging state and forces local OrderManager / PositionTracker back in
+   *   sync. Independent of WS, so it works during a drop.
+   * - Gap filler: detects market data staleness and back-fills missing
+   *   candles from the REST historic-rates endpoint.
+   */
+  private initializeExchangeResilience(): void {
+    if (!this.exchange || !this.orderManager) {
+      this.logger.warn('Skipping exchange resilience init — exchange or orderManager not ready');
+      return;
+    }
+
+    try {
+      this.exchange.initializeReconciler(this.orderManager);
+      this.exchange.initializeGapFiller();
+
+      // Surface high-signal events as structured logs. Per-event Prometheus
+      // counters already live in reconciler.ts / gap-filler.ts.
+      this.exchange.on('reconciler:degraded', (reason) => {
+        this.logger.warn('Reconciler degraded', {
+          reason: typeof reason === 'string' ? reason : JSON.stringify(reason),
+        });
+      });
+      this.exchange.on('reconciler:recovered', () => {
+        this.logger.info('Reconciler recovered');
+      });
+      this.exchange.on('gapfill:applied', (data: { symbol: string; timeframe: string; newCandles: number }) => {
+        if (data?.newCandles > 0) {
+          this.logger.info('Gap fill applied', {
+            symbol: data.symbol,
+            timeframe: data.timeframe,
+            newCandles: data.newCandles,
+          });
+        }
+      });
+    } catch (err) {
+      this.logger.error('Failed to initialize exchange resilience components', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Non-fatal — the engine can run without these; degraded mode logs will fire.
+    }
+  }
+
+  /**
+   * Register each active symbol with the gap filler. Must be called after
+   * `validateAndSubscribeToMarketData` so we only register symbols we
+   * actually subscribed to (avoids ghost-symbol REST polls).
+   */
+  private registerSymbolsWithGapFiller(): void {
+    if (!this.exchange || this.activeSymbols.length === 0) return;
+    for (const symbol of this.activeSymbols) {
+      try {
+        this.exchange.registerForGapFill(symbol, '1m');
+      } catch (err) {
+        this.logger.warn('Failed to register symbol with gap filler', {
+          symbol,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    this.logger.info('Registered symbols with gap filler', {
+      count: this.activeSymbols.length,
+      symbols: this.activeSymbols,
+      timeframe: '1m',
+    });
+  }
+
+  /**
+   * Start the reconciler + gap filler polling loops. Idempotent — each
+   * component guards against double-start internally.
+   */
+  private startExchangeResilience(): void {
+    if (!this.exchange) return;
+    try {
+      this.logger.info('Starting reconciler');
+      this.exchange.startReconciler();
+      this.logger.info('Starting gap filler');
+      this.exchange.startGapFiller();
+    } catch (err) {
+      this.logger.error('Failed to start exchange resilience components', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Triggered after WS reconnect — runs an immediate reconciliation pass
+   * so we don't have to wait for the next periodic cycle to learn about
+   * anything that happened during the outage.
+   */
+  private async triggerPostReconnectReconcile(): Promise<void> {
+    if (!this.exchange) return;
+
+    const startedAt = Date.now();
+    this.logger.info('Reconcile pass starting (post-reconnect)', {
+      reason: 'ws_reconnect',
+    });
+
+    try {
+      await this.exchange.triggerReconciliation();
+      const state = this.exchange.getReconcilerState();
+      this.logger.info('Reconcile pass complete (post-reconnect)', {
+        durationMs: Date.now() - startedAt,
+        ordersReconciled: state?.ordersReconciled ?? null,
+        fillsReconciled: state?.fillsReconciled ?? null,
+        degraded: state?.degraded ?? null,
+      });
+    } catch (err) {
+      this.logger.error('Reconcile pass failed (post-reconnect)', {
+        error: err instanceof Error ? err.message : String(err),
+        durationMs: Date.now() - startedAt,
+      });
+      throw err;
+    }
+  }
+
+  /**
+   * Rehydrate position + order state from Supabase before the engine starts
+   * processing exchange events. Without this, every restart looks like a
+   * brand-new bot to PositionTracker / OrderManager and live positions
+   * become invisible.
+   *
+   * Failure modes:
+   * - Supabase unreachable: log + continue (engine still starts; rehydration
+   *   is best-effort, NOT a hard dependency).
+   * - Schema mismatch: log + continue (next reconciler pass will reconcile
+   *   against exchange anyway).
+   */
+  private async hydrateStateFromSupabase(): Promise<void> {
+    const userId = this.config.supabase.userId;
+    if (!userId) {
+      this.logger.warn('Skipping startup state hydration — no userId configured on engine');
+      return;
+    }
+    if (!this.positionTracker || !this.orderManager) {
+      this.logger.warn('Skipping startup state hydration — tracker/manager not initialized');
+      return;
+    }
+
+    const startedAt = Date.now();
+    this.logger.info('Startup state hydration: starting', { userId });
+
+    const results = await Promise.allSettled([
+      this.positionTracker.hydrateOpenPositions(userId),
+      this.orderManager.hydrateOpenOrders(userId, {
+        supabaseUrl: this.config.supabase.url,
+        supabaseKey: this.config.supabase.serviceKey,
+      }),
+    ]);
+
+    const positionsResult = results[0];
+    const ordersResult = results[1];
+
+    const positions = positionsResult.status === 'fulfilled' ? positionsResult.value : 0;
+    const orders = ordersResult.status === 'fulfilled' ? ordersResult.value : 0;
+
+    if (positionsResult.status === 'rejected') {
+      this.logger.error('Startup hydration: positions fetch failed (continuing with empty state)', {
+        error: positionsResult.reason instanceof Error ? positionsResult.reason.message : String(positionsResult.reason),
+      });
+    }
+    if (ordersResult.status === 'rejected') {
+      this.logger.error('Startup hydration: orders fetch failed (continuing with empty state)', {
+        error: ordersResult.reason instanceof Error ? ordersResult.reason.message : String(ordersResult.reason),
+      });
+    }
+
+    this.logger.info('Startup state hydration: complete', {
+      positionsHydrated: positions,
+      ordersHydrated: orders,
+      durationMs: Date.now() - startedAt,
+      positionsOk: positionsResult.status === 'fulfilled',
+      ordersOk: ordersResult.status === 'fulfilled',
+    });
+  }
+
   private initializePaperSimulator(): void {
     const config: PaperTradingConfig = {
       initialBalances: new Map([
@@ -969,10 +1176,26 @@ export class TradingEngine extends EventEmitter {
     this.exchange!.on('fill', this.handleFill.bind(this));
     this.exchange!.on('error', (error) => this.emit('engine:error', error));
     
-    // Handle WebSocket reconnection - reset data gap tracking
+    // Handle WebSocket reconnection - reset data gap tracking and force
+    // an immediate reconciliation pass. Without this, anything that happened
+    // on Coinbase during the WS outage (fills, cancels, etc.) stays invisible
+    // until the next periodic reconcile cycle — which is too slow to be safe.
     this.exchange!.on('reconnected', () => {
-      this.logger.info('Exchange reconnected - resetting data gap tracking');
+      this.logger.info('Exchange reconnected — resetting data gap tracking and triggering reconciliation');
       this.resetDataGapTracking();
+      this.triggerPostReconnectReconcile().catch((err) => {
+        this.logger.error('Post-reconnect reconciliation failed', {
+          error: err instanceof Error ? err.message : String(err),
+          stack: err instanceof Error ? err.stack : undefined,
+        });
+      });
+    });
+    this.exchange!.on('ws:reconnected', () => {
+      this.triggerPostReconnectReconcile().catch((err) => {
+        this.logger.error('Post ws:reconnected reconciliation failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     });
 
     // Order manager events
@@ -1154,6 +1377,11 @@ export class TradingEngine extends EventEmitter {
   private handleTicker(ticker: Ticker): void {
     // Update per-symbol data timestamp for data gap tracking
     this.lastMarketDataPerSymbol.set(ticker.product_id, Date.now());
+
+    // Inform the gap-filler that we just got a live tick for this symbol.
+    // Without this, the gap-filler can't tell "WS is delivering" from
+    // "WS is silent" and may misclassify healthy streams as stale.
+    this.exchange?.recordMarketTick(ticker.product_id);
 
     // Update market price
     const price = parseFloat(ticker.price);
