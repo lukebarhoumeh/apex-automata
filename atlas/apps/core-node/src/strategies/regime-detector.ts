@@ -14,7 +14,17 @@
 import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
 import { TechnicalIndicators, OHLCV } from '../indicators/technical';
+import { ValidatedIndicators } from '../indicators/validated-indicators';
 import { Gauge, Counter } from 'prom-client';
+
+// NOTE (indicator-standardization, 2026-05):
+//   ADX, ATR and SMA used to come from the hand-rolled `TechnicalIndicators`,
+//   which smoothed ATR with an EMA — drifting from the canonical Wilder RMA
+//   used by every other consumer in the system. Regime gating + strategy
+//   stops disagreed by ~10% on the same candle data. We now read these from
+//   `ValidatedIndicators` (Wilder RMA via `trading-signals`) so regime
+//   classification matches what the strategies actually see.
+//   Choppiness + BollingerBandWidth are unique to TechnicalIndicators.
 
 // Prometheus metrics
 const regimeGauge = new Gauge({
@@ -149,9 +159,10 @@ export class RegimeDetector extends EventEmitter {
     const closes = candles.map(c => c.close);
     const currentPrice = candles[candles.length - 1].close;
 
-    // Calculate all indicators
-    const adxResult = TechnicalIndicators.ADX(candles, 14);
-    const atrValues = TechnicalIndicators.ATR(candles, 14);
+    // Wilder RMA (canonical) for ADX/ATR; bbWidth + choppiness stay on the
+    // self-contained TechnicalIndicators implementations.
+    const adxResult = ValidatedIndicators.ADX(candles, 14);
+    const atrValues = ValidatedIndicators.ATR(candles, 14);
     const bbWidth = TechnicalIndicators.BollingerBandWidth(closes, 20, 2);
     const choppiness = TechnicalIndicators.ChoppinessIndex(candles, 14);
 
@@ -306,8 +317,8 @@ export class RegimeDetector extends EventEmitter {
     if (candles.length < 10) return 0;
 
     const closes = candles.map(c => c.close);
-    const sma10 = TechnicalIndicators.SMA(closes, 10);
-    const sma20 = TechnicalIndicators.SMA(closes, 20);
+    const sma10 = ValidatedIndicators.SMA(closes, 10);
+    const sma20 = ValidatedIndicators.SMA(closes, 20);
 
     if (sma10.length === 0 || sma20.length === 0) return 0;
 
