@@ -997,8 +997,21 @@ export class TradingEngine extends EventEmitter {
       return;
     }
 
+    const isPaper = this.config.mode === 'paper';
+
     try {
-      this.exchange.initializeReconciler(this.orderManager);
+      // Reconciler polls the exchange for real-account order/fill state to
+      // detect drift. In paper mode the paper simulator IS the source of
+      // truth — there are no real exchange orders to reconcile, so calling
+      // /orders or /fills returns 404 and cascades into the REST circuit
+      // breaker, eventually locking entries/exits. Skip in paper mode.
+      // Gap filler still runs because paper mode consumes the live market
+      // data feed and benefits from REST back-fill on candle gaps.
+      if (!isPaper) {
+        this.exchange.initializeReconciler(this.orderManager);
+      } else {
+        this.logger.info('Skipping reconciler init in paper mode (paper simulator owns order state)');
+      }
       this.exchange.initializeGapFiller();
 
       // Surface high-signal events as structured logs. Per-event Prometheus
@@ -1058,9 +1071,12 @@ export class TradingEngine extends EventEmitter {
    */
   private startExchangeResilience(): void {
     if (!this.exchange) return;
+    const isPaper = this.config.mode === 'paper';
     try {
-      this.logger.info('Starting reconciler');
-      this.exchange.startReconciler();
+      if (!isPaper) {
+        this.logger.info('Starting reconciler');
+        this.exchange.startReconciler();
+      }
       this.logger.info('Starting gap filler');
       this.exchange.startGapFiller();
     } catch (err) {
@@ -1077,6 +1093,7 @@ export class TradingEngine extends EventEmitter {
    */
   private async triggerPostReconnectReconcile(): Promise<void> {
     if (!this.exchange) return;
+    if (this.config.mode === 'paper') return; // paper sim owns order state
 
     const startedAt = Date.now();
     this.logger.info('Reconcile pass starting (post-reconnect)', {
