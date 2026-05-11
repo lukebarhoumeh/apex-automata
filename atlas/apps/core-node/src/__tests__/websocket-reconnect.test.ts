@@ -242,11 +242,14 @@ describe('CoinbaseWebSocket - Infinite Reconnection', () => {
       
       // Subscribe to channels
       wsClient.subscribe(['ticker'], ['BTC-USD', 'ETH-USD']);
-      
+
+      // Health surface returns CoinbaseChannelSpec[] = { channel, product_ids }[]
       const health = wsClient.getHealth();
-      expect(health.subscriptions.channels).toContain('ticker');
-      expect(health.subscriptions.products).toContain('BTC-USD');
-      expect(health.subscriptions.products).toContain('ETH-USD');
+      const channels = health.subscriptions.map((s) => s.channel);
+      const products = health.subscriptions.flatMap((s) => s.product_ids);
+      expect(channels).toContain('ticker');
+      expect(products).toContain('BTC-USD');
+      expect(products).toContain('ETH-USD');
     });
   });
 
