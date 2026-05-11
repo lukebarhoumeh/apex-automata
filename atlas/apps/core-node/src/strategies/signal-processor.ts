@@ -19,6 +19,7 @@ import {
   PerSymbolOverrides,
 } from './plugins';
 import { SignalArbiter, SignalArbiterConfig, ArbiterResult } from './signal-arbiter';
+import { recordSignalFiltered, recordSignalFunnel } from './signal-filter-telemetry';
 
 export interface SignalProcessorConfig {
   supabaseUrl: string;
@@ -986,16 +987,44 @@ export class SignalProcessor extends EventEmitter {
     if (disabledStrategies.includes(signal.strategy)) {
       this.logger.warn(`Signal from disabled strategy "${signal.strategy}" rejected — strategy killed per Phase 3 backtest verdict`);
       this.emit('signal:filtered', signal, `Disabled strategy: ${signal.strategy}`);
+      recordSignalFiltered(this.logger, {
+        stage: 'disabled_strategy',
+        reason: 'kill_list',
+        symbol: signal.symbol,
+        strategy: signal.strategy,
+        signalId: signal.id,
+        direction: signal.direction,
+        strength: signal.strength,
+        context: { source: 'signal_processor', disabledStrategies },
+      });
       return;
     }
 
-    // Check if we recently generated a similar signal
+    // Check if we recently generated a similar signal — 5-min intra-strategy
+    // dedup. Pre-2026-05-11 this was the dominant SILENT funnel-loss stage:
+    // momentum/trend_follow re-fire on every qualifying candle, so the same
+    // (strategy, symbol, direction) gets dropped here repeatedly with no
+    // metric. recordSignalFiltered here fixes that blind spot.
     const lastSignal = this.lastSignals.get(signal.symbol);
-    if (lastSignal && 
+    if (lastSignal &&
         lastSignal.strategy === signal.strategy &&
         lastSignal.direction === signal.direction &&
         Date.now() - lastSignal.timestamp.getTime() < 300000) { // 5 minutes
       this.emit('signal:filtered', signal, 'Too soon after previous signal');
+      recordSignalFiltered(this.logger, {
+        stage: 'dedup',
+        reason: 'intra_strategy_5min_window',
+        symbol: signal.symbol,
+        strategy: signal.strategy,
+        signalId: signal.id,
+        direction: signal.direction,
+        strength: signal.strength,
+        context: {
+          previousSignalId: lastSignal.id,
+          ageMs: Date.now() - lastSignal.timestamp.getTime(),
+          windowMs: 300000,
+        },
+      });
       return;
     }
 
@@ -1072,6 +1101,19 @@ export class SignalProcessor extends EventEmitter {
 
       if (metaLabel < this.config.metaLabeling.threshold) {
         this.emit('signal:filtered', adjustedSignal, `ML Meta-label below threshold: ${metaLabel.toFixed(3)}`);
+        recordSignalFiltered(this.logger, {
+          stage: 'meta_label',
+          reason: 'ml_below_threshold',
+          symbol: adjustedSignal.symbol,
+          strategy: adjustedSignal.strategy,
+          signalId: adjustedSignal.id,
+          direction: adjustedSignal.direction,
+          strength: adjustedSignal.strength,
+          context: {
+            metaLabel,
+            threshold: this.config.metaLabeling.threshold,
+          },
+        });
         return;
       }
     }
@@ -1090,6 +1132,13 @@ export class SignalProcessor extends EventEmitter {
       positionMultiplier: combinedMultiplier,
       metaQualityScore: metaFilterResult.qualityScore,
       metaLabel: adjustedSignal.metaLabel,
+    });
+    // Funnel checkpoint #1: a signal cleared every pre-emission gate.
+    recordSignalFunnel({
+      stage: 'canonical_emitted',
+      symbol: adjustedSignal.symbol,
+      strategy: adjustedSignal.strategy,
+      direction: adjustedSignal.direction,
     });
   }
 

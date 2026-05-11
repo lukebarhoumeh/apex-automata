@@ -6,7 +6,7 @@ import { createLogger } from '../core/logger';
 import { TradingEngine, TradingEngineConfig, EngineState } from '../trading/trading-engine';
 import { SignalProcessor } from '../strategies/signal-processor';
 import { SignalArbitrator, extractBaseAsset } from '../strategies/signal-arbitrator';
-import { recordSignalFiltered } from '../strategies/signal-filter-telemetry';
+import { recordSignalFiltered, recordSignalFunnel } from '../strategies/signal-filter-telemetry';
 import { computeRawEntryFillPrice } from '../trading/position-entry-vwap';
 import { createClient } from '@supabase/supabase-js';
 import path from 'path';
@@ -1709,6 +1709,16 @@ app.post('/api/engine/start', async (req, res) => {
             `SECURITY: disabled strategy "${signal.strategy}" reached signal:generated handler — rejected`,
             { signalId: signal.id, symbol: signal.symbol },
           );
+          recordSignalFiltered(logger, {
+            stage: 'disabled_strategy',
+            reason: 'router_defense_in_depth',
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            signalId: signal.id,
+            direction: signal.direction,
+            strength: signal.strength,
+            context: { source: 'api_server', disabledStrategies: killed },
+          });
           return;
         }
 
@@ -1778,6 +1788,25 @@ app.post('/api/engine/start', async (req, res) => {
         // Suppress NEW entries when paused/dailyStop/killSwitch, but always allow exits.
         if (!isExitSignal && (runtimeState.paused || runtimeState.dailyStopHit || runtimeState.killSwitch.active)) {
           logger.warn('Signal suppressed due to runtime state (paused/dailyStop/killSwitch)');
+          const reason = runtimeState.killSwitch.active
+            ? 'kill_switch_active'
+            : runtimeState.dailyStopHit
+              ? 'daily_stop_hit'
+              : 'paused';
+          recordSignalFiltered(logger, {
+            stage: 'runtime_state',
+            reason,
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            signalId: signal.id,
+            direction: signal.direction,
+            strength: signal.strength,
+            context: {
+              paused: runtimeState.paused,
+              dailyStopHit: runtimeState.dailyStopHit,
+              killSwitchActive: runtimeState.killSwitch.active,
+            },
+          });
           return;
         }
 
@@ -1793,9 +1822,19 @@ app.post('/api/engine/start', async (req, res) => {
           const openPosition = tradingEngine!.getOpenPositions().find(p => p.symbol === signal.symbol && p.side === 'long' && p.size > 0);
           if (!openPosition) {
             logger.info('Sell signal ignored (no long position to exit)', { symbol: signal.symbol, signalId: signal.id, strategy: signal.strategy });
+            recordSignalFiltered(logger, {
+              stage: 'routing',
+              reason: 'exit_no_open_position',
+              symbol: signal.symbol,
+              strategy: signal.strategy,
+              signalId: signal.id,
+              direction: signal.direction,
+              strength: signal.strength,
+              context: { shortAllowed },
+            });
             return;
           }
-          
+
           // Enforce minimum hold time — don't exit positions too early (fee drag killer)
           // Stop-loss and take-profit from position monitor bypass this (they use order creator directly)
           const holdTimeMs = Date.now() - openPosition.openTime.getTime();
@@ -1806,6 +1845,19 @@ app.post('/api/engine/start', async (req, res) => {
               holdTimeSec: Math.round(holdTimeMs / 1000),
               minHoldSec: Math.round(minHoldMs / 1000),
               strategy: signal.strategy,
+            });
+            recordSignalFiltered(logger, {
+              stage: 'routing',
+              reason: 'exit_position_too_young',
+              symbol: signal.symbol,
+              strategy: signal.strategy,
+              signalId: signal.id,
+              direction: signal.direction,
+              strength: signal.strength,
+              context: {
+                holdTimeSec: Math.round(holdTimeMs / 1000),
+                minHoldSec: Math.round(minHoldMs / 1000),
+              },
             });
             return;
           }
@@ -1935,6 +1987,18 @@ app.post('/api/engine/start', async (req, res) => {
               direction: signal.direction,
               reason: 'excessive_funding_rate',
             });
+            recordSignalFiltered(logger, {
+              stage: 'funding_bias',
+              reason: 'excessive_funding_rate',
+              symbol: signal.symbol,
+              strategy: signal.strategy,
+              signalId: signal.id,
+              direction: signal.direction,
+              strength: signal.strength,
+              context: {
+                positionsWithHighFunding: riskSummary.positionsWithHighFunding,
+              },
+            });
             return;
           }
         }
@@ -1954,6 +2018,22 @@ app.post('/api/engine/start', async (req, res) => {
             entryPrice,
             stopPrice
           });
+          recordSignalFiltered(logger, {
+            stage: 'sizing',
+            reason: 'guardrail_size_zero_or_invalid',
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            signalId: signal.id,
+            direction: signal.direction,
+            strength: signal.strength,
+            context: {
+              rawSize,
+              entryPrice,
+              stopPrice,
+              effectiveRiskPerTrade,
+              isPerpsSymbol,
+            },
+          });
           return;
         }
 
@@ -1968,6 +2048,16 @@ app.post('/api/engine/start', async (req, res) => {
             signalId: signal.id,
             rawSize,
             positionMultiplier,
+          });
+          recordSignalFiltered(logger, {
+            stage: 'sizing',
+            reason: 'position_multiplier_zero',
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            signalId: signal.id,
+            direction: signal.direction,
+            strength: signal.strength,
+            context: { rawSize, positionMultiplier, computedSize },
           });
           return;
         }
@@ -2014,6 +2104,14 @@ app.post('/api/engine/start', async (req, res) => {
           notionalUsd: (computedSize * entryPrice),
           limitPrice: limitPriceStr
         });
+        // Funnel checkpoint #2: a signal cleared every router-side gate and
+        // is about to be sent to the trading engine.
+        recordSignalFunnel({
+          stage: 'sized',
+          symbol: signal.symbol,
+          strategy: signal.strategy,
+          direction: signal.direction,
+        });
 
         const order = await tradingEngine!.createOrder(orderRequest, {
           strategy: signal.strategy,
@@ -2029,6 +2127,16 @@ app.post('/api/engine/start', async (req, res) => {
         });
         if (order) {
           logger.info('Order placed from signal', { orderId: order.id, signal: signal.id });
+          // Funnel checkpoint #3: the trading engine accepted the order.
+          // The gap between `sized` and `order_placed` in /metrics is the
+          // pre-trade risk-engine reject rate (visible via the existing
+          // "Order rejected by risk engine" warn log).
+          recordSignalFunnel({
+            stage: 'order_placed',
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            direction: signal.direction,
+          });
         }
       } catch (error) {
         logger.error('Failed to place order from signal:', error);
