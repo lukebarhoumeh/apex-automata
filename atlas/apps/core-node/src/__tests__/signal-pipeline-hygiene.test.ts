@@ -218,13 +218,17 @@ describe('Audit fix #4 — per-stage signal:filtered telemetry', () => {
 });
 
 describe('Audit fix #5 — momentum plugin defaults are the source of truth', () => {
-  it('plugin uses configSchema defaults (40/60) when no overrides are passed', () => {
+  it('plugin uses configSchema defaults (30/70 industry-standard) when no overrides are passed', () => {
+    // strategy-tuning (Bug B, 2026-05): defaults previously drifted to
+    // 40/60 ("AGGRESSIVE" tuning). Live evidence: RSI 56.5 logged as
+    // "overbought" on ETH-USD. Restored to the textbook 30/70 in both
+    // schema defaults and inline getConfig fallbacks.
     const m = new MomentumStrategy();
     // Read-only access via getConfig: BaseStrategy stores the merged config.
     const oversold = (m as any).getConfig('rsiOversold', undefined as unknown as number);
     const overbought = (m as any).getConfig('rsiOverbought', undefined as unknown as number);
-    expect(oversold).toBe(40);
-    expect(overbought).toBe(60);
+    expect(oversold).toBe(30);
+    expect(overbought).toBe(70);
   });
 
   it('explicit YAML overrides win over plugin defaults', () => {

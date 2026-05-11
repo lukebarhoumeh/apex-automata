@@ -889,8 +889,10 @@ export class SignalProcessor extends EventEmitter {
     const config = this.config.strategies.momentum;
     // Plugin defaults — keep in sync with momentum-strategy.ts configSchema.
     // This legacy code path only runs when usePluginStrategies === false.
-    const rsiOversold = config.rsiOversold ?? 40;
-    const rsiOverbought = config.rsiOverbought ?? 60;
+    // strategy-tuning (2026-05): restored to industry-standard 30/70 from
+    // 40/60 in lock-step with the plugin schema (see Bug B).
+    const rsiOversold = config.rsiOversold ?? 30;
+    const rsiOverbought = config.rsiOverbought ?? 70;
     const rsi = indicators.rsi;
     const macdHistogram = indicators.macdHistogram;
     const ema12 = indicators.ema12;

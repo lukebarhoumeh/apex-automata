@@ -216,9 +216,11 @@ describe('StrategyPlugin System', () => {
     });
 
     it('should have RSI/MACD config parameters', () => {
+      // strategy-tuning (Bug B): industry-standard 30/70 thresholds restored
+      // from the previous aggressive 40/60. See momentum-strategy.ts header.
       expect(strategy.config.rsiPeriod).toBe(14);
-      expect(strategy.config.rsiOversold).toBe(40);
-      expect(strategy.config.rsiOverbought).toBe(60);
+      expect(strategy.config.rsiOversold).toBe(30);
+      expect(strategy.config.rsiOverbought).toBe(70);
       expect(strategy.config.macdFast).toBe(12);
     });
   });

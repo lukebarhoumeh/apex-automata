@@ -95,9 +95,12 @@ per_symbol:
         stopAtr: 2.5
         takeProfitAtr: 5.0
       momentum:
+        # strategy-tuning: rsiOversold/rsiOverbought were 40/55 here, which
+        # was the source of "RSI overbought at 56.5" SELL signals in the
+        # live paper run. Restored to canonical 30/70.
         rsiPeriod: 10
-        rsiOversold: 40
-        rsiOverbought: 55
+        rsiOversold: 30
+        rsiOverbought: 70
         macdFast: 8
         macdSlow: 21
         macdSignal: 5
@@ -150,10 +153,15 @@ strategy:
 # defines the canonical defaults via configSchema; this block lets ops
 # override them without redeploying. Per-symbol overrides under
 # `per_symbol.<symbol>.strategy_overrides.momentum` still take precedence.
+#
+# strategy-tuning (2026-05): rsiOversold/rsiOverbought were 40/60 here,
+# which drove "RSI overbought at 56.5" SELL emissions in paper. Restored
+# to the industry-standard 30/70 thresholds documented in the plugin
+# configSchema.
 momentum:
   rsiPeriod: 14
-  rsiOversold: 40         # plugin default (was 30 hard-coded in api/server.ts)
-  rsiOverbought: 60       # plugin default (was 70 hard-coded in api/server.ts)
+  rsiOversold: 30
+  rsiOverbought: 70
   macdFast: 12
   macdSlow: 26
   macdSignal: 9
@@ -197,9 +205,10 @@ perps_symbols:
         stopAtr: 2.5
         takeProfitAtr: 5.0
       momentum:
+        # strategy-tuning: was 40/55 — restored to canonical 30/70.
         rsiPeriod: 10
-        rsiOversold: 40
-        rsiOverbought: 55
+        rsiOversold: 30
+        rsiOverbought: 70
         macdFast: 8
         macdSlow: 21
         macdSignal: 5
@@ -316,9 +325,10 @@ hyperliquid_symbols:
         stopAtr: 2.5
         takeProfitAtr: 5.0
       momentum:
+        # strategy-tuning: was 40/55 — restored to canonical 30/70.
         rsiPeriod: 10
-        rsiOversold: 40
-        rsiOverbought: 55
+        rsiOversold: 30
+        rsiOverbought: 70
         macdFast: 8
         macdSlow: 21
         macdSignal: 5

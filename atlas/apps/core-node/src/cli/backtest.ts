@@ -145,9 +145,11 @@ async function main() {
       momentum: {
         enabled: argv.strategy === 'momentum' || argv.strategy === 'all',
         parameters: {
+          // strategy-tuning: was 55/40 — restored to canonical 70/30 to
+          // match the plugin schema and guardrails.yaml.
           rsiPeriod: 10,
-          rsiOverbought: 55,
-          rsiOversold: 40,
+          rsiOverbought: 70,
+          rsiOversold: 30,
           macdFast: 8,
           macdSlow: 21,
           macdSignal: 5,

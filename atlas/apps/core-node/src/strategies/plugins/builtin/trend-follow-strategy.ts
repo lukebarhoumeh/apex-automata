@@ -20,6 +20,7 @@
  */
 
 import { BaseStrategy } from '../base-strategy';
+import { ValidatedIndicators } from '../../../indicators/validated-indicators';
 import {
   MarketContext,
   StrategySignal,
@@ -27,6 +28,30 @@ import {
   RegimeCompatibility,
   IndicatorRequirement,
 } from '../types';
+
+// strategy-tuning (Bug A, 2026-05):
+//   This plugin used to emit on every bar for up to `crossoverLookback` (=10)
+//   bars after a single EMA12/EMA15 crossover, and its `requireMtfAlignment`
+//   gate read `context.regime.trendDirection` — a 1m DI proxy from the regime
+//   detector — instead of an actual 1h EMA alignment. Result in the live paper
+//   run: ~3.6 signals/minute/symbol in a `regime: ranging` market with
+//   `mtfAligned: true`. See fix/strategy-tuning. Fixes:
+//
+//     1. Default `crossoverLookback` lowered to 0 — emit ONLY on the bar AT
+//        which the cross occurs. Ops can dial it up if their bar cadence
+//        ever needs lookback, but the plugin will never silently re-emit by
+//        default. Downstream `StrategyRegistry.deduplicateSignals` and
+//        `SignalProcessor.lastSignals` 5-minute windows still apply on top.
+//     2. `ranging` and `choppy` compatibility moved from `neutral` to
+//        `incompatible` so the StrategyRegistry gates them out before
+//        `generateSignals` is even called. Trend-following has negative
+//        expected value in those regimes; the audit's verdict ("stays silent
+//        for hours") is the correct behaviour.
+//     3. When `requireMtfAlignment` is true, the gate now reads
+//        `context.mtfCandles.h1` (real 1h candles aggregated by
+//        SignalProcessor) and computes EMA(emaFast/emaSlow) on h1 closes.
+//        If h1 history is insufficient (< emaSlow + 5 bars) the plugin
+//        refuses to emit rather than lying about `mtfAligned: true`.
 
 export class TrendFollowStrategy extends BaseStrategy {
   readonly id = 'trend_follow';
@@ -103,17 +128,19 @@ export class TrendFollowStrategy extends BaseStrategy {
       {
         key: 'requireMtfAlignment',
         name: 'Require MTF Alignment',
-        description: 'Require higher timeframe (1h) EMA alignment',
+        description:
+          'Require real 1h EMA(emaFast/emaSlow) alignment on aggregated h1 candles. When true and h1 history is insufficient (< emaSlow + 5 bars), the plugin refuses to emit.',
         type: 'boolean',
         default: false,
       },
       {
         key: 'crossoverLookback',
         name: 'Crossover Lookback',
-        description: 'Number of candles to look back for recent crossover',
+        description:
+          'Bars after a crossover within which the plugin is still allowed to emit. 0 = emit only on the bar where the cross occurs (recommended; one signal per crossover event). Higher values cause re-emission per bar.',
         type: 'number',
-        default: 10,
-        min: 1,
+        default: 0,
+        min: 0,
         max: 20,
       },
       {
@@ -151,15 +178,18 @@ export class TrendFollowStrategy extends BaseStrategy {
     },
     {
       regime: 'ranging',
-      compatibility: 'neutral',  // Changed to allow signals with reduced size
-      positionMultiplier: 0.3,
-      notes: 'High whipsaw risk - use minimal size',
+      // strategy-tuning: trend-following has negative expected value in
+      // ranging conditions (audit + Phase 3 backtest). StrategyRegistry
+      // gates 'incompatible' regimes before generateSignals runs.
+      compatibility: 'incompatible',
+      positionMultiplier: 0,
+      notes: 'Trend-following has negative EV in ranging markets — refuse to emit',
     },
     {
       regime: 'choppy',
-      compatibility: 'neutral',  // Changed to allow signals with very small size
-      positionMultiplier: 0.15,
-      notes: 'Very high risk - use minimal size only',
+      compatibility: 'incompatible',
+      positionMultiplier: 0,
+      notes: 'Whipsaw kills trend-following P&L — refuse to emit',
     },
   ];
 
@@ -174,7 +204,10 @@ export class TrendFollowStrategy extends BaseStrategy {
     const takeProfitAtr = this.getConfig<number>('takeProfitAtr', 5.0, symbol);
     const minAdx = this.getConfig<number>('minAdx', 0, symbol);
     const requireMtfAlignment = this.getConfig<boolean>('requireMtfAlignment', false, symbol);
-    const crossoverLookback = this.getConfig<number>('crossoverLookback', 10, symbol);
+    // Inline fallback intentionally matches the schema default (0 = current bar
+    // only). This was 10 previously and was the proximate cause of the per-bar
+    // re-emission documented in fix/strategy-tuning.
+    const crossoverLookback = this.getConfig<number>('crossoverLookback', 0, symbol);
     const minStrength = this.getConfig<number>('minStrength', 0.5, symbol);
 
     // Use dynamic indicator names based on config
@@ -191,7 +224,13 @@ export class TrendFollowStrategy extends BaseStrategy {
       return signals;
     }
 
-    if (fastEma.length < crossoverLookback + 2 || slowEma.length < crossoverLookback + 2) {
+    // Need at least 2 EMA samples to detect a cross between prev/curr bar.
+    // The optional lookback then needs `crossoverLookback` additional bars on
+    // top of those two — guard accordingly.
+    if (
+      fastEma.length < crossoverLookback + 2 ||
+      slowEma.length < crossoverLookback + 2
+    ) {
       return signals;
     }
 
@@ -256,17 +295,49 @@ export class TrendFollowStrategy extends BaseStrategy {
     const priceAboveBothEmas = price > currentFastEma && price > currentSlowEma;
     const priceBelowBothEmas = price < currentFastEma && price < currentSlowEma;
 
-    // Check MTF alignment if required
-    let mtfAligned = true;
-    if (requireMtfAlignment && context.mtfCandles?.h1) {
-      // Check if we have 1h EMA data (would need indicator calculation on 1h candles)
-      // For now, use trend direction from regime detector as proxy
-      const regimeTrend = context.regime.trendDirection;
-      if (bullishCrossover && regimeTrend === 'down') {
-        mtfAligned = false;
-      } else if (bearishCrossover && regimeTrend === 'up') {
-        mtfAligned = false;
+    // Check MTF alignment if required.
+    //
+    // Pre-fix this branch read `context.regime.trendDirection`, which the
+    // RegimeDetector derives from the 1m +DI / -DI difference. That is NOT
+    // a 1h alignment check — it's a 1m DI proxy that frequently disagrees
+    // with actual hourly EMA stack. Real fix: read aggregated 1h candles
+    // from `context.mtfCandles.h1` (populated by SignalProcessor's
+    // `updateMultiTimeframeCandles`) and compute EMA(emaFast/emaSlow) on
+    // 1h closes. If h1 history is insufficient, refuse to emit rather than
+    // claiming `mtfAligned: true`.
+    //
+    // mtfAlignedReport is what we put in the signal metadata:
+    //   - undefined        → gate disabled (`requireMtfAlignment === false`)
+    //   - true             → real 1h check passed
+    //   - 'insufficient'   → blocked (never reaches emission, kept for tests
+    //                        and debugging in earlier exits)
+    let mtfAlignedReport: true | 'insufficient' | undefined;
+    if (requireMtfAlignment) {
+      const h1Candles = context.mtfCandles?.h1;
+      const minH1Bars = emaSlow + 5;
+      if (!h1Candles || h1Candles.length < minH1Bars) {
+        // Required gate has no data — REFUSE to emit. Previously the plugin
+        // would have fallen through to `mtfAligned = true`, which is the
+        // exact lie the audit flagged.
+        return signals;
       }
+      const h1Closes = h1Candles.map(c => c.close);
+      const h1Fast = ValidatedIndicators.EMA(h1Closes, emaFast);
+      const h1Slow = ValidatedIndicators.EMA(h1Closes, emaSlow);
+      if (h1Fast.length === 0 || h1Slow.length === 0) {
+        return signals;
+      }
+      const h1FastLatest = h1Fast[h1Fast.length - 1];
+      const h1SlowLatest = h1Slow[h1Slow.length - 1];
+      const h1Bullish = h1FastLatest > h1SlowLatest;
+      const h1Bearish = h1FastLatest < h1SlowLatest;
+      if (bullishCrossover && !h1Bullish) {
+        return signals;
+      }
+      if (bearishCrossover && !h1Bearish) {
+        return signals;
+      }
+      mtfAlignedReport = true;
     }
 
     // Calculate signal strength
@@ -287,8 +358,9 @@ export class TrendFollowStrategy extends BaseStrategy {
       strength += 0.1;
     }
 
-    // Boost for MTF alignment
-    if (mtfAligned) {
+    // Boost for MTF alignment — only credit when the gate actually ran and
+    // passed (not when the gate is disabled).
+    if (mtfAlignedReport === true) {
       strength += 0.1;
     }
 
@@ -309,7 +381,17 @@ export class TrendFollowStrategy extends BaseStrategy {
     const stopDistance = currentAtr * stopAtr;
     const targetDistance = currentAtr * takeProfitAtr;
 
-    if (bullishCrossover && priceAboveBothEmas && mtfAligned) {
+    // Reported metadata for downstream dashboards/audit logs: explicit
+    // tristate so consumers can tell "gate disabled" from "gate passed".
+    const metadataMtf: {
+      mtfRequired: boolean;
+      mtfAligned: boolean | 'disabled';
+    } = {
+      mtfRequired: requireMtfAlignment,
+      mtfAligned: requireMtfAlignment ? mtfAlignedReport === true : 'disabled',
+    };
+
+    if (bullishCrossover && priceAboveBothEmas) {
       const stopLoss = price - stopDistance;
       const takeProfit = price + targetDistance;
 
@@ -327,12 +409,12 @@ export class TrendFollowStrategy extends BaseStrategy {
             atr: currentAtr,
             adx: currentAdx,
             crossoverBarsAgo,
-            mtfAligned,
+            ...metadataMtf,
             regime: context.regime.regime,
           },
         })
       );
-    } else if (bearishCrossover && priceBelowBothEmas && mtfAligned) {
+    } else if (bearishCrossover && priceBelowBothEmas) {
       const stopLoss = price + stopDistance;
       const takeProfit = price - targetDistance;
 
@@ -350,7 +432,7 @@ export class TrendFollowStrategy extends BaseStrategy {
             atr: currentAtr,
             adx: currentAdx,
             crossoverBarsAgo,
-            mtfAligned,
+            ...metadataMtf,
             regime: context.regime.regime,
           },
         })
