@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { register as promRegister } from 'prom-client';
 import { Logger } from '../core/logger';
 import type { OHLCV } from '../indicators/technical';
 // NOTE (indicator-standardization, 2026-05): TechnicalIndicators import was
@@ -238,6 +239,15 @@ export class BacktestEngine extends EventEmitter {
   private disabledStrategies: Set<string>;
   private activeStrategies: string[] = [];
   private tradeIdCounter: number = 0;
+  // Funnel diagnostics — populated as bars stream past `processTimeSteps`.
+  // The point of these counters is to make the "9 trades in the first 40h
+  // then silence for 87 days" pathology immediately visible in the
+  // structured run summary at end-of-run, rather than having to scrape
+  // 80k-line stdout logs after the fact.
+  private barIndex: number = 0;
+  private lastSignalBarPerStrategy: Map<string, number> = new Map();
+  private lastSignalTimestampPerStrategy: Map<string, Date> = new Map();
+  private signalAdmittedPerStrategy: Map<string, number> = new Map();
 
   constructor(config: BacktestConfig, logger: Logger) {
     super();
@@ -298,7 +308,74 @@ export class BacktestEngine extends EventEmitter {
       byStrategy: metrics.byStrategy,
     });
 
+    await this.logFunnelDiagnostics();
+
     return result;
+  }
+
+  /**
+   * Dump per-stage rejection counts, per-strategy candidate emission counts,
+   * and the bar index of the last admitted signal per strategy at end of
+   * run. This is the "smoking-gun" surface for funnel-latch debugging — see
+   * fix/funnel-latch-bug investigation, May 2026.
+   *
+   * Reads the prom-client default registry (the same one the live engine
+   * exposes via `/metrics`). Counter values reflect the entire backtest run
+   * because the registry is process-wide.
+   */
+  private async logFunnelDiagnostics(): Promise<void> {
+    const candidatesPerStrategy: Record<string, number> = {};
+    const filteredByStage: Record<string, Record<string, number>> = {};
+    const funnelByStage: Record<string, Record<string, number>> = {};
+
+    try {
+      const metrics = await promRegister.getMetricsAsJSON();
+      for (const m of metrics) {
+        if (m.name === 'atlas_strategy_signals_generated_total') {
+          for (const sample of (m as any).values ?? []) {
+            const strategy = sample.labels?.strategy ?? 'unknown';
+            candidatesPerStrategy[strategy] =
+              (candidatesPerStrategy[strategy] ?? 0) + Number(sample.value || 0);
+          }
+        } else if (m.name === 'atlas_signal_filtered_total') {
+          for (const sample of (m as any).values ?? []) {
+            const stage = sample.labels?.stage ?? 'unknown';
+            const reason = sample.labels?.reason ?? 'unknown';
+            filteredByStage[stage] = filteredByStage[stage] || {};
+            filteredByStage[stage][reason] =
+              (filteredByStage[stage][reason] ?? 0) + Number(sample.value || 0);
+          }
+        } else if (m.name === 'atlas_signal_funnel_total') {
+          for (const sample of (m as any).values ?? []) {
+            const stage = sample.labels?.stage ?? 'unknown';
+            const strategy = sample.labels?.strategy ?? 'unknown';
+            funnelByStage[stage] = funnelByStage[stage] || {};
+            funnelByStage[stage][strategy] =
+              (funnelByStage[stage][strategy] ?? 0) + Number(sample.value || 0);
+          }
+        }
+      }
+    } catch (err) {
+      this.logger.warn('Funnel diagnostics: failed to read prom registry', err);
+    }
+
+    const lastAdmittedBars: Record<string, { barIndex: number; signalTime: string }> = {};
+    for (const [strategy, idx] of this.lastSignalBarPerStrategy) {
+      const ts = this.lastSignalTimestampPerStrategy.get(strategy);
+      lastAdmittedBars[strategy] = {
+        barIndex: idx,
+        signalTime: ts ? ts.toISOString() : 'unknown',
+      };
+    }
+
+    this.logger.info('Backtest funnel diagnostics', {
+      totalBars: this.barIndex,
+      candidatesPerStrategy,
+      admittedPerStrategy: Object.fromEntries(this.signalAdmittedPerStrategy),
+      lastAdmittedBarPerStrategy: lastAdmittedBars,
+      filteredByStage,
+      funnelByStage,
+    });
   }
 
   private initializeSignalProcessor(): void {
@@ -423,6 +500,7 @@ export class BacktestEngine extends EventEmitter {
         continue;
       }
       const timestamp = new Date(baseCandle.time);
+      this.barIndex = i;
 
       for (const [product, data] of this.historicalData.entries()) {
         const candle = data[i];
@@ -465,6 +543,15 @@ export class BacktestEngine extends EventEmitter {
       });
       return;
     }
+
+    // Funnel diagnostics — track final admissions per strategy. Logged at
+    // end-of-run via `logFunnelDiagnostics`.
+    this.signalAdmittedPerStrategy.set(
+      signal.strategy,
+      (this.signalAdmittedPerStrategy.get(signal.strategy) ?? 0) + 1,
+    );
+    this.lastSignalBarPerStrategy.set(signal.strategy, this.barIndex);
+    this.lastSignalTimestampPerStrategy.set(signal.strategy, signal.timestamp);
 
     const position = this.positions.get(signal.symbol);
     if (position) {

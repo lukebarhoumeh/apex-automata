@@ -18,6 +18,7 @@ import {
   StrategyRegistryEvents,
 } from './types';
 import { Counter, Gauge, Histogram } from 'prom-client';
+import { recordSignalFiltered } from '../signal-filter-telemetry';
 
 // Prometheus metrics
 const strategiesRegisteredGauge = new Gauge({
@@ -68,8 +69,11 @@ export class StrategyRegistry extends EventEmitter {
   // Registered strategies
   private strategies: Map<string, StrategyRegistration> = new Map();
   
-  // Signal deduplication
-  private recentSignals: Map<string, { signal: StrategySignal; expiry: number }> = new Map();
+  // Signal deduplication. We track the LAST admitted signal time per
+  // (strategy, symbol, direction) tuple as the **signal's own timestamp**
+  // (which is the candle time the strategy was evaluating), NOT wall-clock.
+  // See `deduplicateSignals` for the historical Date.now() bug this replaces.
+  private recentSignals: Map<string, { signal: StrategySignal; signalTime: number }> = new Map();
   
   constructor(config: Partial<StrategyRegistryConfig>, logger: Logger) {
     super();
@@ -250,8 +254,10 @@ export class StrategyRegistry extends EventEmitter {
     const enabledStrategies = this.getEnabled();
     const allSignals: StrategySignal[] = [];
 
-    // Clean up expired signals from dedupe cache
-    this.cleanupExpiredSignals();
+    // Bound the dedupe cache. With signal-time-based dedup the cache is
+    // naturally tiny (strategies × symbols × 2 directions) and entries are
+    // overwritten on each admission, so this is defensive-only.
+    this.cleanupExpiredSignals(context);
 
     if (parallelExecution) {
       // Parallel execution (careful with shared state)
@@ -351,36 +357,87 @@ export class StrategyRegistry extends EventEmitter {
 
   /**
    * Deduplicate signals within the dedupe window.
+   *
+   * Pre-2026-05-12 this compared `Date.now()` against `expiry = Date.now() +
+   * windowMs`. That's a wall-clock check; in backtest the engine processes
+   * 8641 × 15m candles in ~30s of wall-clock time, so the entire 90-day run
+   * sits inside ONE 5-min wall-clock dedup window. After each unique
+   * (strategy, symbol, direction) tuple emitted its first signal, every
+   * subsequent emission of the same tuple was silently skipped here — with
+   * NO metric and NO log line. The funnel collapsed to exactly
+   * `symbols × strategies × 2 directions` admitted signals per backtest
+   * regardless of length, which is the "12 admissions in the first 40h"
+   * pathology documented in
+   * `atlas/var/backtest_results/report_2026-05-11_post-monitor-fixes.txt`.
+   *
+   * The fix is to dedupe in **signal time** (the candle timestamp the
+   * strategy was evaluating). In live the candle time tracks wall-clock so
+   * behaviour is unchanged; in backtest the window collapses correctly to a
+   * 5-minute slice of market time.
+   *
+   * Rejections are also surfaced via `recordSignalFiltered` so the dedupe
+   * stage shows up in the same `atlas_signal_filtered_total{stage}` Prom
+   * counter the rest of the funnel uses — this site was a major part of the
+   * "Round 2 silent funnel sites" the prior audit chased.
    */
-  private deduplicateSignals(signals: StrategySignal[], symbol: string): StrategySignal[] {
+  private deduplicateSignals(signals: StrategySignal[], _symbol: string): StrategySignal[] {
     const unique: StrategySignal[] = [];
-    const now = Date.now();
 
     for (const signal of signals) {
       const key = `${signal.strategy}:${signal.symbol}:${signal.direction}`;
       const existing = this.recentSignals.get(key);
+      const signalTime = signal.timestamp.getTime();
 
-      if (!existing || existing.expiry < now) {
-        // No recent signal, this one is unique
+      const withinWindow =
+        existing !== undefined &&
+        signalTime - existing.signalTime < this.config.signalDedupeWindowMs &&
+        // Out-of-order arrivals (signalTime <= existing.signalTime) are
+        // treated as duplicates too — admitting an older signal after a
+        // newer one is processed would be a silent re-fire.
+        signalTime >= existing.signalTime;
+
+      if (!withinWindow) {
         unique.push(signal);
-        this.recentSignals.set(key, {
-          signal,
-          expiry: now + this.config.signalDedupeWindowMs,
+        this.recentSignals.set(key, { signal, signalTime });
+      } else {
+        recordSignalFiltered(this.logger, {
+          stage: 'dedup',
+          reason: 'registry_dedup_window',
+          symbol: signal.symbol,
+          strategy: signal.strategy,
+          signalId: signal.id,
+          direction: signal.direction,
+          strength: signal.strength,
+          context: {
+            previousSignalId: existing!.signal.id,
+            previousSignalTimeIso: new Date(existing!.signalTime).toISOString(),
+            currentSignalTimeIso: new Date(signalTime).toISOString(),
+            ageMs: signalTime - existing!.signalTime,
+            windowMs: this.config.signalDedupeWindowMs,
+            source: 'strategy_registry',
+          },
         });
       }
-      // Else: duplicate within window, skip
     }
 
     return unique;
   }
 
   /**
-   * Clean up expired signals from dedupe cache.
+   * Clean up dedupe cache. With signal-time dedup we don't expire entries on
+   * a wall-clock timer (that's what got us into the latch bug to begin
+   * with). Instead we drop entries whose stored signal time is older than
+   * the dedupe window relative to the latest context we've been handed —
+   * which keeps the map from drifting forever in long backtests with many
+   * symbols.
    */
-  private cleanupExpiredSignals(): void {
-    const now = Date.now();
+  private cleanupExpiredSignals(context?: MarketContext): void {
+    if (!context) return;
+    const referenceTime = context.latestCandle.time;
+    if (!Number.isFinite(referenceTime)) return;
+    const cutoff = referenceTime - this.config.signalDedupeWindowMs;
     for (const [key, entry] of this.recentSignals) {
-      if (entry.expiry < now) {
+      if (entry.signalTime < cutoff) {
         this.recentSignals.delete(key);
       }
     }
