@@ -1,0 +1,27 @@
+-- =============================================================================
+-- RECONCILIATION STUB — version 20260108
+-- =============================================================================
+-- This file is intentionally a no-op. It exists ONLY so that the local
+-- supabase/migrations/ manifest matches the `supabase_migrations.schema_migrations`
+-- table on the remote project (ref: gdrdaajvutmewgxbjurk), which still records
+-- this version as applied.
+--
+-- The original migration (filename: 20260108_fix_missing_tables.sql) was
+-- deleted from the repo in commit d8a8edf ("fix: startup + regime UI +
+-- supabase migration hygiene", 2026-01-08) because it was the second of two
+-- duplicate migrations creating `public.exchange_credentials` and
+-- `public.trading_sessions`, with a fixed-user RLS policy that conflicted
+-- with the auth.uid()-based policies in the parallel migration. The current,
+-- correct schema and RLS for those tables is established by the surviving
+-- migrations (notably 20260108211500_drop_trade_analytics_auth_fks.sql).
+--
+-- Restoring this file as a stub un-blocks the Supabase Preview GitHub check
+-- ("Remote migration versions not found in local migrations directory") without
+-- re-introducing the conflicting schema.
+--
+-- DO NOT add SQL here. If you need to change exchange_credentials or
+-- trading_sessions, write a NEW dated migration. Re-running this stub on a
+-- fresh database is intentionally a no-op.
+-- =============================================================================
+
+SELECT 1;
