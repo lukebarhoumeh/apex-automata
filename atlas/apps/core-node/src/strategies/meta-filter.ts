@@ -62,6 +62,22 @@ const coldStreakActiveGauge = new Gauge({
   labelNames: ['strategy'],
 });
 
+// CoinDesk news/sentiment soft-weight rule metrics. The rule never blocks a
+// signal — it only nudges the meta quality score by a bounded delta. These
+// metrics let the A/B harness measure how often the rule fires vs abstains.
+const coindeskSentimentEvaluatedCounter = new Counter({
+  name: 'meta_filter_coindesk_sentiment_evaluated_total',
+  help: 'Outcomes of the coindesk_sentiment meta-filter rule',
+  labelNames: ['symbol', 'outcome'],
+});
+
+const coindeskSentimentScoreHistogram = new Histogram({
+  name: 'meta_filter_coindesk_sentiment_score',
+  help: 'Distribution of coindesk_sentiment aggregate score [-1, +1]',
+  labelNames: ['symbol'],
+  buckets: [-1, -0.75, -0.5, -0.25, -0.1, 0, 0.1, 0.25, 0.5, 0.75, 1],
+});
+
 // Trade outcome for learning
 export interface TradeOutcome {
   signalId: string;
@@ -172,7 +188,16 @@ export interface MetaFilterConfig {
   
   // Quality score threshold
   minQualityScore: number;           // Min score to pass (default: 0.5)
-  
+
+  // CoinDesk news/sentiment soft-weight rule. ALWAYS soft — never blocks a
+  // signal outright. Defaults are off so this is opt-in via guardrails.yaml.
+  coindeskSentimentEnabled: boolean;
+  coindeskSentimentLookbackMinutes: number;     // window for aggregation (default 60)
+  coindeskSentimentStaleThresholdMs: number;    // abstain when freshest article > this old
+  coindeskSentimentWeightDeltaBound: number;    // |max delta| applied to quality score (default 0.25)
+  coindeskSentimentRuleWeight: number;          // contribution weight in averaged score
+  coindeskSentimentEnabledSymbols: string[];    // base assets the rule applies to (e.g. ["BTC","ETH","SOL"])
+
   // Logging
   logDecisions: boolean;             // Log all decisions to DB
   logToSupabase: boolean;            // Persist to Supabase
@@ -202,9 +227,18 @@ const DEFAULT_CONFIG: MetaFilterConfig = {
   
   crossConfirmEnabled: true,
   requireMTFConfirm: false,
-  
+
   minQualityScore: 0.5,
-  
+
+  // CoinDesk sentiment rule — OFF by default. Even when on, behavior is
+  // strictly additive: bounded weight delta, never a hard block.
+  coindeskSentimentEnabled: false,
+  coindeskSentimentLookbackMinutes: 60,
+  coindeskSentimentStaleThresholdMs: 30 * 60 * 1000,
+  coindeskSentimentWeightDeltaBound: 0.25,
+  coindeskSentimentRuleWeight: 0.2,
+  coindeskSentimentEnabledSymbols: [],
+
   logDecisions: true,
   logToSupabase: false,
 };
@@ -296,6 +330,17 @@ export class MetaFilter extends EventEmitter {
       atr?: number;
       regime?: string;
       mtfAlignment?: number;
+      /**
+       * Pre-computed CoinDesk aggregate sentiment for the signal's base asset.
+       * Producer (signal-processor) is responsible for fetching this asynchronously
+       * before calling .filter(). When undefined and the rule is enabled, the
+       * rule abstains (no penalty).
+       */
+      coindeskSentiment?: {
+        score: number;
+        articleCount: number;
+        freshnessMs: number;
+      };
     } = {}
   ): MetaFilterResult {
     metaFilterReceivedCounter.inc({ symbol: signal.symbol, strategy: signal.strategy });
@@ -393,6 +438,16 @@ export class MetaFilter extends EventEmitter {
       rulesEvaluated.push(mtfResult);
       totalWeight += mtfResult.weight;
       totalScore += mtfResult.contribution;
+    }
+
+    // Rule 5b: CoinDesk News/Sentiment (soft weight, never a hard block).
+    // Honors per-symbol allowlist so we don't waste API quota on assets we
+    // haven't validated coverage for yet.
+    if (this.config.coindeskSentimentEnabled) {
+      const sentimentResult = this.evaluateCoinDeskSentiment(signal, context.coindeskSentiment);
+      rulesEvaluated.push(sentimentResult);
+      totalWeight += sentimentResult.weight;
+      totalScore += sentimentResult.contribution;
     }
 
     // Rule 6: Historical Win Rate for Strategy
@@ -663,6 +718,104 @@ export class MetaFilter extends EventEmitter {
       weight,
       contribution: weight * alignmentScore,
     };
+  }
+
+  /**
+   * Soft-weight rule: nudge quality score by ±weightDeltaBound based on
+   * aggregate CoinDesk news sentiment for the signal's base asset.
+   * Always returns passed=true — we never block on news. The rule abstains
+   * (neutral contribution) when:
+   *   - the symbol isn't in the per-symbol allowlist, OR
+   *   - no sentiment payload was provided (fetch error / disabled upstream), OR
+   *   - articleCount === 0, OR
+   *   - the freshest article is older than the configured stale threshold.
+   */
+  private evaluateCoinDeskSentiment(
+    signal: Signal,
+    sentiment: { score: number; articleCount: number; freshnessMs: number } | undefined
+  ): MetaFilterResult['rulesEvaluated'][0] {
+    const weight = this.config.coindeskSentimentRuleWeight;
+    const bound = this.config.coindeskSentimentWeightDeltaBound;
+    const baseAsset = this.symbolToBaseAsset(signal.symbol);
+
+    const allowlist = this.config.coindeskSentimentEnabledSymbols ?? [];
+    const allowed =
+      allowlist.length === 0 ||
+      allowlist.some((s) => s.toUpperCase() === signal.symbol.toUpperCase()) ||
+      allowlist.some((s) => this.symbolToBaseAsset(s) === baseAsset);
+
+    if (!allowed) {
+      coindeskSentimentEvaluatedCounter.inc({ symbol: signal.symbol, outcome: 'symbol_not_allowed' });
+      return {
+        rule: 'coindesk_sentiment',
+        passed: true,
+        reason: `Symbol ${signal.symbol} not in coindesk allowlist`,
+        weight,
+        contribution: weight * 0.5,
+      };
+    }
+
+    if (!sentiment) {
+      coindeskSentimentEvaluatedCounter.inc({ symbol: signal.symbol, outcome: 'no_payload' });
+      return {
+        rule: 'coindesk_sentiment',
+        passed: true,
+        reason: 'No sentiment payload (upstream fetch unavailable)',
+        weight,
+        contribution: weight * 0.5,
+      };
+    }
+
+    if (sentiment.articleCount === 0) {
+      coindeskSentimentEvaluatedCounter.inc({ symbol: signal.symbol, outcome: 'abstain_no_articles' });
+      return {
+        rule: 'coindesk_sentiment',
+        passed: true,
+        reason: 'No articles in lookback window — abstaining',
+        weight,
+        contribution: weight * 0.5,
+      };
+    }
+
+    if (sentiment.freshnessMs > this.config.coindeskSentimentStaleThresholdMs) {
+      coindeskSentimentEvaluatedCounter.inc({ symbol: signal.symbol, outcome: 'abstain_stale' });
+      return {
+        rule: 'coindesk_sentiment',
+        passed: true,
+        reason: `Stale news (${(sentiment.freshnessMs / 60000).toFixed(0)}m) — abstaining`,
+        weight,
+        contribution: weight * 0.5,
+      };
+    }
+
+    // Aligned/Contrarian determination: BUY signals like POSITIVE news, SELL
+    // signals like NEGATIVE news. We map to a [-1, +1] alignment, then to a
+    // bounded delta around the neutral 0.5 contribution.
+    const directional = signal.direction === 'sell' ? -sentiment.score : sentiment.score;
+    const clampedScore = Math.max(-1, Math.min(1, directional));
+    const delta = clampedScore * bound; // ∈ [-bound, +bound]
+    const contribution = weight * (0.5 + delta);
+
+    coindeskSentimentScoreHistogram.observe({ symbol: signal.symbol }, sentiment.score);
+    coindeskSentimentEvaluatedCounter.inc({
+      symbol: signal.symbol,
+      outcome: delta >= 0 ? 'aligned' : 'contrarian',
+    });
+
+    return {
+      rule: 'coindesk_sentiment',
+      passed: true,
+      reason: `Sentiment ${sentiment.score.toFixed(2)} (n=${sentiment.articleCount}, fresh=${(sentiment.freshnessMs / 60000).toFixed(0)}m), Δ=${delta >= 0 ? '+' : ''}${delta.toFixed(3)}`,
+      weight,
+      contribution,
+    };
+  }
+
+  /** Strip common quote/venue suffixes to get the CoinDesk base-asset tag. */
+  private symbolToBaseAsset(symbol: string): string {
+    const upper = symbol.toUpperCase();
+    const stripped = upper.replace(/-(PERP|PERP-INTX|USD|USDC|USDT|EUR|GBP)$/u, '');
+    return stripped.split('-')[0];
   }
 
   private evaluateStrategyWinRate(perf: StrategyPerformance): MetaFilterResult['rulesEvaluated'][0] {
@@ -1006,6 +1159,20 @@ export class MetaFilter extends EventEmitter {
   public updateConfig(config: Partial<MetaFilterConfig>): void {
     this.config = { ...this.config, ...config };
     this.logger.info('Meta filter config updated', { config: this.config });
+  }
+
+  /**
+   * Lookback window (minutes) for the coindesk_sentiment rule. The
+   * SignalProcessor uses this to size its pre-fetch so guardrails.yaml stays
+   * the single source of truth.
+   */
+  public getCoinDeskLookbackMinutes(): number {
+    return this.config.coindeskSentimentLookbackMinutes;
+  }
+
+  /** Whether the coindesk_sentiment rule is currently enabled. */
+  public isCoinDeskSentimentEnabled(): boolean {
+    return this.config.coindeskSentimentEnabled;
   }
 
   /**
