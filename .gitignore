@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local backtest artifacts (stdout dumps, reports, session folders)
+atlas/var/backtest_results/
