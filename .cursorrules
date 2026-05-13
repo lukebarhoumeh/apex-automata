@@ -82,9 +82,7 @@ supabase/
 
 ### Testing
 - Vitest for unit tests
-- Known failing tests (pre-existing, not regressions):
-  - coinbase-resilience, trading-engine-lifecycle, websocket-reconnect
-  - websocket-unified, position-tracker-fifo, risk-engine
+- All Vitest suites currently pass — any new failure is a regression.
 - ZERO new test failures allowed — run `pnpm test` after changes
 
 ### Guardrails Config
