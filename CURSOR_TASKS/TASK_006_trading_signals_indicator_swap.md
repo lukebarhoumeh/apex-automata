@@ -908,6 +908,8 @@ cd atlas/apps/core-node && pnpm test
 
 **Target:** 245/245 tests passing (or at minimum no regressions from the current 232/245).
 
+> **Note (2026-05-13):** all tests now pass — Vitest migration completed in May 11 PRs. Current baseline: 35 test files / 493 tests, all passing in ~3s. The "232/245" figure above reflects the task's design-time snapshot (2026-03-24); use the current baseline as the gate.
+
 If any strategy tests fail due to indicator value changes, investigate:
 1. Run the parity test to see which indicator diverges
 2. If the `trading-signals` value is more correct (matches TradingView), update the test assertion
