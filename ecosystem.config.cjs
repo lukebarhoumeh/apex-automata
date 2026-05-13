@@ -22,14 +22,23 @@
 
 const path = require('path');
 
+// Windows note: PM2 can't spawn pnpm.cmd directly (spawn EINVAL on .cmd
+// shims), so we point at tsx's mjs CLI under node_modules and run it with
+// the system node binary. The result is identical to `pnpm api` — that
+// script is itself just `tsx src/api/server.ts`.
+const tsxCli = path.resolve(
+  __dirname,
+  'atlas/apps/core-node/node_modules/tsx/dist/cli.mjs'
+);
+
 module.exports = {
   apps: [
     {
       name: 'apex-backend',
       cwd: path.resolve(__dirname, 'atlas/apps/core-node'),
-      script: 'pnpm',
-      args: 'api',
-      interpreter: 'none',
+      script: tsxCli,
+      args: 'src/api/server.ts',
+      interpreter: 'node',
       // Restart policy
       autorestart: true,
       max_restarts: 10,
