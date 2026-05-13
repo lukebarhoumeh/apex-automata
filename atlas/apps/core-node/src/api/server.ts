@@ -5,6 +5,7 @@ import { WebSocketServer } from 'ws';
 import { createLogger } from '../core/logger';
 import { TradingEngine, TradingEngineConfig, EngineState } from '../trading/trading-engine';
 import { SignalProcessor } from '../strategies/signal-processor';
+import { CoinDeskClient } from '../data-sources/coindesk-client';
 import { SignalArbitrator, extractBaseAsset } from '../strategies/signal-arbitrator';
 import { recordSignalFiltered, recordSignalFunnel } from '../strategies/signal-filter-telemetry';
 import { computeRawEntryFillPrice } from '../trading/position-entry-vwap';
@@ -1456,6 +1457,48 @@ app.post('/api/engine/start', async (req, res) => {
     // truth for any key the YAML omits — this server forwards an empty
     // object when no overrides are set.
     const momentumYaml = guardrails.momentum ?? {};
+
+    // Optional CoinDesk news/sentiment wiring. Default OFF — only initialized
+    // when guardrails.meta_filter.coindesk_sentiment.enabled === true AND a
+    // COINDESK_API_KEY is present in env. Missing key with flag on logs a warn
+    // and leaves the rule disabled (graceful degradation).
+    const coindeskCfg = guardrails.meta_filter?.coindesk_sentiment;
+    let coinDeskClient: CoinDeskClient | undefined;
+    if (coindeskCfg?.enabled) {
+      const apiKey = process.env.COINDESK_API_KEY ?? '';
+      if (!apiKey) {
+        logger.warn(
+          'guardrails.meta_filter.coindesk_sentiment.enabled=true but COINDESK_API_KEY is missing — rule will abstain'
+        );
+      } else {
+        coinDeskClient = new CoinDeskClient(
+          {
+            apiKey,
+            cacheTtlMs: coindeskCfg.cache_ttl_ms,
+            requestTimeoutMs: coindeskCfg.request_timeout_ms,
+          },
+          logger
+        );
+        logger.info('CoinDesk sentiment client initialized', {
+          lookbackMinutes: coindeskCfg.lookback_minutes,
+          enabledSymbols: coindeskCfg.enabled_symbols,
+        });
+      }
+    }
+
+    const metaFilterYaml: Record<string, unknown> = {};
+    if (coindeskCfg) {
+      metaFilterYaml.coindeskSentimentEnabled = coindeskCfg.enabled && Boolean(coinDeskClient);
+      metaFilterYaml.coindeskSentimentLookbackMinutes = coindeskCfg.lookback_minutes;
+      metaFilterYaml.coindeskSentimentStaleThresholdMs = coindeskCfg.stale_threshold_ms;
+      metaFilterYaml.coindeskSentimentWeightDeltaBound = Math.min(
+        Math.abs(coindeskCfg.weight_delta_bounds[0]),
+        Math.abs(coindeskCfg.weight_delta_bounds[1])
+      );
+      metaFilterYaml.coindeskSentimentRuleWeight = coindeskCfg.rule_weight;
+      metaFilterYaml.coindeskSentimentEnabledSymbols = coindeskCfg.enabled_symbols;
+    }
+
     const signalConfig = {
       supabaseUrl: env.SUPABASE_URL || '',
       supabaseKey: env.SUPABASE_SERVICE_KEY || '',
@@ -1482,7 +1525,9 @@ app.post('/api/engine/start', async (req, res) => {
       metaLabeling: {
         enabled: false,
         threshold: 0.5
-      }
+      },
+      metaFilter: metaFilterYaml,
+      coinDeskClient,
     };
 
     signalProcessor = new SignalProcessor(signalConfig, logger);

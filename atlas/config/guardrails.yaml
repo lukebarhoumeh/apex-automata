@@ -251,6 +251,32 @@ circuit_breakers:
   vol_spike_atr: 0.03
   data_gap_sec: 30             # 30 seconds (was 2 - too aggressive)
 
+# Meta-filter (rule-based trade quality) config. The MetaFilter class lives in
+# atlas/apps/core-node/src/strategies/meta-filter.ts and uses zod-validated
+# defaults for everything not specified here. Only fields with operational
+# tuning value are surfaced to YAML.
+#
+# coindesk_sentiment: SOFT-WEIGHT-ONLY rule that nudges the meta quality score
+# by a bounded delta based on CoinDesk news sentiment for the signal's base
+# asset. Never blocks signals (no `allowed: false`). Default OFF — flip
+# `enabled: true` to A/B test against the existing rule-based meta-filter.
+# Free-tier API key sunsets 2026-05-21; verify tier before enabling.
+meta_filter:
+  coindesk_sentiment:
+    enabled: false
+    lookback_minutes: 60
+    stale_threshold_ms: 1800000        # 30 min
+    weight_delta_bounds: [-0.25, 0.25]
+    cache_ttl_ms: 60000                # 60s in-memory cache (per symbol+lookback)
+    request_timeout_ms: 5000
+    rule_weight: 0.2                   # weight in averaged quality score
+    enabled_symbols:
+      - BTC-USD
+      - ETH-USD
+      - SOL-USD
+      - ETH-PERP-INTX
+      - BTC-PERP-INTX
+
 filters:
   atr_volatility_min: 0.0005
   atr_volatility_max: 0.05

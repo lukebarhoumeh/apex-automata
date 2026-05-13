@@ -7,6 +7,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { RegimeDetector, RegimeDetectorConfig, RegimeState, MarketRegime } from './regime-detector';
 import { RegimeFilter, RegimeFilterConfig, FilterResult } from './regime-filter';
 import { MetaFilter, MetaFilterConfig, MetaFilterResult, TradeOutcome, StrategyPerformance } from './meta-filter';
+import type { CoinDeskClient } from '../data-sources/coindesk-client';
 import {
   StrategyRegistry,
   StrategyRegistryConfig,
@@ -49,6 +50,12 @@ export interface SignalProcessorConfig {
   signalArbiter?: Partial<SignalArbiterConfig>;
   // Whether to enable signal arbitration (default: true)
   enableArbiter?: boolean;
+  // Optional CoinDesk news/sentiment client. When supplied AND
+  // metaFilter.coindeskSentimentEnabled is true, sentiment is pre-fetched
+  // for each signal's base asset before the meta-filter runs. The wiring is
+  // strictly opt-in via guardrails.yaml; a missing client is the same as
+  // the rule abstaining.
+  coinDeskClient?: CoinDeskClient;
 }
 
 export interface BreakoutConfig {
@@ -160,6 +167,10 @@ export class SignalProcessor extends EventEmitter {
   private metaFilter: MetaFilter;
   private lastMetaFilterResults: Map<string, MetaFilterResult> = new Map();
 
+  // Optional CoinDesk client (set when meta_filter.coindesk_sentiment.enabled
+  // is true in guardrails.yaml). Pre-fetched into context before metaFilter.filter().
+  private coinDeskClient?: CoinDeskClient;
+
   // Strategy plugin registry
   private strategyRegistry: StrategyRegistry;
   private usePluginStrategies: boolean;
@@ -193,6 +204,9 @@ export class SignalProcessor extends EventEmitter {
       config.supabaseUrl,
       config.supabaseKey
     );
+
+    // Optional CoinDesk client — opt-in via guardrails.meta_filter.coindesk_sentiment.enabled.
+    this.coinDeskClient = config.coinDeskClient;
 
     // Forward regime events
     this.regimeDetector.on('regime:updated', (symbol: string, state: RegimeState) => {
@@ -1082,11 +1096,42 @@ export class SignalProcessor extends EventEmitter {
       ? latestCandle.volume / volumeSMA[volumeSMA.length - 1]
       : undefined;
 
+    // Pre-fetch CoinDesk aggregate sentiment for the signal's base asset when
+    // the rule is enabled. This is the only async step in the meta-filter
+    // path; failures degrade gracefully (rule abstains via undefined payload).
+    let coindeskSentiment:
+      | { score: number; articleCount: number; freshnessMs: number }
+      | undefined;
+    if (this.coinDeskClient && this.metaFilter.isCoinDeskSentimentEnabled()) {
+      try {
+        // Lookback minutes is owned by the meta-filter config — keep a single
+        // source of truth so guardrails.yaml controls the window.
+        const lookback = this.metaFilter.getCoinDeskLookbackMinutes();
+        const result = await this.coinDeskClient.getAggregateSentiment(
+          adjustedSignal.symbol,
+          lookback
+        );
+        coindeskSentiment = {
+          score: result.score,
+          articleCount: result.articleCount,
+          freshnessMs: result.freshnessMs,
+        };
+      } catch (err) {
+        // Never block the signal on a news fetch failure. Log and let the
+        // meta-filter rule abstain.
+        this.logger.warn('CoinDesk sentiment fetch failed; rule will abstain', {
+          symbol: adjustedSignal.symbol,
+          err: (err as Error)?.message,
+        });
+      }
+    }
+
     const metaFilterResult = this.metaFilter.filter(adjustedSignal, {
       volumeRatio,
       atr: indicators.atr?.[indicators.atr.length - 1],
       regime: filterResult.regimeState.regime,
       mtfAlignment: filterResult.regimeState.mtfAlignment,
+      coindeskSentiment,
     });
 
     this.lastMetaFilterResults.set(signal.symbol, metaFilterResult);

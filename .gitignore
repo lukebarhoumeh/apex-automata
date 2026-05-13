@@ -12,6 +12,15 @@ dist
 dist-ssr
 *.local
 
+# Local environment / secrets (per AGENTS.md)
+.env
+.env.*
+!.env.example
+
+# Local-only runtime artifacts
+atlas/var/tmp/
+atlas/var/backtest_results/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -39,6 +39,12 @@ export const EnvSchema = z.object({
   HYPERLIQUID_TESTNET: z.enum(['true', 'false']).optional(),
   HYPERLIQUID_PRIVATE_KEY: z.string().optional(),
   HYPERLIQUID_WALLET_ADDRESS: z.string().optional(),
+
+  // CoinDesk News + Sentiment (optional — only required when
+  // guardrails.meta_filter.coindesk_sentiment.enabled = true). The free tier
+  // sunsets 2026-05-21, verify tier before enabling. Never log these values.
+  COINDESK_API_KEY: z.string().optional(),
+  COINDESK_API_KEY_NAME: z.string().optional(),
 });
 
 export type Env = z.infer<typeof EnvSchema>;
@@ -132,6 +138,8 @@ export function loadEnv(rootDir: string): Env {
       SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY,
       ENCRYPTION_KEY: process.env.ENCRYPTION_KEY,
       CONFIRM_LIVE: (process.env.CONFIRM_LIVE as 'YES' | 'NO') ?? 'NO',
+      COINDESK_API_KEY: process.env.COINDESK_API_KEY,
+      COINDESK_API_KEY_NAME: process.env.COINDESK_API_KEY_NAME,
     });
     return env;
   } catch (error) {

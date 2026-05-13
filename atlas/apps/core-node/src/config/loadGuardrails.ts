@@ -80,6 +80,33 @@ const MomentumConfigSchema = z.object({
 
 export type MomentumConfigOverrides = z.infer<typeof MomentumConfigSchema>;
 
+// Meta-filter config — currently only carries the optional CoinDesk sentiment
+// soft-weight rule. Default OFF, validated up-front so a malformed YAML block
+// fails startup loudly instead of silently disabling the rule at runtime.
+const CoinDeskSentimentSchema = z.object({
+  enabled: z.boolean().default(false),
+  lookback_minutes: z.number().int().min(1).max(1440).default(60),
+  stale_threshold_ms: z.number().int().nonnegative().default(30 * 60 * 1000),
+  weight_delta_bounds: z
+    .tuple([z.number(), z.number()])
+    .refine(([lo, hi]) => lo <= 0 && hi >= 0 && hi <= 1 && lo >= -1, {
+      message: 'weight_delta_bounds must be [lo, hi] with lo <= 0 <= hi and within [-1, 1]',
+    })
+    .default([-0.25, 0.25]),
+  cache_ttl_ms: z.number().int().nonnegative().default(60_000),
+  request_timeout_ms: z.number().int().positive().max(60_000).default(5_000),
+  rule_weight: z.number().min(0).max(1).default(0.2),
+  enabled_symbols: z.array(z.string()).default([]),
+});
+
+const MetaFilterYamlSchema = z
+  .object({
+    coindesk_sentiment: CoinDeskSentimentSchema.optional(),
+  })
+  .optional();
+
+export type CoinDeskSentimentConfig = z.infer<typeof CoinDeskSentimentSchema>;
+
 const GuardrailsSchema = z.object({
   disabled_strategies: z.array(z.string()).optional().default([]),
   momentum: MomentumConfigSchema.optional(),
@@ -165,6 +192,9 @@ const GuardrailsSchema = z.object({
     time_filter_enabled: z.boolean(),
     allowed_hours_utc: z.array(z.number().int().min(0).max(23)).nonempty()
   }),
+  // Meta-filter config block. Only carries the CoinDesk sentiment rule today.
+  // Strictly optional — when absent, MetaFilter defaults (rule disabled) apply.
+  meta_filter: MetaFilterYamlSchema,
   compliance: z.object({
     tax_method: z.string(),
     export_frequency_days: z.number().int().positive(),
