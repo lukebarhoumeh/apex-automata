@@ -1,0 +1,51 @@
+# ------------------------------------------------------------------------------
+# Apex Automata / AtlasBot v2 — Prometheus Operator ScrapeConfig for Supabase
+# ------------------------------------------------------------------------------
+# K8s-native equivalent of the `supabase` job in `prometheus.yml`. Use this on
+# clusters running the Prometheus Operator (matches the existing pattern in
+# `servicemonitor-api.yaml` + `alertrules.yaml`).
+#
+# Sprint task: E1 — wire Supabase Pro Prometheus-compatible metrics endpoint
+# into the existing Grafana stack. Reference: SPRINT-PLAN-FINAL.md §3 E1 and
+# supabase-pro-research.md §19.
+#
+# Required Kubernetes Secret (one-time setup, per D9/G2 rotation procedure):
+#
+#   kubectl -n atlas-bot create secret generic supabase-prometheus \
+#     --from-literal=username=service_role \
+#     --from-literal=password='<SUPABASE_PROMETHEUS_PASSWORD>'
+#
+# The password value is the project's service_role JWT — same one stored in
+# SUPABASE_SERVICE_KEY. Rotate via docs/runbooks/secret-rotation.md (G2).
+# ------------------------------------------------------------------------------
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: supabase
+  namespace: atlas-bot
+  labels:
+    release: monitoring  # Must match Prometheus operator release name
+    component: supabase
+    tier: pro
+spec:
+  scheme: HTTPS
+  metricsPath: /customer/v1/privileged/metrics
+  scrapeInterval: 60s
+  scrapeTimeout: 30s
+  staticConfigs:
+    - targets:
+        # SUPABASE_PROJECT_REF is the project ref slug from the dashboard URL
+        # (e.g. gdrdaajvutmewgxbjurk.supabase.co). Substitute via your
+        # deployment templating (helm values, kustomize, sed, etc.) — the
+        # operator does not expand env vars inside ScrapeConfig at scrape time.
+        - '${SUPABASE_PROJECT_REF}.supabase.co'
+      labels:
+        component: supabase
+        tier: pro
+  basicAuth:
+    username:
+      name: supabase-prometheus
+      key: username
+    password:
+      name: supabase-prometheus
+      key: password
