@@ -521,7 +521,13 @@ export class BacktestEngine extends EventEmitter {
 
         // Step 4: Feed close into the signal pipeline. Any signal it emits
         // is queued for next bar via handleSignal -> pendingFills.
-        processor.addCandle(product, candle);
+        //
+        // Pass the bar's own timestamp as `nowMs`. The signal funnel's
+        // dedup, flip-cooldown, cold-streak cooldown and decision-log ID
+        // generation all consult this clock — feeding wall-clock here
+        // collapses the entire backtest into a single ~36-48h trade-active
+        // window (May 2026 funnel-latch bug; see SPRINT-PLAN-FINAL.md §3 F1).
+        processor.addCandle(product, candle, candle.time);
       }
 
       this.recordEquity(timestamp);
