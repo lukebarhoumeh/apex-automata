@@ -107,9 +107,14 @@ jobs:
         # we actually plan to deploy to. ETH-USD is the spot proxy that we
         # know has bars data; ETH-PERP-INTX is included so perps coverage
         # surfaces if/when bars are loaded for it.
+        # NB: do NOT use `pnpm backtest -- --flags`. pnpm forwards the `--`
+        # token to the underlying script, where yargs treats `--` as the
+        # "stop parsing options" sentinel — every subsequent flag becomes
+        # a positional arg and the CLI dies with "Missing required
+        # arguments: start-date, end-date". Invoke tsx directly to bypass.
         run: |
           set -o pipefail
-          pnpm backtest -- \
+          pnpm exec tsx src/cli/backtest.ts \
             --start-date "${{ steps.window.outputs.start }}" \
             --end-date "${{ steps.window.outputs.end }}" \
             --products ETH-USD ETH-PERP-INTX \
