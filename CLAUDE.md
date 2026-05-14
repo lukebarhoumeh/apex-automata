@@ -25,7 +25,7 @@ pnpm install:all      # Install all dependencies (root + backend)
 pnpm api              # Start Express API + WebSocket server
 pnpm dev              # Paper trading mode via CLI
 pnpm build            # TypeScript compilation (rimraf dist && tsc)
-pnpm test             # Run tests (vitest run) — 38 files / 529 tests, all pass (~7s)
+pnpm test             # Run tests (vitest run) — 42 files / 548 tests, all pass (~7s)
 pnpm test:watch       # Watch mode
 pnpm test:coverage    # Coverage report
 pnpm backtest         # Run backtest analysis
@@ -91,7 +91,7 @@ The meta-filter is **rule-based** (cold-streak cooldown after 10 losses → 5 mi
 - Do NOT change Logger or ConfigLoader patterns
 
 ## Testing
-- Backend: `pnpm test` in `atlas/apps/core-node/` — **38 files / 529 tests**, all pass (~7s, verified 2026-05-14)
+- Backend: `pnpm test` in `atlas/apps/core-node/` — **42 files / 548 tests**, all pass (~7s, verified 2026-05-14)
 - ZERO test failures allowed; any failure is a regression.
 - Frontend: `pnpm test` from root (Vitest + jsdom)
 
