@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import { Filter, ArrowDown, ArrowUp, CircleCheck, CircleX, Info, Radio, ShieldAlert } from "lucide-react";
 import { Panel } from "@/components/apex/Panel";
 import { Pill } from "@/components/apex/Pill";
@@ -22,41 +21,11 @@ const KIND_META: Record<
   SESSION: { icon: Info,        label: "SESSION", tone: "default" },
 };
 
-const SYNTHETIC_PULSES: ReadonlyArray<Omit<FeedEvent, "ts" | "id">> = [
-  { kind: "SIGNAL", msg: "BTC-USD candidate p=0.74", tag: "breakout", score: 0.74, risk: "MED" },
-  { kind: "SIGNAL", msg: "ETH-USD z-score +1.96σ",   tag: "vwap_mr", score: 0.62, risk: "LOW" },
-  { kind: "REGIME", msg: "ADX holding above 30",     tag: "system" },
-  { kind: "SIGNAL", msg: "SOL-USD mom pulse 15m",    tag: "momentum", score: 0.69, risk: "MED" },
-  { kind: "FILL",   msg: "ETH-USD BUY 0.42 @ 3,282.10", tag: "trend_follow", score: 0.77, risk: "LOW" },
-  { kind: "REJECT", msg: "LINK-USD p=0.54 < meta 0.65", tag: "meta" },
-];
-
-function nowStamp(): string {
-  const d = new Date();
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
-}
-
 export function LiveSignalFeed({ initialEvents, className }: LiveSignalFeedProps) {
-  const [events, setEvents] = useState<FeedEvent[]>(() => [...initialEvents]);
-
-  useEffect(() => {
-    let n = 0;
-    const id = window.setInterval(() => {
-      const pulse = SYNTHETIC_PULSES[n % SYNTHETIC_PULSES.length]!;
-      n += 1;
-      setEvents((prev) => {
-        const next: FeedEvent = {
-          id: `live-${Date.now()}`,
-          ts: nowStamp(),
-          ...pulse,
-        };
-        return [next, ...prev].slice(0, 40);
-      });
-    }, 6000);
-    return () => window.clearInterval(id);
-  }, []);
-
+  // Render the real feed straight from the upstream prop — useSignalFeed() polls
+  // /signals on a 15s cadence via React Query. The previous implementation injected
+  // synthetic pulses every 6s with KILLED strategy tags ("breakout", "vwap_mr") which
+  // showed as live signals to operators; that lied about engine state during paper runs.
   return (
     <Panel
       header
@@ -66,7 +35,7 @@ export function LiveSignalFeed({ initialEvents, className }: LiveSignalFeedProps
         <>
           <span className="flex items-center gap-1.5">
             <span className="dot-live" />
-            <span className="mono text-[11px] text-fg-1">LIVE · 43ms</span>
+            <span className="mono text-[11px] text-fg-1">LIVE</span>
           </span>
           <button
             type="button"
@@ -81,7 +50,7 @@ export function LiveSignalFeed({ initialEvents, className }: LiveSignalFeedProps
     >
       <div className="max-h-[520px] overflow-y-auto">
         <ul className="divide-y divide-obsidian-line">
-          {events.map((ev, i) => (
+          {initialEvents.map((ev, i) => (
             <FeedRow key={ev.id} event={ev} isNew={i === 0} />
           ))}
         </ul>
