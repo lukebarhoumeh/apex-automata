@@ -6,10 +6,7 @@
 
 ## Supabase Edge Functions
 - `GET /functions/v1/runtime-health` returns `{ ok: true, dbOk: true }`
-- `POST /functions/v1/ingest-alert` inserts a new alert row
-- `POST /functions/v1/alerts-ack` sets `acked_at` for a known alert
 - `POST /functions/v1/journal-entry` create/update/delete works for a test entry
-- `POST /functions/v1/strategy-toggle` flips a strategy and persists
 - `POST /functions/v1/risk-settings-update` persists an update for the user
 - `POST /functions/v1/strategy-signal-upsert` updates `meta` threshold params
 
