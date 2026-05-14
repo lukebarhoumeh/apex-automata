@@ -17,9 +17,20 @@ dist-ssr
 .env.*
 !.env.example
 
-# Local-only runtime artifacts
-atlas/var/tmp/
+# Local-only runtime artifacts.
+# We ignore the *contents* of these dirs (not the dirs themselves) so that
+# operational scripts can still be re-included below. Git can't re-include
+# a file if a parent directory is wholesale ignored.
+atlas/var/tmp/*
+atlas/var/tmp/monitor/*
 atlas/var/backtest_results/
+
+# Track operational monitor scripts (pulse, etc.) even though their
+# parent dir is otherwise local-only runtime data. Logs, snapshots, and
+# captured run files stay ignored via the directory contents rule above.
+!atlas/var/tmp/monitor/
+!atlas/var/tmp/monitor/pulse.sh
+!atlas/var/tmp/monitor/test-pulse-fix.sh
 
 # Editor directories and files
 .vscode/*
