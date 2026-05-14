@@ -1,0 +1,141 @@
+name: backtest-gate
+
+# I3 — Backtest CI gate (replaces I4 branch protection per locked sprint
+# decision). Any PR that touches strategy / trading / backtest / guardrails
+# code MUST pass a fast 7-day backtest before merge. Today this is
+# enforcement-by-convention because branch protection is intentionally OFF —
+# reviewers must verify the green checkmark on this workflow before merging.
+
+on:
+  pull_request:
+    paths:
+      - 'atlas/apps/core-node/src/strategies/**'
+      - 'atlas/apps/core-node/src/trading/**'
+      - 'atlas/apps/core-node/src/backtesting/**'
+      - 'atlas/config/guardrails.yaml'
+      - '.github/workflows/backtest-gate.yml'
+
+# Cancel in-flight runs when a new commit lands on the same PR — the latest
+# diff is the one we care about.
+concurrency:
+  group: backtest-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  backtest:
+    name: Fast backtest (7d, ETH spot + perp)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Required by atlas/apps/core-node/src/cli/backtest.ts (lines 83-87 will
+      # exit 1 without these — backtest reads candles from public.bars).
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      # Not strictly required by the backtest CLI but several modules read it
+      # at import-time. Provide a deterministic dummy if not set as a secret;
+      # backtest does not exercise encryption paths.
+      ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY || '0000000000000000000000000000000000000000000000000000000000000000' }}
+
+    steps:
+      - name: Fail fast if required secrets are missing
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
+            echo "::error::SUPABASE_URL and SUPABASE_SERVICE_KEY must be configured as repo secrets."
+            echo "::error::See .github/workflows/README.md for the manual setup steps."
+            exit 1
+          fi
+
+      - name: Checkout PR
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          # core-node engines.node = ">=20"; use the active LTS.
+          node-version: '20'
+          cache: pnpm
+
+      - name: Install root deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Install core-node deps
+        working-directory: atlas/apps/core-node
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore Rollup native binary
+        # core-node/.npmrc sets optional=false which prevents the
+        # platform-specific @rollup/rollup-linux-x64-gnu from installing.
+        # See AGENTS.md "Important gotchas" item 1.
+        run: |
+          cd /tmp
+          npm pack @rollup/rollup-linux-x64-gnu@4.53.3
+          tar xzf rollup-rollup-linux-x64-gnu-*.tgz
+          DEST="$GITHUB_WORKSPACE/atlas/node_modules/.pnpm/rollup@4.53.3/node_modules/@rollup/rollup-linux-x64-gnu"
+          mkdir -p "$DEST"
+          cp -r package/* "$DEST"/
+          rm -rf package rollup-rollup-linux-x64-gnu-*.tgz
+
+      - name: Compute 7-day window
+        id: window
+        # NB: a `--quick` mode does not yet exist on the backtest CLI; a
+        # follow-up could add one (skip per-stage tracing, smaller bar buffer).
+        # In the meantime, a 7-day window keeps wall-clock under ~3 minutes.
+        run: |
+          START=$(date -u -d '7 days ago' +%Y-%m-%d)
+          END=$(date -u +%Y-%m-%d)
+          echo "start=$START" >> "$GITHUB_OUTPUT"
+          echo "end=$END" >> "$GITHUB_OUTPUT"
+          echo "Backtest window: $START -> $END"
+
+      - name: Run fast backtest
+        id: backtest
+        working-directory: atlas/apps/core-node
+        # Use HL fee schedule (4.5 bps taker) so the gate measures the venue
+        # we actually plan to deploy to. ETH-USD is the spot proxy that we
+        # know has bars data; ETH-PERP-INTX is included so perps coverage
+        # surfaces if/when bars are loaded for it.
+        run: |
+          set -o pipefail
+          pnpm backtest -- \
+            --start-date "${{ steps.window.outputs.start }}" \
+            --end-date "${{ steps.window.outputs.end }}" \
+            --products ETH-USD ETH-PERP-INTX \
+            --commission 0.00045 \
+            --slippage 0.0005 \
+            --strategy all \
+            | tee /tmp/backtest-stdout.log
+
+      - name: Verify trade count >= 5
+        # Structural smoke: a 7-day window across 2 products should produce
+        # at least a handful of trades. Zero-or-near-zero trades almost
+        # always means a regression in the funnel (see SPRINT-PLAN-FINAL.md
+        # F1: backtest funnel-latch bug today caps at 12 signals/run).
+        run: |
+          TRADES=$(grep -E '^Total Trades:' /tmp/backtest-stdout.log | tail -1 | awk '{print $3}')
+          echo "Reported Total Trades: ${TRADES:-<not parsed>}"
+          if [ -z "$TRADES" ]; then
+            echo "::error::Could not parse 'Total Trades:' from backtest stdout. CLI output format may have changed."
+            exit 1
+          fi
+          if [ "$TRADES" -lt 5 ]; then
+            echo "::error::Backtest produced $TRADES trades over a 7-day window — expected >= 5."
+            echo "::error::This usually means the strategy pipeline regressed (signal-arbiter, meta-filter, or signal-processor). See SPRINT-PLAN-FINAL.md F1."
+            exit 1
+          fi
+          echo "Backtest produced $TRADES trades — gate PASSED."
+
+      - name: Upload backtest artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-output
+          path: |
+            /tmp/backtest-stdout.log
+            atlas/var/backtest_results/**
+          retention-days: 14
