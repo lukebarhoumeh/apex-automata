@@ -29,6 +29,24 @@ const mockGuardrails = {
     max_open_positions: 5,
     min_notional_buffer: 1.5,
   },
+  // Mirror production guardrails.yaml -> fees: block so the paper
+  // simulator's FeeModel routing has a real source of truth in tests.
+  // Pre-2026-05-14 this mock omitted the fees block and relied on the
+  // eager FeeModel.getFeeRate() call in initializePaperSimulator()
+  // throwing to short-circuit engine.start() under fake timers. After
+  // the B5 fee-routing fix, fee resolution is lazy (per-fill), so a
+  // missing fees block lets start() proceed into other mocked paths
+  // that hang. Adding the block is the correct fix — the fixture now
+  // matches the real config shape.
+  fees: {
+    coinbase: {
+      spot: { maker_bps: 25, taker_bps: 40 },
+      perps_intx: { maker_bps: 0, taker_bps: 5 },
+    },
+    hyperliquid: {
+      perps: { maker_bps: -1.5, taker_bps: 4.5 },
+    },
+  },
   risk: {
     max_position_exposure_pct: 0.2,
     daily_loss_limit: -0.02,
@@ -113,16 +131,23 @@ describe('TradingEngine Lifecycle', () => {
     it('should track state changes', async () => {
       const stateChangedHandler = vi.fn();
       engine.on('engine:state_changed', stateChangedHandler);
-      
-      // State should change when we try to start (will fail due to mocks, but state changes first)
-      try {
-        await engine.start();
-      } catch (e) {
-        // Expected to fail due to mocked dependencies
-      }
-      
-      // Should have emitted state_changed for 'starting'
+
+      // Fire-and-forget. start() awaits mocked async paths that, post-B5
+      // fee-routing fix, no longer short-circuit via initializePaperSimulator()
+      // and instead reach the `setTimeout(resolve, 1000)` inside start() —
+      // which under `vi.useFakeTimers()` hangs forever. We only need the
+      // synchronous 'starting' state transition that fires before any await.
+      engine.start().catch(() => {
+        // Expected to fail (or hang) due to mocked dependencies; swallow.
+      });
+      await Promise.resolve(); // yield once so setEngineState's emit is observed
+
       expect(stateChangedHandler).toHaveBeenCalledWith('starting', expect.any(String));
+
+      // Detach the in-flight (hanging) start so afterEach's stop() doesn't
+      // hit the 2s "waiting for start to finish" branch. The actual start
+      // promise is intentionally orphaned — it's catch'd above.
+      (engine as any).startInFlight = false;
     });
   });
 
@@ -276,16 +301,21 @@ describe('TradingEngine Lifecycle', () => {
     });
 
     it('should track start/stop counts', async () => {
-      // Simulate a start (even if it fails)
-      try {
-        await engine.start('test');
-      } catch (e) {
-        // Expected
-      }
-      
+      // Fire-and-forget; see "should track state changes" for why we no
+      // longer await. startCount is incremented synchronously inside
+      // start() before any await boundary, so it's observable here.
+      engine.start('test').catch(() => {
+        // Expected to fail (or hang) due to mocked dependencies; swallow.
+      });
+      await Promise.resolve();
+
       const health = engine.getHealthInfo();
       expect(health.startCount).toBe(1);
       expect(health.lastStartReason).toBe('test');
+
+      // Detach the in-flight (hanging) start so afterEach's stop() can
+      // short-circuit. Same rationale as in "should track state changes".
+      (engine as any).startInFlight = false;
     });
   });
 
