@@ -112,16 +112,29 @@ jobs:
         # "stop parsing options" sentinel — every subsequent flag becomes
         # a positional arg and the CLI dies with "Missing required
         # arguments: start-date, end-date". Invoke tsx directly to bypass.
+        # Backtest CLI does not call process.exit() at end of main() — the
+        # Supabase client keeps the event loop alive after results print, so
+        # the Node process hangs indefinitely. Wrap with `timeout` so CI is
+        # bounded; success is judged by "Total Trades:" appearing in stdout,
+        # NOT by process exit code. Follow-up: add explicit process.exit(0)
+        # to atlas/apps/core-node/src/cli/backtest.ts in a separate PR.
         run: |
           set -o pipefail
-          pnpm exec tsx src/cli/backtest.ts \
-            --start-date "${{ steps.window.outputs.start }}" \
-            --end-date "${{ steps.window.outputs.end }}" \
-            --products ETH-USD ETH-PERP-INTX \
-            --commission 0.00045 \
-            --slippage 0.0005 \
-            --strategy all \
-            | tee /tmp/backtest-stdout.log
+          timeout --preserve-status 240 \
+            pnpm exec tsx src/cli/backtest.ts \
+              --start-date "${{ steps.window.outputs.start }}" \
+              --end-date "${{ steps.window.outputs.end }}" \
+              --products ETH-USD ETH-PERP-INTX \
+              --commission 0.00045 \
+              --slippage 0.0005 \
+              --strategy all \
+            | tee /tmp/backtest-stdout.log \
+            || echo "::warning::Backtest process exited non-zero (likely SIGTERM from timeout — verifying via stdout)"
+          if ! grep -qE '^Total Trades:' /tmp/backtest-stdout.log; then
+            echo "::error::Backtest did not produce 'Total Trades:' line — see uploaded artefacts."
+            exit 1
+          fi
+          echo "Backtest produced 'Total Trades:' line — proceeding to verification step."
 
       - name: Verify trade count >= 5
         # Structural smoke: a 7-day window across 2 products should produce
