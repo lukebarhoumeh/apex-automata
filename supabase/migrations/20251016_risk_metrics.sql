@@ -40,21 +40,24 @@ CREATE TABLE IF NOT EXISTS public.risk_metrics (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Create indexes
-CREATE INDEX idx_risk_metrics_user_symbol ON public.risk_metrics(user_id, symbol);
-CREATE INDEX idx_risk_metrics_calculated_at ON public.risk_metrics(calculated_at DESC);
+-- Create indexes (idempotent for preview branch re-application)
+CREATE INDEX IF NOT EXISTS idx_risk_metrics_user_symbol ON public.risk_metrics(user_id, symbol);
+CREATE INDEX IF NOT EXISTS idx_risk_metrics_calculated_at ON public.risk_metrics(calculated_at DESC);
 
 -- Enable RLS
 ALTER TABLE public.risk_metrics ENABLE ROW LEVEL SECURITY;
 
--- Create RLS policies
+-- Create RLS policies (idempotent)
+DROP POLICY IF EXISTS "Users can view own risk metrics" ON public.risk_metrics;
 CREATE POLICY "Users can view own risk metrics" ON public.risk_metrics
     FOR SELECT USING (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS "Service role can manage all risk metrics" ON public.risk_metrics;
 CREATE POLICY "Service role can manage all risk metrics" ON public.risk_metrics
     FOR ALL USING (auth.jwt()->>'role' = 'service_role');
 
--- Create update trigger
+-- Create update trigger (idempotent)
+DROP TRIGGER IF EXISTS update_risk_metrics_updated_at ON public.risk_metrics;
 CREATE TRIGGER update_risk_metrics_updated_at
     BEFORE UPDATE ON public.risk_metrics
     FOR EACH ROW

@@ -92,26 +92,26 @@ CREATE TABLE IF NOT EXISTS public.audit_log (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Add indexes
-CREATE INDEX idx_trades_position_id ON public.trades(position_id);
-CREATE INDEX idx_trades_order_id ON public.trades(order_id);
-CREATE INDEX idx_trades_timestamp ON public.trades(timestamp);
+-- Add indexes (idempotent for preview branch re-application)
+CREATE INDEX IF NOT EXISTS idx_trades_position_id ON public.trades(position_id);
+CREATE INDEX IF NOT EXISTS idx_trades_order_id ON public.trades(order_id);
+CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON public.trades(timestamp);
 
-CREATE INDEX idx_positions_symbol ON public.positions(symbol);
-CREATE INDEX idx_positions_side ON public.positions(side);
-CREATE INDEX idx_positions_updated_at ON public.positions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_positions_symbol ON public.positions(symbol);
+CREATE INDEX IF NOT EXISTS idx_positions_side ON public.positions(side);
+CREATE INDEX IF NOT EXISTS idx_positions_updated_at ON public.positions(updated_at);
 
-CREATE INDEX idx_orders_product_id ON public.orders(product_id);
-CREATE INDEX idx_orders_status ON public.orders(status);
-CREATE INDEX idx_orders_parent_order_id ON public.orders(parent_order_id);
-CREATE INDEX idx_orders_created_at ON public.orders(created_at);
+CREATE INDEX IF NOT EXISTS idx_orders_product_id ON public.orders(product_id);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);
+CREATE INDEX IF NOT EXISTS idx_orders_parent_order_id ON public.orders(parent_order_id);
+CREATE INDEX IF NOT EXISTS idx_orders_created_at ON public.orders(created_at);
 
-CREATE INDEX idx_risk_metrics_timestamp ON public.risk_metrics(timestamp);
-CREATE INDEX idx_risk_metrics_kill_switch ON public.risk_metrics(kill_switch_active);
+CREATE INDEX IF NOT EXISTS idx_risk_metrics_timestamp ON public.risk_metrics(timestamp);
+CREATE INDEX IF NOT EXISTS idx_risk_metrics_kill_switch ON public.risk_metrics(kill_switch_active);
 
-CREATE INDEX idx_audit_log_timestamp ON public.audit_log(timestamp);
-CREATE INDEX idx_audit_log_category ON public.audit_log(category);
-CREATE INDEX idx_audit_log_level ON public.audit_log(level);
+CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON public.audit_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_log_category ON public.audit_log(category);
+CREATE INDEX IF NOT EXISTS idx_audit_log_level ON public.audit_log(level);
 
 -- Add RLS policies
 ALTER TABLE public.trades ENABLE ROW LEVEL SECURITY;
@@ -121,36 +121,45 @@ ALTER TABLE public.risk_metrics ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.daily_equity ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.audit_log ENABLE ROW LEVEL SECURITY;
 
--- Service role has full access
+-- Service role has full access (idempotent guard for preview branch re-application)
+DROP POLICY IF EXISTS "Service role full access" ON public.trades;
 CREATE POLICY "Service role full access" ON public.trades
     FOR ALL USING (auth.jwt() ->> 'role' = 'service_role');
 
+DROP POLICY IF EXISTS "Service role full access" ON public.positions;
 CREATE POLICY "Service role full access" ON public.positions
     FOR ALL USING (auth.jwt() ->> 'role' = 'service_role');
 
+DROP POLICY IF EXISTS "Service role full access" ON public.orders;
 CREATE POLICY "Service role full access" ON public.orders
     FOR ALL USING (auth.jwt() ->> 'role' = 'service_role');
 
+DROP POLICY IF EXISTS "Service role full access" ON public.risk_metrics;
 CREATE POLICY "Service role full access" ON public.risk_metrics
     FOR ALL USING (auth.jwt() ->> 'role' = 'service_role');
 
+DROP POLICY IF EXISTS "Service role full access" ON public.daily_equity;
 CREATE POLICY "Service role full access" ON public.daily_equity
     FOR ALL USING (auth.jwt() ->> 'role' = 'service_role');
 
+DROP POLICY IF EXISTS "Service role full access" ON public.audit_log;
 CREATE POLICY "Service role full access" ON public.audit_log
     FOR ALL USING (auth.jwt() ->> 'role' = 'service_role');
 
--- Create updated_at triggers
+-- Create updated_at triggers (idempotent)
+DROP TRIGGER IF EXISTS update_positions_updated_at ON public.positions;
 CREATE TRIGGER update_positions_updated_at
     BEFORE UPDATE ON public.positions
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_orders_updated_at ON public.orders;
 CREATE TRIGGER update_orders_updated_at
     BEFORE UPDATE ON public.orders
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_daily_equity_updated_at ON public.daily_equity;
 CREATE TRIGGER update_daily_equity_updated_at
     BEFORE UPDATE ON public.daily_equity
     FOR EACH ROW

@@ -49,7 +49,8 @@ CREATE INDEX IF NOT EXISTS idx_mf_decisions_ml_training
 -- Enable RLS
 ALTER TABLE public.meta_filter_decisions ENABLE ROW LEVEL SECURITY;
 
--- RLS Policy for user isolation
+-- RLS Policy for user isolation (idempotent for preview branch re-application)
+DROP POLICY IF EXISTS "Users can only access their own decisions" ON public.meta_filter_decisions;
 CREATE POLICY "Users can only access their own decisions"
     ON public.meta_filter_decisions FOR ALL
     USING (auth.uid() = user_id);
