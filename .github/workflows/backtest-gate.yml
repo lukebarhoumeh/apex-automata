@@ -61,29 +61,27 @@ jobs:
           node-version: '20'
           cache: pnpm
 
-      - name: Install root deps
-        # NOTE: --no-frozen-lockfile required because the root pnpm-lock.yaml's
-        # `importers:` section does not currently include `atlas/apps/core-node`
-        # (separate per-workspace lockfile pattern predates the workspace
-        # declaration in pnpm-workspace.yaml). Until the lockfiles are unified
-        # (Wave 2 D1 migration consolidation territory), frozen install fails
-        # with ERR_PNPM_OUTDATED_LOCKFILE. Track in follow-up issue.
-        run: pnpm install --no-frozen-lockfile
-
-      - name: Install core-node deps
-        working-directory: atlas/apps/core-node
-        # See note on root install above — same root-lockfile workspace mismatch.
-        run: pnpm install --no-frozen-lockfile
+      - name: Install workspace deps
+        # Root pnpm-lock.yaml is the single source of truth — its `importers:`
+        # section includes atlas/apps/core-node as a workspace member
+        # (pnpm-workspace.yaml declares `packages: ['atlas/apps/*']`). One
+        # workspace-aware install at the root installs everything core-node
+        # needs; no second install under atlas/apps/core-node required.
+        run: pnpm install --frozen-lockfile
 
       - name: Restore Rollup native binary
-        # core-node/.npmrc sets optional=false which prevents the
+        # atlas/apps/core-node/.npmrc sets optional=false which prevents the
         # platform-specific @rollup/rollup-linux-x64-gnu from installing.
         # See AGENTS.md "Important gotchas" item 1.
+        # Path note: now that the unified workspace install hoists rollup to
+        # the root node_modules/.pnpm/, the destination lives under the repo
+        # root rather than atlas/node_modules/. Rollup version is pinned by
+        # the root pnpm-lock.yaml — keep this in sync if vite/rollup bumps.
         run: |
           cd /tmp
-          npm pack @rollup/rollup-linux-x64-gnu@4.53.3
+          npm pack @rollup/rollup-linux-x64-gnu@4.52.4
           tar xzf rollup-rollup-linux-x64-gnu-*.tgz
-          DEST="$GITHUB_WORKSPACE/atlas/node_modules/.pnpm/rollup@4.53.3/node_modules/@rollup/rollup-linux-x64-gnu"
+          DEST="$GITHUB_WORKSPACE/node_modules/.pnpm/rollup@4.52.4/node_modules/@rollup/rollup-linux-x64-gnu"
           mkdir -p "$DEST"
           cp -r package/* "$DEST"/
           rm -rf package rollup-rollup-linux-x64-gnu-*.tgz

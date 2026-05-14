@@ -28,11 +28,11 @@ The backend uses `tsx` to run TypeScript directly (no compilation step needed fo
 
 ### Important gotchas
 
-1. **Rollup native binary**: The backend's `atlas/apps/core-node/.npmrc` sets `optional=false`, which prevents `@rollup/rollup-linux-x64-gnu` (required by vitest) from being installed. After `pnpm install`, manually install it:
+1. **Rollup native binary**: The backend's `atlas/apps/core-node/.npmrc` sets `optional=false`, which prevents `@rollup/rollup-linux-x64-gnu` (required by vitest) from being installed. After `pnpm install`, manually install it. Since W2-D12, the unified workspace install hoists rollup to the repo-root `node_modules/.pnpm/` (not `atlas/node_modules/`), and rollup is currently pinned to `4.52.4` in the root lockfile:
    ```bash
-   cd /tmp && npm pack @rollup/rollup-linux-x64-gnu@4.53.3 && tar xzf rollup-rollup-linux-x64-gnu-*.tgz
-   mkdir -p /workspace/atlas/node_modules/.pnpm/rollup@4.53.3/node_modules/@rollup/rollup-linux-x64-gnu
-   cp -r package/* /workspace/atlas/node_modules/.pnpm/rollup@4.53.3/node_modules/@rollup/rollup-linux-x64-gnu/
+   cd /tmp && npm pack @rollup/rollup-linux-x64-gnu@4.52.4 && tar xzf rollup-rollup-linux-x64-gnu-*.tgz
+   mkdir -p /workspace/node_modules/.pnpm/rollup@4.52.4/node_modules/@rollup/rollup-linux-x64-gnu
+   cp -r package/* /workspace/node_modules/.pnpm/rollup@4.52.4/node_modules/@rollup/rollup-linux-x64-gnu/
    rm -rf package rollup-rollup-linux-x64-gnu-*.tgz
    ```
 
