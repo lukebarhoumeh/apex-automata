@@ -1,0 +1,68 @@
+# ------------------------------------------------------------------------------
+# Apex Automata / AtlasBot v2 — Prometheus scrape configuration
+# ------------------------------------------------------------------------------
+# This file is the canonical scrape spec for standalone Prometheus deployments
+# (Docker Compose, local dev, single-node Prometheus). The Kubernetes deployment
+# uses the Prometheus Operator with `ServiceMonitor` and `PrometheusRule` CRDs
+# (see `servicemonitor-api.yaml`, `alertrules.yaml`); the same Supabase target
+# is mirrored in `scrapeconfig-supabase.yaml` so both runtimes stay in sync.
+#
+# Sprint task: E1 — wire Supabase Pro Prometheus-compatible metrics endpoint
+# into the existing observability stack. Reference: SPRINT-PLAN-FINAL.md §3 E1
+# and supabase-pro-research.md §19 (logs & observability).
+# ------------------------------------------------------------------------------
+
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+  external_labels:
+    project: apex-automata
+    cluster: atlas-bot
+
+scrape_configs:
+  # --------------------------------------------------------------------------
+  # AtlasBot core API — exposes /metrics via prom-client (see deps in
+  # atlas/apps/core-node/package.json). Mirrors `servicemonitor-api.yaml`.
+  # --------------------------------------------------------------------------
+  - job_name: atlas-api
+    metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    static_configs:
+      - targets:
+          - 'atlas-api:3001'
+        labels:
+          component: trading-engine
+
+  # --------------------------------------------------------------------------
+  # Supabase Pro — privileged Prometheus-compatible metrics endpoint.
+  # Pro-tier feature (NOT available on Free). Surfaces supabase_* series:
+  # postgres replication / pgbouncer pool / auth requests / realtime channels
+  # / edge function invocations / disk + cpu + memory.
+  # Endpoint contract: https://<project-ref>.supabase.co/customer/v1/privileged/metrics
+  # Auth: HTTP Basic — username `service_role`, password = service_role JWT.
+  # The password is sourced from ${SUPABASE_PROMETHEUS_PASSWORD}; rotate via
+  # the D9/G2 procedure documented in docs/runbooks/secret-rotation.md (G2).
+  # ${SUPABASE_PROJECT_REF} is the project ref slug from the dashboard URL.
+  # --------------------------------------------------------------------------
+  - job_name: supabase
+    scheme: https
+    metrics_path: /customer/v1/privileged/metrics
+    scrape_interval: 60s
+    scrape_timeout: 30s
+    static_configs:
+      - targets:
+          - '${SUPABASE_PROJECT_REF}.supabase.co'
+        labels:
+          component: supabase
+          tier: pro
+    basic_auth:
+      username: service_role
+      password: ${SUPABASE_PROMETHEUS_PASSWORD}
+
+# ------------------------------------------------------------------------------
+# Alerting + recording rules are defined in `alertrules.yaml` (Prometheus
+# Operator CRD format). For standalone deployments, translate them into the
+# `rule_files` block here and point at the same expressions.
+# ------------------------------------------------------------------------------

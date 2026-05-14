@@ -524,12 +524,21 @@ export class SignalProcessor extends EventEmitter {
     return true;
   }
 
-  // Add new candle data from live feed
-  public addCandle(symbol: string, candle: OHLCV): void {
+  /**
+   * Add new candle data from live feed.
+   *
+   * @param nowMs Current timestamp in epoch ms used for downstream
+   *   dedup / cooldown / cold-streak windows. Defaults to `Date.now()` for
+   *   the live path. **Backtest callers MUST pass the simulated bar
+   *   timestamp** (typically `candle.time`) — wall-clock here latches the
+   *   funnel after the first bars of every run. See SPRINT-PLAN-FINAL.md
+   *   §3 F1 (May 2026 funnel-latch fix).
+   */
+  public addCandle(symbol: string, candle: OHLCV, nowMs: number = Date.now()): void {
     this.logger.debug(`Signal processor: ${symbol} receiving candle, current count: ${this.getCandleCount(symbol)}`);
-    
+
     // Use internal method, don't skip signals (this is live data)
-    this.addCandleInternal(symbol, candle, false);
+    this.addCandleInternal(symbol, candle, false, nowMs);
   }
 
   /**
@@ -613,7 +622,12 @@ export class SignalProcessor extends EventEmitter {
     } : undefined);
   }
 
-  private checkSignals(symbol: string): void {
+  /**
+   * @param nowMs See {@link addCandle}. Threaded to plugin path + legacy
+   *   strategy paths so cooldown/dedup math uses the same clock the caller
+   *   supplied.
+   */
+  private checkSignals(symbol: string, nowMs: number = Date.now()): void {
     const candles = this.candles.get(symbol);
     const indicators = this.indicators.get(symbol);
 
@@ -626,33 +640,37 @@ export class SignalProcessor extends EventEmitter {
 
     // Use plugin-based strategy system if enabled
     if (this.usePluginStrategies) {
-      this.checkSignalsViaPlugins(symbol, candles, indicators, latestCandle, previousCandle);
+      this.checkSignalsViaPlugins(symbol, candles, indicators, latestCandle, previousCandle, nowMs);
       return;
     }
 
     // Legacy: Check each strategy directly
     if (this.config.strategies.breakout.enabled) {
-      this.checkBreakoutSignal(symbol, candles, indicators, latestCandle);
+      this.checkBreakoutSignal(symbol, candles, indicators, latestCandle, nowMs);
     }
 
     if (this.config.strategies.vwapMeanReversion.enabled) {
-      this.checkVWAPSignal(symbol, candles, indicators, latestCandle);
+      this.checkVWAPSignal(symbol, candles, indicators, latestCandle, nowMs);
     }
 
     if (this.config.strategies.momentum.enabled) {
-      this.checkMomentumSignal(symbol, candles, indicators, latestCandle);
+      this.checkMomentumSignal(symbol, candles, indicators, latestCandle, nowMs);
     }
   }
 
   /**
    * Generate signals using the plugin-based strategy system.
+   *
+   * @param nowMs See {@link addCandle}. Threaded to arbiter + processSignal
+   *   so flip-cooldown, dedup and cold-streak windows agree on a single clock.
    */
   private checkSignalsViaPlugins(
     symbol: string,
     candles: OHLCV[],
     indicators: Record<string, number[]>,
     latestCandle: OHLCV,
-    previousCandle: OHLCV
+    previousCandle: OHLCV,
+    nowMs: number = Date.now(),
   ): void {
     // Get regime state
     const regimeState = this.regimeDetector.getState(symbol);
@@ -695,7 +713,7 @@ export class SignalProcessor extends EventEmitter {
     let signalsToProcess: StrategySignal[] = signals;
     
     if (this.enableArbiter && signals.length > 1) {
-      const arbiterResult = this.signalArbiter.arbitrate(signals, regimeState);
+      const arbiterResult = this.signalArbiter.arbitrate(signals, regimeState, nowMs);
       signalsToProcess = arbiterResult.signals;
       
       // Emit event for filtered signals
@@ -739,7 +757,7 @@ export class SignalProcessor extends EventEmitter {
       };
 
       // Process through regime filter and meta filter
-      this.processSignal(signal);
+      this.processSignal(signal, nowMs);
     }
   }
 
@@ -747,7 +765,8 @@ export class SignalProcessor extends EventEmitter {
     symbol: string,
     candles: OHLCV[],
     indicators: Record<string, number[]>,
-    latestCandle: OHLCV
+    latestCandle: OHLCV,
+    nowMs: number = Date.now(),
   ): void {
     const config = this.config.strategies.breakout;
     const donchianUpper = indicators.donchianUpper;
@@ -824,7 +843,7 @@ export class SignalProcessor extends EventEmitter {
     }
 
     if (signal) {
-      this.processSignal(signal);
+      this.processSignal(signal, nowMs);
     } else {
       this.logger.debug('No breakout signal', {
         symbol,
@@ -840,7 +859,8 @@ export class SignalProcessor extends EventEmitter {
     symbol: string,
     candles: OHLCV[],
     indicators: Record<string, number[]>,
-    latestCandle: OHLCV
+    latestCandle: OHLCV,
+    nowMs: number = Date.now(),
   ): void {
     const config = this.config.strategies.vwapMeanReversion;
     const vwap = indicators.vwap;
@@ -909,7 +929,7 @@ export class SignalProcessor extends EventEmitter {
     }
 
     if (signal) {
-      this.processSignal(signal);
+      this.processSignal(signal, nowMs);
     }
   }
 
@@ -917,7 +937,8 @@ export class SignalProcessor extends EventEmitter {
     symbol: string,
     candles: OHLCV[],
     indicators: Record<string, number[]>,
-    latestCandle: OHLCV
+    latestCandle: OHLCV,
+    nowMs: number = Date.now(),
   ): void {
     const config = this.config.strategies.momentum;
     // Plugin defaults — keep in sync with momentum-strategy.ts configSchema.
@@ -994,7 +1015,7 @@ export class SignalProcessor extends EventEmitter {
     }
 
     if (signal) {
-      this.processSignal(signal);
+      this.processSignal(signal, nowMs);
     }
   }
 
@@ -1015,7 +1036,15 @@ export class SignalProcessor extends EventEmitter {
     return Math.sqrt(sumSquaredDiff / recentCandles.length);
   }
 
-  private async processSignal(signal: Signal): Promise<void> {
+  /**
+   * @param nowMs Current timestamp in epoch ms used for the 5-min intra-
+   *   strategy dedup window AND threaded into `metaFilter.filter()`.
+   *   Defaults to `Date.now()` for the live path. **Backtest callers MUST
+   *   pass the simulated bar timestamp** (typically `candle.time`) — wall-
+   *   clock here latches the funnel after the first ~36-48h of every run.
+   *   See SPRINT-PLAN-FINAL.md §3 F1.
+   */
+  private async processSignal(signal: Signal, nowMs: number = Date.now()): Promise<void> {
     // Hard-reject signals from disabled strategies (Phase 3 backtest kill list)
     const disabledStrategies = this.config.disabledStrategies || [];
     if (disabledStrategies.includes(signal.strategy)) {
@@ -1039,11 +1068,16 @@ export class SignalProcessor extends EventEmitter {
     // momentum/trend_follow re-fire on every qualifying candle, so the same
     // (strategy, symbol, direction) gets dropped here repeatedly with no
     // metric. recordSignalFiltered here fixes that blind spot.
+    //
+    // 2026-05-13 (F1 funnel-residuals fix): use `nowMs` not `Date.now()`. In
+    // backtest mode the engine processes thousands of candles in a few
+    // seconds of wall clock, so the 5-min window collapses the entire run
+    // into a single dedup slice. Use the bar-time clock the caller supplied.
     const lastSignal = this.lastSignals.get(signal.symbol);
     if (lastSignal &&
         lastSignal.strategy === signal.strategy &&
         lastSignal.direction === signal.direction &&
-        Date.now() - lastSignal.timestamp.getTime() < 300000) { // 5 minutes
+        nowMs - lastSignal.timestamp.getTime() < 300000) { // 5 minutes
       this.emit('signal:filtered', signal, 'Too soon after previous signal');
       recordSignalFiltered(this.logger, {
         stage: 'dedup',
@@ -1055,7 +1089,7 @@ export class SignalProcessor extends EventEmitter {
         strength: signal.strength,
         context: {
           previousSignalId: lastSignal.id,
-          ageMs: Date.now() - lastSignal.timestamp.getTime(),
+          ageMs: nowMs - lastSignal.timestamp.getTime(),
           windowMs: 300000,
         },
       });
@@ -1126,13 +1160,17 @@ export class SignalProcessor extends EventEmitter {
       }
     }
 
-    const metaFilterResult = this.metaFilter.filter(adjustedSignal, {
-      volumeRatio,
-      atr: indicators.atr?.[indicators.atr.length - 1],
-      regime: filterResult.regimeState.regime,
-      mtfAlignment: filterResult.regimeState.mtfAlignment,
-      coindeskSentiment,
-    });
+    const metaFilterResult = this.metaFilter.filter(
+      adjustedSignal,
+      {
+        volumeRatio,
+        atr: indicators.atr?.[indicators.atr.length - 1],
+        regime: filterResult.regimeState.regime,
+        mtfAlignment: filterResult.regimeState.mtfAlignment,
+        coindeskSentiment,
+      },
+      nowMs,
+    );
 
     this.lastMetaFilterResults.set(signal.symbol, metaFilterResult);
 
@@ -1318,8 +1356,16 @@ export class SignalProcessor extends EventEmitter {
   
   /**
    * Internal method to add a candle, with option to skip signal generation.
+   *
+   * @param nowMs See {@link addCandle}. Threaded into `checkSignals` so all
+   *   downstream cooldown/dedup math agrees on a single clock.
    */
-  private addCandleInternal(symbol: string, candle: OHLCV, skipSignals: boolean): void {
+  private addCandleInternal(
+    symbol: string,
+    candle: OHLCV,
+    skipSignals: boolean,
+    nowMs: number = Date.now(),
+  ): void {
     if (!this.candles.has(symbol)) {
       this.candles.set(symbol, []);
     }
@@ -1347,7 +1393,7 @@ export class SignalProcessor extends EventEmitter {
 
     // Only check for signals if not skipping (during historical load)
     if (!skipSignals && this.warmupComplete.get(symbol)) {
-      this.checkSignals(symbol);
+      this.checkSignals(symbol, nowMs);
     }
   }
 
