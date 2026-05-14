@@ -57,11 +57,14 @@ CREATE INDEX IF NOT EXISTS equity_curve_user_date_idx
 -- RLS policies
 ALTER TABLE equity_curve ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY IF NOT EXISTS "Users can view own equity curve"
+-- Postgres does not support `CREATE POLICY IF NOT EXISTS`; use DROP+CREATE for idempotency.
+DROP POLICY IF EXISTS "Users can view own equity curve" ON equity_curve;
+CREATE POLICY "Users can view own equity curve"
   ON equity_curve FOR SELECT
   USING (auth.uid() = user_id);
 
-CREATE POLICY IF NOT EXISTS "Service role can manage equity curve"
+DROP POLICY IF EXISTS "Service role can manage equity curve" ON equity_curve;
+CREATE POLICY "Service role can manage equity curve"
   ON equity_curve FOR ALL
   USING (auth.role() = 'service_role');
 
