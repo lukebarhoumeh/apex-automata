@@ -1,15 +1,31 @@
 import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
 import { OrderRequest, Fill, Ticker } from '../exchanges/coinbase/types';
+import { FeeModel, Exchange, Market, Side } from '../core/fee-model';
 import { v4 as uuidv4 } from 'uuid';
 
 export interface PaperTradingConfig {
   initialBalances: Map<string, number>; // currency -> amount (e.g., 'USD' -> 10000, 'BTC' -> 0)
-  // Maker/taker rates are DECIMALS (e.g. 0.004 == 0.4%). They MUST be sourced
-  // from FeeModel.getFeeRate(...) — see TradingEngine.initializePaperSimulator.
-  // Do not hardcode fee constants here or at any other call site.
-  makerFee: number;
-  takerFee: number;
+
+  // Fee resolution — preferred path is `feeModel` + `venue` so per-symbol
+  // perps vs spot is routed to the correct tier in guardrails.yaml. The
+  // flat `makerFee`/`takerFee` decimals remain as a fallback so existing
+  // tests + single-venue setups keep working without a FeeModel instance.
+  //
+  // Sourcing precedence per fill (see `resolveFeeRate`):
+  //   1. feeModel.getFeeRate(venue, market(symbol), side) — venue/market-aware
+  //   2. flat makerFee/takerFee — legacy single-rate fallback
+  //   3. throw — never silently zero
+  //
+  // The flat values MUST be sourced from FeeModel.getFeeRate(...) at the
+  // call site if used — see TradingEngine.initializePaperSimulator. Do not
+  // hardcode fee constants here or at any other call site.
+  feeModel?: FeeModel;
+  /** Default venue for symbol classification. Defaults to 'coinbase'. */
+  venue?: Exchange;
+  makerFee?: number;
+  takerFee?: number;
+
   slippage: number; // 0.001 for 0.1% base slippage
   latencyMs: number; // Simulated order latency
   
@@ -96,10 +112,58 @@ export class PaperTradingSimulator extends EventEmitter {
       avgDailyVolumeUsd: 1000000,
       enablePartialFills: false,
       maxPartialFillPct: 0.25,
+      venue: 'coinbase',
       ...config,
     };
     this.logger = logger;
     this.balances = new Map(config.initialBalances);
+
+    if (!this.config.feeModel && this.config.makerFee === undefined && this.config.takerFee === undefined) {
+      throw new Error(
+        'PaperTradingSimulator: either `feeModel` or both `makerFee` + `takerFee` must be provided. ' +
+          'Fees come from guardrails.yaml — see TradingEngine.initializePaperSimulator.',
+      );
+    }
+  }
+
+  /**
+   * Classify a product symbol to its market bucket. Coinbase perp products
+   * use the `XXX-PERP-INTX` pattern (see exchanges/coinbase-perps-adapter
+   * isPerpsSymbol); everything else is treated as spot for this simulator.
+   * Hyperliquid uses bare `BTC-USD`-style symbols routed via a separate path,
+   * so they never reach this classifier today.
+   */
+  private marketForSymbol(symbol: string): Market {
+    return symbol.includes('-PERP-') ? 'perps' : 'spot';
+  }
+
+  /**
+   * Resolve the maker/taker fee RATE (decimal, NOT bps) for a fill on
+   * `symbol`. Honors the precedence documented on PaperTradingConfig.
+   *
+   * The fix this method exists to deliver: prior to 2026-05-14 the simulator
+   * stored a SINGLE makerFee/takerFee pair (configured to Coinbase spot
+   * rates) and applied it to every symbol, so paper trades on
+   * `*-PERP-INTX` were charged ~40 bps taker (spot) instead of the
+   * configured ~5 bps (perps_intx). That biased every perp paper EV
+   * number by ~55 bps round-trip. See SPRINT-PLAN-FINAL.md §1.4 / B5.
+   */
+  private resolveFeeRate(symbol: string, side: Side): number {
+    if (this.config.feeModel) {
+      return this.config.feeModel.getFeeRate(
+        this.config.venue ?? 'coinbase',
+        this.marketForSymbol(symbol),
+        side,
+      );
+    }
+    const flat = side === 'taker' ? this.config.takerFee : this.config.makerFee;
+    if (flat === undefined) {
+      throw new Error(
+        `PaperTradingSimulator: no fee rate configured for side='${side}'. ` +
+          'Provide a FeeModel or both makerFee + takerFee.',
+      );
+    }
+    return flat;
   }
   
   /**
@@ -437,9 +501,13 @@ export class PaperTradingSimulator extends EventEmitter {
       ? parseFloat(request.price)
       : this.marketPrices.get(request.product_id) || 0;
 
+    // Pre-trade balance/collateral check uses the symbol's taker rate so
+    // perp trades don't reserve spot-tier amounts (and vice versa).
+    const takerRate = this.resolveFeeRate(request.product_id, 'taker');
+
     if (request.side === 'buy') {
       // Check quote currency balance
-      const requiredAmount = size * price * (1 + this.config.takerFee);
+      const requiredAmount = size * price * (1 + takerRate);
       const available = this.getBalance(quoteCurrency);
       
       if (available < requiredAmount) {
@@ -456,7 +524,7 @@ export class PaperTradingSimulator extends EventEmitter {
       } else {
         // Short sell: check quote currency (USD) for collateral
         const notional = size * price;
-        const requiredCollateral = notional * (1 + this.config.takerFee);
+        const requiredCollateral = notional * (1 + takerRate);
         const quoteAvailable = this.getBalance(quoteCurrency);
 
         if (quoteAvailable < requiredCollateral) {
@@ -493,7 +561,10 @@ export class PaperTradingSimulator extends EventEmitter {
       ? marketPrice * (1 + priceImpact)
       : marketPrice * (1 - priceImpact);
 
-    // Create fill
+    // Create fill. Fee rate is resolved per-symbol so perp products are
+    // charged at the perps tier and spot products at the spot tier — see
+    // resolveFeeRate for the precedence + the B5 bug context.
+    const takerRate = this.resolveFeeRate(order.productId, 'taker');
     const fillId = ++this.fillSequence;
     const fill: Fill = {
       trade_id: fillId,
@@ -504,7 +575,7 @@ export class PaperTradingSimulator extends EventEmitter {
       liquidity: 'T', // Taker
       price: executionPrice.toString(),
       size: order.size.toString(),
-      fee: (order.size * executionPrice * this.config.takerFee).toString(),
+      fee: (order.size * executionPrice * takerRate).toString(),
       side: order.side,
       settled: true,
       created_at: new Date().toISOString(),
@@ -547,7 +618,8 @@ export class PaperTradingSimulator extends EventEmitter {
                    (order.side === 'sell' && marketPrice >= limitPrice);
 
     if (canFill) {
-      // Create fill at limit price (maker)
+      // Create fill at limit price (maker). Per-symbol rate as above.
+      const makerRate = this.resolveFeeRate(order.productId, 'maker');
       const fillId = ++this.fillSequence;
       const fill: Fill = {
         trade_id: fillId,
@@ -558,7 +630,7 @@ export class PaperTradingSimulator extends EventEmitter {
         liquidity: 'M', // Maker
         price: limitPrice.toString(),
         size: order.size.toString(),
-        fee: (order.size * limitPrice * this.config.makerFee).toString(),
+        fee: (order.size * limitPrice * makerRate).toString(),
         side: order.side,
         settled: true,
         created_at: new Date().toISOString(),

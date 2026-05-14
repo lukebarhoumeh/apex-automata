@@ -1179,8 +1179,14 @@ export class TradingEngine extends EventEmitter {
   }
 
   private initializePaperSimulator(): void {
-    // Fees come from guardrails.yaml -> fees.coinbase.spot via FeeModel so
+    // Fees come from guardrails.yaml -> fees.coinbase.* via FeeModel so
     // paper, live, and backtest stay directly comparable. Do NOT hardcode here.
+    //
+    // We pass the FeeModel itself (not pre-resolved spot rates) so the
+    // simulator can route per-symbol — `*-PERP-INTX` symbols hit the
+    // `coinbase.perps_intx` tier instead of being charged at the spot
+    // tier the way every prior paper run was. See SPRINT-PLAN-FINAL.md
+    // §1.4 / B5 for the quant impact (paper EV biased ~55 bps RT).
     const feeModel = FeeModel.fromGuardrails(this.guardrails);
     const config: PaperTradingConfig = {
       initialBalances: new Map([
@@ -1188,8 +1194,8 @@ export class TradingEngine extends EventEmitter {
         ['BTC', 0],
         ['ETH', 0]
       ]),
-      makerFee: feeModel.getFeeRate('coinbase', 'spot', 'maker'),
-      takerFee: feeModel.getFeeRate('coinbase', 'spot', 'taker'),
+      feeModel,
+      venue: 'coinbase',
       slippage: 0.001,  // 0.1%
       latencyMs: 100    // 100ms simulated latency
     };
