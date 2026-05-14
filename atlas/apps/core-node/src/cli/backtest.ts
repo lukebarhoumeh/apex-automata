@@ -237,6 +237,15 @@ async function main() {
     console.error('Backtest failed:', error);
     process.exit(1);
   }
+
+  // The Supabase client (used by BacktestRunner to read candles from
+  // public.bars) keeps the Node event loop alive after main() resolves —
+  // its connection pool / realtime subscription holds open handles. Without
+  // an explicit exit here, the process hangs indefinitely after results
+  // print and the CI step has to wrap us in `timeout`. Exit cleanly now
+  // that we have nothing useful left to do.
+  logger.info('Backtest CLI exiting cleanly');
+  process.exit(0);
 }
 
 main().catch((err) => {
