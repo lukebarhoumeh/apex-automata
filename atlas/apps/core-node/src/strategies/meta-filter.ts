@@ -321,7 +321,15 @@ export class MetaFilter extends EventEmitter {
   }
 
   /**
-   * Filter a signal based on meta-labeling rules
+   * Filter a signal based on meta-labeling rules.
+   *
+   * @param nowMs Current timestamp in epoch ms used for cold-streak cooldown
+   *   accounting and decision-log ID generation. **Backtest callers MUST pass
+   *   the simulated bar timestamp** — defaulting to `Date.now()` is correct
+   *   only for live trading. Mixing wall-clock and bar-time here is the root
+   *   cause of the May-2026 funnel-latch bug (cold-streak window measured by
+   *   wall-clock collapses an entire multi-month backtest into a single
+   *   `coldStreakCooldownMs` slice). See SPRINT-PLAN-FINAL.md §3 F1.
    */
   public filter(
     signal: Signal,
@@ -341,7 +349,8 @@ export class MetaFilter extends EventEmitter {
         articleCount: number;
         freshnessMs: number;
       };
-    } = {}
+    } = {},
+    nowMs: number = Date.now(),
   ): MetaFilterResult {
     metaFilterReceivedCounter.inc({ symbol: signal.symbol, strategy: signal.strategy });
 
@@ -358,7 +367,9 @@ export class MetaFilter extends EventEmitter {
       };
     }
 
-    const now = new Date();
+    // Hour-of-day / day-of-week derive from the SAME `nowMs` source so the
+    // time-of-day rule sees simulated time in backtest, not wall clock.
+    const now = new Date(nowMs);
     const hourOfDay = now.getUTCHours();
     const dayOfWeek = now.getUTCDay();
 
@@ -372,7 +383,7 @@ export class MetaFilter extends EventEmitter {
 
     // Rule 1: Cold Streak Detection
     if (this.config.coldStreakEnabled) {
-      const coldStreakResult = this.evaluateColdStreak(signal.strategy, perf);
+      const coldStreakResult = this.evaluateColdStreak(signal.strategy, perf, nowMs);
       rulesEvaluated.push(coldStreakResult);
       totalWeight += coldStreakResult.weight;
       totalScore += coldStreakResult.contribution;
@@ -380,7 +391,7 @@ export class MetaFilter extends EventEmitter {
       if (!coldStreakResult.passed) {
         // Hard block for cold streak
         metaFilterBlockedCounter.inc({ symbol: signal.symbol, strategy: signal.strategy, rule: 'cold_streak' });
-        this.logDecision(signal, context, false, 0, rulesEvaluated, hourOfDay, dayOfWeek);
+        this.logDecision(signal, context, false, 0, rulesEvaluated, hourOfDay, dayOfWeek, nowMs);
 
         recordSignalFiltered(this.logger, {
           stage: 'meta',
@@ -501,7 +512,7 @@ export class MetaFilter extends EventEmitter {
     }
 
     // Log decision
-    this.logDecision(signal, context, passed, qualityScore, rulesEvaluated, hourOfDay, dayOfWeek);
+    this.logDecision(signal, context, passed, qualityScore, rulesEvaluated, hourOfDay, dayOfWeek, nowMs);
 
     const reason = passed
       ? `Quality score ${(qualityScore * 100).toFixed(0)}% passed threshold`
@@ -513,24 +524,31 @@ export class MetaFilter extends EventEmitter {
       reason,
       rulesEvaluated,
       adjustedStrength: signal.strength * qualityScore,
-      coldStreakActive: this.isColdStreakActive(signal.strategy),
+      coldStreakActive: this.isColdStreakActive(signal.strategy, nowMs),
       strategyPerformance: perf,
     };
   }
 
   // ============ Rule Evaluators ============
 
+  /**
+   * @param nowMs Caller-supplied "current" timestamp. Live: `Date.now()`.
+   *   Backtest: simulated bar timestamp. Wall-clock here latches the cooldown
+   *   for the entire backtest run after the first cold streak fires —
+   *   see SPRINT-PLAN-FINAL.md §3 F1 for the full pathology.
+   */
   private evaluateColdStreak(
     strategy: string,
-    perf: StrategyPerformance
+    perf: StrategyPerformance,
+    nowMs: number,
   ): MetaFilterResult['rulesEvaluated'][0] {
     const isColdStreak = perf.consecutiveLosses >= this.config.coldStreakThreshold;
     const cooldownStart = this.coldStreakStart.get(strategy);
-    const inCooldown = cooldownStart && (Date.now() - cooldownStart) < this.config.coldStreakCooldownMs;
+    const inCooldown = cooldownStart !== undefined && (nowMs - cooldownStart) < this.config.coldStreakCooldownMs;
 
     // Update cold streak tracking
-    if (isColdStreak && !cooldownStart) {
-      this.coldStreakStart.set(strategy, Date.now());
+    if (isColdStreak && cooldownStart === undefined) {
+      this.coldStreakStart.set(strategy, nowMs);
       coldStreakActiveGauge.set({ strategy }, 1);
       this.logger.warn('Cold streak detected', { 
         strategy, 
@@ -990,13 +1008,14 @@ export class MetaFilter extends EventEmitter {
     qualityScore: number,
     rulesEvaluated: MetaFilterResult['rulesEvaluated'],
     hourOfDay: number,
-    dayOfWeek: number
+    dayOfWeek: number,
+    nowMs: number = Date.now(),
   ): void {
     if (!this.config.logDecisions) return;
 
     const logEntry: FilterDecisionLog = {
-      id: `mf-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      timestamp: new Date(),
+      id: `mf-${nowMs}-${Math.random().toString(36).substr(2, 9)}`,
+      timestamp: new Date(nowMs),
       signalId: signal.id,
       symbol: signal.symbol,
       strategy: signal.strategy,
@@ -1089,10 +1108,14 @@ export class MetaFilter extends EventEmitter {
     return perf;
   }
 
-  private isColdStreakActive(strategy: string): boolean {
+  /**
+   * @param nowMs Caller-supplied "current" timestamp. Live: `Date.now()`.
+   *   Backtest: simulated bar timestamp. See `evaluateColdStreak`.
+   */
+  private isColdStreakActive(strategy: string, nowMs: number = Date.now()): boolean {
     const cooldownStart = this.coldStreakStart.get(strategy);
-    if (!cooldownStart) return false;
-    return (Date.now() - cooldownStart) < this.config.coldStreakCooldownMs;
+    if (cooldownStart === undefined) return false;
+    return (nowMs - cooldownStart) < this.config.coldStreakCooldownMs;
   }
 
   // ============ Public API ============
