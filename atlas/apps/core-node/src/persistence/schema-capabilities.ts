@@ -328,8 +328,10 @@ export const EXPECTED_SCHEMA = createManualCapabilities({
   },
   meta_filter_decisions: {
     columns: [
-      'id', 'user_id', 'signal_id', 'symbol', 'decision',
-      'reasons', 'scores', 'created_at',
+      'id', 'timestamp', 'user_id', 'signal_id', 'symbol', 'strategy', 'direction',
+      'signal_strength', 'volume_ratio', 'regime', 'hour_of_day', 'day_of_week',
+      'passed', 'meta_score', 'rules_evaluated', 'outcome', 'pnl',
+      'created_at', 'updated_at',
     ],
   },
 });
