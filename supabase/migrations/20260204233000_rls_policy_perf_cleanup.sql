@@ -99,6 +99,12 @@ create policy "trade_log_user_policy"
 -- user_roles: consolidate duplicate permissive select policies
 drop policy if exists "Admins can manage all roles" on public.user_roles;
 drop policy if exists "Users can view their own roles" on public.user_roles;
+-- Idempotency: prod already has these new policies from historical apply;
+-- preview branches clone prod and would conflict without the DROP.
+drop policy if exists "user_roles_select" on public.user_roles;
+drop policy if exists "user_roles_insert_admin" on public.user_roles;
+drop policy if exists "user_roles_update_admin" on public.user_roles;
+drop policy if exists "user_roles_delete_admin" on public.user_roles;
 
 create policy "user_roles_select"
   on public.user_roles
