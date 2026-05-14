@@ -274,6 +274,18 @@ export class BacktestEngine extends EventEmitter {
     }
   }
 
+  /**
+   * Inspection accessor for the SignalProcessor instance the engine drives.
+   * Returns null until `run()` has called `initializeSignalProcessor()`.
+   *
+   * Surfaces MetaFilter / SignalArbiter / RegimeDetector state for tests
+   * and post-run analysis (e.g. F5 backtest-runs UI wiring will read funnel
+   * + meta-filter performance through this).
+   */
+  public getSignalProcessor(): SignalProcessor | null {
+    return this.signalProcessor;
+  }
+
   public async run(): Promise<BacktestResult> {
     this.logger.info('Starting backtest', {
       products: this.config.products,
@@ -789,6 +801,21 @@ export class BacktestEngine extends EventEmitter {
     const pnl = (exitPrice - position.entryPrice) * position.size * sideMultiplier;
     this.capital += pnl - exitFee;
 
+    // Live ↔ backtest parity (F2): mirror the live engine's
+    // `position:closed` → `signalProcessor.recordTradeOutcome` flow at
+    // `trading-engine.ts:940-973`. Without this, MetaFilter's strategy
+    // performance counters (consecutive losses, win rate, hourly perf)
+    // never update during a backtest, so the cold-streak rule never
+    // fires — which means the backtest funnel does NOT reflect live
+    // funnel behaviour. See SPRINT-PLAN-FINAL.md §3 F2 / §3 A5.
+    //
+    // Use `firstTrade.pnl` (fee-adjusted, the same number that flows
+    // into `result.metrics.winningTrades / losingTrades`) so the
+    // win/loss classification matches the result metrics exactly.
+    // The live engine passes `position.realizedPnL`, which is also
+    // fee-adjusted (`position-tracker.ts` deducts fees there).
+    this.recordOutcomeToSignalProcessor(position, firstTrade, firstTrade?.pnl ?? 0);
+
     this.positions.delete(product);
 
     this.logger.debug('Backtest closed position', {
@@ -797,6 +824,67 @@ export class BacktestEngine extends EventEmitter {
       reason,
       pnl: firstTrade?.pnl ?? 0,
     });
+  }
+
+  /**
+   * Forward a closed-position outcome to the SignalProcessor → MetaFilter
+   * so the backtest's strategy-perf and cold-streak state evolve the same
+   * way the live engine's do. Shape mirrors `trading-engine.ts:956-972`
+   * (the canonical live caller) so any future change to TradeOutcome
+   * is one-touch.
+   *
+   * Errors here must NOT poison the close path — MetaFilter is a
+   * downstream consumer; failing to record is a telemetry gap, not a
+   * trade-accounting bug. We log and swallow.
+   */
+  private recordOutcomeToSignalProcessor(
+    position: BacktestPosition,
+    firstTrade: BacktestTrade | undefined,
+    realizedPnl: number,
+  ): void {
+    if (!this.signalProcessor || !firstTrade) {
+      return;
+    }
+
+    const exitTime = firstTrade.exitTimestamp ?? position.entryTimestamp;
+    const outcome: 'win' | 'loss' | 'breakeven' =
+      realizedPnl > 0 ? 'win' : realizedPnl < 0 ? 'loss' : 'breakeven';
+
+    const signal = firstTrade.signal;
+    const direction: 'buy' | 'sell' = position.side === 'long' ? 'buy' : 'sell';
+
+    try {
+      this.signalProcessor.recordTradeOutcome({
+        signalId: signal?.id ?? firstTrade.id,
+        strategy: firstTrade.strategy ?? signal?.strategy ?? 'unknown',
+        symbol: position.product,
+        direction,
+        signalStrength: typeof signal?.strength === 'number' ? signal.strength : 0.5,
+        entryTime: position.entryTimestamp,
+        exitTime,
+        pnl: realizedPnl,
+        outcome,
+        regime:
+          typeof signal?.metadata?.regime === 'string'
+            ? (signal.metadata.regime as string)
+            : undefined,
+        hourOfDay: position.entryTimestamp.getUTCHours(),
+        dayOfWeek: position.entryTimestamp.getUTCDay(),
+        metaScore:
+          typeof signal?.metadata?.metaQualityScore === 'number'
+            ? (signal.metadata.metaQualityScore as number)
+            : undefined,
+        filtersPassed: [],
+        filtersBlocked: [],
+      });
+    } catch (err) {
+      // Telemetry-only path — never block the close.
+      this.logger.error('Failed to record backtest trade outcome to MetaFilter', {
+        product: position.product,
+        strategy: firstTrade.strategy,
+        err: (err as Error)?.message,
+      });
+    }
   }
 
   private updatePositions(product: string, currentPrice: number, timestamp: Date): void {
