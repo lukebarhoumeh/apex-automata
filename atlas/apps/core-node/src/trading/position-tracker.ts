@@ -112,7 +112,27 @@ export class PositionTracker extends EventEmitter {
   private updateTimer: NodeJS.Timeout | null = null;
   // Accumulator to preserve realized P&L after positions are closed and removed from memory.
   private realizedPnLClosed = 0;
-  
+
+  // ── 'position:updated' coalescing (D10) ──────────────────────────────────
+  // Rationale: 5 symbols × 1 Hz ticker ≈ 5 in-flight updates/sec, each of
+  // which would otherwise drive a Supabase positions UPDATE (and a fresh
+  // realtime message to every subscriber). At 4.3M realtime msg/min the
+  // Pro plan headroom is too thin to absorb that. Collapsing intra-second
+  // updates into a single tail-edge emission per symbol cuts msg/min by
+  // ~5–10× without changing what consumers eventually see.
+  //
+  // Contract:
+  //  - 'position:updated' is debounced per symbol, max 1 emission per
+  //    `updateDebounceMs`. The LATEST state emits at the tail edge.
+  //  - 'position:opened' and 'position:closed' bypass the debounce — they
+  //    are lifecycle transitions UI / persistence must see immediately.
+  //  - On close, any pending intermediate update for that symbol is
+  //    cancelled so a stale 'position:updated' can never fire AFTER a
+  //    'position:closed' (downstream reconcilers assume strict ordering).
+  private updateDebounceMs = 1000;
+  private pendingPositionUpdates: Map<string, Position> = new Map();
+  private updateDebounceTimers: Map<string, NodeJS.Timeout> = new Map();
+
   // Order creator for placing flatten orders
   private orderCreator: ((symbol: string, side: 'buy' | 'sell', size: number, tag?: string) => Promise<string | null>) | null = null;
   
@@ -250,6 +270,11 @@ export class PositionTracker extends EventEmitter {
       clearInterval(this.updateTimer);
       this.updateTimer = null;
     }
+    // Drain any pending debounced 'position:updated' timers so shutdown
+    // doesn't leave dangling Node handles.
+    for (const symbol of Array.from(this.updateDebounceTimers.keys())) {
+      this.cancelPendingPositionUpdate(symbol);
+    }
   }
 
   // Process a fill to update positions
@@ -353,6 +378,10 @@ export class PositionTracker extends EventEmitter {
       if (Number.isFinite(position.realizedPnL)) {
         this.realizedPnLClosed += position.realizedPnL;
       }
+      // Drop any debounced in-flight update for this symbol so 'position:closed'
+      // is the LAST event observers receive, and the close state itself is
+      // emitted undebounced (downstream reconciliation depends on this).
+      this.cancelPendingPositionUpdate(symbol);
       this.emit('position:closed', position);
       // Remove closed positions so a new trade creates a fresh position (new id/openTime)
       this.positions.delete(symbol);
@@ -360,7 +389,7 @@ export class PositionTracker extends EventEmitter {
     } else if (position.trades.length === 1) {
       this.emit('position:opened', position);
     } else {
-      this.emit('position:updated', position);
+      this.schedulePositionUpdate(position);
     }
   }
 
@@ -626,12 +655,76 @@ export class PositionTracker extends EventEmitter {
   // Update market price for a symbol
   public updateMarketPrice(symbol: string, price: number): void {
     this.marketPrices.set(symbol, price);
-    
+
     const position = this.positions.get(symbol);
     if (position) {
       position.marketPrice = price;
+      position.lastUpdateTime = new Date();
       this.calculatePnL(position);
+      // Each tick rewrites unrealized PnL / marketPrice on the in-memory
+      // Position. Schedule a debounced 'position:updated' emission so the
+      // persistence layer (api/server.ts → syncPositionToSupabase) and the
+      // realtime fanout only see a tail-edge collapsed view of the burst.
+      // Flat positions don't need to broadcast price ticks.
+      if (position.side !== 'flat' && position.size > 0) {
+        this.schedulePositionUpdate(position);
+      }
     }
+  }
+
+  // ── Debounce helpers (D10) ────────────────────────────────────────────────
+  // See class-level comment for contract. These are intentionally narrow:
+  // they touch only 'position:updated' emission, not open/close paths.
+
+  /**
+   * Coalesce intra-window 'position:updated' emissions for one symbol into a
+   * single tail-edge emit. Latest position state wins.
+   */
+  private schedulePositionUpdate(position: Position): void {
+    const symbol = position.symbol;
+    // Always stash latest state so whichever fires next sees the freshest view.
+    this.pendingPositionUpdates.set(symbol, position);
+
+    if (this.updateDebounceTimers.has(symbol)) {
+      // Existing timer will flush the latest pending state on expiry.
+      return;
+    }
+
+    const timer = setTimeout(
+      () => this.flushPendingPositionUpdate(symbol),
+      this.updateDebounceMs,
+    );
+    this.updateDebounceTimers.set(symbol, timer);
+  }
+
+  /**
+   * Emit the most recent pending 'position:updated' for a symbol, if any.
+   * Called both by the timer and (defensively) on explicit flush requests.
+   */
+  private flushPendingPositionUpdate(symbol: string): void {
+    const existing = this.updateDebounceTimers.get(symbol);
+    if (existing) {
+      clearTimeout(existing);
+      this.updateDebounceTimers.delete(symbol);
+    }
+    const pending = this.pendingPositionUpdates.get(symbol);
+    this.pendingPositionUpdates.delete(symbol);
+    if (pending) {
+      this.emit('position:updated', pending);
+    }
+  }
+
+  /**
+   * Drop any pending debounced update for a symbol without emitting.
+   * Used on close so the close event is the strict-last observer event.
+   */
+  private cancelPendingPositionUpdate(symbol: string): void {
+    const timer = this.updateDebounceTimers.get(symbol);
+    if (timer) {
+      clearTimeout(timer);
+      this.updateDebounceTimers.delete(symbol);
+    }
+    this.pendingPositionUpdates.delete(symbol);
   }
 
   // Update all positions with latest market prices
@@ -767,6 +860,9 @@ export class PositionTracker extends EventEmitter {
           if (Number.isFinite(position.realizedPnL)) {
             this.realizedPnLClosed += position.realizedPnL;
           }
+          // Same close-ordering invariant as processFill: stale debounced
+          // update events must not slip out after the close.
+          this.cancelPendingPositionUpdate(position.symbol);
           this.emit('position:closed', position);
           this.positions.delete(position.symbol);
           this.lots.delete(position.symbol);

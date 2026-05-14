@@ -1,5 +1,7 @@
 export interface PortfolioRisk {
-  equity: number;
+  // null when backend has no live equity to report (engine stopped / pnl snapshot unavailable).
+  // Consumers must render an empty-state ("--") rather than a hardcoded fallback so we never lie about live equity.
+  equity: number | null;
   exposure: number;
   heat: number;
   heatCap: number;

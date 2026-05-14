@@ -112,9 +112,9 @@ The system generates profit by exploiting short-term market inefficiencies acros
 │    - Backend REST API      │    │        risk_events, alerts, risk_metrics       │
 │    - Supabase direct reads │    │                                               │
 │    - Supabase Realtime     │    │  Edge Functions                               │
-└────────────────────────────┘    │    ├── risk-settings-update                   │
+└────────────────────────────┘    │    ├── runtime-health                          │
+                                  │    ├── risk-settings-update                   │
                                   │    ├── journal-entry                           │
-                                  │    ├── alerts-ack                              │
                                   │    └── strategy-signal-upsert                  │
                                   └───────────────────────────────────────────────┘
 ```

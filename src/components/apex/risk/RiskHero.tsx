@@ -87,7 +87,10 @@ export function RiskHero({ portfolio, killLadder }: Props) {
           </div>
           <p className="max-w-[380px] text-[12.5px] leading-[1.55] text-fg-1">
             Exposure <span className="mono text-fg-0">${portfolio.exposure.toLocaleString()}</span> on{" "}
-            <span className="mono text-fg-0">${portfolio.equity.toLocaleString()}</span> equity. Heat at{" "}
+            <span className="mono text-fg-0">
+              {portfolio.equity !== null ? `$${portfolio.equity.toLocaleString()}` : "--"}
+            </span>{" "}
+            equity. Heat at{" "}
             <span className="mono text-accent">{portfolio.heat.toFixed(2)}%</span>, drawdown{" "}
             <span className="mono text-up">{portfolio.dd.toFixed(1)}%</span>.
           </p>

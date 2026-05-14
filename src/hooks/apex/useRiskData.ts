@@ -17,7 +17,8 @@ async function fetchJsonOrNull<T>(path: string): Promise<T | null> {
   } catch {
     throw new Error(`network error: ${path}`);
   }
-  if (res.status === 400) return null; // intentional empty — engine not running
+  // 400 (/api/risk/*) and 503 (/api/pnl) are both "engine not running" signals — treat as no-data.
+  if (res.status === 400 || res.status === 503) return null;
   if (res.status === 429) throw new Error(`rate-limited: ${path}`);
   if (res.status >= 500) throw new Error(`server error ${res.status}: ${path}`);
   if (!res.ok) return null;
@@ -39,36 +40,26 @@ interface BackendRiskStatus {
   positions: { open: number; max: number };
 }
 
-interface BackendRiskAnalytics {
-  session: {
-    trades: number;
-    wins: number;
-    losses: number;
-    winRate: number;
-    profitFactor: number | null;
-  };
-  equity: {
-    current: number;
-    dailyPnL: number;
-    maxDrawdown: number;
-  };
-  streaks: {
-    consecutiveWins: number;
-    consecutiveLosses: number;
-    maxConsecutiveLosses: number;
-  };
-  riskMetrics: {
-    currentExposure: number;
-    dailyPnL: number;
-    dailyLossPercentage: number;
-    maxDrawdown: number;
-    openOrderCount: number;
-    consecutiveLosses: number;
-    errorRate: number;
-    averageLatency: number;
+// Canonical PnL snapshot fields we consume. /api/pnl returns 503 when the engine is stopped,
+// in which case we render empty-state rather than fabricating equity.
+interface BackendPnL {
+  totalEquityUsd: number;
+  exposureUsd: number;
+  maxDrawdownPct: number; // ALREADY in percent units (e.g., 1.11 means 1.11%)
+}
+
+// Canonical /api/status payload (only fields we read here).
+// status.risk.maxDrawdownPct is the same number as pnl.maxDrawdownPct, but /api/status is
+// always 200 even with the engine stopped, so it gives us a stable zero floor for the UI.
+interface BackendStatus {
+  killSwitch?: { active: boolean };
+  risk?: {
+    exposureUsd: number;
+    dailyPnLUsd: number;
+    maxDrawdownPct: number; // percent units
     killSwitchActive: boolean;
-    lastUpdated: string;
   };
+  pnl?: BackendPnL | null;
 }
 
 interface BackendBlockedSymbols {
@@ -86,7 +77,6 @@ interface BackendBlockedSymbols {
 const HEAT_CAP_PCT = 3.0;
 const DD_CAP_PCT = 15.0;
 const CONSEC_CAP = 5;
-const ACCOUNT_EQUITY_INITIAL = 10_000;
 
 // Per-symbol max notional from guardrails per_symbol.*.max_notional_usd
 const PER_SYMBOL_CAP: Record<string, number> = {
@@ -111,19 +101,32 @@ const KILL_LADDER_TEMPLATE: readonly Omit<KillLadderRow, "tripped">[] = [
 // ============================================================
 
 function buildPortfolio(
-  status: BackendRiskStatus | null,
-  analytics: BackendRiskAnalytics | null,
+  status: BackendStatus | null,
+  pnl: BackendPnL | null,
+  riskStatus: BackendRiskStatus | null,
 ): PortfolioRisk {
-  const equity = analytics?.equity.current ?? ACCOUNT_EQUITY_INITIAL;
-  const exposure = status?.metrics.currentExposure ?? 0;
-  const heat = equity > 0 ? (exposure / equity) * 100 : 0;
-  const ddFrac = analytics?.equity.maxDrawdown ?? status?.metrics.maxDrawdown ?? 0;
-  const dd = Math.abs(ddFrac) * (Math.abs(ddFrac) <= 1 ? 100 : 1);
-  const consecLosses =
-    analytics?.streaks.consecutiveLosses ?? status?.metrics.consecutiveLosses ?? 0;
+  // Equity: read from the canonical PnL snapshot (/api/pnl.totalEquityUsd or /api/status.pnl).
+  // When the snapshot is null (engine stopped → /api/pnl 503), keep equity null so the UI
+  // renders an empty-state ("--") instead of pretending we still have a hardcoded $10k.
+  const pnlSnapshot = pnl ?? status?.pnl ?? null;
+  const equity = pnlSnapshot?.totalEquityUsd ?? null;
+
+  // Drawdown: backend already returns percent units in `maxDrawdownPct` (e.g., 1.11 means 1.11%).
+  // Use it directly — no "is this a fraction or a percent?" heuristic. /api/status is always
+  // 200 so its risk.maxDrawdownPct gives us a stable zero when the engine is stopped.
+  const dd = pnlSnapshot?.maxDrawdownPct ?? status?.risk?.maxDrawdownPct ?? 0;
+
+  // Exposure: prefer the live PnL snapshot; fall back to /api/risk/status. Both are USD.
+  const exposure =
+    pnlSnapshot?.exposureUsd ?? riskStatus?.metrics.currentExposure ?? 0;
+
+  // Heat: only meaningful when we have real equity. Otherwise show 0 (no equity → no heat).
+  const heat = equity && equity > 0 ? (exposure / equity) * 100 : 0;
+
+  const consecLosses = riskStatus?.metrics.consecutiveLosses ?? 0;
 
   return {
-    equity: equity || ACCOUNT_EQUITY_INITIAL,
+    equity,
     exposure,
     heat,
     heatCap: HEAT_CAP_PCT,
@@ -220,16 +223,22 @@ export function useRiskData() {
   return useQuery<RiskData>({
     queryKey: ["apex", "risk-data"],
     queryFn: async () => {
-      const [status, analytics, blocked] = await Promise.all([
+      const [status, pnl, riskStatus, blocked] = await Promise.all([
+        fetchJsonOrNull<BackendStatus>("/api/status"),
+        fetchJsonOrNull<BackendPnL>("/api/pnl"),
         fetchJsonOrNull<BackendRiskStatus>("/api/risk/status"),
-        fetchJsonOrNull<BackendRiskAnalytics>("/api/risk/analytics"),
         fetchJsonOrNull<BackendBlockedSymbols>("/api/risk/blocked/symbols"),
       ]);
 
-      const portfolio = buildPortfolio(status, analytics);
-      const openPositions = status?.positions.open ?? 0;
-      const maxPositions = status?.positions.max ?? 4;
+      const portfolio = buildPortfolio(status, pnl, riskStatus);
+      const openPositions = riskStatus?.positions.open ?? 0;
+      const maxPositions = riskStatus?.positions.max ?? 4;
       const blockedCount = blocked?.count ?? 0;
+      const killSwitchActive =
+        status?.killSwitch?.active ||
+        status?.risk?.killSwitchActive ||
+        riskStatus?.killSwitchActive ||
+        false;
 
       return {
         portfolio,
@@ -238,10 +247,7 @@ export function useRiskData() {
         corr: IDENTITY_CORR,
         corrLabels: [...CORR_LABELS],
         tree: buildEmptyTree(),
-        killLadder: buildKillLadder(
-          portfolio,
-          status?.killSwitchActive || analytics?.riskMetrics.killSwitchActive || false,
-        ),
+        killLadder: buildKillLadder(portfolio, killSwitchActive),
       };
     },
     staleTime: 3_000,

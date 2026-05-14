@@ -25,7 +25,7 @@ pnpm install:all      # Install all dependencies (root + backend)
 pnpm api              # Start Express API + WebSocket server
 pnpm dev              # Paper trading mode via CLI
 pnpm build            # TypeScript compilation (rimraf dist && tsc)
-pnpm test             # Run tests (vitest run) — 35 files / 493 tests, all pass (~3s)
+pnpm test             # Run tests (vitest run) — 38 files / 529 tests, all pass (~7s)
 pnpm test:watch       # Watch mode
 pnpm test:coverage    # Coverage report
 pnpm backtest         # Run backtest analysis
@@ -75,7 +75,7 @@ Controlled by `atlas/config/guardrails.yaml`:
 - **VWAP MR, Breakout** — in `disabled_strategies: [vwap_mr, breakout]` per Phase 3 backtest verdict. Plugin files kept as `@deprecated` reference (DO NOT delete). Signals still get generated + written to Supabase with `allowed: false` for auditability; they never reach order routing.
 
 ## Meta-filter
-The current meta-filter is **rule-based**, not ML: cold-streak cooldown (10 losses → 5 min pause), time-of-day filter (lo-liq 04–07 UTC, preferred 13–17 UTC), strength/volume filters available but disabled. `signals.meta_prob` column will be NULL for now — the `/model` page's ML metrics (ROC AUC, SHAP, calibration) are aspirational mocks, see its on-page banner.
+The meta-filter is **rule-based** (cold-streak cooldown after 10 losses → 5 min pause, time-of-day filter for lo-liq 04–07 UTC / preferred 13–17 UTC, plus optional ATR/strength/volume gates). There is **no ML model** in this codebase — `signals.meta_prob` is always NULL. The `/model` page renders rule-based meta-filter state today (cold-streak, time-of-day, recent decisions); any ML-style metrics displayed there (ROC AUC, SHAP, calibration) are placeholder mocks and the on-page banner says so. Treat ML as a future workstream, not a current feature.
 
 ## Exchange Status
 - **Hyperliquid** — Target (0.05% fees)
@@ -91,7 +91,7 @@ The current meta-filter is **rule-based**, not ML: cold-streak cooldown (10 loss
 - Do NOT change Logger or ConfigLoader patterns
 
 ## Testing
-- Backend: `pnpm test` in `atlas/apps/core-node/` — 35 files / 493 tests, all pass (~3s)
+- Backend: `pnpm test` in `atlas/apps/core-node/` — **38 files / 529 tests**, all pass (~7s, verified 2026-05-14)
 - ZERO test failures allowed; any failure is a regression.
 - Frontend: `pnpm test` from root (Vitest + jsdom)
 

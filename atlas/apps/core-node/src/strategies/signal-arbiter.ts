@@ -154,10 +154,17 @@ export class SignalArbiter extends EventEmitter {
   /**
    * Arbitrate a batch of signals for a single symbol.
    * Call this with all signals generated in the same processing cycle.
+   *
+   * @param nowMs Current timestamp in epoch ms used for the flip-cooldown
+   *   window and signal-history timestamps. **Backtest callers MUST pass the
+   *   simulated bar timestamp.** Defaulting to `Date.now()` is correct only
+   *   for the live engine — the backtest path latches the cooldown across
+   *   the entire simulated window otherwise. See SPRINT-PLAN-FINAL.md §3 F1.
    */
   public arbitrate(
     signals: StrategySignal[],
-    regime: RegimeState
+    regime: RegimeState,
+    nowMs: number = Date.now(),
   ): ArbiterResult {
     if (signals.length === 0) {
       return { signals: [], filteredSignals: [], reason: 'No signals to arbitrate' };
@@ -181,8 +188,7 @@ export class SignalArbiter extends EventEmitter {
 
     // Check cooldown
     const state = this.getOrCreateSymbolState(symbol);
-    const now = Date.now();
-    const timeSinceFlip = now - state.lastFlipTime;
+    const timeSinceFlip = nowMs - state.lastFlipTime;
     
     // Determine if this would be a flip
     const dominantDirection = this.getDominantDirection(strongSignals);
@@ -217,7 +223,7 @@ export class SignalArbiter extends EventEmitter {
     // Check for conflict (signals in both directions)
     if (buySignals.length > 0 && sellSignals.length > 0) {
       this.stats.conflictsResolved++;
-      return this.resolveConflict(buySignals, sellSignals, regime, weakSignals);
+      return this.resolveConflict(buySignals, sellSignals, regime, weakSignals, nowMs);
     }
 
     // No conflict - check consensus if required
@@ -243,7 +249,7 @@ export class SignalArbiter extends EventEmitter {
     const winner = rankedSignals[0];
 
     // Update state
-    this.updateSymbolState(symbol, winner.direction, rankedSignals);
+    this.updateSymbolState(symbol, winner.direction, rankedSignals, nowMs);
     
     this.stats.signalsPassedThrough++;
     this.stats.signalsFiltered += signals.length - 1;
@@ -268,12 +274,17 @@ export class SignalArbiter extends EventEmitter {
 
   /**
    * Resolve conflicting signals (buy vs sell).
+   *
+   * @param nowMs Current timestamp in epoch ms threaded through to
+   *   `updateSymbolState` so flip-cooldown bookkeeping uses the same clock
+   *   the caller supplied to `arbitrate`.
    */
   private resolveConflict(
     buySignals: StrategySignal[],
     sellSignals: StrategySignal[],
     regime: RegimeState,
-    weakSignals: StrategySignal[]
+    weakSignals: StrategySignal[],
+    nowMs: number,
   ): ArbiterResult {
     const symbol = buySignals[0]?.symbol || sellSignals[0]?.symbol;
     
@@ -300,7 +311,7 @@ export class SignalArbiter extends EventEmitter {
 
     // Winner takes all
     if (buyScore > sellScore) {
-      this.updateSymbolState(symbol, 'buy', rankedBuys);
+      this.updateSymbolState(symbol, 'buy', rankedBuys, nowMs);
       this.stats.signalsPassedThrough++;
       this.stats.signalsFiltered += sellSignals.length + weakSignals.length + rankedBuys.length - 1;
       
@@ -311,7 +322,7 @@ export class SignalArbiter extends EventEmitter {
         consensusScore: buySignals.length / (buySignals.length + sellSignals.length),
       };
     } else if (sellScore > buyScore) {
-      this.updateSymbolState(symbol, 'sell', rankedSells);
+      this.updateSymbolState(symbol, 'sell', rankedSells, nowMs);
       this.stats.signalsPassedThrough++;
       this.stats.signalsFiltered += buySignals.length + weakSignals.length + rankedSells.length - 1;
       
@@ -405,18 +416,23 @@ export class SignalArbiter extends EventEmitter {
 
   /**
    * Update symbol state after a signal is selected.
+   *
+   * @param nowMs Caller-supplied "current" timestamp. Live: `Date.now()`.
+   *   Backtest: simulated bar timestamp. The flip-cooldown window keys off
+   *   this — wall-clock here latches the cooldown for the entire backtest
+   *   run after the first flip. See SPRINT-PLAN-FINAL.md §3 F1.
    */
   private updateSymbolState(
     symbol: string,
     direction: 'buy' | 'sell',
-    signals: StrategySignal[]
+    signals: StrategySignal[],
+    nowMs: number = Date.now(),
   ): void {
     const state = this.getOrCreateSymbolState(symbol);
-    const now = Date.now();
-    
+
     // Check if this is a flip
     if (state.lastDirection !== null && state.lastDirection !== direction) {
-      state.lastFlipTime = now;
+      state.lastFlipTime = nowMs;
       this.emit('flip', { symbol, from: state.lastDirection, to: direction });
     }
     
@@ -425,7 +441,7 @@ export class SignalArbiter extends EventEmitter {
     // Update history (keep last 50 signals)
     for (const signal of signals) {
       state.signalHistory.push({
-        timestamp: now,
+        timestamp: nowMs,
         strategy: signal.strategy,
         direction: signal.direction,
         strength: signal.strength,
