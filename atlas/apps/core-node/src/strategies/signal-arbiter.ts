@@ -75,7 +75,7 @@ interface SymbolState {
 
 const DEFAULT_CONFIG: SignalArbiterConfig = {
   flipCooldownMs: 5 * 60 * 1000, // 5 minutes between direction flips to prevent churn
-  minSignalStrength: 0.3,  // Require medium-strength signals (filters weak counter-signals)
+  minSignalStrength: 0.4,  // Raised 0.3->0.4 for HL fee floor (A1 retune 2026-05-18)
   requireConsensus: false,
   minConsensusCount: 2,
   strategyPriorities: {

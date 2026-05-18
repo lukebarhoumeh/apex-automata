@@ -93,7 +93,7 @@ per_symbol:
         emaFast: 12
         emaSlow: 15
         stopAtr: 2.5
-        takeProfitAtr: 5.0
+        takeProfitAtr: 6.0
       momentum:
         # strategy-tuning: rsiOversold/rsiOverbought were 40/55 here, which
         # was the source of "RSI overbought at 56.5" SELL signals in the
@@ -105,7 +105,7 @@ per_symbol:
         macdSlow: 21
         macdSignal: 5
         stopAtr: 2.0
-        takeProfitAtr: 4.0
+        takeProfitAtr: 5.0
         atrMultiplier: 2.0
       breakout:
         atrMultiplier: 2.0
@@ -165,10 +165,10 @@ momentum:
   macdFast: 12
   macdSlow: 26
   macdSignal: 9
-  requireMacdConfirm: false
+  requireMacdConfirm: true
   requireMacdCrossover: false
   stopAtr: 2.0
-  takeProfitAtr: 4.0
+  takeProfitAtr: 5.0
 
 # Perpetual Futures Configuration
 # Applies only when trading via 'coinbase-perps' adapter
@@ -203,7 +203,7 @@ perps_symbols:
         emaFast: 12
         emaSlow: 15
         stopAtr: 2.5
-        takeProfitAtr: 5.0
+        takeProfitAtr: 6.0
       momentum:
         # strategy-tuning: was 40/55 — restored to canonical 30/70.
         rsiPeriod: 10
@@ -213,7 +213,7 @@ perps_symbols:
         macdSlow: 21
         macdSignal: 5
         stopAtr: 2.0
-        takeProfitAtr: 4.0
+        takeProfitAtr: 5.0
         atrMultiplier: 2.0
   BTC-PERP-INTX:
     max_notional_usd: 5000
@@ -228,8 +228,8 @@ perps_symbols:
       trend_follow:
         emaFast: 12
         emaSlow: 26
-        stopAtr: 2.0
-        takeProfitAtr: 4.0
+        stopAtr: 2.5
+        takeProfitAtr: 6.0
 
 execution:
   order_type: marketable_limit
@@ -278,7 +278,7 @@ meta_filter:
       - BTC-PERP-INTX
 
 filters:
-  atr_volatility_min: 0.0005
+  atr_volatility_min: 0.005
   atr_volatility_max: 0.05
   funding_bias_enabled: true
   # Time-of-day filter is OFF by default. The previous default
@@ -349,7 +349,7 @@ hyperliquid_symbols:
         emaFast: 12
         emaSlow: 15
         stopAtr: 2.5
-        takeProfitAtr: 5.0
+        takeProfitAtr: 6.0
       momentum:
         # strategy-tuning: was 40/55 — restored to canonical 30/70.
         rsiPeriod: 10
@@ -359,7 +359,7 @@ hyperliquid_symbols:
         macdSlow: 21
         macdSignal: 5
         stopAtr: 2.0
-        takeProfitAtr: 4.0
+        takeProfitAtr: 5.0
   BTC-USD:
     max_notional_usd: 3000
     max_daily_loss_usd: 200
@@ -367,6 +367,6 @@ hyperliquid_symbols:
       trend_follow:
         emaFast: 12
         emaSlow: 26
-        stopAtr: 2.0
-        takeProfitAtr: 4.0
+        stopAtr: 2.5
+        takeProfitAtr: 6.0
 
