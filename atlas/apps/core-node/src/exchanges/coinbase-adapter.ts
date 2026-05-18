@@ -8,6 +8,7 @@
 
 import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
+import { FeeModel } from '../core/fee-model';
 import { CoinbaseExchange } from './coinbase';
 import {
   CoinbaseConfig,
@@ -39,11 +40,18 @@ export class CoinbaseAdapter extends EventEmitter implements IExchangeAdapter {
 
   private exchange: CoinbaseExchange;
   private logger: Logger;
+  // Single source of truth for spot fee rates surfaced via AdapterMarketInfo.
+  // Resolved per-call through FeeModel.getFeeRate('coinbase','spot',side) so
+  // the UI cost-estimate path matches guardrails.yaml -> fees.coinbase.spot
+  // instead of drifting from the values used by paper/live fill paths.
+  // `protected` so CoinbasePerpsAdapter can resolve perps rates too.
+  protected feeModel: FeeModel;
   private _connected = false;
 
-  constructor(logger: Logger) {
+  constructor(logger: Logger, feeModel: FeeModel) {
     super();
     this.logger = logger;
+    this.feeModel = feeModel;
     this.exchange = null as unknown as CoinbaseExchange;
   }
 
@@ -283,8 +291,8 @@ export class CoinbaseAdapter extends EventEmitter implements IExchangeAdapter {
       maxOrderSize: p.base_max_size || '999999',
       tickSize: p.quote_increment || '0.01',
       stepSize: p.base_increment || '0.00000001',
-      makerFee: '0.004',
-      takerFee: '0.006',
+      makerFee: this.feeModel.getFeeRate('coinbase', 'spot', 'maker').toString(),
+      takerFee: this.feeModel.getFeeRate('coinbase', 'spot', 'taker').toString(),
       exchangeType: 'spot',
     };
   }

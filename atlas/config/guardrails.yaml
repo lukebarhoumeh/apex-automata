@@ -186,6 +186,9 @@ perps:
   # Funding rate check interval (seconds)
   funding_check_interval_sec: 300
   # Fee schedule for perps (decimal format)
+  # @deprecated 2026-05-18 — superseded by `fees.coinbase.perps_intx` (see top of file).
+  # Still loaded into PerpsRiskMonitor for back-compat but never read in
+  # `trading/perps/perps-risk-monitor.ts`. Safe to delete in a follow-up PR.
   maker_fee: 0.0000
   taker_fee: 0.0003
   # Contract specifications
@@ -335,6 +338,10 @@ hyperliquid:
   risk_per_trade: 0.03
   default_leverage: 3
   max_leverage: 5
+  # @deprecated 2026-05-18 — superseded by `fees.hyperliquid.perps` (see top of file).
+  # Loaded by `loadGuardrails.ts` but has zero read sites in `atlas/apps/core-node/src`.
+  # Note: legacy values here also LOST the maker rebate sign (true value: -1.5 bps).
+  # Safe to delete in a follow-up PR.
   maker_fee: 0.0002
   taker_fee: 0.0005
   funding_check_interval_sec: 300

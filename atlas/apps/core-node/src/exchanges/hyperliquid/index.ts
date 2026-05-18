@@ -17,6 +17,7 @@
 import { EventEmitter } from 'events';
 import { Hyperliquid } from 'hyperliquid';
 import { Logger } from '../../core/logger.js';
+import { FeeModel } from '../../core/fee-model.js';
 import type {
   IExchangeAdapter,
   IPerpsAdapter,
@@ -52,10 +53,17 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
   private connected = false;
   private walletAddress: string = '';
   private marketCache: Map<string, AdapterMarketInfo> = new Map();
+  // Single source of truth for HL fee rates surfaced on AdapterMarketInfo.
+  // Resolved per refresh via FeeModel.getFeeRate('hyperliquid','perps',side)
+  // so this UI surface honors guardrails.yaml -> fees.hyperliquid.perps —
+  // critically preserving the maker-rebate sign (-1.5 bps) the legacy
+  // hardcode dropped.
+  private feeModel: FeeModel;
 
-  constructor(logger: Logger, config?: Partial<HyperliquidConfig>) {
+  constructor(logger: Logger, feeModel: FeeModel, config?: Partial<HyperliquidConfig>) {
     super();
     this.logger = logger;
+    this.feeModel = feeModel;
     this.config = { ...DEFAULT_HYPERLIQUID_CONFIG, ...config };
   }
 
@@ -513,6 +521,8 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
       const universe = meta?.universe || meta || [];
 
       this.marketCache.clear();
+      const makerFee = this.feeModel.getFeeRate('hyperliquid', 'perps', 'maker').toString();
+      const takerFee = this.feeModel.getFeeRate('hyperliquid', 'perps', 'taker').toString();
       for (const asset of universe) {
         const name = asset.name || asset.coin;
         if (!name) continue;
@@ -525,8 +535,8 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
           maxOrderSize: String(asset.maxLeverage ? 1000000 / (asset.maxLeverage || 1) : '100000'),
           tickSize: '0.01',
           stepSize: String(asset.szDecimals ? Math.pow(10, -asset.szDecimals) : '0.001'),
-          makerFee: '0.0002',
-          takerFee: '0.0005',
+          makerFee,
+          takerFee,
           exchangeType: 'perpetual',
           maxLeverage: asset.maxLeverage || 50,
         });

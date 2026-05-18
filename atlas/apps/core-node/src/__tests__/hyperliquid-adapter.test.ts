@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { HyperliquidAdapter } from '../exchanges/hyperliquid/index';
+import { FeeModel } from '../core/fee-model';
+import type { FeesConfig } from '../config/loadGuardrails';
 import type { Logger } from '../core/logger';
 import {
   toHyperliquidSymbol,
@@ -16,11 +18,21 @@ const mockLogger: Logger = {
   debug: vi.fn(),
 } as any;
 
+const TEST_FEES: FeesConfig = {
+  coinbase: {
+    spot: { maker_bps: 25, taker_bps: 40 },
+    perps_intx: { maker_bps: 0, taker_bps: 5 },
+  },
+  hyperliquid: {
+    perps: { maker_bps: -1.5, taker_bps: 4.5 },
+  },
+};
+
 describe('HyperliquidAdapter', () => {
   let adapter: HyperliquidAdapter;
 
   beforeEach(() => {
-    adapter = new HyperliquidAdapter(mockLogger, { testnet: true });
+    adapter = new HyperliquidAdapter(mockLogger, new FeeModel(TEST_FEES), { testnet: true });
   });
 
   it('has correct identity', () => {

@@ -330,3 +330,70 @@ describe('TradingEngine Lifecycle', () => {
     });
   });
 });
+
+/**
+ * Engine-integration coverage for B5 residual: verify the engine wires its
+ * `FeeModel.fromGuardrails(...)` instance through to the paper simulator so
+ * perps fills land on the `coinbase.perps_intx` tier (5 bps) instead of the
+ * spot tier (40 bps).
+ *
+ * `paper-trading-simulator.test.ts` already verifies the simulator-in-isolation
+ * resolves rates correctly when handed a FeeModel; this test closes the
+ * remaining gap by driving the same construction the live API path runs
+ * (TradingEngine -> initializePaperSimulator -> FeeModel.fromGuardrails(this.guardrails))
+ * end-to-end against a real fill, without depending on engine.start()'s mocked
+ * async paths (which hang under fake timers — see comments above in this file).
+ */
+describe('TradingEngine — FeeModel wiring (B5 engine-integration)', () => {
+  let engine: TradingEngine;
+
+  beforeEach(() => {
+    // Real timers: the paper simulator awaits a setTimeout for latencyMs,
+    // which would deadlock under vi.useFakeTimers().
+    vi.useRealTimers();
+    vi.clearAllMocks();
+    engine = new TradingEngine(mockConfig, mockLogger);
+  });
+
+  afterEach(async () => {
+    try {
+      await engine.stop();
+    } catch {
+      // ignore stop errors in cleanup
+    }
+  });
+
+  it('engine-built paper simulator charges ~5 bps on ETH-PERP-INTX (perps tier, not spot)', async () => {
+    // Drive the same private init path engine.start() uses for paper mode.
+    (engine as any).initializePaperSimulator();
+    const sim = engine.getPaperSimulator();
+    expect(sim).not.toBeNull();
+
+    // The engine attaches a 'fill' handler that routes into handleFill ->
+    // positionTracker.processFill; in this lifecycle harness positionTracker
+    // is null because we never ran initializeExchange/initializePositionTracker.
+    // Detach to avoid an unhandled rejection blowing up the test runner.
+    sim!.removeAllListeners('fill');
+
+    const price = 2253.51;
+    const size = 0.1;
+    sim!.updateMarketPrice('ETH-PERP-INTX', price);
+
+    const resp = await sim!.placeOrder({
+      product_id: 'ETH-PERP-INTX',
+      side: 'buy',
+      type: 'market',
+      size: String(size),
+    });
+
+    const fee = parseFloat(resp.fill_fees);
+    const executed = parseFloat(resp.executed_value);
+    // Use executed_value (already slippage-adjusted) so the assertion is exact:
+    // FeeModel.coinbase.perps_intx.taker_bps = 5 -> 0.0005 decimal rate.
+    expect(fee / executed).toBeCloseTo(0.0005, 8);
+    // And explicitly NOT the spot tier (0.004) the pre-fix wiring used —
+    // any value approaching 0.004 means a 8x over-charge regression.
+    expect(fee / executed).toBeLessThan(0.001);
+  });
+});
+

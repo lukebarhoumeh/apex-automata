@@ -13,6 +13,7 @@
  */
 
 import { Logger } from '../core/logger';
+import { FeeModel } from '../core/fee-model';
 import {
   CoinbasePerpsProduct,
   CoinbaseIntxPosition,
@@ -37,8 +38,8 @@ export class CoinbasePerpsAdapter extends CoinbaseAdapter implements IPerpsAdapt
   private leverageCache: Map<string, number> = new Map();
   private perpsLogger: Logger;
 
-  constructor(logger: Logger) {
-    super(logger);
+  constructor(logger: Logger, feeModel: FeeModel) {
+    super(logger, feeModel);
     this.perpsLogger = logger;
   }
 
@@ -206,7 +207,10 @@ export class CoinbasePerpsAdapter extends CoinbaseAdapter implements IPerpsAdapt
 
   /**
    * Override getMarketInfo to return perps-specific data when symbol is a perp.
-   * Perps have different fee structure: 0% maker / 0.03% taker.
+   * Fees are resolved per-call via FeeModel.getFeeRate('coinbase','perps',side)
+   * so this AdapterMarketInfo surface stays in lock-step with the fee tier
+   * the fill path charges (paper sim + live INTX), driven by
+   * guardrails.yaml -> fees.coinbase.perps_intx.
    */
   override async getMarketInfo(symbol: string): Promise<AdapterMarketInfo> {
     if (this.isPerpsSymbol(symbol)) {
@@ -220,8 +224,8 @@ export class CoinbasePerpsAdapter extends CoinbaseAdapter implements IPerpsAdapt
           maxOrderSize: '10000',
           tickSize: product.quote_increment,
           stepSize: product.base_increment,
-          makerFee: '0.0000',
-          takerFee: '0.0003',
+          makerFee: this.feeModel.getFeeRate('coinbase', 'perps', 'maker').toString(),
+          takerFee: this.feeModel.getFeeRate('coinbase', 'perps', 'taker').toString(),
           exchangeType: 'perpetual',
           maxLeverage: parseInt(product.max_leverage) || 10,
         };

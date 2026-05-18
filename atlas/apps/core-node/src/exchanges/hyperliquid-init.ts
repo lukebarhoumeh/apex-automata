@@ -30,6 +30,7 @@
 import type { Logger } from '../core/logger';
 import type { Env } from '../core/env';
 import type { GuardrailConfig } from '../config/loadGuardrails';
+import type { FeeModel } from '../core/fee-model';
 import { ExchangeRegistry } from './exchange-registry';
 import { HyperliquidAdapter } from './hyperliquid';
 
@@ -38,6 +39,8 @@ export interface HyperliquidInitDeps {
   registry: ExchangeRegistry;
   guardrails: GuardrailConfig;
   env: Env;
+  /** FeeModel built from the same guardrails block — single source of truth. */
+  feeModel: FeeModel;
   /** Bypass network init (used by tests / read-only smoke checks). */
   skipInitialize?: boolean;
 }
@@ -84,7 +87,7 @@ export function isHyperliquidEnabled(
 export async function initHyperliquidAdapter(
   deps: HyperliquidInitDeps,
 ): Promise<HyperliquidInitResult> {
-  const { logger, registry, guardrails, env, skipInitialize } = deps;
+  const { logger, registry, guardrails, env, feeModel, skipInitialize } = deps;
 
   // Resolve testnet: env override (HYPERLIQUID_TESTNET) wins over YAML; default true.
   const yamlBlock = guardrails.hyperliquid;
@@ -107,7 +110,7 @@ export async function initHyperliquidAdapter(
 
   // Always construct + register the adapter so the registry is consistent and
   // introspectable, regardless of enabled state.
-  const adapter = new HyperliquidAdapter(logger, {
+  const adapter = new HyperliquidAdapter(logger, feeModel, {
     testnet,
     privateKey: env.HYPERLIQUID_PRIVATE_KEY,
     walletAddress: env.HYPERLIQUID_WALLET_ADDRESS,

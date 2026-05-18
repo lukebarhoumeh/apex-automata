@@ -1176,8 +1176,14 @@ app.post('/api/engine/start', async (req, res) => {
     // paths and also on startup-failure cleanup.
     exchangeRegistry = new ExchangeRegistry(logger);
 
+    // FeeModel for this engine session. Built from engineGuardrails (the
+    // session-scoped guardrails clone) so any session-time fee overrides flow
+    // through to every adapter — the single-source-of-truth invariant called
+    // out in core/fee-model.ts.
+    const engineFeeModel = FeeModel.fromGuardrails(engineGuardrails);
+
     // Register perps adapter and start risk monitor
-    perpsAdapter = new CoinbasePerpsAdapter(logger);
+    perpsAdapter = new CoinbasePerpsAdapter(logger, engineFeeModel);
     const perpsCredentials = {
       apiKey: env.COINBASE_API_KEY || '',
       apiSecret: env.COINBASE_API_SECRET || '',
@@ -1195,6 +1201,7 @@ app.post('/api/engine/start', async (req, res) => {
       registry: exchangeRegistry,
       guardrails: engineGuardrails,
       env,
+      feeModel: engineFeeModel,
     });
     hyperliquidAdapter = hlInit.adapter;
     logger.info('Hyperliquid adapter init complete', {
