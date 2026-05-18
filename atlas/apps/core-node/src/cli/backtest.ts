@@ -12,11 +12,14 @@ import { FeeModel } from '../core/fee-model';
 
 async function main() {
   // Single source of truth for fees — backtest must match paper/live or
-  // comparisons are meaningless. CLI flag overrides only when explicitly set.
+  // comparisons are meaningless. Per #11 (2026-05-18), we pass the
+  // FeeModel into BacktestConfig so per-fill fees route by symbol
+  // (spot vs perps_intx) instead of one flat decimal applied uniformly.
+  // CLI `--commission` is kept as an explicit sensitivity-analysis
+  // override (e.g. simulate HL 4.5 bps on Coinbase candles).
   const atlasRoot = path.resolve(process.cwd(), '../..');
   const guardrails = loadGuardrails(atlasRoot);
   const feeModel = FeeModel.fromGuardrails(guardrails);
-  const defaultCommission = feeModel.getFeeRate('coinbase', 'spot', 'taker');
 
   const argv = await yargs(hideBin(process.argv))
     .scriptName('atlas-backtest')
@@ -54,10 +57,12 @@ async function main() {
     .option('commission', {
       type: 'number',
       describe:
-        'Commission rate override (decimal, e.g. 0.004 = 40 bps). ' +
-        'Default comes from guardrails.yaml -> fees.coinbase.spot.taker_bps so ' +
-        'backtest matches paper/live; only override for sensitivity analysis.',
-      default: defaultCommission,
+        'OPTIONAL flat commission override (decimal, e.g. 0.00045 = 4.5 bps). ' +
+        'When set, every fill is charged this rate regardless of symbol — ' +
+        'use this to simulate Hyperliquid fees on Coinbase candles or for ' +
+        'sensitivity analysis. When omitted, fees are resolved per-symbol ' +
+        'via FeeModel (coinbase.spot.taker_bps for spot, ' +
+        'coinbase.perps_intx.taker_bps for *-PERP-INTX).',
     })
     .option('slippage', {
       type: 'number',
@@ -74,11 +79,11 @@ async function main() {
 
   const logger = createLogger(path.join(process.cwd(), '../../var/logs/backtest.jsonl'));
 
-  // NOTE (merge): `guardrails` is already loaded at the top of main()
-  // for the FeeModel default-commission lookup. Reusing that single
-  // instance — both backtest-engine (disabled_strategies, per-symbol
-  // overrides, account sizing) and FeeModel read from the same source
-  // of truth so backtest behaviour can't drift from paper/live.
+  // NOTE: `guardrails` and `feeModel` are loaded at the top of main()
+  // and passed into BacktestConfig below. Both backtest-engine
+  // (disabled_strategies, per-symbol overrides, account sizing) and
+  // the fee resolution path read from the same source of truth so
+  // backtest behaviour can't drift from paper/live.
 
   const SUPABASE_URL = process.env.SUPABASE_URL || '';
   const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
@@ -92,6 +97,8 @@ async function main() {
     endDate: argv.endDate,
     products: argv.products,
     strategy: argv.strategy,
+    feeRouting: argv.commission !== undefined ? 'flat-override' : 'per-symbol-feeModel',
+    commissionOverride: argv.commission,
   });
 
   const runnerConfig: BacktestRunnerConfig = {
@@ -114,12 +121,22 @@ async function main() {
 
   const initialCapital = Number(argv.initialCapital);
 
+  // #11 (2026-05-18): only set `commission` when the user passed
+  // `--commission` explicitly. When omitted, the engine routes per-fill
+  // via `feeModel.getFeeRate(venue, marketForSymbol(symbol), 'taker')`
+  // so mixed --products lists (spot + perps) charge the correct tier
+  // per symbol — the bug that 402e757 fixed in the paper path.
+  const commissionOverride =
+    argv.commission !== undefined ? Number(argv.commission) : undefined;
+
   // Configure backtest
   const backtestConfig: BacktestConfig = {
     startDate: new Date(String(argv.startDate)),
     endDate: new Date(String(argv.endDate)),
     initialCapital,
-    commission: Number(argv.commission),
+    feeModel,
+    venue: 'coinbase',
+    ...(commissionOverride !== undefined ? { commission: commissionOverride } : {}),
     slippage: Number(argv.slippage),
     products: argv.products as string[],
     // Strategy parameters mirror atlas/config/guardrails.yaml. trend_follow

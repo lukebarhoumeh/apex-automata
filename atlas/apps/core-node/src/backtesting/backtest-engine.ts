@@ -7,6 +7,8 @@ import type { OHLCV } from '../indicators/technical';
 // engine just consumes signals. Removed to keep call-graph honest.
 import { SignalProcessor, Signal } from '../strategies/signal-processor';
 import { computeRiskBasedSize } from '../trading/risk/position-sizing';
+import { FeeModel, Exchange } from '../core/fee-model';
+import { marketForSymbol } from '../core/symbol-utils';
 
 type OrderSide = 'BUY' | 'SELL';
 
@@ -68,7 +70,34 @@ export interface BacktestConfig {
   startDate: Date;
   endDate: Date;
   initialCapital: number;
-  commission: number; // Decimal fraction (e.g. 0.0005 for 5 bps fee)
+  /**
+   * Per-symbol fee resolution. When set (and `commission` is not), every
+   * fill is charged `feeModel.getFeeRate(venue, marketForSymbol(symbol),
+   * 'taker')` so mixed `--products` lists (spot + perps) route to the
+   * correct fee tier per symbol. This mirrors the live/paper fix in
+   * `paper-trading-simulator.resolveFeeRate` and was added in #11
+   * (2026-05-18) as the pre-F4 blocker — see
+   * docs/research/2026-05-18_b4-fee-model-audit.md §"Recommended fix shape"
+   * option B.
+   */
+  feeModel?: FeeModel;
+  /**
+   * Exchange venue tag for FeeModel lookups. Defaults to 'coinbase' since
+   * backtest sources from Coinbase candles. To simulate Hyperliquid fee
+   * economics on Coinbase price action, pass `--commission 0.00045` (the
+   * flat-override path) since the backtest engine doesn't yet have
+   * per-bar venue routing (B1 will land that for Wave 3).
+   */
+  venue?: Exchange;
+  /**
+   * Flat-decimal commission override. When set, EVERY fill is charged
+   * `size * price * commission` regardless of symbol — overrides any
+   * `feeModel`. Kept after #11 (2026-05-18) for sensitivity-analysis use
+   * (CLI `--commission 0.00045` to simulate HL fees on Coinbase candles).
+   * New callers should populate `feeModel` instead; either commission or
+   * feeModel MUST be set or the constructor throws.
+   */
+  commission?: number;
   /**
    * @deprecated Use `realism.entrySlippageBps`. Kept on the type so older
    * callers don't break, but the engine now reads bps directly.
@@ -251,6 +280,13 @@ export class BacktestEngine extends EventEmitter {
 
   constructor(config: BacktestConfig, logger: Logger) {
     super();
+    if (config.commission === undefined && !config.feeModel) {
+      throw new Error(
+        'BacktestConfig: either `feeModel` or `commission` (decimal override) must be set. ' +
+          'Pass `feeModel: FeeModel.fromGuardrails(...)` for per-symbol routing, ' +
+          'or `commission: 0.00045` for a flat sensitivity-analysis run.',
+      );
+    }
     this.config = config;
     this.logger = logger;
     this.capital = config.initialCapital;
@@ -258,6 +294,33 @@ export class BacktestEngine extends EventEmitter {
     this.dailyStartEquity = config.initialCapital;
     this.realism = { ...DEFAULT_REALISM, ...(config.realism || {}) };
     this.disabledStrategies = new Set(config.disabledStrategies ?? DEFAULT_DISABLED_STRATEGIES);
+  }
+
+  /**
+   * Resolve the fee RATE (decimal) for a fill on `symbol`. Precedence:
+   *   1. `config.commission` flat override (sensitivity-analysis path)
+   *   2. `config.feeModel.getFeeRate(venue, marketForSymbol(symbol), 'taker')`
+   *
+   * Backtest fills are assumed taker — same assumption the live/paper
+   * simulator uses for market orders. Per-fill maker/taker split awaits
+   * a future ladder/limit-fill model upgrade.
+   *
+   * Constructor invariant guarantees at least one path is populated, so
+   * we never silently return 0. Falls through to `commission ?? 0` only
+   * if the type system is bypassed.
+   */
+  private resolveCommissionRate(symbol: string): number {
+    if (this.config.commission !== undefined) {
+      return this.config.commission;
+    }
+    if (this.config.feeModel) {
+      return this.config.feeModel.getFeeRate(
+        this.config.venue ?? 'coinbase',
+        marketForSymbol(symbol),
+        'taker',
+      );
+    }
+    return 0;
   }
 
   public async loadHistoricalData(dataProvider: (product: string, start: Date, end: Date) => Promise<OHLCV[]>): Promise<void> {
@@ -648,6 +711,7 @@ export class BacktestEngine extends EventEmitter {
       return;
     }
 
+    const entryFeeRate = this.resolveCommissionRate(signal.symbol);
     const trade: BacktestTrade = {
       id: this.nextTradeId(signal.symbol),
       timestamp: fillTimestamp,
@@ -655,7 +719,7 @@ export class BacktestEngine extends EventEmitter {
       side: signal.direction === 'buy' ? 'BUY' : 'SELL',
       entryPrice: fillPrice,
       size: positionSize,
-      entryFee: positionSize * fillPrice * this.config.commission,
+      entryFee: positionSize * fillPrice * entryFeeRate,
       signal,
       strategy: signal.strategy,
       stopLoss,
@@ -779,10 +843,11 @@ export class BacktestEngine extends EventEmitter {
         : rawExitPrice * (1 + slipFactor);
     }
 
+    const exitFeeRate = this.resolveCommissionRate(product);
     for (const trade of position.trades) {
       trade.exitPrice = exitPrice;
       trade.exitTimestamp = timestamp;
-      trade.exitFee = trade.size * exitPrice * this.config.commission;
+      trade.exitFee = trade.size * exitPrice * exitFeeRate;
       trade.exitReason = reason;
       if (position.side === 'long') {
         trade.pnl = (exitPrice - trade.entryPrice) * trade.size - trade.entryFee - (trade.exitFee || 0);

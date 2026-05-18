@@ -1,7 +1,8 @@
 import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
 import { OrderRequest, Fill, Ticker } from '../exchanges/coinbase/types';
-import { FeeModel, Exchange, Market, Side } from '../core/fee-model';
+import { FeeModel, Exchange, Side } from '../core/fee-model';
+import { marketForSymbol } from '../core/symbol-utils';
 import { v4 as uuidv4 } from 'uuid';
 
 export interface PaperTradingConfig {
@@ -127,17 +128,6 @@ export class PaperTradingSimulator extends EventEmitter {
   }
 
   /**
-   * Classify a product symbol to its market bucket. Coinbase perp products
-   * use the `XXX-PERP-INTX` pattern (see exchanges/coinbase-perps-adapter
-   * isPerpsSymbol); everything else is treated as spot for this simulator.
-   * Hyperliquid uses bare `BTC-USD`-style symbols routed via a separate path,
-   * so they never reach this classifier today.
-   */
-  private marketForSymbol(symbol: string): Market {
-    return symbol.includes('-PERP-') ? 'perps' : 'spot';
-  }
-
-  /**
    * Resolve the maker/taker fee RATE (decimal, NOT bps) for a fill on
    * `symbol`. Honors the precedence documented on PaperTradingConfig.
    *
@@ -147,12 +137,15 @@ export class PaperTradingSimulator extends EventEmitter {
    * `*-PERP-INTX` were charged ~40 bps taker (spot) instead of the
    * configured ~5 bps (perps_intx). That biased every perp paper EV
    * number by ~55 bps round-trip. See SPRINT-PLAN-FINAL.md §1.4 / B5.
+   *
+   * Symbol classification (perps vs spot) is delegated to
+   * `core/symbol-utils.marketForSymbol` so backtest + paper agree.
    */
   private resolveFeeRate(symbol: string, side: Side): number {
     if (this.config.feeModel) {
       return this.config.feeModel.getFeeRate(
         this.config.venue ?? 'coinbase',
-        this.marketForSymbol(symbol),
+        marketForSymbol(symbol),
         side,
       );
     }
