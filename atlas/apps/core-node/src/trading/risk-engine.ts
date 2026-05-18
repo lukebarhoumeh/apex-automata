@@ -21,6 +21,8 @@ import {
   computeDailyStopThresholdR,
 } from './risk-math';
 import { computeRiskBasedSize } from './risk/position-sizing';
+import { evaluateEvGate, type EvGateInputs, type EvGateResult } from './risk/ev-gate';
+import { FeeModel } from '../core/fee-model';
 
 // Prometheus metrics for risk engine reliability
 const riskMetricsWriteFailures = new Counter({
@@ -36,6 +38,22 @@ const accountMetricsUpsertFailures = new Counter({
 const dailyEquityWriteFailures = new Counter({
   name: 'atlas_daily_equity_write_failures_total',
   help: 'Total number of failed daily_equity database writes',
+});
+
+// #A3 (2026-05-18): pre-trade EV gate counters. Labeled by strategy +
+// symbol so /metrics shows where the gate is biting hardest. Reject
+// reason is collapsed into a single coarse label ('below_threshold' or
+// the default-allow path tag) to keep cardinality bounded.
+const evGateAccepted = new Counter({
+  name: 'atlas_risk_ev_gate_accepted_total',
+  help: 'Pre-trade EV gate accepted signals (including cold-start default-allow paths)',
+  labelNames: ['strategy', 'symbol', 'path'] as const,
+});
+
+const evGateRejected = new Counter({
+  name: 'atlas_risk_ev_gate_rejected_total',
+  help: 'Pre-trade EV gate rejected signals',
+  labelNames: ['strategy', 'symbol'] as const,
 });
 
 export interface RiskEngineConfig {
@@ -68,6 +86,12 @@ export interface RiskEngineConfig {
   kellyFraction: number;           // Kelly criterion fraction (0.25 = quarter Kelly)
   guardrails: GuardrailConfig;
   accountEquity: number;
+  /**
+   * Optional FeeModel used by `evaluateSignalEv` (#A3) for round-trip
+   * fee computation. When omitted, the EV gate default-allows with a
+   * structured warn — never silently zeros fees.
+   */
+  feeModel?: FeeModel;
   /**
    * Soft-launch safety clamps (intended for early live trading).
    * These are applied dynamically for the first N new positions opened.
@@ -158,6 +182,10 @@ export class RiskEngine extends EventEmitter {
   private riskMath: RiskMath;
   private dailyStopThresholdR: number;
 
+  // #A3 (2026-05-18): pre-trade EV gate
+  private feeModel: FeeModel | null;
+  private minEvThreshold: number;
+
   constructor(
     config: RiskEngineConfig,
     logger: Logger,
@@ -183,6 +211,14 @@ export class RiskEngine extends EventEmitter {
     this.maxOpenPositionsLimit = accountCfg.max_open_positions;
     this.minOrderNotionalUsd = this.accountEquity * accountCfg.risk_per_trade * accountCfg.min_notional_buffer;
     this.rapidLossThresholdUsd = Math.abs(circuitCfg.rapid_loss_trigger) * this.accountEquity;
+
+    // #A3 EV gate state. Threshold is in USD; default 0 rejects strictly
+    // negative-EV trades. FeeModel is optional — when absent the gate
+    // default-allows with a structured warn (cold-start safe).
+    this.feeModel = config.feeModel ?? null;
+    this.minEvThreshold = Number.isFinite(riskCfg.min_ev_threshold)
+      ? Number(riskCfg.min_ev_threshold)
+      : 0;
     
     // Safe defaults until async loaders complete (prevents metrics from using 0 start equity).
     this.dailyStartEquity = this.accountEquity;
@@ -626,6 +662,43 @@ export class RiskEngine extends EventEmitter {
     const baseEquity = this.accountEquity;
     const portfolioSummary = this.positionTracker.getPortfolioSummary();
     return baseEquity + portfolioSummary.totalPnL;
+  }
+
+  /**
+   * #A3 (2026-05-18): pre-trade fee-adjusted EV gate. Thin wrapper around
+   * the pure `evaluateEvGate` helper so call sites get one logger +
+   * counter + threshold wired in one place.
+   *
+   * Inputs other than (symbol, strategy, direction, entryPrice, stopPrice,
+   * takeProfit, size, winRate) are filled in from the engine state
+   * (feeModel, minEvThreshold) so signal handlers don't have to plumb
+   * fee-routing details.
+   *
+   * Returns the full result struct (allowed + ev/threshold/p/feeUsd +
+   * reason) so callers can route structured logs into the signal funnel.
+   *
+   * Counter labels: `path` = 'priced' (winRate present + EV computed),
+   * 'default_allow' (one of the cold-start fallback paths), or absent
+   * when rejected (rejected uses the separate `evGateRejected` counter).
+   */
+  public evaluateSignalEv(
+    args: Omit<EvGateInputs, 'feeModel' | 'minEvThreshold'>,
+  ): EvGateResult {
+    const inputs: EvGateInputs = {
+      ...args,
+      feeModel: this.feeModel ?? undefined,
+      minEvThreshold: this.minEvThreshold,
+    };
+    const result = evaluateEvGate(inputs, this.logger);
+    const labelSymbol = args.symbol || 'unknown';
+    const labelStrategy = args.strategy || 'unknown';
+    if (!result.allowed) {
+      evGateRejected.labels(labelStrategy, labelSymbol).inc();
+    } else {
+      const path = result.reason ? 'default_allow' : 'priced';
+      evGateAccepted.labels(labelStrategy, labelSymbol, path).inc();
+    }
+    return result;
   }
 
   // Pre-trade risk check

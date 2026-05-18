@@ -60,6 +60,14 @@ risk:
   max_position_exposure_pct: 0.30
   funding_cost_tolerance_bps: 20
   slippage_estimate_bps: 3
+  # A3 (2026-05-18): pre-trade fee-adjusted EV gate. Signals whose
+  # expected USD value [p * (TP_R * size) - (1 - p) * (SL_R * size) -
+  # 2 * fee * notional] is below this threshold are rejected at the
+  # router. 0 = reject strictly negative-EV trades; raise to e.g. 0.50
+  # to require a $0.50 minimum expected edge per trade. See
+  # docs/research/2026-05-18_a1-hl-fee-aware-param-retune.md §5.4 and
+  # docs/research/2026-05-18_f4-hl-backtest-validation.md §4.1.
+  min_ev_threshold: 0
 
 # Per-symbol risk limits and strategy parameter overrides
 # Each symbol can have:

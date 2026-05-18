@@ -123,7 +123,11 @@ const GuardrailsSchema = z.object({
     max_drawdown_limit: z.number(),
     max_position_exposure_pct: z.number().min(0).max(1),
     funding_cost_tolerance_bps: z.number().nonnegative(),
-    slippage_estimate_bps: z.number().nonnegative()
+    slippage_estimate_bps: z.number().nonnegative(),
+    // #A3 (2026-05-18): pre-trade fee-adjusted EV gate. Signals whose
+    // expected USD value (p*win - (1-p)*loss - 2*fee*notional) is below
+    // this threshold are rejected at the router. 0 = reject negative-EV.
+    min_ev_threshold: z.number().default(0),
   }),
   // Required: every code path (backtest, paper, live) reads fees from here.
   // Startup must fail if absent — silent drift between layers is what we just

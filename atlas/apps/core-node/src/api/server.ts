@@ -2165,6 +2165,53 @@ app.post('/api/engine/start', async (req, res) => {
           direction: signal.direction,
         });
 
+        // #A3 (2026-05-18): pre-trade fee-adjusted EV gate. Rejects
+        // signals whose expected USD value [p*win - (1-p)*loss -
+        // 2*fee*notional] is below `risk.min_ev_threshold` (default 0
+        // = reject negative-EV). Cold-start safe: default-allows when
+        // MetaFilter has no perf data yet for the strategy. See
+        // docs/research/2026-05-18_f4-hl-backtest-validation.md §4.1.
+        const strategyPerf = signalProcessor!.getStrategyPerformance(signal.strategy);
+        const evGate = tradingEngine!.getRiskEngineInstance()?.evaluateSignalEv({
+          symbol: signal.symbol,
+          strategy: signal.strategy,
+          direction: signal.direction,
+          entryPrice,
+          stopPrice,
+          takeProfit: typeof signal.takeProfit === 'number' ? signal.takeProfit : 0,
+          size: computedSize,
+          winRate: strategyPerf?.winRate ?? null,
+        });
+        if (evGate && !evGate.allowed) {
+          logger.warn('Signal rejected by EV gate', {
+            signalId: signal.id,
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            reason: evGate.reason,
+            ev: evGate.ev,
+            threshold: evGate.threshold,
+            p: evGate.p,
+            feeUsd: evGate.feeUsd,
+            notionalUsd: computedSize * entryPrice,
+          });
+          recordSignalFiltered(logger, {
+            stage: 'ev_gate',
+            reason: 'ev_below_threshold',
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            signalId: signal.id,
+            direction: signal.direction,
+            strength: signal.strength,
+            context: {
+              ev: evGate.ev,
+              threshold: evGate.threshold,
+              p: evGate.p,
+              feeUsd: evGate.feeUsd,
+            },
+          });
+          return;
+        }
+
         const order = await tradingEngine!.createOrder(orderRequest, {
           strategy: signal.strategy,
           metadata: {

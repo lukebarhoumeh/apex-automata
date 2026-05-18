@@ -846,7 +846,11 @@ export class TradingEngine extends EventEmitter {
       kellyFraction: 0.25,
       guardrails,
       accountEquity,
-      softLaunch
+      softLaunch,
+      // #A3 (2026-05-18): wire FeeModel for the pre-trade EV gate so
+      // round-trip fees route per-symbol (spot vs perps_intx) instead
+      // of using a flat default.
+      feeModel: FeeModel.fromGuardrails(guardrails),
     };
 
     this.riskEngine = new RiskEngine(config, this.logger, this.positionTracker!);
