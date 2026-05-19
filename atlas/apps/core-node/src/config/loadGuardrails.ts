@@ -9,12 +9,21 @@ const StrategyOverridesSchema = z.record(
   z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])) // param key -> value
 ).optional();
 
+// Per-symbol disabled-strategies list. Same shape as the global
+// `disabled_strategies` field, scoped to a single symbol. Absent = inherit
+// global behaviour (only the global kill list applies). Present = these
+// strategies are rejected on this symbol *in addition* to the global list.
+// Added 2026-05-19 to support disabling momentum on PERP-INTX symbols without
+// touching spot — see docs/research/2026-05-19_f4-followup-perps-action.md §8.
+const PerSymbolDisabledStrategiesSchema = z.array(z.string()).optional();
+
 // Per-symbol risk limit configuration with optional strategy overrides
 const PerSymbolLimitSchema = z.object({
   max_notional_usd: z.number().nonnegative(),
   max_daily_loss_usd: z.number().nonnegative(),
   // Optional per-symbol strategy parameter overrides
   strategy_overrides: StrategyOverridesSchema,
+  disabled_strategies: PerSymbolDisabledStrategiesSchema,
 });
 
 // Per-symbol perpetual futures configuration
@@ -24,6 +33,7 @@ const PerpsSymbolLimitSchema = z.object({
   default_leverage: z.number().int().min(1).max(10).optional(),
   max_leverage: z.number().int().min(1).max(10).optional(),
   strategy_overrides: StrategyOverridesSchema,
+  disabled_strategies: PerSymbolDisabledStrategiesSchema,
 });
 
 // Per-symbol Hyperliquid configuration (perpetual DEX)
@@ -33,6 +43,7 @@ const HyperliquidSymbolLimitSchema = z.object({
   default_leverage: z.number().int().min(1).max(50).optional(),
   max_leverage: z.number().int().min(1).max(50).optional(),
   strategy_overrides: StrategyOverridesSchema,
+  disabled_strategies: PerSymbolDisabledStrategiesSchema,
 });
 
 export type PerpsSymbolLimit = z.infer<typeof PerpsSymbolLimitSchema>;

@@ -6,6 +6,11 @@ import type { OHLCV } from '../indicators/technical';
 // dead in this file. The signal pipeline owns indicator computation; this
 // engine just consumes signals. Removed to keep call-graph honest.
 import { SignalProcessor, Signal } from '../strategies/signal-processor';
+import {
+  PerSymbolDisabledStrategies,
+  isSymbolStrategyDisabled,
+} from '../strategies/per-symbol-disable';
+import { recordSignalFiltered } from '../strategies/signal-filter-telemetry';
 import { computeRiskBasedSize } from '../trading/risk/position-sizing';
 import { FeeModel, Exchange } from '../core/fee-model';
 import { marketForSymbol } from '../core/symbol-utils';
@@ -146,6 +151,14 @@ export interface BacktestConfig {
   };
   /** Strategies disabled by Phase-3 verdict. Skipped before signal entry. */
   disabledStrategies?: string[];
+  /**
+   * Per-(symbol, strategy) disable map. Strictly additive vs the global
+   * `disabledStrategies` list — a signal is rejected if either matches.
+   * Built once from guardrails.{per_symbol, perps_symbols, hyperliquid_symbols}
+   * via `buildPerSymbolDisabledStrategies()`. Added 2026-05-19 (F4 follow-up §8)
+   * to disable momentum on *-PERP-INTX without touching spot.
+   */
+  perSymbolDisabledStrategies?: PerSymbolDisabledStrategies;
   /** Per-symbol strategy overrides (forwarded to plugin registry). */
   perSymbolOverrides?: PerSymbolStrategyOverrides;
   /** Realism knobs (look-ahead, overshoot, slippage). */
@@ -497,6 +510,12 @@ export class BacktestEngine extends EventEmitter {
       // hard-rejects signals whose strategy is in this list before they
       // reach the order pipeline (signal-processor.ts:942).
       disabledStrategies: Array.from(this.disabledStrategies),
+      // F4 follow-up §8 (2026-05-19): forward the per-(symbol, strategy)
+      // disable map so the SignalProcessor's per_symbol_disable gate also
+      // fires in backtest. Without this the backtest would only see the
+      // gate at backtest-engine.handleSignal (defence-in-depth) and miss
+      // the per-stage funnel telemetry the live path produces.
+      perSymbolDisabledStrategies: this.config.perSymbolDisabledStrategies,
       enableArbiter: true,
       usePluginStrategies: true,
     } as any;
@@ -615,6 +634,28 @@ export class BacktestEngine extends EventEmitter {
    * opened when the next bar arrives, in `fillPendingAtOpen`.
    */
   private handleSignal(signal: Signal): void {
+    // Per-(symbol, strategy) disable — narrower than the global kill list.
+    // SignalProcessor.processSignal already gates this (with funnel
+    // telemetry); we re-check here as defence-in-depth, matching the
+    // pattern used by the global `disabledStrategies` check below.
+    // Added 2026-05-19 (F4 follow-up §8).
+    if (isSymbolStrategyDisabled(this.config.perSymbolDisabledStrategies, signal.symbol, signal.strategy)) {
+      recordSignalFiltered(this.logger, {
+        stage: 'per_symbol_disable',
+        reason: 'symbol_strategy_disabled',
+        symbol: signal.symbol,
+        strategy: signal.strategy,
+        signalId: signal.id,
+        direction: signal.direction,
+        strength: signal.strength,
+        context: {
+          source: 'backtest_engine',
+          disabledOn: this.config.perSymbolDisabledStrategies?.[signal.symbol],
+        },
+      });
+      return;
+    }
+
     // Disabled strategies are filtered upstream by the signal processor;
     // gate here as defence-in-depth.
     if (this.disabledStrategies.has(signal.strategy)) {

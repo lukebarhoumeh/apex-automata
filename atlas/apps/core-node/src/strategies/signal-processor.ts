@@ -21,6 +21,10 @@ import {
 } from './plugins';
 import { SignalArbiter, SignalArbiterConfig, ArbiterResult } from './signal-arbiter';
 import { recordSignalFiltered, recordSignalFunnel } from './signal-filter-telemetry';
+import {
+  PerSymbolDisabledStrategies,
+  isSymbolStrategyDisabled,
+} from './per-symbol-disable';
 
 export interface SignalProcessorConfig {
   supabaseUrl: string;
@@ -37,6 +41,11 @@ export interface SignalProcessorConfig {
   };
   // Strategies permanently killed by backtest verdict — never fire signals
   disabledStrategies?: string[];
+  // Per-(symbol, strategy) disable map. Strictly additive vs the global
+  // `disabledStrategies` list. Built once from guardrails.per_symbol +
+  // perps_symbols + hyperliquid_symbols `.disabled_strategies` fields via
+  // `buildPerSymbolDisabledStrategies()`. See ./per-symbol-disable.ts.
+  perSymbolDisabledStrategies?: PerSymbolDisabledStrategies;
   // Regime detection configuration
   regimeDetector?: Partial<RegimeDetectorConfig>;
   regimeFilter?: Partial<RegimeFilterConfig>;
@@ -1045,6 +1054,29 @@ export class SignalProcessor extends EventEmitter {
    *   See SPRINT-PLAN-FINAL.md §3 F1.
    */
   private async processSignal(signal: Signal, nowMs: number = Date.now()): Promise<void> {
+    // Per-(symbol, strategy) disable — narrower than the global kill list.
+    // Added 2026-05-19 to disable momentum on *-PERP-INTX without touching
+    // spot (F4 follow-up §8). Checked first so the structured-log reason
+    // distinguishes "this symbol+strategy is policy-disabled" from "this
+    // strategy is globally killed", which matters for funnel auditability.
+    if (isSymbolStrategyDisabled(this.config.perSymbolDisabledStrategies, signal.symbol, signal.strategy)) {
+      this.emit('signal:filtered', signal, `Per-symbol disable: ${signal.symbol} / ${signal.strategy}`);
+      recordSignalFiltered(this.logger, {
+        stage: 'per_symbol_disable',
+        reason: 'symbol_strategy_disabled',
+        symbol: signal.symbol,
+        strategy: signal.strategy,
+        signalId: signal.id,
+        direction: signal.direction,
+        strength: signal.strength,
+        context: {
+          source: 'signal_processor',
+          disabledOn: this.config.perSymbolDisabledStrategies?.[signal.symbol],
+        },
+      });
+      return;
+    }
+
     // Hard-reject signals from disabled strategies (Phase 3 backtest kill list)
     const disabledStrategies = this.config.disabledStrategies || [];
     if (disabledStrategies.includes(signal.strategy)) {

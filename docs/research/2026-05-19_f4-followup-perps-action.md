@@ -288,4 +288,217 @@ node atlas/var/backtest_results/_session_2026-05-19/compare-followup.mjs
 
 ---
 
+## 8. Per-symbol disable activation (explicit-approval follow-up)
+
+**Date:** 2026-05-19 (same day, second commit).
+**Trigger:** §4 + §7's explicit recommendation; user-approved follow-up to the disciplined perps-only TP lift shipped in `4eb1127`.
+
+The 6.8 % → 0 % momentum TP-exit collapse documented in §3.4 was the qualitative case that the wider TP doesn't fix the underlying edge problem on 1-minute perps. This section ships the structural fix: a new per-(symbol, strategy) disable schema field, used to disable `momentum` on both `*-PERP-INTX` symbols. Spot momentum is untouched.
+
+### 8.1 Schema field
+
+Added to all three per-symbol limit schemas in `atlas/apps/core-node/src/config/loadGuardrails.ts` for symmetry, but YAML only uses it on `perps_symbols` right now:
+
+```typescript
+const PerSymbolDisabledStrategiesSchema = z.array(z.string()).optional();
+
+// applied identically to PerSymbolLimitSchema, PerpsSymbolLimitSchema,
+// HyperliquidSymbolLimitSchema:
+disabled_strategies: PerSymbolDisabledStrategiesSchema,
+```
+
+Backward-compatible: optional, no default. Absent on a symbol = inherit global behaviour (only the global `disabled_strategies` kill list applies). Present = these strategies are rejected on this symbol *in addition* to the global list.
+
+### 8.2 Engine reads — actual line numbers
+
+A small pure helper at `atlas/apps/core-node/src/strategies/per-symbol-disable.ts` exports:
+- `buildPerSymbolDisabledStrategies(guardrails) → Record<symbol, string[]>` — flattens the three blocks into a flat map.
+- `isSymbolStrategyDisabled(map, symbol, strategy) → boolean` — O(1) gate check.
+
+The check is applied at three sites with funnel-checkpoint `stage: 'per_symbol_disable'`, `reason: 'symbol_strategy_disabled'`:
+
+| Site | Path | Role |
+|---|---|---|
+| 1 | `atlas/apps/core-node/src/strategies/signal-processor.ts` `processSignal` (around L1047 — first gate, before existing global `disabled_strategy` check) | Primary — produces the funnel telemetry the rest of the pipeline consumes |
+| 2 | `atlas/apps/core-node/src/backtesting/backtest-engine.ts` `handleSignal` (L617-626 prior to this PR) | Defence-in-depth, mirrors the existing global gate at the same site |
+| 3 | `atlas/apps/core-node/src/api/server.ts` `signal:generated` handler (around L1759 — added BEFORE the existing global `disabled_strategy` defence-in-depth check) | Defence-in-depth at the final pre-order chokepoint |
+
+The prompt mentioned `api/server.ts:4136` as a fourth site — that line is `normalizeStrategy()` inside the orders → Supabase upsert path, NOT a signal handler. No gate needed there.
+
+A new telemetry stage `'per_symbol_disable'` was added to the `SignalFilterStage` union in `signal-filter-telemetry.ts` so the existing Prom counter and structured-log helpers accept it without any other changes downstream.
+
+### 8.3 Plumbing
+
+| Layer | Change |
+|---|---|
+| `SignalProcessorConfig` | New optional field `perSymbolDisabledStrategies?: PerSymbolDisabledStrategies` |
+| `BacktestConfig` | Same field, forwarded into the engine's child SignalProcessor |
+| `cli/backtest.ts` | `perSymbolDisabledStrategies: buildPerSymbolDisabledStrategies(guardrails)` — symmetric with how it already builds `perSymbolOverrides` (since 4eb1127) |
+| `api/server.ts` | Same `buildPerSymbolDisabledStrategies(guardrails)` call once, passed into the SignalProcessor wiring AND captured in closure scope for the `signal:generated` defence-in-depth gate |
+
+Zero changes to the strategy registry, plugins, or the global `disabled_strategies` plumbing.
+
+### 8.4 YAML diff
+
+```diff
+   ETH-PERP-INTX:
+     max_notional_usd: 5000
+     max_daily_loss_usd: 300
+     default_leverage: 3
+     max_leverage: 5
++    disabled_strategies: [momentum]    # F4 follow-up §8 — empirical TP-exit collapse
+     strategy_overrides:
+       ...
+   BTC-PERP-INTX:
+     max_notional_usd: 5000
+     max_daily_loss_usd: 300
+     default_leverage: 3
+     max_leverage: 5
++    disabled_strategies: [momentum]    # F4 follow-up §8 — same rationale
+     strategy_overrides:
+       ...
+```
+
+The per-symbol momentum `strategy_overrides` blocks (including the `takeProfitAtr: 6.0` lift from `4eb1127`) are kept verbatim so re-enabling is a one-line undo (delete the `disabled_strategies` list) without losing the calibration.
+
+### 8.5 Test suite
+
+```
+pnpm test (atlas/apps/core-node)  →  47 files / 604 tests passed (was 585)
+```
+
+19 new tests in `src/__tests__/per-symbol-strategy-disable.test.ts`:
+- 7 pure-helper tests covering `isSymbolStrategyDisabled` (undefined map / missing symbol / empty list / exact hit / wrong strategy) and `buildPerSymbolDisabledStrategies` (multi-block merge / skip-no-key / skip-empty).
+- 6 YAML state regression tests (perp symbols disable momentum; spot symbols don't; global kill list unchanged; flattened-map result is exactly the two perp symbols).
+- 6 SignalProcessor end-to-end tests (momentum on `ETH-PERP-INTX` rejected with the right structured-log labels; momentum on `ETH-USD` passes the gate; `trend_follow` on `ETH-PERP-INTX` passes; `signal:filtered` event fires with the right reason; helper match/no-match coverage).
+
+No existing test modified; no regressions in the prior 585.
+
+### 8.6 Empirical re-run — perps
+
+Command:
+```bash
+cd atlas/apps/core-node
+pnpm backtest --start-date 2025-12-05 --end-date 2026-03-05 \
+  --commission 0.00045 --products ETH-PERP-INTX BTC-PERP-INTX \
+  > ../../var/backtest_results/_session_2026-05-19b/run_hl_perps_90d_post_disable.txt 2>&1
+```
+
+JSON artifact: `atlas/var/backtest_results/backtest_2026-05-19T16-16-08.json` (gitignored).
+
+| Metric | F4 baseline | F4 tune | F4 follow-up (`4eb1127`) | **Per-symbol disable (this PR)** | Δ vs baseline | Δ vs follow-up |
+|---|---:|---:|---:|---:|---:|---:|
+| Trades | 902 | 178 | 610 | **365** | -537 (-60 %) | -245 (-40 %) |
+| Win Rate | 33.04 % | 29.21 % | 32.46 % | **25.21 %** | -7.8 pp | -7.3 pp |
+| Net PnL | $-5,870.71 | $-1,370.78 | $-4,787.03 | **$-2,358.62** | **+$3,512.09** | **+$2,428.41** |
+| Profit Factor | 0.37 | 0.29 | 0.29 | **0.44** | +0.07 | +0.15 |
+| Fees | $2,387.70 | $471.17 | $1,614.49 | **$966.13** | -$1,421.57 | -$648.36 |
+| Max DD | 58.77 % | 13.76 % | 47.87 % | **24.25 %** | -34.5 pp | -23.6 pp |
+
+vs the §7 prediction of `~-$1,487`: **actual -$2,358.62**. Approximately $870 worse than predicted; the gap is the trend_follow trade count *rising* once momentum stopped flooding the cold-streak meta-filter (see §8.8). Still well within the predicted "F4 baseline + $3.3k" envelope.
+
+### 8.7 Per (strategy, symbol) — smoking gun
+
+| Strategy | Symbol | Trades | WR | Net PnL | Avg PnL | take_profit | stop_loss | signal |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| **momentum** | ETH-PERP-INTX | **0** | n/a | $0.00 | n/a | 0 | 0 | 0 |
+| **momentum** | BTC-PERP-INTX | **0** | n/a | $0.00 | n/a | 0 | 0 | 0 |
+| trend_follow | ETH-PERP-INTX | 209 | 23.92 % | $-1,408.91 | $-6.74 | 22 | 79 | 108 |
+| trend_follow | BTC-PERP-INTX | 156 | 26.92 % | $-949.71 | $-6.09 | 26 | 66 | 64 |
+
+Funnel diagnostics from the run:
+```
+filteredByStage: {
+  per_symbol_disable: { symbol_strategy_disabled: 4933 },  ← every momentum candidate
+  dedup: { registry_dedup_window: 960 },
+  meta: { cold_streak: 988 },
+  regime: { counter_trend: 2 }
+}
+candidatesPerStrategy: { momentum: 5853, trend_follow: 1616 }
+admittedPerStrategy:   { trend_follow: 586 }    ← momentum admitted: 0
+```
+
+**Smoking-gun confirmation: momentum on perps = 0 trades, 4,933 momentum signals rejected at the per_symbol_disable gate. trend_follow unchanged in plumbing — same per-symbol overrides apply.**
+
+### 8.8 Why trend_follow trade count rose (not a leak — a second-order effect)
+
+trend_follow trade count on perps:
+- F4 baseline: 310 (CLI drift bug — global trend_follow defaults, not per-symbol)
+- `4eb1127`: 121 (CLI drift fix landed; per-symbol stricter `emaSlow=26` BTC, `stopAtr=2.5` applied)
+- **This PR: 365** (per-symbol overrides still applied; cold_streak meta-filter trips less often without momentum's constant losses)
+
+The mechanism: the meta-filter's cold-streak cooldown kicks in after N consecutive losses. Pre-disable, momentum on perps generated a constant background of losses that tripped the cooldown frequently, which in turn filtered out a chunk of *trend_follow* signals (the cooldown is symbol-scoped, not strategy-scoped). With momentum disabled, the cold-streak counter resets more often, and more trend_follow signals reach order placement.
+
+Net effect: trend_follow on perps trades 3× as often, with a worse per-trade WR (23–27 % vs 33–37 % in the more-filtered runs). This is the *next* problem worth solving (see §8.10), but for this PR's scope it's a wash — the dollar save is dominated by momentum's removal, not by trend_follow's behaviour change.
+
+### 8.9 Empirical re-run — spot (unaffected confirmation)
+
+Command:
+```bash
+pnpm backtest --start-date 2025-12-05 --end-date 2026-03-05 \
+  --commission 0.00045 --products BTC-USD ETH-USD SOL-USD \
+  > ../../var/backtest_results/_session_2026-05-19b/run_hl_spot_90d_unaffected_check.txt 2>&1
+```
+
+JSON: `backtest_2026-05-19T16-18-24.json` (gitignored).
+
+| Metric | F4 baseline (run 1) | This PR (spot post-disable) | Δ |
+|---|---:|---:|---:|
+| Trades | 246 | **246** | 0 |
+| Win Rate | 39.84 % | **39.84 %** | 0 |
+| Net PnL | $-521.13 | **$-521.13** | $0.00 |
+| Profit Factor | 0.88 | **0.88** | 0 |
+| Fees | $640.54 | **$640.54** | $0.00 |
+| Max DD | 10.86 % | **10.86 %** | 0 |
+| trend_follow | 145 trades / 39.31 % / $-654.54 | **145 / 39.31 % / $-654.54** | identical |
+| momentum | 101 trades / 40.59 % / $+133.40 | **101 / 40.59 % / $+133.40** | identical |
+
+**Bit-for-bit identical to F4 baseline run 1.** Funnel diagnostics confirm: no `per_symbol_disable` rejections on spot (`filteredByStage` shows only `meta.cold_streak: 767` and `regime.counter_trend: 1` — the gate didn't fire). Spot momentum continues to operate exactly as before.
+
+### 8.10 J1 readiness update
+
+| Metric | F4 baseline (run 4 perps) | This PR (perps) | J1 limit | Status |
+|---|---:|---:|---:|---|
+| Max drawdown | 58.77 % | 24.25 % | `max_drawdown_limit: 0.15` (15 %) | Still 1.6× over (was 3.9×) |
+
+Per-symbol disable cuts the perp drawdown from 58.77 % → 24.25 % — a 34.5 pp improvement. J1's existing 15 % limit still wouldn't hold on perps, but the gap is dramatically smaller. J1 should now:
+1. Tighten `max_drawdown_limit` to 0.25 or split spot vs perps limits (spot's 10.86 % DD is well inside any reasonable bound).
+2. Consider whether trend_follow on perps at 25 % WR warrants the same disable treatment momentum just got — that's an A6/Phase-5 question, not a J1 question.
+
+### 8.11 A6 (regime-conditional) infrastructure
+
+The `disabled_strategies` schema field deliberately uses a flat `string[]` shape that A6 can extend without breaking changes. Two compatible upgrade paths:
+
+1. **Schema additive — A6 adds a sibling regime list:**
+   ```yaml
+   ETH-PERP-INTX:
+     disabled_strategies: [momentum]                     # unconditional (this PR)
+     disabled_strategies_in_regime:                       # A6 future
+       ranging: [trend_follow]
+       choppy:  [trend_follow]
+   ```
+2. **Schema additive — A6 uses object form alongside the string form:**
+   ```yaml
+   ETH-PERP-INTX:
+     disabled_strategies:
+       - momentum                                         # unconditional
+       - { strategy: trend_follow, regimes: [ranging, choppy] }   # conditional
+   ```
+
+Either path keeps the F4-followup string-list semantics intact, so this PR is the right shape to ship now.
+
+### 8.12 Commit
+
+Commit hash: filled in at commit time, recorded in §8 of this doc on push.
+
+### 8.13 Artifacts (gitignored under `atlas/var/`)
+
+- Post-disable perps stdout: `_session_2026-05-19b/run_hl_perps_90d_post_disable.txt`
+- Post-disable perps JSON: `backtest_2026-05-19T16-16-08.json`
+- Post-disable perps report: `report_2026-05-19T16-16-08.txt`
+- Spot unaffected-check stdout: `_session_2026-05-19b/run_hl_spot_90d_unaffected_check.txt`
+- Spot unaffected-check JSON: `backtest_2026-05-19T16-18-24.json`
+
+---
+
 **End of F4 follow-up.**

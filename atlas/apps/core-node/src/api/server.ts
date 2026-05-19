@@ -8,6 +8,10 @@ import { SignalProcessor } from '../strategies/signal-processor';
 import { CoinDeskClient } from '../data-sources/coindesk-client';
 import { SignalArbitrator, extractBaseAsset } from '../strategies/signal-arbitrator';
 import { recordSignalFiltered, recordSignalFunnel } from '../strategies/signal-filter-telemetry';
+import {
+  buildPerSymbolDisabledStrategies,
+  isSymbolStrategyDisabled,
+} from '../strategies/per-symbol-disable';
 import { computeRawEntryFillPrice } from '../trading/position-entry-vwap';
 import { createClient } from '@supabase/supabase-js';
 import path from 'path';
@@ -1458,6 +1462,11 @@ app.post('/api/engine/start', async (req, res) => {
     // Initialize signal processor
     const strategyGuard = guardrails.strategy;
     const disabledStrategies = guardrails.disabled_strategies || [];
+    // F4 follow-up §8 (2026-05-19): flatten per-(symbol, strategy) disable
+    // policy from per_symbol / perps_symbols / hyperliquid_symbols into a
+    // single map. Passed to SignalProcessor for the live gate, and used by
+    // the signal:generated defence-in-depth handler below.
+    const perSymbolDisabledStrategies = buildPerSymbolDisabledStrategies(guardrails);
     // Momentum runtime constants live in guardrails.yaml's `momentum:` block
     // (or per-symbol overrides). Plugin configSchema in
     // strategies/plugins/builtin/momentum-strategy.ts is the source of
@@ -1510,6 +1519,7 @@ app.post('/api/engine/start', async (req, res) => {
       supabaseUrl: env.SUPABASE_URL || '',
       supabaseKey: env.SUPABASE_SERVICE_KEY || '',
       disabledStrategies,
+      perSymbolDisabledStrategies,
       strategies: {
         breakout: {
           enabled: !disabledStrategies.includes('breakout'),
@@ -1751,10 +1761,36 @@ app.post('/api/engine/start', async (req, res) => {
     // Listen for signals and create orders
     signalProcessor.on('signal:generated', async (signal) => {
       try {
-        // Defense-in-depth: even if signal-processor.ts's disabled-strategy
-        // filter were ever bypassed by a future bug or a new code path, the
-        // server-level handler is the final chokepoint before orders are
-        // created. Reject here too.
+        // Defense-in-depth (per-(symbol, strategy)): SignalProcessor's
+        // per_symbol_disable gate should have caught this already. Re-check
+        // here at the final chokepoint so a future code path bypass surfaces
+        // as a rejected funnel event rather than a live order. Added
+        // 2026-05-19 (F4 follow-up §8).
+        if (isSymbolStrategyDisabled(perSymbolDisabledStrategies, signal.symbol, signal.strategy)) {
+          logger.warn(
+            `SECURITY: per-symbol-disabled (${signal.symbol}/${signal.strategy}) reached signal:generated handler — rejected`,
+            { signalId: signal.id, symbol: signal.symbol, strategy: signal.strategy },
+          );
+          recordSignalFiltered(logger, {
+            stage: 'per_symbol_disable',
+            reason: 'router_defense_in_depth',
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            signalId: signal.id,
+            direction: signal.direction,
+            strength: signal.strength,
+            context: {
+              source: 'api_server',
+              disabledOn: perSymbolDisabledStrategies[signal.symbol],
+            },
+          });
+          return;
+        }
+
+        // Defense-in-depth (global): even if signal-processor.ts's disabled-
+        // strategy filter were ever bypassed by a future bug or a new code
+        // path, the server-level handler is the final chokepoint before
+        // orders are created. Reject here too.
         const killed = guardrails.disabled_strategies ?? [];
         if (killed.includes(signal.strategy)) {
           logger.warn(

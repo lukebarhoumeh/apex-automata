@@ -209,6 +209,15 @@ perps_symbols:
     max_daily_loss_usd: 300
     default_leverage: 3
     max_leverage: 5
+    # F4 follow-up §8 (2026-05-19): structurally disable momentum on this
+    # 1-minute perp symbol. Empirical evidence (4eb1127 re-run): momentum
+    # take_profit exit rate collapsed 6.8% -> 0% with the wider TP, WR
+    # stayed at ~30%, and the strategy bled -$1,782 on 251 trades over the
+    # HL 90d window. Disable saves the full per-trade fee+stop drag rather
+    # than slowing it via wider TPs. Spot momentum (ETH-USD/BTC-USD/SOL-USD)
+    # is unaffected. A6 (regime-conditional) can later relax this to
+    # specific regimes once it lands; until then this is unconditional.
+    disabled_strategies: [momentum]
     strategy_overrides:
       trend_follow:
         emaFast: 12
@@ -237,6 +246,12 @@ perps_symbols:
     max_daily_loss_usd: 300
     default_leverage: 3
     max_leverage: 5
+    # F4 follow-up §8 (2026-05-19): structurally disable momentum on this
+    # 1-minute perp symbol — same rationale as ETH-PERP-INTX above. Empirical
+    # bleed -$2,082 on 238 trades, WR ~29%. The momentum override block below
+    # is kept (with its takeProfitAtr=6.0 from 4eb1127) so that re-enabling
+    # via removing this list is a one-line undo without losing the calibration.
+    disabled_strategies: [momentum]
     strategy_overrides:
       momentum:
         atrMultiplier: 2.0

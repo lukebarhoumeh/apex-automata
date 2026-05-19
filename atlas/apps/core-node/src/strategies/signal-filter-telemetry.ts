@@ -57,7 +57,15 @@ export type SignalFilterStage =
   | 'runtime_state'
   | 'routing'
   | 'funding_bias'
-  | 'sizing';
+  | 'sizing'
+  // Added 2026-05-19 (F4 follow-up §8) — per-(symbol, strategy) disable
+  // narrower than the global `disabled_strategy` kill list. Reason slug
+  // 'symbol_strategy_disabled' indicates the specific (symbol, strategy)
+  // pair is policy-disabled via guardrails.{per_symbol,perps_symbols,
+  // hyperliquid_symbols}.<sym>.disabled_strategies. Checked at three sites:
+  // signal-processor.processSignal, backtest-engine.handleSignal, and
+  // api/server signal:generated handler (defense in depth).
+  | 'per_symbol_disable';
 
 const signalFilteredCounter = new Counter({
   name: 'atlas_signal_filtered_total',

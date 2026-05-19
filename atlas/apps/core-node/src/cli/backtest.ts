@@ -8,6 +8,7 @@ import { createLogger } from '../core/logger';
 import { BacktestRunner, BacktestRunnerConfig } from '../backtesting/backtest-runner';
 import { BacktestConfig, PerSymbolStrategyOverrides } from '../backtesting/backtest-engine';
 import { loadGuardrails } from '../config/loadGuardrails';
+import { buildPerSymbolDisabledStrategies } from '../strategies/per-symbol-disable';
 import { FeeModel } from '../core/fee-model';
 
 async function main() {
@@ -208,6 +209,10 @@ async function main() {
     },
     // Defect #2: honour the same kill list live uses.
     disabledStrategies: guardrails.disabled_strategies,
+    // F4 follow-up §8 (2026-05-19): same shape as the live API server reads
+    // — flatten per-(symbol, strategy) disable from per_symbol /
+    // perps_symbols / hyperliquid_symbols blocks into a single map.
+    perSymbolDisabledStrategies: buildPerSymbolDisabledStrategies(guardrails),
     // Defect #1: forward per-symbol parameter overrides so trend_follow on
     // ETH-USD uses emaFast=12 / emaSlow=15, momentum on ETH uses rsi 10/40/55, etc.
     perSymbolOverrides,
