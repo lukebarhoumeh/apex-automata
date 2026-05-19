@@ -110,10 +110,24 @@ async function main() {
   const runner = new BacktestRunner(runnerConfig, logger);
 
   // Build per-symbol overrides snapshot the same way live trading does
-  // (signal-processor.loadPerSymbolOverridesFromGuardrails). Backtest then
-  // forwards this verbatim to the strategy registry.
+  // (signal-processor.loadPerSymbolOverridesFromGuardrails called twice in
+  // api/server.ts:1631-1644 — once for per_symbol, once for perps_symbols).
+  // Backtest then forwards this verbatim to the strategy registry.
+  //
+  // F4 follow-up (2026-05-19): same backtest/live drift class as #11 — the
+  // CLI previously read only `guardrails.per_symbol` and silently dropped
+  // `guardrails.perps_symbols.*.strategy_overrides`, so YAML-side perps
+  // momentum/trend_follow tuning was invisible to backtests while live
+  // honoured it. Mirror the live dual-call here so the backtest sees the
+  // same per-symbol config the engine uses in paper/live. See
+  // docs/research/2026-05-19_f4-followup-perps-action.md §3.
   const perSymbolOverrides: PerSymbolStrategyOverrides = {};
   for (const [symbol, cfg] of Object.entries(guardrails.per_symbol ?? {})) {
+    if (cfg.strategy_overrides) {
+      perSymbolOverrides[symbol] = cfg.strategy_overrides as Record<string, Record<string, unknown>>;
+    }
+  }
+  for (const [symbol, cfg] of Object.entries(guardrails.perps_symbols ?? {})) {
     if (cfg.strategy_overrides) {
       perSymbolOverrides[symbol] = cfg.strategy_overrides as Record<string, Record<string, unknown>>;
     }

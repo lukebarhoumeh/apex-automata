@@ -224,7 +224,13 @@ perps_symbols:
         macdSlow: 21
         macdSignal: 5
         stopAtr: 2.0
-        takeProfitAtr: 5.0
+        # F4 follow-up (2026-05-19): lifted 5.0 -> 6.0 perps-only landing zone.
+        # Empirical p_momentum_on_perps averages ~30% across F4 baseline + tune
+        # runs; the +20% tune (TP 5.0 -> 6.0) empirically saved $1,682 on this
+        # symbol (-$2,169 -> -$487 net) at the cost of 82% trade-count
+        # reduction. Spot momentum takeProfitAtr stays at 5.0.
+        # See docs/research/2026-05-19_f4-followup-perps-action.md.
+        takeProfitAtr: 6.0
         atrMultiplier: 2.0
   BTC-PERP-INTX:
     max_notional_usd: 5000
@@ -236,6 +242,12 @@ perps_symbols:
         atrMultiplier: 2.0
         rsiOversold: 30
         rsiOverbought: 70
+        # F4 follow-up (2026-05-19): perps-only landing zone — momentum on
+        # BTC-PERP-INTX previously inherited the global momentum.takeProfitAtr
+        # (5.0). Pinned to 6.0 here so spot stays at 5.0 while perps gets the
+        # wider TP that empirically saved $1,719 on this symbol in F4 tune
+        # (-$2,229 -> -$510 net).
+        takeProfitAtr: 6.0
       trend_follow:
         emaFast: 12
         emaSlow: 26
