@@ -10,6 +10,7 @@ import {
   PerSymbolDisabledStrategies,
   isSymbolStrategyDisabled,
 } from '../strategies/per-symbol-disable';
+import { RegimeGateConfig, evaluateRegimeGate } from '../strategies/regime-gate';
 import { recordSignalFiltered } from '../strategies/signal-filter-telemetry';
 import { computeRiskBasedSize } from '../trading/risk/position-sizing';
 import {
@@ -232,6 +233,15 @@ export interface BacktestConfig {
    * to disable momentum on *-PERP-INTX without touching spot.
    */
   perSymbolDisabledStrategies?: PerSymbolDisabledStrategies;
+  /**
+   * A6 (2026-05-29) — regime-conditional gate config (disabled by default).
+   * Forwarded into the child SignalProcessor so the gate fires (with funnel
+   * telemetry) in backtest exactly as it would live, and re-checked in
+   * handleSignal as defence-in-depth. Distinct from `regimeGates` above,
+   * which only toggles the RegimeFilter compatibility check: this is the
+   * `guardrails.regime_gates` policy (strategy × regime block rules).
+   */
+  regimeConditionalGates?: RegimeGateConfig;
   /** Per-symbol strategy overrides (forwarded to plugin registry). */
   perSymbolOverrides?: PerSymbolStrategyOverrides;
   /** Realism knobs (look-ahead, overshoot, slippage). */
@@ -805,6 +815,10 @@ export class BacktestEngine extends EventEmitter {
       // gate at backtest-engine.handleSignal (defence-in-depth) and miss
       // the per-stage funnel telemetry the live path produces.
       perSymbolDisabledStrategies: this.config.perSymbolDisabledStrategies,
+      // A6 (2026-05-29) — forward the regime-conditional gate so the
+      // SignalProcessor's regime_gate stage fires in backtest with the same
+      // funnel telemetry the live path produces (disabled by default).
+      regimeConditionalGates: this.config.regimeConditionalGates,
       enableArbiter: true,
       usePluginStrategies: true,
     } as any;
@@ -997,6 +1011,37 @@ export class BacktestEngine extends EventEmitter {
         },
       });
       return;
+    }
+
+    // A6 (2026-05-29) — regime-conditional gate defence-in-depth. The child
+    // SignalProcessor.processSignal already gates this (with funnel telemetry);
+    // re-check here mirroring the per_symbol_disable pattern so no path reaches
+    // the order pipeline ungated. Disabled by default.
+    {
+      const regime =
+        typeof signal.metadata?.regime === 'string' ? signal.metadata.regime : undefined;
+      const decision = evaluateRegimeGate(this.config.regimeConditionalGates, {
+        strategy: signal.strategy,
+        symbol: signal.symbol,
+        regime,
+      });
+      if (decision.blocked) {
+        recordSignalFiltered(this.logger, {
+          stage: 'regime_gate',
+          reason: 'regime_blocked',
+          symbol: signal.symbol,
+          strategy: signal.strategy,
+          signalId: signal.id,
+          direction: signal.direction,
+          strength: signal.strength,
+          context: {
+            source: 'backtest_engine',
+            regime,
+            blockRegimes: decision.rule?.blockRegimes,
+          },
+        });
+        return;
+      }
     }
 
     // Disabled strategies are filtered upstream by the signal processor;

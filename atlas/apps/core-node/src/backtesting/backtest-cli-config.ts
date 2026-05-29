@@ -11,6 +11,7 @@
 
 import type { GuardrailConfig } from '../config/loadGuardrails';
 import { buildPerSymbolDisabledStrategies } from '../strategies/per-symbol-disable';
+import { buildRegimeGateConfig } from '../strategies/regime-gate';
 import { FeeModel } from '../core/fee-model';
 import type { MarketVenue } from '../trading/execution/venue-capabilities';
 import type { BacktestConfig, EvGateMode, PerSymbolStrategyOverrides } from './backtest-engine';
@@ -111,7 +112,16 @@ export interface BacktestConfigInput {
   commissionOverride?: number;
   venueOverride?: MarketVenue;
   evGateMode: EvGateMode;
+  /** RegimeFilter (regime/strategy compatibility) toggle — `--regime-gates on|off`. */
   regimeGates: boolean;
+  /**
+   * A6 (2026-05-29) — force-enable the regime-conditional gates
+   * (`guardrails.regime_gates`, `--regime-conditional-gates`) for THIS run
+   * regardless of the YAML `enabled` flag. Default false: the YAML decides,
+   * and it ships `enabled: false`, so `pnpm backtest` and the E4 harness stay
+   * at live/paper parity (the gate is a no-op) unless explicitly forced.
+   */
+  forceRegimeConditionalGates?: boolean;
   /** `--slippage` as a decimal rate; maps onto realism.entrySlippageBps. */
   slippageRate?: number;
   /**
@@ -134,6 +144,12 @@ export interface BacktestConfigInput {
  */
 export function buildBacktestConfig(input: BacktestConfigInput, guardrails: GuardrailConfig): BacktestConfig {
   const { strategy, initialCapital } = input;
+  // A6: same normalised shape the live API server passes to SignalProcessor.
+  // Rules always come from guardrails.yaml; only `enabled` may be forced on.
+  const regimeConditionalGates = buildRegimeGateConfig(guardrails);
+  if (input.forceRegimeConditionalGates) {
+    regimeConditionalGates.enabled = true;
+  }
   return {
     startDate: input.startDate,
     endDate: input.endDate,
@@ -207,6 +223,9 @@ export function buildBacktestConfig(input: BacktestConfigInput, guardrails: Guar
     disabledStrategies: guardrails.disabled_strategies,
     // F4 follow-up §8 (2026-05-19): same shape as the live API server reads.
     perSymbolDisabledStrategies: buildPerSymbolDisabledStrategies(guardrails),
+    // A6 (2026-05-29): regime-conditional gates — disabled by default via
+    // guardrails.regime_gates.enabled; see `forceRegimeConditionalGates`.
+    regimeConditionalGates,
     // Defect #1: forward per-symbol parameter overrides.
     perSymbolOverrides: collectPerSymbolOverrides(guardrails),
     realism: {

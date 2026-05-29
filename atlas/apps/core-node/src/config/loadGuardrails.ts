@@ -53,6 +53,26 @@ export type HyperliquidSymbolLimit = z.infer<typeof HyperliquidSymbolLimitSchema
 export type PerSymbolLimit = z.infer<typeof PerSymbolLimitSchema>;
 export type StrategyOverrides = z.infer<typeof StrategyOverridesSchema>;
 
+// A6 (2026-05-29) — regime-conditional gates. DISABLED BY DEFAULT: when the
+// block is absent or `enabled: false`, the gate is a no-op and live/paper
+// behaviour is unchanged. Each rule blocks a strategy's signals when the
+// confidently-classified regime is in `block_regimes`, optionally scoped to
+// `venues` (spot|PERP) and/or `symbols`. Derived from the A6 diagnostic —
+// see docs/research/2026-05-29_a6-regime-conditional-gates.md.
+const RegimeNameSchema = z.enum(['strong_trend', 'weak_trend', 'ranging', 'choppy']);
+const RegimeGateRuleSchema = z.object({
+  strategy: z.string(),
+  block_regimes: z.array(RegimeNameSchema).default([]),
+  venues: z.array(z.enum(['spot', 'PERP'])).optional(),
+  symbols: z.array(z.string()).optional(),
+});
+const RegimeGatesSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    rules: z.array(RegimeGateRuleSchema).default([]),
+  })
+  .optional();
+
 // Fee model — single source of truth for fee assumptions across
 // backtest, paper, and live so all three are directly comparable.
 // Negative maker values represent rebates (Hyperliquid). All values in bps.
@@ -239,6 +259,8 @@ export const GuardrailsSchema = z.object({
   // Live-mode knobs (TASK_011). Optional; absent = fail-closed defaults via
   // `resolveLiveConfig()`. Paper mode ignores this block entirely.
   live: LiveConfigSchema.optional(),
+  // A6 (2026-05-29) — regime-conditional gates (disabled by default).
+  regime_gates: RegimeGatesSchema,
   compliance: z.object({
     tax_method: z.string(),
     export_frequency_days: z.number().int().positive(),

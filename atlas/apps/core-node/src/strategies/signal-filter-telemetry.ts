@@ -78,7 +78,15 @@ export type SignalFilterStage =
   // exit. Reason slug 'venue_no_shorting'. Emitted by backtest-engine today;
   // the live router adopts the same stage when TASK_012 lands so funnel
   // comparisons line up.
-  | 'spot_short_blocked';
+  | 'spot_short_blocked'
+  // Added 2026-05-29 (A6) — regime-conditional gate, narrower than the
+  // plugin-level regimeCompatibility gate. Reason slug 'regime_blocked'
+  // indicates the (strategy, regime[, venue, symbol]) tuple is policy-blocked
+  // via guardrails.regime_gates. Checked at three sites:
+  // signal-processor.processSignal (primary, after RegimeFilter),
+  // backtest-engine.handleSignal, and api/server signal:generated handler
+  // (defense in depth). Disabled by default — see ./regime-gate.ts.
+  | 'regime_gate';
 
 const signalFilteredCounter = new Counter({
   name: 'atlas_signal_filtered_total',
