@@ -1,18 +1,27 @@
 /**
- * E4 multi-timeframe FeeModel expectancy harness — CLI.
+ * E4 multi-timeframe FeeModel expectancy harness — CLI (Algo Creator Beta card).
  *
- * One timeframe per invocation. Desk order: 4H → 1D → (1H demoted).
+ * One timeframe per invocation on one per-TF fixture directory. Desk order:
+ * 4H (this card) → 1D → (1H demoted; 15m out). From `atlas/apps/core-node`:
  *
- *   cd atlas/apps/core-node
- *   pnpm exec tsx src/cli/backtest-e4.ts --tf 4h --fixture-dir fixtures/bars/4h \
- *     --products BTC-USD ETH-USD SOL-USD --start-date 2026-08-01 --end-date 2026-09-01
- *   pnpm exec tsx src/cli/backtest-e4.ts --tf 1d --fixture-dir fixtures/bars/1d \
- *     --products BTC-USD ETH-USD SOL-USD --start-date 2024-09-01 --end-date 2026-08-31
+ *   # 4H eval window (GO bars here only; run ONCE). Defaults ARE the card:
+ *   # BTC/ETH/SOL spot long-only, trend_follow A1 2.5/6.0 (asserted), true 4H,
+ *   # cooldown 1 bar, atr_volatility_min 0.005 (asserted), EV gate enforce,
+ *   # GO fee book 40 bps/side, stress 25/75/120 separate, month-block MC.
+ *   pnpm exec tsx src/cli/backtest-e4.ts --tf 4h --window eval --run-card <card id>
  *
- * Never put `--` after `pnpm backtest:e4` (yargs then treats every flag as
- * positional). There is deliberately NO `--allow-synthetic`: missing data is
- * DATA_UNAVAILABLE (exit 2). Line 1 of stdout is the DERIVED label
- * (SMOKE ONLY / FULL WINDOW / VOID); line 2 is the DATA stamp.
+ *   # 4H tune window (diagnostics only; never GO bars)
+ *   pnpm exec tsx src/cli/backtest-e4.ts --tf 4h --window tune --run-card <card id>
+ *
+ *   # 1D eval window (EXPLORATORY unless counted E[n] ≥ 100)
+ *   pnpm exec tsx src/cli/backtest-e4.ts --tf 1d --window eval --run-card <card id>
+ *
+ * `--window` presets --fixture-dir / --start-date / --end-date; explicit flags
+ * override them (a window that is not the locked eval/tune pair is `custom`
+ * and can never reach BETA BARS PASS). Never put `--` after `pnpm backtest:e4`.
+ * There is NO --allow-synthetic and NO override for floors or bars (yargs
+ * strict ⇒ "Unknown arguments"). Line 1 of stdout is the DERIVED label; the
+ * counted-E[n] preflight block prints first.
  */
 import path from 'node:path';
 import fs from 'node:fs/promises';
@@ -26,9 +35,12 @@ import { isDataUnavailableError } from '../backtesting/data-loader';
 import { isBarAggregationError } from '../backtesting/bar-aggregation';
 import { loadGuardrails } from '../config/loadGuardrails';
 import type { EvGateMode } from '../backtesting/backtest-engine';
-import type { MarketVenue } from '../trading/execution/venue-capabilities';
 import {
+  E4_CARD,
+  E4_DEFAULT_FIXTURE_DIR,
   E4_TF_POLICY,
+  E4_WALK_FORWARD,
+  isE4DataPathError,
   parseTimeframe,
   resolveE4FeeTier,
   renderE4Report,
@@ -43,41 +55,52 @@ async function main(): Promise<void> {
 
   const argv = await yargs(hideBin(process.argv))
     .scriptName('atlas-backtest-e4')
-    .usage('$0 --tf <4h|1d|1h> --start-date YYYY-MM-DD --end-date YYYY-MM-DD [options]')
+    .usage('$0 --tf <4h|1d|1h> (--window eval|tune | --fixture-dir <dir> --start-date YYYY-MM-DD --end-date YYYY-MM-DD) [--run-card <id>] [options]')
     .option('tf', {
       type: 'string',
       demandOption: true,
-      describe: 'Timeframe for THIS run: 4h (first, month-block MC) | 1d (next; EXPLORATORY if E[n] < 100) | 1h (demoted). 15m is refused.',
+      describe: 'Timeframe for THIS run: 4h (first; floor 1.61; month-block MC) | 1d (floor 1.44; EXPLORATORY if E[n] < 100) | 1h (demoted; floor 2.25). 15m is out.',
     })
-    .option('start-date', { type: 'string', demandOption: true, describe: 'Window start (YYYY-MM-DD or ISO, UTC)' })
-    .option('end-date', { type: 'string', demandOption: true, describe: 'Window end (YYYY-MM-DD or ISO, UTC)' })
-    .option('products', { type: 'array', default: ['BTC-USD', 'ETH-USD', 'SOL-USD'], describe: 'Spot products (space-separated)' })
+    .option('window', {
+      type: 'string',
+      choices: ['eval', 'tune'],
+      describe: `Locked walk-forward window preset. eval = ${E4_WALK_FORWARD.eval.start.slice(0, 10)} → ${E4_WALK_FORWARD.eval.end.slice(0, 10)} (run ONCE; GO bars here only) | tune = ${E4_WALK_FORWARD.tune.start.slice(0, 10)} → ${E4_WALK_FORWARD.tune.end.slice(0, 10)} (diagnostics only). Presets --fixture-dir and dates; explicit flags override.`,
+    })
+    .option('fixture-dir', {
+      type: 'string',
+      describe: 'Per-TF fixture directory (one timeframe per directory). Defaults from --window (4h: fixtures/bars/4h/holdout-… | tune-…; 1d: fixtures/bars/1d). Bar width must equal --tf; 15m gate fixtures are refused; missing data is DATA_UNAVAILABLE — never synthetic.',
+    })
+    .option('start-date', { type: 'string', describe: 'Window start (YYYY-MM-DD or ISO, UTC). Default from --window.' })
+    .option('end-date', { type: 'string', describe: 'Window end (YYYY-MM-DD or ISO, UTC). Default from --window.' })
+    .option('products', { type: 'array', default: [...E4_CARD.products], describe: 'Spot products (space-separated). Perps (XXX-PERP-INTX) are refused.' })
     .option('strategy', {
       type: 'string',
-      default: 'trend_follow',
+      default: E4_CARD.strategy,
       choices: ['trend_follow', 'momentum', 'all'],
-      describe: 'Paper GO set: trend_follow (spot+PERP) | momentum (spot). disabled_strategies in guardrails.yaml still apply to "all".',
+      describe: 'Card: trend_follow (A1 2.5/6.0 per-symbol pins asserted). momentum | all are off-card sensitivity runs.',
     })
     .option('initial-capital', { type: 'number', default: 1000, describe: 'Starting equity (TASK_018 E1 uses $1,000)' })
     .option('fee-tier', {
       type: 'string',
-      describe: 'Fee pass tier: intro1 (60/120) | t1k (35/75) | t10k (25/40) | custom:<maker>,<taker>. Default per TF: intro1 for 4h/1d, t1k for 1h (the tier a $1K account sits in at that frequency).',
+      describe: 'Fee-book pass tier. Default = guardrails spot bucket = GO fee book (40 bps/side, 80 RT). intro1 | t1k | t10k | custom:<maker>,<taker> make it a sensitivity run (never GO). Stress 25/75/120 runs separately via --fee-stress.',
     })
-    .option('ev-gate', { type: 'string', choices: ['enforce', 'shadow', 'off'], default: 'enforce', describe: 'EV-gate mode for the FEE pass (zero-fee pass is always off)' })
+    .option('ev-gate', { type: 'string', choices: ['enforce', 'shadow', 'off'], default: 'enforce', describe: 'EV-gate mode for the fee-book pass (card: enforce; zero-fee pass is always off)' })
     .option('regime-gates', { type: 'string', choices: ['on', 'off'], default: 'on' })
-    .option('venue', { type: 'string', choices: ['spot', 'perps'], describe: 'Force venue class. Default: inferred per symbol (spot for XXX-USD; long-only).' })
-    .option('fixture-dir', { type: 'string', describe: 'Load <dir>/<SYMBOL>.json fixtures (one timeframe per directory). Omit to read Supabase public.bars (15m, rolled up to the TF).' })
-    .option('min-coverage', { type: 'number', default: 0.5, describe: 'Native-load coverage floor before DATA_UNAVAILABLE (0 disables)' })
-    .option('min-bucket-fill', { type: 'number', default: 0.5, describe: 'Rollup: min fraction of sub-bars a bucket needs to be kept (only when stored bars are finer than the TF)' })
+    .option('cooldown-bars', { type: 'number', default: E4_CARD.cooldownBars, describe: 'Min hold in BARS before an opposite-signal exit (card: 1 × 4H bar; live trade_cooldown_min analog on the bar clock). Must be ≥ 1.' })
+    .option('min-coverage', { type: 'number', default: 0.5, describe: 'Fixture coverage floor before DATA_UNAVAILABLE (0 disables)' })
     .option('mc-runs', { type: 'number', default: 2000, describe: 'Monte Carlo replicates' })
     .option('mc-block', { type: 'string', choices: ['month', 'trade', 'none'], describe: 'Bootstrap unit. Default per TF: month for 4h/1h, trade for 1d.' })
     .option('seed', { type: 'number', default: 20260910, describe: 'PRNG seed (deterministic MC)' })
-    .option('zero-fee-pf-min', { type: 'number', describe: 'Override the zero-fee PF fail-fast threshold (defaults: 4h 1.61 · 1d 1.44 · 1h 2.25)' })
-    .option('min-zero-fee-trades', { type: 'number', default: 10, describe: 'Below this zero-fee trade count the run is INCONCLUSIVE and stops' })
-    .option('min-expected-trades', { type: 'number', describe: 'Override the E[n] gate (defaults: 4h 60 · 1d 100 · 1h 60)' })
-    .option('min-full-window-days', { type: 'number', default: 365, describe: 'Windows shorter than this are SMOKE ONLY (no grade issued)' })
-    .option('smoke-run-all-stages', { type: 'boolean', default: false, describe: 'SMOKE ONLY runs: keep going past a fail-fast so the fee pass and MC are exercised (pipeline validation)' })
-    .option('results-path', { type: 'string', default: path.resolve(process.cwd(), '../../var/backtest_results/e4'), describe: 'Where per-pass backtest_*.json/report_*.txt and the e4_*.json/.md live' })
+    .option('fee-stress', { type: 'boolean', default: true, describe: `Run separate ${E4_CARD.stressBpsPerSide.join('/')} bps-per-side stress passes after the fee book (informational; never cherry-picked). --no-fee-stress to skip.` })
+    .option('run-card', {
+      type: 'string',
+      describe: 'Run card id (Algo Creator Beta CLEAR / Algo Alpha card). Required for a FULL (≥ 365d) REAL window to be graded; without it the run is UNGRADED. Recorded on line 1, in E4_RESULT and in the eval ledger.',
+    })
+    .option('smoke-run-all-stages', { type: 'boolean', default: false, describe: 'SMOKE ONLY windows: keep going past a STOP so MC/stress are exercised (pipeline validation; never evidence)' })
+    .option('results-path', { type: 'string', default: path.resolve(process.cwd(), '../../var/backtest_results/e4'), describe: 'Where per-pass backtest_*.json/report_*.txt, e4_*.json/.md and E4_EVAL_LEDGER.jsonl live' })
+    // Floors, bars and the card are LOCKED: no --zero-fee-pf-min / --min-expected-trades /
+    // --allow-synthetic. strict() makes any such attempt a hard error instead of a silent no-op.
+    .strict()
     .help()
     .parse();
 
@@ -85,21 +108,29 @@ async function main(): Promise<void> {
 
   const tf = parseTimeframe(String(argv.tf));
   const policy = E4_TF_POLICY[tf];
-  const startDate = new Date(String(argv.startDate));
-  const endDate = new Date(String(argv.endDate));
+  const preset = argv.window ? E4_WALK_FORWARD[String(argv.window) as 'eval' | 'tune'] : undefined;
+  const startRaw = argv.startDate ? String(argv.startDate) : preset?.start;
+  const endRaw = argv.endDate ? String(argv.endDate) : preset?.end;
+  if (!startRaw || !endRaw) {
+    throw new Error('Pass --window eval|tune or both --start-date and --end-date.');
+  }
+  const startDate = new Date(startRaw);
+  const endDate = new Date(endRaw);
   if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime()) || endDate <= startDate) {
     throw new Error('Invalid --start-date/--end-date (end must be after start)');
   }
-
-  const fixtureDir = argv.fixtureDir ? path.resolve(process.cwd(), String(argv.fixtureDir)) : undefined;
-  const SUPABASE_URL = process.env.SUPABASE_URL || '';
-  const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
-  if (!fixtureDir && (!SUPABASE_URL || !SUPABASE_SERVICE_KEY)) {
-    console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY — pass --fixture-dir <dir> to run offline on committed fixtures.');
-    process.exit(1);
+  const fixtureRel = argv.fixtureDir
+    ? String(argv.fixtureDir)
+    : preset
+      ? E4_DEFAULT_FIXTURE_DIR[tf][preset.role]
+      : undefined;
+  if (!fixtureRel) {
+    throw new Error(`Pass --fixture-dir <per-TF dir> (no default for --tf ${tf}${preset ? ` --window ${preset.role}` : ''}); see ${policy.fixtureHint}.`);
   }
+  const fixtureDir = path.resolve(process.cwd(), fixtureRel);
 
-  const feeTier = resolveE4FeeTier(tf, argv.feeTier ? String(argv.feeTier) : undefined, guardrails);
+  const feeTier = resolveE4FeeTier(argv.feeTier ? String(argv.feeTier) : undefined, guardrails);
+  const resultsPath = String(argv.resultsPath);
   const request: E4Request = {
     tf,
     startDate,
@@ -110,31 +141,27 @@ async function main(): Promise<void> {
     feeTier,
     evGateMode: String(argv.evGate) as EvGateMode,
     regimeGates: String(argv.regimeGates) !== 'off',
-    venueOverride: argv.venue ? (String(argv.venue) as MarketVenue) : undefined,
-    data: { minCoverage: Number(argv.minCoverage), minBucketFill: Number(argv.minBucketFill) },
+    fixtureDir,
+    minCoverage: Number(argv.minCoverage),
+    cooldownBars: Number(argv.cooldownBars),
     mc: {
       runs: Number(argv.mcRuns),
       block: (argv.mcBlock ? String(argv.mcBlock) : policy.defaultMcBlock) as McBlockMode,
       seed: Number(argv.seed),
     },
-    zeroFeePfMin: argv.zeroFeePfMin !== undefined ? Number(argv.zeroFeePfMin) : undefined,
-    minZeroFeeTrades: Number(argv.minZeroFeeTrades),
-    minExpectedTrades: argv.minExpectedTrades !== undefined ? Number(argv.minExpectedTrades) : undefined,
-    minFullWindowDays: Number(argv.minFullWindowDays),
+    feeStress: Boolean(argv.feeStress),
+    runCard: argv.runCard ? String(argv.runCard) : undefined,
+    evalLedgerPath: path.join(resultsPath, 'E4_EVAL_LEDGER.jsonl'),
     smokeRunAllStages: Boolean(argv.smokeRunAllStages),
   };
 
   logger.info('E4 harness starting', {
-    tf, barMinutes: policy.barMinutes, policy: policy.status, startDate, endDate, products: request.products,
-    strategy: request.strategy, feeTier, evGateMode: request.evGateMode, mc: request.mc, fixtureDir,
-    dataSource: fixtureDir ? 'fixture' : 'supabase',
+    tf, barMinutes: policy.barMinutes, policy: policy.status, window: preset?.role ?? 'custom', startDate, endDate, products: request.products,
+    strategy: request.strategy, feeTier, evGateMode: request.evGateMode, cooldownBars: request.cooldownBars, mc: request.mc, feeStress: request.feeStress,
+    fixtureDir, runCard: request.runCard ?? null, floors: { zeroFeePf: policy.zeroFeePfMin, minExpectedTrades: policy.minExpectedTrades },
   });
 
-  const resultsPath = String(argv.resultsPath);
-  const runner = new BacktestRunner(
-    { resultsPath, supabaseUrl: SUPABASE_URL || undefined, supabaseKey: SUPABASE_SERVICE_KEY || undefined, fixtureDir },
-    logger,
-  );
+  const runner = new BacktestRunner({ resultsPath, fixtureDir }, logger);
 
   try {
     const report = await runE4(request, runner, guardrails, logger);
@@ -142,8 +169,8 @@ async function main(): Promise<void> {
 
     await fs.mkdir(resultsPath, { recursive: true });
     const stamp = new Date().toISOString().replace(/:/g, '-').split('.')[0];
-    const jsonPath = path.join(resultsPath, `e4_${tf}_${stamp}.json`);
-    const mdPath = path.join(resultsPath, `e4_${tf}_${stamp}.md`);
+    const jsonPath = path.join(resultsPath, `e4_${tf}_${report.window.role}_${stamp}.json`);
+    const mdPath = path.join(resultsPath, `e4_${tf}_${report.window.role}_${stamp}.md`);
     await fs.writeFile(jsonPath, JSON.stringify(report, null, 2));
     await fs.writeFile(mdPath, `${text}\n`);
 
@@ -151,15 +178,15 @@ async function main(): Promise<void> {
     console.log(text);
     console.log(`E4 artefacts: ${jsonPath}`);
     console.log(`              ${mdPath}`);
-    logger.info('E4 harness complete', { tf, label: report.label, verdict: report.verdict, jsonPath, mdPath });
+    logger.info('E4 harness complete', { tf, window: report.window.role, label: report.label, graded: report.graded, verdict: report.verdict, preflight: report.preflight, jsonPath, mdPath });
   } catch (error) {
     if (isDataUnavailableError(error)) {
       logger.error('E4 harness aborted: DATA_UNAVAILABLE', { symbol: error.symbol, windowStart: error.windowStart, windowEnd: error.windowEnd });
       console.error(`\n${error.message}`);
       process.exit(2);
     }
-    if (isBarAggregationError(error)) {
-      logger.error('E4 harness aborted: BAR_AGGREGATION_INVALID', { message: error.message });
+    if (isBarAggregationError(error) || isE4DataPathError(error)) {
+      logger.error('E4 harness aborted: not the card experiment', { message: error.message });
       console.error(`\n${error.message}`);
       process.exit(2);
     }
@@ -168,7 +195,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Supabase client keeps handles open (see cli/backtest.ts) — exit explicitly.
   process.exit(0);
 }
 

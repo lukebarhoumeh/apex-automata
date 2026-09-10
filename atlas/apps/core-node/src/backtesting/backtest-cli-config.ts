@@ -114,6 +114,17 @@ export interface BacktestConfigInput {
   regimeGates: boolean;
   /** `--slippage` as a decimal rate; maps onto realism.entrySlippageBps. */
   slippageRate?: number;
+  /**
+   * Min hold (in BARS) before an opposite-direction signal may close a
+   * position — live `trade_cooldown_min` analog on the bar clock. Default 0
+   * (`pnpm backtest` unchanged); the E4 harness passes 1.
+   */
+  minHoldBars?: number;
+  /**
+   * Apply the live pre-entry ATR volatility filter (`guardrails.filters`).
+   * Default true — backtest/live parity. Set false only for legacy comparison.
+   */
+  applyAtrVolatilityFilter?: boolean;
 }
 
 /**
@@ -211,5 +222,16 @@ export function buildBacktestConfig(input: BacktestConfigInput, guardrails: Guar
       // TASK_017 B5: `--slippage` (decimal) overrides the guardrails bps.
       ...(input.slippageRate !== undefined ? { entrySlippageBps: input.slippageRate * 10_000 } : {}),
     },
+    // Live parity (E4 card 2026-09-10): the same pre-entry ATR volatility
+    // filter api/server.ts applies (`filters.atr_volatility_min/max`).
+    ...(input.applyAtrVolatilityFilter === false
+      ? {}
+      : {
+          filters: {
+            atrVolatilityMin: guardrails.filters.atr_volatility_min,
+            atrVolatilityMax: guardrails.filters.atr_volatility_max,
+          },
+        }),
+    ...(input.minHoldBars ? { execution: { minHoldBars: input.minHoldBars } } : {}),
   };
 }

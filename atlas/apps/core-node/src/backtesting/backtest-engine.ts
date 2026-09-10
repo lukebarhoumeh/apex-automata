@@ -236,6 +236,28 @@ export interface BacktestConfig {
   perSymbolOverrides?: PerSymbolStrategyOverrides;
   /** Realism knobs (look-ahead, overshoot, slippage). */
   realism?: BacktestRealismConfig;
+  /**
+   * Live pre-entry filters mirrored from `guardrails.filters` (api/server.ts
+   * routing stage `atr_vol`): an entry whose signal ATR% (`indicators.atr /
+   * price`) is below `atrVolatilityMin` or above `atrVolatilityMax` is
+   * rejected with the same telemetry reason as live. Absent = no filter
+   * (pre-E4 behaviour).
+   */
+  filters?: {
+    atrVolatilityMin?: number;
+    atrVolatilityMax?: number;
+  };
+  /**
+   * Execution-rule parity knobs.
+   *  - `minHoldBars`: an opposite-direction signal may NOT close a position
+   *    held for fewer than this many BARS (bar clock, not wall clock). Live
+   *    analog: `strategy.trade_cooldown_min` (15 min = 1 × 15m bar), routing
+   *    reason `exit_position_too_young`. Stops/TPs bypass it exactly as live.
+   *    E4 4H card: 1 bar (= 240 min). Default 0 (pre-E4 behaviour).
+   */
+  execution?: {
+    minHoldBars?: number;
+  };
 }
 
 export interface BacktestTrade {
@@ -280,6 +302,8 @@ export interface BacktestPosition {
   size: number;
   entryPrice: number;
   entryTimestamp: Date;
+  /** Timeline step the entry filled on (drives `execution.minHoldBars`). */
+  entryBarIndex: number;
   unrealizedPnl: number;
   trades: BacktestTrade[];
 }
@@ -330,6 +354,10 @@ export interface BacktestMetrics {
   evGate: EvGateStats;
   /** Entries bucketed by the regime label the signal carried. */
   entriesByRegime: Record<string, number>;
+  /** Entries rejected by the live-parity ATR volatility filter (`filters`). */
+  atrFilterRejects: number;
+  /** Opposite-signal exits ignored because the position was younger than `execution.minHoldBars`. */
+  exitsIgnoredMinHold: number;
 }
 
 /** Regime-gate (RegimeFilter) state snapshot for the report. */
@@ -443,6 +471,9 @@ export class BacktestEngine extends EventEmitter {
   private sellSignalExits: number = 0;
   private shortBlocked: number = 0;
   private entriesByRegime: Record<string, number> = {};
+  private atrFilterRejects: number = 0;
+  private exitsIgnoredMinHold: number = 0;
+  private readonly minHoldBars: number;
 
   constructor(config: BacktestConfig, logger: Logger) {
     super();
@@ -465,6 +496,8 @@ export class BacktestEngine extends EventEmitter {
       ? Number(config.evGate?.minEvThreshold)
       : 0;
     this.evGatePrior = config.evGate?.prior ?? DEFAULT_WIN_RATE_PRIOR;
+    const minHold = config.execution?.minHoldBars ?? 0;
+    this.minHoldBars = Number.isInteger(minHold) && minHold > 0 ? minHold : 0;
     this.evGateStats = {
       mode: this.evGateMode,
       evaluated: 0,
@@ -992,11 +1025,35 @@ export class BacktestEngine extends EventEmitter {
       const isOppositeOfLong = position.side === 'long' && signal.direction === 'sell';
       const isOppositeOfShort = position.side === 'short' && signal.direction === 'buy';
       if (isOppositeOfLong || isOppositeOfShort) {
+        // Live parity: `trade_cooldown_min` min-hold (api/server.ts routing,
+        // reason `exit_position_too_young`), expressed in BARS on the bar
+        // clock. Stops/TPs are handled in checkExitConditions and bypass it.
+        const barsHeld = this.barIndex - position.entryBarIndex;
+        if (this.minHoldBars > 0 && barsHeld < this.minHoldBars) {
+          this.exitsIgnoredMinHold += 1;
+          recordSignalFiltered(this.logger, {
+            stage: 'routing',
+            reason: 'exit_position_too_young',
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            signalId: signal.id,
+            direction: signal.direction,
+            strength: signal.strength,
+            context: { source: 'backtest_engine', barsHeld, minHoldBars: this.minHoldBars },
+          });
+          return;
+        }
         if (isOppositeOfLong && !this.isShortAllowed(signal.symbol)) {
           this.sellSignalExits += 1;
         }
         this.closePosition(signal.symbol, signal.price, barTime, 'signal');
       }
+      return;
+    }
+
+    // Live parity: ATR volatility filter (api/server.ts routing stage
+    // `atr_vol`) — same inputs (signal ATR / signal price) and reasons.
+    if (this.config.filters && !this.passesAtrVolatilityFilter(signal)) {
       return;
     }
 
@@ -1032,6 +1089,40 @@ export class BacktestEngine extends EventEmitter {
       // Legacy same-bar fill mode — kept only for parity testing.
       this.openPositionAt(signal, signal.price, barTime);
     }
+  }
+
+  /**
+   * Live-parity ATR volatility filter. Mirrors api/server.ts: reads
+   * `signal.metadata.indicators.atr`, computes ATR% against the signal price
+   * and rejects outside `[atrVolatilityMin, atrVolatilityMax]`. A signal
+   * without a usable ATR passes (same as live).
+   */
+  private passesAtrVolatilityFilter(signal: Signal): boolean {
+    const atrMin = this.config.filters?.atrVolatilityMin;
+    const atrMax = this.config.filters?.atrVolatilityMax;
+    const indicators = signal.metadata?.indicators as Record<string, unknown> | undefined;
+    const atrValue = indicators?.atr;
+    if (typeof atrValue !== 'number' || !(atrValue > 0) || !(signal.price > 0)) {
+      return true;
+    }
+    const atrPct = atrValue / signal.price;
+    const belowMin = typeof atrMin === 'number' && atrPct < atrMin;
+    const aboveMax = typeof atrMax === 'number' && atrPct > atrMax;
+    if (!belowMin && !aboveMax) {
+      return true;
+    }
+    this.atrFilterRejects += 1;
+    recordSignalFiltered(this.logger, {
+      stage: 'atr_vol',
+      reason: belowMin ? 'atr_below_min' : 'atr_above_max',
+      symbol: signal.symbol,
+      strategy: signal.strategy,
+      signalId: signal.id,
+      direction: signal.direction,
+      strength: signal.strength,
+      context: { source: 'backtest_engine', atrPct, atrMin, atrMax },
+    });
+    return false;
   }
 
   private fillPendingAtOpen(product: string, candle: OHLCV, timestamp: Date): void {
@@ -1140,6 +1231,7 @@ export class BacktestEngine extends EventEmitter {
       size: positionSize,
       entryPrice: trade.entryPrice,
       entryTimestamp: fillTimestamp,
+      entryBarIndex: this.barIndex,
       unrealizedPnl: 0,
       trades: [trade],
     };
@@ -1678,6 +1770,8 @@ export class BacktestEngine extends EventEmitter {
         rejectedByStrategy: { ...this.evGateStats.rejectedByStrategy },
       },
       entriesByRegime: { ...this.entriesByRegime },
+      atrFilterRejects: this.atrFilterRejects,
+      exitsIgnoredMinHold: this.exitsIgnoredMinHold,
     };
   }
 
