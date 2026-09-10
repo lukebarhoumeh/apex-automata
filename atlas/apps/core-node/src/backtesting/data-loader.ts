@@ -95,13 +95,32 @@ export interface DataProvenance {
   fixturePath?: string;
   fixtureSha256?: string;
   loadTimeMs: number;
+  /**
+   * Present when the series was rolled up from finer stored bars
+   * (`--bar-minutes`, TASK_017 step 5 / E4). Absent = native stored bars.
+   * Shape is `AggregationSummary` from `bar-aggregation.ts`.
+   */
+  aggregation?: {
+    targetMinutes: number;
+    sourceMinutes: number;
+    sourceCandleCount: number;
+    outputCandleCount: number;
+    subBarsPerBucket: number;
+    bucketsDropped: number;
+    partialBucketsKept: number;
+    minBucketFill: number;
+  };
 }
 
-export interface DataLoaderResult {
+/** Minimal `{ candles, provenance }` pair a data provider hands the engine. */
+export interface DataProviderOutputLike {
   candles: OHLCV[];
+  provenance: DataProvenance;
+}
+
+export interface DataLoaderResult extends DataProviderOutputLike {
   source: DataSource;
   loadTime: number;
-  provenance: DataProvenance;
 }
 
 /**

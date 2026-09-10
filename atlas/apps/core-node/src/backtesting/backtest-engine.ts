@@ -778,6 +778,27 @@ export class BacktestEngine extends EventEmitter {
 
     this.signalProcessor = new SignalProcessor(signalConfig, this.logger);
 
+    // Strategy selector toggles (E4 harness, 2026-09-10). `BaseStrategy.enabled`
+    // defaults to true and the constructor config's `enabled: false` never
+    // flips it, so before this only trend_follow (below) honoured its
+    // toggle: `--strategy trend_follow` still ran momentum, contaminating
+    // every single-strategy expectancy. Apply the toggles explicitly at the
+    // registry, the same way trend_follow always has. Strategies on the
+    // guardrails kill list were never registered; disable() is a no-op there.
+    const selectorToggles: Array<[string, boolean]> = [
+      ['breakout', this.config.signals.breakout.enabled],
+      ['vwap_mr', this.config.signals.vwapMeanReversion.enabled],
+      ['momentum', this.config.signals.momentum.enabled],
+    ];
+    for (const [strategyId, enabled] of selectorToggles) {
+      if (this.disabledStrategies.has(strategyId)) continue;
+      if (enabled) {
+        this.signalProcessor.enableStrategy(strategyId);
+      } else {
+        this.signalProcessor.disableStrategy(strategyId);
+      }
+    }
+
     // Defect #1 — apply optional global trend_follow params. Per-symbol
     // overrides (e.g. ETH-USD emaFast=12 / emaSlow=15) flow through
     // perSymbolOverrides below.

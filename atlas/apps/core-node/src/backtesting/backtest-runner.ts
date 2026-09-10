@@ -1,6 +1,7 @@
 import { Logger } from '../core/logger';
 import { BacktestEngine, BacktestConfig, BacktestResult } from './backtest-engine';
-import { HistoricalDataLoader, LoadCandlesOptions, DataProvenance } from './data-loader';
+import { HistoricalDataLoader, LoadCandlesOptions, DataProvenance, DEFAULT_GRANULARITY_SECONDS } from './data-loader';
+import { withBarAggregation, describeBarTimeframe, type SeriesProvider } from './bar-aggregation';
 import fs from 'fs/promises';
 import path from 'path';
 
@@ -23,6 +24,21 @@ export interface BacktestRunnerConfig {
 export interface BacktestDataOptions extends LoadCandlesOptions {
   /** Granularity of the stored bars (default 900 = 15m). */
   granularitySeconds?: number;
+  /**
+   * Bar size the ENGINE runs on (TASK_017 step 5 / E4 frequency lever).
+   * When it differs from the stored spacing, series are rolled up
+   * UTC-aligned after the fail-closed native load (`bar-aggregation.ts`).
+   * Default: stored spacing (no aggregation).
+   */
+  barMinutes?: number;
+  /** Min fraction of sub-bars a rolled-up bucket needs to be kept (default 0.5). */
+  minBucketFill?: number;
+}
+
+/** Where `saveResults` wrote a run, so harnesses can cross-reference. */
+export interface SavedBacktestPaths {
+  jsonPath: string;
+  reportPath: string;
 }
 
 /** Fee-tier label + bps as resolved by the CLI, echoed into the report. */
@@ -34,6 +50,12 @@ export interface FeeTierLabel {
 
 export interface BacktestReportOptions {
   feeTier?: FeeTierLabel;
+  /**
+   * Suffix for the saved `backtest_<ts>[_<tag>].json` / `report_…` files.
+   * Multi-pass harnesses set this so two passes in the same second cannot
+   * overwrite each other (the timestamp alone is second-resolution).
+   */
+  fileTag?: string;
 }
 
 export class BacktestRunner {
@@ -67,49 +89,98 @@ export class BacktestRunner {
     dataOptions: BacktestDataOptions = {},
     reportOptions: BacktestReportOptions = {},
   ): Promise<BacktestResult> {
+    const { result } = await this.runBacktestDetailed(config, dataOptions, reportOptions);
+    return result;
+  }
+
+  /**
+   * Same as {@link runBacktest} but also returns where the run was saved.
+   * Accepts a pre-built provider (e.g. a memoized one shared across the
+   * zero-fee and fee passes of the E4 harness) — when omitted one is built
+   * from `dataOptions` via {@link createDataProvider}.
+   */
+  public async runBacktestDetailed(
+    config: BacktestConfig,
+    dataOptions: BacktestDataOptions = {},
+    reportOptions: BacktestReportOptions = {},
+    provider: SeriesProvider = this.createDataProvider(dataOptions),
+  ): Promise<{ result: BacktestResult; saved: SavedBacktestPaths | null }> {
     this.logger.info('Running backtest', {
       startDate: config.startDate,
       endDate: config.endDate,
       products: config.products,
       allowSynthetic: Boolean(dataOptions.allowSynthetic),
       fixtureDir: this.config.fixtureDir,
+      barMinutes: dataOptions.barMinutes ?? 'native',
     });
 
     const engine = new BacktestEngine(config, this.logger);
-    await engine.loadHistoricalData(this.dataLoader.createDataProvider(dataOptions));
+    await engine.loadHistoricalData(provider);
     const result = await engine.run();
-    await this.saveResults(result, reportOptions);
+    const saved = await this.saveResults(result, reportOptions);
 
-    return result;
+    return { result, saved };
   }
 
   /**
-   * Save backtest results
+   * Build the series provider for a run: fail-closed native load, then an
+   * optional UTC-aligned rollup to `dataOptions.barMinutes`. Exposed so
+   * multi-pass harnesses can load once and reuse.
    */
-  private async saveResults(result: BacktestResult, reportOptions: BacktestReportOptions): Promise<void> {
+  public createDataProvider(dataOptions: BacktestDataOptions = {}): SeriesProvider {
+    const { barMinutes, minBucketFill, ...loaderOptions } = dataOptions;
+    const native: SeriesProvider = this.dataLoader.createDataProvider(loaderOptions);
+    const nativeMinutes = (loaderOptions.granularitySeconds ?? DEFAULT_GRANULARITY_SECONDS) / 60;
+    if (barMinutes === undefined || barMinutes === nativeMinutes) {
+      return native;
+    }
+    return withBarAggregation(native, barMinutes, { minBucketFill }, this.logger);
+  }
+
+  /**
+   * Save backtest results. Returns the written paths, or null when the
+   * write failed (logged; a failed save never aborts the run).
+   */
+  private async saveResults(result: BacktestResult, reportOptions: BacktestReportOptions): Promise<SavedBacktestPaths | null> {
     try {
       // Ensure directory exists
       await fs.mkdir(this.config.resultsPath, { recursive: true });
 
-      // Generate filename with timestamp
+      // Filename = second-resolution timestamp [+ caller tag]; a collision
+      // guard appends -2, -3, … so back-to-back runs never overwrite.
       const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0];
-      const filename = `backtest_${timestamp}.json`;
-      const filepath = path.join(this.config.resultsPath, filename);
+      const tag = reportOptions.fileTag ? `_${reportOptions.fileTag.replace(/[^A-Za-z0-9_-]+/g, '-')}` : '';
+      const stem = await this.uniqueStem(`${timestamp}${tag}`);
+      const filepath = path.join(this.config.resultsPath, `backtest_${stem}.json`);
 
       // Save full results
       await fs.writeFile(filepath, JSON.stringify(result, null, 2));
 
       // Also save a summary report
-      const reportFilename = `report_${timestamp}.txt`;
-      const reportPath = path.join(this.config.resultsPath, reportFilename);
+      const reportPath = path.join(this.config.resultsPath, `report_${stem}.txt`);
 
       const report = this.generateReport(result, reportOptions);
       await fs.writeFile(reportPath, report);
 
       this.logger.info(`Saved backtest results to ${filepath}`);
       this.logger.info(`Saved report to ${reportPath}`);
+      return { jsonPath: filepath, reportPath };
     } catch (error) {
       this.logger.error('Failed to save backtest results:', error);
+      return null;
+    }
+  }
+
+  /** First `stem`, `stem-2`, `stem-3`, … whose `backtest_<stem>.json` does not exist yet. */
+  private async uniqueStem(base: string): Promise<string> {
+    let stem = base;
+    for (let i = 2; ; i++) {
+      try {
+        await fs.access(path.join(this.config.resultsPath, `backtest_${stem}.json`));
+        stem = `${base}-${i}`;
+      } catch {
+        return stem;
+      }
     }
   }
 
@@ -138,9 +209,7 @@ export class BacktestRunner {
       .map((p) => describeProvenance(p))
       .join('\n') || '(no data provenance recorded)';
 
-    const barMinutes = Array.from(
-      new Set(Object.values(result.dataProvenance ?? {}).map((p) => p.inferredBarMinutes ?? 'n/a')),
-    ).join(', ') || 'n/a';
+    const barTimeframe = describeBarTimeframe(Object.values(result.dataProvenance ?? {}));
 
     const venueLines = Object.entries(result.venueBySymbol ?? {})
       .map(([symbol, venue]) => `${symbol}: ${venue}${config.venueOverride ? ' (forced via --venue)' : ''}`)
@@ -169,7 +238,7 @@ BACKTEST REPORT
 Data Provenance:
 ----------------
 ${provenanceLines}
-Bar timeframe: ${barMinutes} min (native stored bars; no aggregation)
+Bar timeframe: ${barTimeframe}
 
 Configuration:
 --------------
@@ -368,10 +437,14 @@ function describeProvenance(p: DataProvenance): string {
   const coveragePct = `${(p.coverage * 100).toFixed(1)}%`;
   const fixture = p.fixturePath ? `  fixture=${path.basename(p.fixturePath)} sha256=${(p.fixtureSha256 ?? '').slice(0, 12)}` : '';
   const stamp = p.source === 'synthetic' ? '  [SYNTHETIC — VOID]' : '';
+  const agg = p.aggregation && p.aggregation.subBarsPerBucket > 1
+    ? `  aggregated=${p.aggregation.sourceMinutes}m→${p.aggregation.targetMinutes}m from ${p.aggregation.sourceCandleCount} bars ` +
+      `(dropped=${p.aggregation.bucketsDropped} partialKept=${p.aggregation.partialBucketsKept})`
+    : '';
   return (
     `${p.symbol.padEnd(14)} source=${p.source.padEnd(9)} bars=${String(p.candleCount).padStart(6)}/${String(p.expectedCount).padEnd(6)} ` +
     `coverage=${coveragePct.padStart(6)}  spacing=${p.inferredBarMinutes ?? 'n/a'}m  ` +
-    `first=${p.firstBarTime ?? 'n/a'} last=${p.lastBarTime ?? 'n/a'}${fixture}${stamp}`
+    `first=${p.firstBarTime ?? 'n/a'} last=${p.lastBarTime ?? 'n/a'}${fixture}${agg}${stamp}`
   );
 }
 
