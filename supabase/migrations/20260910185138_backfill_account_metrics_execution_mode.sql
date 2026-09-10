@@ -1,0 +1,29 @@
+-- =============================================================================
+-- RECONCILIATION STUB — version 20260910185138
+-- (name: backfill_account_metrics_execution_mode)
+-- =============================================================================
+-- This file is intentionally a no-op. It exists ONLY so that the local
+-- supabase/migrations/ manifest matches `supabase_migrations.schema_migrations`
+-- on the linked project, which records this version as applied on 2026-09-10
+-- 18:51:38 UTC. Without a file here, `supabase db push` and Supabase Preview
+-- refuse to run ("Remote migration versions not found in local migrations
+-- directory").
+--
+-- What it is: a DUPLICATE APPLY STAMP of 20260910180200. The TM-authorised MCP
+-- apply of `20260910180200_backfill_account_metrics_execution_mode.sql` was
+-- recorded by the Supabase MCP `apply_migration` under its own apply-time
+-- version (185138) with the same name, in addition to the repo version
+-- (180200). Verified read-only on 2026-09-10 ~19:00 UTC: the recorded
+-- `statements` of 20260910185138 are identical to the repo file for
+-- 20260910180200 after stripping comments and whitespace
+-- (md5 c7510556766652a4ac439c78773a25e1 on both sides).
+--
+-- Source of truth for this DDL stays `20260910180200_*.sql`. DO NOT copy the
+-- SQL here: two live bodies for the same DDL would re-run it on every fresh
+-- chain (Supabase Preview). On prod the runner skips this version (already
+-- recorded); on a fresh chain it sorts after 20260910180200..180400 and is a
+-- no-op. Version stamp MUST stay 20260910185138 to match the remote history;
+-- do not rename.
+-- =============================================================================
+
+SELECT 1;
