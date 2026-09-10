@@ -56,6 +56,7 @@ The backend uses `tsx` to run TypeScript directly (no compilation step needed fo
 | Frontend build | `pnpm build` |
 | Frontend lint | `pnpm lint` |
 | Backend tests | `cd atlas/apps/core-node && pnpm test` |
+| Config drift check (single-source guardrails + desk pins) | `cd atlas/apps/core-node && pnpm check:config` |
 | Start engine | `curl -X POST localhost:3001/api/engine/start -H 'Content-Type: application/json' -d '{"mode":"paper"}'` |
 | Engine status | `curl localhost:3001/api/status` |
 | Health check | `curl localhost:3001/health` |
