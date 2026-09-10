@@ -1,35 +1,49 @@
 /**
  * E4 multi-timeframe FeeModel expectancy harness (TASK_018 E4, TM-corrected).
  *
- * One invocation = ONE timeframe. Desk run order: 4H first (month-block MC
- * default) → 1D next (EXPLORATORY unless E[n] ≥ 100) → 1H demoted (never
- * GO-eligible here; zero-fee fail-fast 2.25; not a marketable-fill lead).
- * 15m is refused: FeeModel 15m spot trend_follow is NO-GO per desk.
+ * One invocation = ONE timeframe on ONE per-timeframe fixture directory.
+ * Desk run order: 4H first (month-block MC default) → 1D next (EXPLORATORY
+ * unless E[n] ≥ 100) → 1H demoted (never GO-eligible here; not a
+ * marketable-fill lead). 15m is refused: FeeModel 15m spot trend_follow is
+ * NO-GO per desk.
  *
  * Pipeline per run (fail-fast, in this order):
- *   0. Data: fail-closed loader, DATA stamp. SYNTHETIC ⇒ VOID, nothing else runs.
- *   1. Zero-fee pass (commission 0, EV gate off) ⇒ raw-signal PF. If n is
- *      below `minZeroFeeTrades` ⇒ INCONCLUSIVE; if PF < TF threshold
- *      (1H 2.25 · 4H 1.61 · 1D 1.44, live-readiness audit §4.1) ⇒ NO-GO.
- *      Fee pass and Monte Carlo are skipped on either.
- *   2. Fee pass at the tier-consistent FeeModel (EV gate = live parity by
- *      default) ⇒ expectancy stats, E[n] (12-month trade count), gates.
+ *   0. Data: fail-closed loader on a per-TF fixture directory (Dev Backtest
+ *      fixtures-only PRs: `fixtures/bars/4h/<window>`, `fixtures/bars/1d`).
+ *      The fixture's declared bar width MUST equal the TF — the harness never
+ *      rolls 15m gate fixtures up on the fly (that is `pnpm backtest
+ *      --bar-minutes`, a different tool). Spot products only. SYNTHETIC ⇒
+ *      VOID, nothing else runs (there is no --allow-synthetic here).
+ *   1. Zero-fee pass (commission 0, EV gate off) ⇒ raw-signal PF against the
+ *      LOCKED floors {@link E4_ZERO_FEE_PF_FLOOR}: zf PF < floor ⇒ STOP (fee
+ *      pass and Monte Carlo never run). Fewer than
+ *      {@link E4_MIN_ZERO_FEE_TRADES} trades ⇒ INCONCLUSIVE, also STOP.
+ *   2. Fee pass at the FeeModel (default: guardrails.yaml spot bucket =
+ *      "FeeModel 40", 25/40 bps; `--fee-tier` for tier-consistent re-runs),
+ *      EV gate = live parity by default ⇒ expectancy stats, E[n] (12-month
+ *      trade count), TASK_018 gates.
  *   3. Monte Carlo bootstrap on the fee-pass trades (month-block on 4H).
  *
- * LABEL LOCK (desk, 2026-09-10): the run label is DERIVED from the data,
- * never asserted by the operator. REAL data over ≥ `minFullWindowDays`
- * (default 365) is a full window and receives a grade
- * (GO-ELIGIBLE / NO-GO / EXPLORATORY / INCONCLUSIVE). Anything shorter is
- * `SMOKE ONLY` — stats are printed for pipeline validation but NO grade is
- * issued and the numbers must not be packaged as a screen or preflight.
+ * LABEL LOCK (desk, 2026-09-10) — derived, never operator-asserted:
+ *   - DATA: SYNTHETIC anywhere ⇒ VOID.
+ *   - REAL, window < {@link E4_FULL_WINDOW_MIN_DAYS} ⇒ SMOKE ONLY, no grade.
+ *   - REAL, full window ⇒ FULL WINDOW. A grade (GO-ELIGIBLE / NO-GO /
+ *     EXPLORATORY / INCONCLUSIVE) is issued ONLY under an Algo Alpha run card
+ *     (`--run-card`), i.e. after the desk's Beta design clear. Without one the
+ *     run is UNGRADED: every statistic is printed, no grade is issued.
  *
- * No new dependencies. Financial arithmetic here is on already-realized
- * backtest P&L (floats from the engine); nothing flows to execution.
+ * Floors/gates are constants on purpose (no CLI overrides): the desk locked
+ * them; the cited pre-registration docs (quant-prereg-atr-fee-floors.md,
+ * e4-timeframe-brief.md) are not in the repo, so the values are encoded here
+ * and in docs/research/2026-09-10_e4-multi-tf-feemodel-harness.md.
+ *
+ * No new dependencies. Arithmetic here is on already-realized backtest P&L
+ * (engine floats); nothing flows to execution.
  */
 
 import type { Logger } from '../core/logger';
 import type { GuardrailConfig } from '../config/loadGuardrails';
-import type { MarketVenue } from '../trading/execution/venue-capabilities';
+import { venueForSymbol, type MarketVenue } from '../trading/execution/venue-capabilities';
 import type { BacktestConfig, BacktestResult, BacktestTrade, EvGateMode } from './backtest-engine';
 import type { BacktestDataOptions, BacktestRunner, FeeTierLabel, SavedBacktestPaths } from './backtest-runner';
 import type { DataProvenance } from './data-loader';
@@ -37,11 +51,34 @@ import type { SeriesProvider } from './bar-aggregation';
 import { buildBacktestConfig, buildFeeModel, resolveFeeTier, type StrategySelector } from './backtest-cli-config';
 
 // ---------------------------------------------------------------------------
-// Timeframe policy
+// Locked thresholds + timeframe policy
 // ---------------------------------------------------------------------------
 
 export type E4Timeframe = '4h' | '1d' | '1h';
 export type McBlockMode = 'month' | 'trade' | 'none';
+
+/**
+ * LOCKED (desk 2026-09-10). Zero-fee PF needed for PF 1.2 at 40 bps
+ * (live-readiness audit §4.1). zf PF below the floor ⇒ STOP.
+ */
+export const E4_ZERO_FEE_PF_FLOOR: Readonly<Record<E4Timeframe, number>> = Object.freeze({
+  '4h': 1.61,
+  '1d': 1.44,
+  '1h': 2.25,
+});
+
+/** Minimum 12-month expected trade count for GO eligibility (TM: 1D ≥ 100; TASK_018: ≥ 60/12m). */
+export const E4_MIN_EXPECTED_TRADES: Readonly<Record<E4Timeframe, number>> = Object.freeze({
+  '4h': 60,
+  '1d': 100,
+  '1h': 60,
+});
+
+/** Below this zero-fee trade count a PF is noise: INCONCLUSIVE, STOP. */
+export const E4_MIN_ZERO_FEE_TRADES = 10;
+
+/** Windows shorter than this are SMOKE ONLY (the 4H holdout is exactly 12 months). */
+export const E4_FULL_WINDOW_MIN_DAYS = 365;
 
 export interface E4TimeframePolicy {
   tf: E4Timeframe;
@@ -49,33 +86,36 @@ export interface E4TimeframePolicy {
   /** Desk run order (1 = first). */
   order: number;
   status: 'primary' | 'secondary' | 'demoted';
-  /** Zero-fee PF needed for PF 1.2 at 40 bps (live-readiness audit §4.1). */
+  /** {@link E4_ZERO_FEE_PF_FLOOR}[tf], repeated for report convenience. */
   zeroFeePfMin: number;
-  /** Tier a $1K account would actually be in at this frequency (TASK_018 E4). */
-  defaultFeeTier: 'intro1' | 't1k';
-  defaultMcBlock: McBlockMode;
-  /** Minimum expected 12-month trade count for GO eligibility. */
+  /** {@link E4_MIN_EXPECTED_TRADES}[tf]. */
   minExpectedTrades: number;
+  defaultMcBlock: McBlockMode;
   /** Whether this TF can ever be GO-ELIGIBLE from this harness. */
   goEligible: boolean;
+  /** Per-TF fixture directory Dev Backtest lands (one timeframe per directory). */
+  fixtureHint: string;
   note: string;
 }
 
 export const E4_TF_POLICY: Record<E4Timeframe, E4TimeframePolicy> = {
   '4h': {
-    tf: '4h', barMinutes: 240, order: 1, status: 'primary', zeroFeePfMin: 1.61,
-    defaultFeeTier: 'intro1', defaultMcBlock: 'month', minExpectedTrades: 60, goEligible: true,
-    note: '4H first. Month-block bootstrap default. Gate set: PF ≥ 1.20, E[n] ≥ 60/12m, maxDD ≤ 15%, ≥ 3/4 window-quarters PF ≥ 1.0.',
+    tf: '4h', barMinutes: 240, order: 1, status: 'primary', zeroFeePfMin: E4_ZERO_FEE_PF_FLOOR['4h'],
+    minExpectedTrades: E4_MIN_EXPECTED_TRADES['4h'], defaultMcBlock: 'month', goEligible: true,
+    fixtureHint: 'fixtures/bars/4h/holdout-2025-03_2026-03 (hard-preflight SoT) · fixtures/bars/4h/tune-2023-03_2025-03 (in-sample) · fixtures/bars/4h/smoke-aug2026 (SMOKE ONLY)',
+    note: '4H first. First burn (when cleared): long-only, no synthetic, FeeModel 40, zero-fee fail-fast @ 1.61. Month-block MC. Gates: PF ≥ 1.20, E[n] ≥ 60/12m, maxDD ≤ 15%, ≥ 3/4 window-quarters PF ≥ 1.0.',
   },
   '1d': {
-    tf: '1d', barMinutes: 1440, order: 2, status: 'secondary', zeroFeePfMin: 1.44,
-    defaultFeeTier: 'intro1', defaultMcBlock: 'trade', minExpectedTrades: 100, goEligible: true,
-    note: '1D next. EXPLORATORY if E[n] < 100; GO-eligible only if E[n] ≥ 100 (TM). Trade-level bootstrap default (≈1–3 trades/month makes month blocks degenerate).',
+    tf: '1d', barMinutes: 1440, order: 2, status: 'secondary', zeroFeePfMin: E4_ZERO_FEE_PF_FLOOR['1d'],
+    minExpectedTrades: E4_MIN_EXPECTED_TRADES['1d'], defaultMcBlock: 'trade', goEligible: true,
+    fixtureHint: 'fixtures/bars/1d (native ONE_DAY, 24 months)',
+    note: '1D next. Zero-fee fail-fast @ 1.44. EXPLORATORY if E[n] < 100; GO-eligible only if E[n] ≥ 100 (TM). Trade-level MC default (≈1–3 trades/month makes month blocks degenerate).',
   },
   '1h': {
-    tf: '1h', barMinutes: 60, order: 3, status: 'demoted', zeroFeePfMin: 2.25,
-    defaultFeeTier: 't1k', defaultMcBlock: 'month', minExpectedTrades: 60, goEligible: false,
-    note: '1H DEMOTED: GO-ineligible until the multi-ATR/maker path is proven (E5/E6). Marketable-fill assumption. Do not lead with 1H.',
+    tf: '1h', barMinutes: 60, order: 3, status: 'demoted', zeroFeePfMin: E4_ZERO_FEE_PF_FLOOR['1h'],
+    minExpectedTrades: E4_MIN_EXPECTED_TRADES['1h'], defaultMcBlock: 'month', goEligible: false,
+    fixtureHint: 'a per-TF 1h fixture directory (native ONE_HOUR) — none committed yet',
+    note: '1H DEMOTED: GO-ineligible until the multi-ATR/maker path is proven (E5/E6). Zero-fee fail-fast @ 2.25. Marketable-fill assumption; do not lead with 1H.',
   },
 };
 
@@ -91,6 +131,23 @@ export function parseTimeframe(raw: string | number): E4Timeframe {
   throw new Error(`Unknown --tf "${raw}". Use 4h | 1d | 1h (or 240 | 1440 | 60).`);
 }
 
+/**
+ * Thrown before any engine work when the data path is not an E4 data path:
+ * fixture bar width ≠ TF, non-spot product, or no fixture directory.
+ */
+export class E4DataPathError extends Error {
+  public readonly code: 'E4_FIXTURE_TF_MISMATCH' | 'E4_SPOT_ONLY' | 'E4_FIXTURE_DIR_REQUIRED';
+  constructor(code: E4DataPathError['code'], message: string) {
+    super(`${code}: ${message}`);
+    this.name = 'E4DataPathError';
+    this.code = code;
+  }
+}
+
+export function isE4DataPathError(err: unknown): err is E4DataPathError {
+  return Boolean(err) && typeof err === 'object' && String((err as { code?: string }).code ?? '').startsWith('E4_');
+}
+
 // ---------------------------------------------------------------------------
 // Request / report types
 // ---------------------------------------------------------------------------
@@ -102,26 +159,27 @@ export interface E4Request {
   products: string[];
   strategy: StrategySelector | string;
   initialCapital: number;
+  /** Fee pass tier. Default = guardrails.yaml spot bucket ("FeeModel 40"). */
   feeTier: FeeTierLabel;
   /** EV-gate mode for the FEE pass (the zero-fee pass always runs `off`). */
   evGateMode: EvGateMode;
   regimeGates: boolean;
-  venueOverride?: MarketVenue;
-  /** Loader options (fixtureDir lives on the runner). Never allowSynthetic. */
-  data: Pick<BacktestDataOptions, 'minCoverage' | 'minBucketFill' | 'granularitySeconds'>;
+  /** Per-TF fixture directory (absolute or relative to core-node). Required. */
+  fixtureDir: string;
+  /** Loader coverage floor (native fixture bars). Default 0.5. */
+  minCoverage?: number;
   mc: { runs: number; block: McBlockMode; seed: number };
-  /** Overrides for the policy thresholds (report always prints the effective value). */
-  zeroFeePfMin?: number;
-  minZeroFeeTrades: number;
-  minExpectedTrades?: number;
-  /** Window length (days) below which the run is SMOKE ONLY (default 365). */
-  minFullWindowDays: number;
+  /**
+   * Algo Alpha run card id. Required for a FULL window to be GRADED; without
+   * it the run is UNGRADED (desk burn hold 2026-09-10). Recorded verbatim.
+   */
+  runCard?: string;
   /** SMOKE ONLY runs: keep going past a fail-fast so every stage is exercised. */
   smokeRunAllStages: boolean;
 }
 
 export type E4Label = 'SMOKE' | 'FULL' | 'VOID';
-export type E4Verdict = 'GO-ELIGIBLE' | 'NO-GO' | 'EXPLORATORY' | 'INCONCLUSIVE' | 'SMOKE ONLY' | 'VOID';
+export type E4Verdict = 'GO-ELIGIBLE' | 'NO-GO' | 'EXPLORATORY' | 'INCONCLUSIVE' | 'UNGRADED' | 'SMOKE ONLY' | 'VOID';
 
 export interface QuarterStat {
   index: number;
@@ -209,21 +267,31 @@ export interface E4PassSummary {
 
 export interface E4Report {
   harness: 'e4-multi-tf-feemodel';
-  version: 1;
+  version: 2;
   generatedAt: string;
   label: E4Label;
+  /** True only for FULL windows run under a run card. */
+  graded: boolean;
+  runCard: string | null;
   labelLine: string;
   verdict: E4Verdict;
   reasons: string[];
   tf: E4Timeframe;
   barMinutes: number;
   policy: E4TimeframePolicy;
+  thresholds: {
+    zeroFeePfFloor: number;
+    minZeroFeeTrades: number;
+    minExpectedTrades: number;
+    fullWindowMinDays: number;
+    feePassPfMin: number;
+    maxDrawdownMax: number;
+    quartersMin: string;
+  };
   request: {
     startDate: string; endDate: string; windowDays: number; products: string[]; strategy: string;
     initialCapital: number; feeTier: FeeTierLabel; evGateMode: EvGateMode; regimeGates: boolean;
-    venueOverride: MarketVenue | 'per-symbol'; mc: E4Request['mc']; zeroFeePfMin: number;
-    minZeroFeeTrades: number; minExpectedTrades: number; minFullWindowDays: number; smokeRunAllStages: boolean;
-    data: E4Request['data'];
+    fixtureDir: string; minCoverage: number; mc: E4Request['mc']; smokeRunAllStages: boolean;
   };
   data: { stamp: 'REAL' | 'SYNTHETIC'; provenance: Record<string, DataProvenance>; venueBySymbol: Record<string, MarketVenue> };
   zeroFee: (E4PassSummary & { threshold: number; passed: boolean | null; failFast: 'none' | 'inconclusive' | 'pf'; frequency: TradeFrequency }) | null;
@@ -354,7 +422,7 @@ export function computeTradeFrequency(trades: BacktestTrade[], startDate: Date, 
 /**
  * Split the run window into 4 equal segments ("window quarters") and score
  * each by the trades that EXITED inside it. Deterministic and independent
- * of calendar alignment, so a 2025-03-05 → 2026-03-05 holdout yields exactly
+ * of calendar alignment, so a 2025-03-01 → 2026-03-01 holdout yields exactly
  * four comparable segments.
  */
 export function computeWindowQuarters(trades: BacktestTrade[], startDate: Date, endDate: Date): QuarterStat[] {
@@ -492,18 +560,38 @@ export function runMonteCarlo(
 // Label / gates / verdict (pure)
 // ---------------------------------------------------------------------------
 
-/** Derive the run label from data stamp + window length. Never operator-asserted. */
-export function deriveLabel(stamp: 'REAL' | 'SYNTHETIC', windowDays: number, minFullWindowDays: number): { label: E4Label; line: string } {
+/**
+ * Derive the run label from data stamp, window length and run card. Never
+ * operator-asserted: a FULL window is GRADED only under a run card.
+ */
+export function deriveLabel(
+  stamp: 'REAL' | 'SYNTHETIC',
+  windowDays: number,
+  runCard: string | undefined | null,
+): { label: E4Label; graded: boolean; line: string } {
   if (stamp === 'SYNTHETIC') {
-    return { label: 'VOID', line: 'VOID — DATA: SYNTHETIC (SMOKE/VOID; random-walk candles; not evidence of anything)' };
+    return { label: 'VOID', graded: false, line: 'VOID — DATA: SYNTHETIC (SMOKE/VOID; random-walk candles; not evidence of anything)' };
   }
-  if (windowDays < minFullWindowDays) {
+  if (windowDays < E4_FULL_WINDOW_MIN_DAYS) {
     return {
       label: 'SMOKE',
-      line: `SMOKE ONLY — NOT screen, NOT holdout, NOT Beta hard-preflight (window ${windowDays.toFixed(1)}d < ${minFullWindowDays}d; no grade issued)`,
+      graded: false,
+      line: `SMOKE ONLY — NOT screen, NOT holdout, NOT Beta hard-preflight (window ${windowDays.toFixed(1)}d < ${E4_FULL_WINDOW_MIN_DAYS}d; no grade issued)`,
     };
   }
-  return { label: 'FULL', line: `FULL WINDOW — DATA: REAL, ${windowDays.toFixed(1)}d ≥ ${minFullWindowDays}d (grade issued below)` };
+  const card = runCard?.trim();
+  if (!card) {
+    return {
+      label: 'FULL',
+      graded: false,
+      line: `FULL WINDOW — DATA: REAL, ${windowDays.toFixed(1)}d ≥ ${E4_FULL_WINDOW_MIN_DAYS}d — UNGRADED (burn hold 2026-09-10: pass --run-card <Algo Alpha run card> after Beta design clear; stats only, no grade)`,
+    };
+  }
+  return {
+    label: 'FULL',
+    graded: true,
+    line: `FULL WINDOW — DATA: REAL, ${windowDays.toFixed(1)}d ≥ ${E4_FULL_WINDOW_MIN_DAYS}d — GRADED under run card ${card}`,
+  };
 }
 
 function fmt(x: number | null | undefined, digits = 2): string {
@@ -515,6 +603,7 @@ function fmt(x: number | null | undefined, digits = 2): string {
 
 export interface VerdictInput {
   label: E4Label;
+  graded: boolean;
   policy: E4TimeframePolicy;
   /**
    * `frequency` is the zero-fee E[n] — an UPPER bound on the tier E[n]
@@ -537,8 +626,8 @@ export interface VerdictInput {
 
 /**
  * Build the gate table and the verdict. Hard gates (PF, E[n], maxDD,
- * window-quarters, REAL data, long-only) decide GO/NO-GO on FULL windows.
- * SMOKE windows get the same table but the verdict is `SMOKE ONLY`.
+ * window-quarters, REAL data, long-only) decide GO/NO-GO on GRADED FULL
+ * windows. SMOKE and UNGRADED runs get the same table but no grade.
  */
 export function evaluateVerdict(input: VerdictInput): { verdict: E4Verdict; reasons: string[]; gates: E4Gate[] } {
   const gates: E4Gate[] = [];
@@ -560,9 +649,9 @@ export function evaluateVerdict(input: VerdictInput): { verdict: E4Verdict; reas
     });
     const pfOk = z.profitFactor !== null && z.profitFactor >= z.threshold;
     gates.push({
-      id: 'zero_fee_pf', label: `Zero-fee PF fail-fast (${policy.tf})`, value: fmt(z.profitFactor), threshold: `≥ ${z.threshold}`,
+      id: 'zero_fee_pf', label: `Zero-fee PF fail-fast floor (${policy.tf}, LOCKED)`, value: fmt(z.profitFactor), threshold: `≥ ${z.threshold}`,
       hard: true, status: !enough ? 'n/a' : pfOk ? 'pass' : 'fail',
-      note: 'Raw signal edge before fees; below threshold the fee pass and MC are not run.',
+      note: 'Raw signal edge before fees; below the floor the fee pass and MC are not run (STOP).',
     });
   }
 
@@ -601,6 +690,23 @@ export function evaluateVerdict(input: VerdictInput): { verdict: E4Verdict; reas
     reasons.push('Numbers above validate the pipeline; they are not a screen, holdout, or Beta hard-preflight.');
     return { verdict: 'SMOKE ONLY', reasons, gates };
   }
+  if (!input.graded) {
+    reasons.push('FULL window run without an Algo Alpha run card: UNGRADED (desk burn hold 2026-09-10). Statistics and gate statuses are informational; no GO / NO-GO / EXPLORATORY is issued.');
+    if (input.zeroFee) {
+      if (input.zeroFee.n < input.zeroFee.minTrades) {
+        reasons.push(`(context) zero-fee pass n=${input.zeroFee.n} < ${input.zeroFee.minTrades}: fee pass + MC stopped.`);
+      } else if (input.zeroFee.profitFactor === null || input.zeroFee.profitFactor < input.zeroFee.threshold) {
+        reasons.push(`(context) zero-fee PF ${fmt(input.zeroFee.profitFactor)} < locked floor ${input.zeroFee.threshold}: STOP — fee pass + MC not run.`);
+      } else {
+        reasons.push(`(context) zero-fee PF ${fmt(input.zeroFee.profitFactor)} ≥ locked floor ${input.zeroFee.threshold}.`);
+      }
+    }
+    for (const g of gates.filter((x) => x.hard && x.status === 'fail' && x.id !== 'zero_fee_pf' && x.id !== 'zero_fee_n')) {
+      reasons.push(`(context) gate would fail: ${g.label} = ${g.value} (need ${g.threshold}).`);
+    }
+    reasons.push('To grade: re-run with --run-card <id> once the desk clears the burn.');
+    return { verdict: 'UNGRADED', reasons, gates };
+  }
   if (input.zeroFee && input.zeroFee.n < input.zeroFee.minTrades) {
     reasons.push(`Zero-fee pass produced n=${input.zeroFee.n} < ${input.zeroFee.minTrades}: nothing to evaluate.`);
     return { verdict: 'INCONCLUSIVE', reasons, gates };
@@ -621,10 +727,10 @@ export function evaluateVerdict(input: VerdictInput): { verdict: E4Verdict; reas
 
   if (input.zeroFee) {
     if (input.zeroFee.profitFactor === null || input.zeroFee.profitFactor < input.zeroFee.threshold) {
-      reasons.push(`Zero-fee PF ${fmt(input.zeroFee.profitFactor)} < ${input.zeroFee.threshold} (${policy.tf} fail-fast): no raw edge to pay fees with.`);
+      reasons.push(`Zero-fee PF ${fmt(input.zeroFee.profitFactor)} < locked floor ${input.zeroFee.threshold} (${policy.tf} fail-fast): STOP — no raw edge to pay fees with.`);
       return { verdict: 'NO-GO', reasons, gates };
     }
-    reasons.push(`Zero-fee PF ${fmt(input.zeroFee.profitFactor)} ≥ ${input.zeroFee.threshold}: fail-fast passed.`);
+    reasons.push(`Zero-fee PF ${fmt(input.zeroFee.profitFactor)} ≥ locked floor ${input.zeroFee.threshold}: fail-fast passed.`);
   }
   if (!input.fee) {
     reasons.push('Fee pass did not run.');
@@ -644,8 +750,45 @@ export function evaluateVerdict(input: VerdictInput): { verdict: E4Verdict; reas
     for (const g of notEvaluable) reasons.push(`Gate not evaluable: ${g.label}${g.note ? ` — ${g.note}` : ''}`);
     return { verdict: 'EXPLORATORY', reasons, gates };
   }
-  reasons.push('All hard gates passed at the tier-consistent fee on a full REAL window. Desk GO remains a human decision.');
+  reasons.push('All hard gates passed at the FeeModel fee on a full REAL window under a run card. Desk GO remains a human decision.');
   return { verdict: 'GO-ELIGIBLE', reasons, gates };
+}
+
+// ---------------------------------------------------------------------------
+// Data path validation
+// ---------------------------------------------------------------------------
+
+/** Spot-only: E4 is spot long-only; US INTX perps are parked. */
+export function assertSpotProducts(products: string[]): void {
+  const perps = products.filter((p) => venueForSymbol(p) === 'perps');
+  if (perps.length > 0) {
+    throw new E4DataPathError('E4_SPOT_ONLY', `E4 is spot long-only (INTX parked); remove ${perps.join(', ')} from --products.`);
+  }
+}
+
+/**
+ * The fixture directory must hold bars of exactly the TF's width. A 15m
+ * gate fixture (or any other width) is refused — E4 needs separate REAL
+ * fixtures per timeframe (Dev Backtest lands them); on-the-fly rollup is
+ * `pnpm backtest --bar-minutes`, not this harness.
+ */
+export function assertFixtureTimeframe(provenance: DataProvenance, policy: E4TimeframePolicy, fixtureDir: string): void {
+  const declaredMinutes = provenance.granularitySeconds / 60;
+  const inferred = provenance.inferredBarMinutes;
+  const ok =
+    provenance.source === 'fixture' &&
+    !provenance.aggregation &&
+    declaredMinutes === policy.barMinutes &&
+    (inferred === null || inferred === policy.barMinutes);
+  if (!ok) {
+    throw new E4DataPathError(
+      'E4_FIXTURE_TF_MISMATCH',
+      `${provenance.symbol} in ${fixtureDir}: source=${provenance.source} declared=${declaredMinutes}m spacing=${inferred ?? 'n/a'}m, ` +
+        `but --tf ${policy.tf} needs native ${policy.barMinutes}m fixtures. Use a per-TF directory (${policy.fixtureHint}). ` +
+        'The 15m fixtures under fixtures/bars/ are backtest-gate only (~7d) and are not E4 data; ' +
+        'on-the-fly rollup lives on `pnpm backtest --bar-minutes`, not on the E4 harness.',
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -685,9 +828,9 @@ function summarizePass(result: BacktestResult, saved: SavedBacktestPaths | null)
 }
 
 /**
- * Run the E4 pipeline for one timeframe. `runner` must already point at the
- * data source (fixtureDir or Supabase); `--allow-synthetic` is deliberately
- * not reachable from here.
+ * Run the E4 pipeline for one timeframe on one per-TF fixture directory.
+ * `runner` must be constructed with `fixtureDir = request.fixtureDir`;
+ * `--allow-synthetic` is deliberately not reachable from here.
  */
 export async function runE4(
   request: E4Request,
@@ -696,16 +839,28 @@ export async function runE4(
   logger: Logger,
 ): Promise<E4Report> {
   const policy = E4_TF_POLICY[request.tf];
-  const zeroFeePfMin = request.zeroFeePfMin ?? policy.zeroFeePfMin;
-  const minExpectedTrades = request.minExpectedTrades ?? policy.minExpectedTrades;
+  const zeroFeePfMin = E4_ZERO_FEE_PF_FLOOR[request.tf];
+  const minExpectedTrades = E4_MIN_EXPECTED_TRADES[request.tf];
   const windowDays = Math.max(0, (request.endDate.getTime() - request.startDate.getTime()) / DAY_MS);
 
+  if (!request.fixtureDir) {
+    throw new E4DataPathError('E4_FIXTURE_DIR_REQUIRED', `--fixture-dir is required (per-TF fixtures: ${policy.fixtureHint}).`);
+  }
+  assertSpotProducts(request.products);
+
+  // Native load only — no barMinutes: a fixture that is not already the TF
+  // width is refused below, never rolled up.
   const dataOptions: BacktestDataOptions = {
-    ...request.data,
+    minCoverage: request.minCoverage ?? 0.5,
     allowSynthetic: false,
-    barMinutes: policy.barMinutes,
   };
   const provider = memoizeProvider(runner.createDataProvider(dataOptions));
+
+  // Stage 0 — data path pre-flight (also surfaces DATA_UNAVAILABLE before any engine work).
+  for (const product of request.products) {
+    const out = await provider(product, request.startDate, request.endDate);
+    assertFixtureTimeframe(out.provenance, policy, request.fixtureDir);
+  }
 
   const baseInput = {
     startDate: request.startDate,
@@ -713,12 +868,11 @@ export async function runE4(
     initialCapital: request.initialCapital,
     products: request.products,
     strategy: request.strategy,
-    venueOverride: request.venueOverride,
     regimeGates: request.regimeGates,
   };
   const feeModel = buildFeeModel(guardrails, request.feeTier);
 
-  logger.info('E4 harness: stage 1 — zero-fee pass', { tf: request.tf, barMinutes: policy.barMinutes, products: request.products });
+  logger.info('E4 harness: stage 1 — zero-fee pass', { tf: request.tf, barMinutes: policy.barMinutes, products: request.products, floor: zeroFeePfMin });
   const zeroFeeConfig: BacktestConfig = buildBacktestConfig(
     { ...baseInput, feeModel, commissionOverride: 0, evGateMode: 'off' },
     guardrails,
@@ -730,16 +884,18 @@ export async function runE4(
     provider,
   );
   const stamp = zeroFeeRun.result.dataStamp;
-  const { label, line: labelLine } = deriveLabel(stamp, windowDays, request.minFullWindowDays);
+  const { label, graded, line: labelLine } = deriveLabel(stamp, windowDays, request.runCard);
   const zeroFeeSummary = summarizePass(zeroFeeRun.result, zeroFeeRun.saved);
   const zeroFeeFrequency = computeTradeFrequency(zeroFeeRun.result.trades, request.startDate, request.endDate);
   const zPf = zeroFeeSummary.stats.profitFactor;
-  const zEnough = zeroFeeSummary.stats.n >= request.minZeroFeeTrades;
+  const zEnough = zeroFeeSummary.stats.n >= E4_MIN_ZERO_FEE_TRADES;
   const zPass = !zEnough ? null : zPf !== null && zPf >= zeroFeePfMin;
   const failFast: 'none' | 'inconclusive' | 'pf' = !zEnough ? 'inconclusive' : zPass ? 'none' : 'pf';
 
   let fee: E4Report['fee'] = null;
   let monteCarlo: MonteCarloSummary | null = null;
+  // STOP on fail-fast. The only exception is a SMOKE ONLY window with
+  // --smoke-run-all-stages (pipeline validation; never evidence).
   const continueToFee =
     stamp === 'REAL' && (failFast === 'none' || (label === 'SMOKE' && request.smokeRunAllStages));
 
@@ -762,20 +918,21 @@ export async function runE4(
       frequency: computeTradeFrequency(feeRun.result.trades, request.startDate, request.endDate),
       quarters,
       quartersPassing: quarters.filter((q) => q.profitFactor !== null && q.profitFactor >= 1.0).length,
-      quartersEvaluable: windowDays >= request.minFullWindowDays,
+      quartersEvaluable: windowDays >= E4_FULL_WINDOW_MIN_DAYS,
     };
     logger.info('E4 harness: stage 3 — Monte Carlo', { block: request.mc.block, runs: request.mc.runs, seed: request.mc.seed });
     monteCarlo = runMonteCarlo(feeRun.result.trades, { ...request.mc, initialCapital: request.initialCapital });
   } else {
-    logger.warn('E4 harness: fee pass and Monte Carlo skipped', { stamp, failFast, label });
+    logger.warn('E4 harness: STOP — fee pass and Monte Carlo not run', { stamp, failFast, label });
   }
 
   const evaluation = evaluateVerdict({
     label,
+    graded,
     policy,
     stamp,
     minExpectedTrades,
-    zeroFee: { n: zeroFeeSummary.stats.n, profitFactor: zPf, threshold: zeroFeePfMin, minTrades: request.minZeroFeeTrades, frequency: zeroFeeFrequency },
+    zeroFee: { n: zeroFeeSummary.stats.n, profitFactor: zPf, threshold: zeroFeePfMin, minTrades: E4_MIN_ZERO_FEE_TRADES, frequency: zeroFeeFrequency },
     fee: fee
       ? {
           stats: fee.stats, maxDrawdownPct: fee.metrics.maxDrawdownPercent, frequency: fee.frequency,
@@ -787,22 +944,32 @@ export async function runE4(
 
   return {
     harness: 'e4-multi-tf-feemodel',
-    version: 1,
+    version: 2,
     generatedAt: new Date().toISOString(),
     label,
+    graded,
+    runCard: request.runCard?.trim() || null,
     labelLine,
     verdict: evaluation.verdict,
     reasons: evaluation.reasons,
     tf: request.tf,
     barMinutes: policy.barMinutes,
     policy,
+    thresholds: {
+      zeroFeePfFloor: zeroFeePfMin,
+      minZeroFeeTrades: E4_MIN_ZERO_FEE_TRADES,
+      minExpectedTrades,
+      fullWindowMinDays: E4_FULL_WINDOW_MIN_DAYS,
+      feePassPfMin: 1.2,
+      maxDrawdownMax: 0.15,
+      quartersMin: '3/4',
+    },
     request: {
       startDate: request.startDate.toISOString(), endDate: request.endDate.toISOString(), windowDays,
       products: request.products, strategy: String(request.strategy), initialCapital: request.initialCapital,
       feeTier: request.feeTier, evGateMode: request.evGateMode, regimeGates: request.regimeGates,
-      venueOverride: request.venueOverride ?? 'per-symbol', mc: request.mc, zeroFeePfMin,
-      minZeroFeeTrades: request.minZeroFeeTrades, minExpectedTrades, minFullWindowDays: request.minFullWindowDays,
-      smokeRunAllStages: request.smokeRunAllStages, data: request.data,
+      fixtureDir: request.fixtureDir, minCoverage: request.minCoverage ?? 0.5, mc: request.mc,
+      smokeRunAllStages: request.smokeRunAllStages,
     },
     data: { stamp, provenance: zeroFeeRun.result.dataProvenance, venueBySymbol: zeroFeeRun.result.venueBySymbol },
     zeroFee: { ...zeroFeeSummary, threshold: zeroFeePfMin, passed: zPass, failFast, frequency: zeroFeeFrequency },
@@ -812,9 +979,13 @@ export async function runE4(
   };
 }
 
-/** Resolve the fee tier for a TF: explicit flag wins, else the policy default. */
-export function resolveE4FeeTier(tf: E4Timeframe, flag: string | undefined, guardrails: GuardrailConfig): FeeTierLabel {
-  return resolveFeeTier(flag ?? E4_TF_POLICY[tf].defaultFeeTier, guardrails.fees.coinbase.spot);
+/**
+ * Fee tier for the fee pass: explicit `--fee-tier` wins; otherwise the
+ * guardrails.yaml spot bucket — the FeeModel single source of truth
+ * ("FeeModel 40": 25/40 bps today).
+ */
+export function resolveE4FeeTier(flag: string | undefined, guardrails: GuardrailConfig): FeeTierLabel {
+  return resolveFeeTier(flag, guardrails.fees.coinbase.spot);
 }
 
 // ---------------------------------------------------------------------------
@@ -841,37 +1012,36 @@ function renderPassStats(title: string, pass: E4PassSummary): string[] {
   return lines;
 }
 
-/** Human-readable report. Line 1 is ALWAYS the derived label. */
+/** Human-readable report. Line 1 is ALWAYS the derived label; line 2 the DATA stamp. */
 export function renderE4Report(report: E4Report): string {
   const r = report.request;
+  const t = report.thresholds;
   const out: string[] = [];
   out.push(report.labelLine);
   out.push(`DATA: ${report.data.stamp}`);
-  out.push(`E4 FeeModel expectancy harness — TF=${report.tf.toUpperCase()} (${report.barMinutes}m bars) [${report.policy.status.toUpperCase()}, desk run order ${report.policy.order}/3]`);
+  out.push(`E4 FeeModel expectancy harness — TF=${report.tf.toUpperCase()} (${report.barMinutes}m bars) [${report.policy.status.toUpperCase()}, desk run order ${report.policy.order}/3]${report.runCard ? `   run card: ${report.runCard}` : '   run card: none (UNGRADED on full windows)'}`);
   out.push(`Policy: ${report.policy.note}`);
+  out.push(`Locked thresholds: zero-fee PF floor ≥ ${t.zeroFeePfFloor} (STOP below)  min zero-fee trades ${t.minZeroFeeTrades}  E[n] ≥ ${t.minExpectedTrades}/12m  fee-pass PF ≥ ${t.feePassPfMin}  maxDD ≤ ${pct(t.maxDrawdownMax)}  window-quarters ≥ ${t.quartersMin}  full window ≥ ${t.fullWindowMinDays}d`);
   out.push(`Window: ${r.startDate} → ${r.endDate} (${r.windowDays.toFixed(1)} days)   Products: ${r.products.join(', ')}   Strategy: ${r.strategy}   Venue: ${Object.entries(report.data.venueBySymbol).map(([k, v]) => `${k}=${v}`).join(', ')}`);
-  out.push(`Fee tier (fee pass): ${r.feeTier.name} (maker ${r.feeTier.makerBps} / taker ${r.feeTier.takerBps} bps; taker charged per fill)   EV gate (fee pass): ${r.evGateMode}   Regime gates: ${r.regimeGates ? 'on' : 'off'}   Initial capital: $${r.initialCapital}`);
+  out.push(`Fixture dir: ${r.fixtureDir}   Fee pass: ${r.feeTier.name} (maker ${r.feeTier.makerBps} / taker ${r.feeTier.takerBps} bps; taker charged per fill)   EV gate (fee pass): ${r.evGateMode}   Regime gates: ${r.regimeGates ? 'on' : 'off'}   Initial capital: $${r.initialCapital}`);
   for (const p of Object.values(report.data.provenance)) {
-    const agg = p.aggregation && p.aggregation.subBarsPerBucket > 1
-      ? ` aggregated=${p.aggregation.sourceMinutes}m→${p.aggregation.targetMinutes}m (src=${p.aggregation.sourceCandleCount}, dropped=${p.aggregation.bucketsDropped})`
-      : '';
-    out.push(`Data source ${p.symbol}: ${p.source} bars=${p.candleCount}/${p.expectedCount} coverage=${(p.coverage * 100).toFixed(1)}% spacing=${p.inferredBarMinutes ?? 'n/a'}m first=${p.firstBarTime ?? 'n/a'} last=${p.lastBarTime ?? 'n/a'}${agg}${p.fixtureSha256 ? ` sha256=${p.fixtureSha256.slice(0, 12)}` : ''}${p.source === 'synthetic' ? ' [SYNTHETIC — VOID]' : ''}`);
+    out.push(`Data source ${p.symbol}: ${p.source} bars=${p.candleCount}/${p.expectedCount} coverage=${(p.coverage * 100).toFixed(1)}% spacing=${p.inferredBarMinutes ?? 'n/a'}m declared=${p.granularitySeconds / 60}m first=${p.firstBarTime ?? 'n/a'} last=${p.lastBarTime ?? 'n/a'}${p.fixtureSha256 ? ` sha256=${p.fixtureSha256.slice(0, 12)}` : ''}${p.source === 'synthetic' ? ' [SYNTHETIC — VOID]' : ''}`);
   }
   out.push('');
   if (report.zeroFee) {
     const z = report.zeroFee;
-    out.push(...renderPassStats(`Stage 1 — zero-fee PF fail-fast (commission 0, EV gate off)   threshold PF ≥ ${z.threshold}  min trades ${r.minZeroFeeTrades}  → ${z.failFast === 'inconclusive' ? 'INCONCLUSIVE (too few trades)' : z.failFast === 'pf' ? 'FAIL (fee pass + MC skipped)' : 'PASS'}`, z));
+    out.push(...renderPassStats(`Stage 1 — zero-fee PF fail-fast (commission 0, EV gate off)   LOCKED floor PF ≥ ${z.threshold}  min trades ${t.minZeroFeeTrades}  → ${z.failFast === 'inconclusive' ? 'INCONCLUSIVE (too few trades) — STOP' : z.failFast === 'pf' ? 'BELOW FLOOR — STOP (fee pass + MC not run)' : 'PASS'}`, z));
     out.push(`  zero-fee E[n] (12m, upper bound) = ${z.frequency.expectedTrades12m.toFixed(1)}  from n=${z.frequency.n} over ${z.frequency.windowDays.toFixed(1)} days (${z.frequency.tradesPerMonth.toFixed(2)} trades/month)`);
     out.push('');
   }
   if (report.fee) {
     const f = report.fee;
-    out.push(...renderPassStats(`Stage 2 — FeeModel expectancy @ ${r.feeTier.name} (EV gate ${r.evGateMode})`, f));
+    out.push(...renderPassStats(`Stage 2 — FeeModel expectancy @ ${r.feeTier.name} (EV gate ${r.evGateMode})${report.zeroFee?.failFast !== 'none' ? '   [SMOKE ONLY: ran past fail-fast via --smoke-run-all-stages]' : ''}`, f));
     out.push(`  E[n] (12m) = ${f.frequency.expectedTrades12m.toFixed(1)}  from n=${f.frequency.n} over ${f.frequency.windowDays.toFixed(1)} days (${f.frequency.tradesPerMonth.toFixed(2)} trades/month)   first trade ${f.frequency.firstTradeAt ?? 'n/a'}   last ${f.frequency.lastTradeAt ?? 'n/a'}`);
     out.push(`  window quarters (by exit): ${f.quarters.map((q) => `Q${q.index} ${q.start.slice(0, 10)}→${q.end.slice(0, 10)} n=${q.n} PF=${fmt(q.profitFactor)} net=$${q.netProfit.toFixed(2)}`).join(' | ')}${f.quartersEvaluable ? '' : '   [not evaluable: window < 12 months]'}`);
     out.push('');
   } else {
-    out.push(`Stage 2 — fee pass: SKIPPED (${report.zeroFee?.failFast === 'inconclusive' ? 'zero-fee pass inconclusive' : report.zeroFee?.failFast === 'pf' ? 'zero-fee PF fail-fast' : 'data not REAL'})`);
+    out.push(`Stage 2 — fee pass: NOT RUN (${report.zeroFee?.failFast === 'inconclusive' ? 'STOP: zero-fee pass inconclusive' : report.zeroFee?.failFast === 'pf' ? 'STOP: zero-fee PF below locked floor' : 'data not REAL'})`);
     out.push('');
   }
   if (report.monteCarlo) {
@@ -881,7 +1051,7 @@ export function renderE4Report(report: E4Report): string {
     out.push(`  meanR p05/p50/p95 = ${m.meanR.p05.toFixed(3)} / ${m.meanR.p50.toFixed(3)} / ${m.meanR.p95.toFixed(3)}   PF p05/p50/p95 = ${fmt(m.profitFactor.p05)} / ${fmt(m.profitFactor.p50)} / ${fmt(m.profitFactor.p95)}   maxDD p50/p95/max = ${pct(m.maxDrawdownPct.p50)} / ${pct(m.maxDrawdownPct.p95)} / ${pct(m.maxDrawdownPct.max)}`);
     out.push('');
   } else if (report.fee) {
-    out.push(`Stage 3 — Monte Carlo: SKIPPED (${r.mc.block === 'none' ? '--mc-block none' : 'no fee-pass trades'})`);
+    out.push(`Stage 3 — Monte Carlo: NOT RUN (${r.mc.block === 'none' ? '--mc-block none' : 'no fee-pass trades'})`);
     out.push('');
   }
   out.push('Gates:');
@@ -895,11 +1065,11 @@ export function renderE4Report(report: E4Report): string {
   const z = report.zeroFee;
   const f = report.fee;
   out.push(
-    `E4_RESULT tf=${report.tf} label=${report.label} verdict="${report.verdict}" data=${report.data.stamp} ` +
-      `zeroFeeN=${z ? z.stats.n : 'n/a'} zeroFeePF=${z ? fmt(z.stats.profitFactor) : 'n/a'} zeroFeeMin=${z ? z.threshold : 'n/a'} ` +
+    `E4_RESULT tf=${report.tf} label=${report.label} graded=${report.graded} runCard=${report.runCard ?? 'none'} verdict="${report.verdict}" data=${report.data.stamp} ` +
+      `zeroFeeN=${z ? z.stats.n : 'n/a'} zeroFeePF=${z ? fmt(z.stats.profitFactor) : 'n/a'} zeroFeeFloor=${t.zeroFeePfFloor} ` +
       `feeN=${f ? f.stats.n : 'n/a'} feePF=${f ? fmt(f.stats.profitFactor) : 'n/a'} feeMeanR=${f ? f.stats.meanR.toFixed(3) : 'n/a'} ` +
       `E_n_12m=${f ? f.frequency.expectedTrades12m.toFixed(1) : 'n/a'} maxDD=${f ? pct(f.metrics.maxDrawdownPercent) : 'n/a'} ` +
-      `mcProbLoss=${report.monteCarlo ? pct(report.monteCarlo.probNetLeqZero) : 'n/a'} feeTier=${r.feeTier.name}`,
+      `mcProbLoss=${report.monteCarlo ? pct(report.monteCarlo.probNetLeqZero) : 'n/a'} feeTier="${r.feeTier.name}" fixtureDir=${r.fixtureDir}`,
   );
   return out.join('\n');
 }

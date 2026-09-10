@@ -1,18 +1,22 @@
 /**
  * E4 multi-timeframe FeeModel expectancy harness — CLI.
  *
- * One timeframe per invocation. Desk order: 4H → 1D → (1H demoted).
+ * One timeframe per invocation on one per-TF fixture directory. Desk order:
+ * 4H → 1D → (1H demoted). From `atlas/apps/core-node`:
  *
- *   cd atlas/apps/core-node
- *   pnpm exec tsx src/cli/backtest-e4.ts --tf 4h --fixture-dir fixtures/bars/4h \
- *     --products BTC-USD ETH-USD SOL-USD --start-date 2026-08-01 --end-date 2026-09-01
+ *   pnpm exec tsx src/cli/backtest-e4.ts --tf 4h \
+ *     --fixture-dir fixtures/bars/4h/holdout-2025-03_2026-03 \
+ *     --products BTC-USD ETH-USD SOL-USD --start-date 2025-03-01 --end-date 2026-03-01 \
+ *     --run-card <Algo Alpha run card>          # only after the desk clears the burn
  *   pnpm exec tsx src/cli/backtest-e4.ts --tf 1d --fixture-dir fixtures/bars/1d \
  *     --products BTC-USD ETH-USD SOL-USD --start-date 2024-09-01 --end-date 2026-08-31
  *
  * Never put `--` after `pnpm backtest:e4` (yargs then treats every flag as
- * positional). There is deliberately NO `--allow-synthetic`: missing data is
- * DATA_UNAVAILABLE (exit 2). Line 1 of stdout is the DERIVED label
- * (SMOKE ONLY / FULL WINDOW / VOID); line 2 is the DATA stamp.
+ * positional). There is deliberately NO `--allow-synthetic` and NO override
+ * for the locked floors. Missing/short data is DATA_UNAVAILABLE (exit 2); a
+ * fixture directory whose bar width is not the TF is refused (exit 2). Line 1
+ * of stdout is the DERIVED label (SMOKE ONLY / FULL WINDOW … UNGRADED or
+ * GRADED / VOID); line 2 is the DATA stamp.
  */
 import path from 'node:path';
 import fs from 'node:fs/promises';
@@ -26,9 +30,9 @@ import { isDataUnavailableError } from '../backtesting/data-loader';
 import { isBarAggregationError } from '../backtesting/bar-aggregation';
 import { loadGuardrails } from '../config/loadGuardrails';
 import type { EvGateMode } from '../backtesting/backtest-engine';
-import type { MarketVenue } from '../trading/execution/venue-capabilities';
 import {
   E4_TF_POLICY,
+  isE4DataPathError,
   parseTimeframe,
   resolveE4FeeTier,
   renderE4Report,
@@ -43,15 +47,22 @@ async function main(): Promise<void> {
 
   const argv = await yargs(hideBin(process.argv))
     .scriptName('atlas-backtest-e4')
-    .usage('$0 --tf <4h|1d|1h> --start-date YYYY-MM-DD --end-date YYYY-MM-DD [options]')
+    .usage('$0 --tf <4h|1d|1h> --fixture-dir <per-TF dir> --start-date YYYY-MM-DD --end-date YYYY-MM-DD [options]')
     .option('tf', {
       type: 'string',
       demandOption: true,
-      describe: 'Timeframe for THIS run: 4h (first, month-block MC) | 1d (next; EXPLORATORY if E[n] < 100) | 1h (demoted). 15m is refused.',
+      describe: 'Timeframe for THIS run: 4h (first; zero-fee floor 1.61; month-block MC) | 1d (next; floor 1.44; EXPLORATORY if E[n] < 100) | 1h (demoted; floor 2.25). 15m is refused.',
+    })
+    .option('fixture-dir', {
+      type: 'string',
+      demandOption: true,
+      describe:
+        'Per-TF fixture directory (one timeframe per directory), e.g. fixtures/bars/4h/holdout-2025-03_2026-03 or fixtures/bars/1d. ' +
+        'Bar width must equal --tf; the 15m gate fixtures (fixtures/bars/*.json) are refused. Missing data is DATA_UNAVAILABLE — never synthetic.',
     })
     .option('start-date', { type: 'string', demandOption: true, describe: 'Window start (YYYY-MM-DD or ISO, UTC)' })
     .option('end-date', { type: 'string', demandOption: true, describe: 'Window end (YYYY-MM-DD or ISO, UTC)' })
-    .option('products', { type: 'array', default: ['BTC-USD', 'ETH-USD', 'SOL-USD'], describe: 'Spot products (space-separated)' })
+    .option('products', { type: 'array', default: ['BTC-USD', 'ETH-USD', 'SOL-USD'], describe: 'Spot products (space-separated). Perps (XXX-PERP-INTX) are refused.' })
     .option('strategy', {
       type: 'string',
       default: 'trend_follow',
@@ -61,23 +72,27 @@ async function main(): Promise<void> {
     .option('initial-capital', { type: 'number', default: 1000, describe: 'Starting equity (TASK_018 E1 uses $1,000)' })
     .option('fee-tier', {
       type: 'string',
-      describe: 'Fee pass tier: intro1 (60/120) | t1k (35/75) | t10k (25/40) | custom:<maker>,<taker>. Default per TF: intro1 for 4h/1d, t1k for 1h (the tier a $1K account sits in at that frequency).',
+      describe:
+        'Fee-pass tier: intro1 (60/120) | t1k (35/75) | t10k (25/40) | custom:<maker>,<taker>. ' +
+        'Default: guardrails.yaml spot bucket = FeeModel 40 (25/40 bps) — the first-burn spec. Tier-consistent re-runs are a second step.',
     })
     .option('ev-gate', { type: 'string', choices: ['enforce', 'shadow', 'off'], default: 'enforce', describe: 'EV-gate mode for the FEE pass (zero-fee pass is always off)' })
     .option('regime-gates', { type: 'string', choices: ['on', 'off'], default: 'on' })
-    .option('venue', { type: 'string', choices: ['spot', 'perps'], describe: 'Force venue class. Default: inferred per symbol (spot for XXX-USD; long-only).' })
-    .option('fixture-dir', { type: 'string', describe: 'Load <dir>/<SYMBOL>.json fixtures (one timeframe per directory). Omit to read Supabase public.bars (15m, rolled up to the TF).' })
-    .option('min-coverage', { type: 'number', default: 0.5, describe: 'Native-load coverage floor before DATA_UNAVAILABLE (0 disables)' })
-    .option('min-bucket-fill', { type: 'number', default: 0.5, describe: 'Rollup: min fraction of sub-bars a bucket needs to be kept (only when stored bars are finer than the TF)' })
+    .option('min-coverage', { type: 'number', default: 0.5, describe: 'Fixture coverage floor before DATA_UNAVAILABLE (0 disables)' })
     .option('mc-runs', { type: 'number', default: 2000, describe: 'Monte Carlo replicates' })
     .option('mc-block', { type: 'string', choices: ['month', 'trade', 'none'], describe: 'Bootstrap unit. Default per TF: month for 4h/1h, trade for 1d.' })
     .option('seed', { type: 'number', default: 20260910, describe: 'PRNG seed (deterministic MC)' })
-    .option('zero-fee-pf-min', { type: 'number', describe: 'Override the zero-fee PF fail-fast threshold (defaults: 4h 1.61 · 1d 1.44 · 1h 2.25)' })
-    .option('min-zero-fee-trades', { type: 'number', default: 10, describe: 'Below this zero-fee trade count the run is INCONCLUSIVE and stops' })
-    .option('min-expected-trades', { type: 'number', describe: 'Override the E[n] gate (defaults: 4h 60 · 1d 100 · 1h 60)' })
-    .option('min-full-window-days', { type: 'number', default: 365, describe: 'Windows shorter than this are SMOKE ONLY (no grade issued)' })
-    .option('smoke-run-all-stages', { type: 'boolean', default: false, describe: 'SMOKE ONLY runs: keep going past a fail-fast so the fee pass and MC are exercised (pipeline validation)' })
+    .option('run-card', {
+      type: 'string',
+      describe:
+        'Algo Alpha run card id. Required for a FULL (≥ 365d) REAL window to be GRADED; without it the run is UNGRADED ' +
+        '(desk burn hold 2026-09-10: wait for run card + Beta design clear). Recorded on line 1 and in E4_RESULT.',
+    })
+    .option('smoke-run-all-stages', { type: 'boolean', default: false, describe: 'SMOKE ONLY windows: keep going past a fail-fast so the fee pass and MC are exercised (pipeline validation; never evidence)' })
     .option('results-path', { type: 'string', default: path.resolve(process.cwd(), '../../var/backtest_results/e4'), describe: 'Where per-pass backtest_*.json/report_*.txt and the e4_*.json/.md live' })
+    // Floors and gates are LOCKED: there is no --zero-fee-pf-min / --min-expected-trades /
+    // --allow-synthetic. strict() makes any such attempt a hard error instead of a silent no-op.
+    .strict()
     .help()
     .parse();
 
@@ -91,15 +106,8 @@ async function main(): Promise<void> {
     throw new Error('Invalid --start-date/--end-date (end must be after start)');
   }
 
-  const fixtureDir = argv.fixtureDir ? path.resolve(process.cwd(), String(argv.fixtureDir)) : undefined;
-  const SUPABASE_URL = process.env.SUPABASE_URL || '';
-  const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
-  if (!fixtureDir && (!SUPABASE_URL || !SUPABASE_SERVICE_KEY)) {
-    console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY — pass --fixture-dir <dir> to run offline on committed fixtures.');
-    process.exit(1);
-  }
-
-  const feeTier = resolveE4FeeTier(tf, argv.feeTier ? String(argv.feeTier) : undefined, guardrails);
+  const fixtureDir = path.resolve(process.cwd(), String(argv.fixtureDir));
+  const feeTier = resolveE4FeeTier(argv.feeTier ? String(argv.feeTier) : undefined, guardrails);
   const request: E4Request = {
     tf,
     startDate,
@@ -110,31 +118,25 @@ async function main(): Promise<void> {
     feeTier,
     evGateMode: String(argv.evGate) as EvGateMode,
     regimeGates: String(argv.regimeGates) !== 'off',
-    venueOverride: argv.venue ? (String(argv.venue) as MarketVenue) : undefined,
-    data: { minCoverage: Number(argv.minCoverage), minBucketFill: Number(argv.minBucketFill) },
+    fixtureDir,
+    minCoverage: Number(argv.minCoverage),
     mc: {
       runs: Number(argv.mcRuns),
       block: (argv.mcBlock ? String(argv.mcBlock) : policy.defaultMcBlock) as McBlockMode,
       seed: Number(argv.seed),
     },
-    zeroFeePfMin: argv.zeroFeePfMin !== undefined ? Number(argv.zeroFeePfMin) : undefined,
-    minZeroFeeTrades: Number(argv.minZeroFeeTrades),
-    minExpectedTrades: argv.minExpectedTrades !== undefined ? Number(argv.minExpectedTrades) : undefined,
-    minFullWindowDays: Number(argv.minFullWindowDays),
+    runCard: argv.runCard ? String(argv.runCard) : undefined,
     smokeRunAllStages: Boolean(argv.smokeRunAllStages),
   };
 
   logger.info('E4 harness starting', {
     tf, barMinutes: policy.barMinutes, policy: policy.status, startDate, endDate, products: request.products,
     strategy: request.strategy, feeTier, evGateMode: request.evGateMode, mc: request.mc, fixtureDir,
-    dataSource: fixtureDir ? 'fixture' : 'supabase',
+    runCard: request.runCard ?? null, floors: { zeroFeePf: policy.zeroFeePfMin, minExpectedTrades: policy.minExpectedTrades },
   });
 
   const resultsPath = String(argv.resultsPath);
-  const runner = new BacktestRunner(
-    { resultsPath, supabaseUrl: SUPABASE_URL || undefined, supabaseKey: SUPABASE_SERVICE_KEY || undefined, fixtureDir },
-    logger,
-  );
+  const runner = new BacktestRunner({ resultsPath, fixtureDir }, logger);
 
   try {
     const report = await runE4(request, runner, guardrails, logger);
@@ -151,15 +153,15 @@ async function main(): Promise<void> {
     console.log(text);
     console.log(`E4 artefacts: ${jsonPath}`);
     console.log(`              ${mdPath}`);
-    logger.info('E4 harness complete', { tf, label: report.label, verdict: report.verdict, jsonPath, mdPath });
+    logger.info('E4 harness complete', { tf, label: report.label, graded: report.graded, verdict: report.verdict, jsonPath, mdPath });
   } catch (error) {
     if (isDataUnavailableError(error)) {
       logger.error('E4 harness aborted: DATA_UNAVAILABLE', { symbol: error.symbol, windowStart: error.windowStart, windowEnd: error.windowEnd });
       console.error(`\n${error.message}`);
       process.exit(2);
     }
-    if (isBarAggregationError(error)) {
-      logger.error('E4 harness aborted: BAR_AGGREGATION_INVALID', { message: error.message });
+    if (isBarAggregationError(error) || isE4DataPathError(error)) {
+      logger.error('E4 harness aborted: invalid data path', { message: error.message });
       console.error(`\n${error.message}`);
       process.exit(2);
     }
@@ -168,7 +170,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Supabase client keeps handles open (see cli/backtest.ts) — exit explicitly.
   process.exit(0);
 }
 

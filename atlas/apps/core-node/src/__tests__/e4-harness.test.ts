@@ -1,17 +1,18 @@
 /**
  * E4 multi-TF FeeModel expectancy harness (TASK_018 E4, TM-corrected).
  *
- *   1. Timeframe policy: 4h → 1d → 1h (demoted); 15m refused.
+ *   1. Timeframe policy: 4h → 1d → 1h (demoted); 15m refused; LOCKED floors
+ *      (4H 1.61 · 1D 1.44 · 1H 2.25); fee pass defaults to FeeModel 40.
  *   2. Expectancy statistics from a hand-built trade set (PF, R, t-stat, fees).
  *   3. E[n] annualisation and window-quarter bucketing.
  *   4. Seeded Monte Carlo: deterministic, month-block vs trade units.
- *   5. Derived label: SYNTHETIC ⇒ VOID, < 365d ⇒ SMOKE ONLY, else FULL.
- *   6. Verdict order: SMOKE never graded; INCONCLUSIVE; zero-fee fail-fast
- *      NO-GO; 1D E[n] < 100 ⇒ EXPLORATORY; 1H capped at EXPLORATORY;
- *      GO-ELIGIBLE only when every hard gate passes on a FULL window.
- *   7. End-to-end on the committed REAL 4h / 1d fixtures (#47) through the
- *      runner: label lock honoured, per-symbol n, fail-fast skips fee/MC,
- *      data loaded once across passes.
+ *   5. Derived label: SYNTHETIC ⇒ VOID, < 365d ⇒ SMOKE ONLY, FULL without a
+ *      run card ⇒ UNGRADED, FULL + run card ⇒ GRADED.
+ *   6. Verdict order: SMOKE / UNGRADED never graded; INCONCLUSIVE; zero-fee
+ *      floor NO-GO (STOP); 1D E[n] < 100 ⇒ EXPLORATORY; 1H capped at
+ *      EXPLORATORY; GO-ELIGIBLE only when every hard gate passes.
+ *   7. Data path: per-TF fixtures only (15m gate fixtures refused), spot only.
+ *   8. End-to-end on the committed REAL 4h / 1d fixtures through the runner.
  */
 import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
@@ -19,6 +20,10 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   E4_TF_POLICY,
+  E4_ZERO_FEE_PF_FLOOR,
+  E4_MIN_EXPECTED_TRADES,
+  E4_MIN_ZERO_FEE_TRADES,
+  E4_FULL_WINDOW_MIN_DAYS,
   parseTimeframe,
   computeExpectancy,
   computeTradeFrequency,
@@ -27,12 +32,15 @@ import {
   mulberry32,
   deriveLabel,
   evaluateVerdict,
+  assertSpotProducts,
+  assertFixtureTimeframe,
   memoizeProvider,
   runE4,
   renderE4Report,
   resolveE4FeeTier,
   profitFactorOf,
   tradeR,
+  isE4DataPathError,
   type E4Request,
   type VerdictInput,
   type ExpectancyStats,
@@ -40,6 +48,7 @@ import {
 } from '../backtesting/e4-harness';
 import { BacktestRunner } from '../backtesting/backtest-runner';
 import type { BacktestTrade } from '../backtesting/backtest-engine';
+import type { DataProvenance } from '../backtesting/data-loader';
 import { loadGuardrails } from '../config/loadGuardrails';
 
 function makeLogger() {
@@ -47,8 +56,13 @@ function makeLogger() {
 }
 
 const ATLAS_ROOT = path.resolve(__dirname, '../../../..');
-const FIXTURES_4H = path.resolve(__dirname, '../../fixtures/bars/4h');
-const FIXTURES_1D = path.resolve(__dirname, '../../fixtures/bars/1d');
+const FIXTURES_ROOT = path.resolve(__dirname, '../../fixtures/bars');
+/** Aug-2026 4h set: `4h/smoke-aug2026` once Dev Backtest's #49 lands, `4h/` before that. */
+const FIXTURES_4H_SMOKE = fs.existsSync(path.join(FIXTURES_ROOT, '4h/smoke-aug2026'))
+  ? path.join(FIXTURES_ROOT, '4h/smoke-aug2026')
+  : path.join(FIXTURES_ROOT, '4h');
+const FIXTURES_1D = path.join(FIXTURES_ROOT, '1d');
+const FIXTURES_15M_GATE = FIXTURES_ROOT;
 const guardrails = loadGuardrails(ATLAS_ROOT);
 
 /** Minimal closed trade for the pure statistics functions. */
@@ -83,11 +97,25 @@ function trade(
   };
 }
 
-describe('E4 §1 — timeframe policy', () => {
-  it('desk order 4h → 1d → 1h, thresholds from the live-readiness audit §4.1, 1h demoted', () => {
-    expect(E4_TF_POLICY['4h']).toMatchObject({ order: 1, barMinutes: 240, zeroFeePfMin: 1.61, defaultFeeTier: 'intro1', defaultMcBlock: 'month', minExpectedTrades: 60, goEligible: true });
-    expect(E4_TF_POLICY['1d']).toMatchObject({ order: 2, barMinutes: 1440, zeroFeePfMin: 1.44, defaultFeeTier: 'intro1', defaultMcBlock: 'trade', minExpectedTrades: 100, goEligible: true });
-    expect(E4_TF_POLICY['1h']).toMatchObject({ order: 3, barMinutes: 60, zeroFeePfMin: 2.25, defaultFeeTier: 't1k', status: 'demoted', goEligible: false });
+describe('E4 §1 — timeframe policy and LOCKED floors', () => {
+  it('zero-fee PF floors are locked at 4H 1.61 · 1D 1.44 · 1H 2.25 and frozen', () => {
+    expect(E4_ZERO_FEE_PF_FLOOR).toEqual({ '4h': 1.61, '1d': 1.44, '1h': 2.25 });
+    expect(Object.isFrozen(E4_ZERO_FEE_PF_FLOOR)).toBe(true);
+    expect(E4_MIN_EXPECTED_TRADES).toEqual({ '4h': 60, '1d': 100, '1h': 60 });
+    expect(E4_MIN_ZERO_FEE_TRADES).toBe(10);
+    expect(E4_FULL_WINDOW_MIN_DAYS).toBe(365);
+    for (const tf of ['4h', '1d', '1h'] as const) {
+      expect(E4_TF_POLICY[tf].zeroFeePfMin).toBe(E4_ZERO_FEE_PF_FLOOR[tf]);
+      expect(E4_TF_POLICY[tf].minExpectedTrades).toBe(E4_MIN_EXPECTED_TRADES[tf]);
+    }
+  });
+
+  it('desk order 4h → 1d → 1h, 1h demoted, per-TF fixture hints name the Dev Backtest directories', () => {
+    expect(E4_TF_POLICY['4h']).toMatchObject({ order: 1, barMinutes: 240, status: 'primary', defaultMcBlock: 'month', goEligible: true });
+    expect(E4_TF_POLICY['1d']).toMatchObject({ order: 2, barMinutes: 1440, status: 'secondary', defaultMcBlock: 'trade', goEligible: true });
+    expect(E4_TF_POLICY['1h']).toMatchObject({ order: 3, barMinutes: 60, status: 'demoted', goEligible: false });
+    expect(E4_TF_POLICY['4h'].fixtureHint).toContain('fixtures/bars/4h/holdout-2025-03_2026-03');
+    expect(E4_TF_POLICY['1d'].fixtureHint).toContain('fixtures/bars/1d');
   });
 
   it('parses aliases and refuses 15m (FeeModel 15m spot trend_follow = NO-GO)', () => {
@@ -102,11 +130,13 @@ describe('E4 §1 — timeframe policy', () => {
     expect(() => parseTimeframe('2h')).toThrow(/Unknown --tf/);
   });
 
-  it('fee tier defaults per TF (tier a $1K account sits in), explicit flag wins', () => {
-    expect(resolveE4FeeTier('4h', undefined, guardrails)).toMatchObject({ name: 'intro1', makerBps: 60, takerBps: 120 });
-    expect(resolveE4FeeTier('1d', undefined, guardrails)).toMatchObject({ name: 'intro1' });
-    expect(resolveE4FeeTier('1h', undefined, guardrails)).toMatchObject({ name: 't1k', makerBps: 35, takerBps: 75 });
-    expect(resolveE4FeeTier('4h', 'custom:0,0', guardrails)).toMatchObject({ makerBps: 0, takerBps: 0 });
+  it('fee pass defaults to the guardrails FeeModel spot bucket (FeeModel 40 = 25/40 bps); explicit --fee-tier wins', () => {
+    const dflt = resolveE4FeeTier(undefined, guardrails);
+    expect(dflt).toMatchObject({ makerBps: 25, takerBps: 40 });
+    expect(dflt.name).toBe('t10k (guardrails.yaml default)');
+    expect(guardrails.fees.coinbase.spot).toEqual({ maker_bps: 25, taker_bps: 40 });
+    expect(resolveE4FeeTier('intro1', guardrails)).toMatchObject({ name: 'intro1', makerBps: 60, takerBps: 120 });
+    expect(resolveE4FeeTier('custom:0,0', guardrails)).toMatchObject({ makerBps: 0, takerBps: 0 });
   });
 });
 
@@ -135,7 +165,7 @@ describe('E4 §2 — expectancy statistics', () => {
     // R = pnl / (|100 − 98| × 5) = pnl / 10.
     expect(s.meanR).toBeCloseTo(0.4, 9);
     expect(s.meanPnl).toBeCloseTo(4, 9);
-    // sample sd of [30,-10,20,-10,-10]: mean 4; devs 26,-14,16,-14,-14 → SS=676+196+256+196+196=1520 → /4 = 380
+    // sample sd of [30,-10,20,-10,-10]: mean 4; devs 26,-14,16,-14,-14 → SS=1520 → /4 = 380
     expect(s.stdPnl).toBeCloseTo(Math.sqrt(380), 9);
     expect(s.tStatPnl).toBeCloseTo(4 / (Math.sqrt(380) / Math.sqrt(5)), 9);
     expect(s.tStatR).toBeCloseTo(s.tStatPnl!, 9); // R is a constant rescaling of pnl here
@@ -178,7 +208,7 @@ describe('E4 §3 — E[n] and window quarters', () => {
     expect(f.n).toBe(13);
     expect(f.expectedTrades12m).toBeCloseTo((13 * 365.25) / 729, 9);
     expect(f.tradesPerMonth).toBeCloseTo((13 / 729) * (365.25 / 12), 9);
-    const year = computeTradeFrequency(new Array(30).fill(0).map(() => trade(1)), new Date('2025-03-05T00:00:00Z'), new Date('2026-03-05T06:00:00Z'));
+    const year = computeTradeFrequency(new Array(30).fill(0).map(() => trade(1)), new Date('2025-03-01T00:00:00Z'), new Date('2026-03-01T06:00:00Z'));
     expect(year.expectedTrades12m).toBeCloseTo(30, 9);
     expect(computeTradeFrequency([], start, end).firstTradeAt).toBeNull();
   });
@@ -255,15 +285,23 @@ describe('E4 §4 — Monte Carlo bootstrap', () => {
   });
 });
 
-describe('E4 §5 — derived label (desk label lock)', () => {
-  it('SYNTHETIC ⇒ VOID, short window ⇒ SMOKE ONLY with the locked wording, ≥ 365d REAL ⇒ FULL', () => {
-    expect(deriveLabel('SYNTHETIC', 800, 365)).toMatchObject({ label: 'VOID' });
-    const smoke = deriveLabel('REAL', 31, 365);
+describe('E4 §5 — derived label (desk label lock + burn hold)', () => {
+  it('SYNTHETIC ⇒ VOID; short window ⇒ SMOKE ONLY with the locked wording; FULL needs a run card to be GRADED', () => {
+    expect(deriveLabel('SYNTHETIC', 800, 'AA-1')).toMatchObject({ label: 'VOID', graded: false });
+    const smoke = deriveLabel('REAL', 31, 'AA-1');
     expect(smoke.label).toBe('SMOKE');
+    expect(smoke.graded).toBe(false);
     expect(smoke.line.startsWith('SMOKE ONLY — NOT screen, NOT holdout, NOT Beta hard-preflight')).toBe(true);
-    expect(deriveLabel('REAL', 364.9, 365).label).toBe('SMOKE');
-    expect(deriveLabel('REAL', 365, 365).label).toBe('FULL');
-    expect(deriveLabel('REAL', 729, 365).label).toBe('FULL');
+    expect(deriveLabel('REAL', 364.9, 'AA-1').label).toBe('SMOKE');
+
+    const ungraded = deriveLabel('REAL', 365, undefined);
+    expect(ungraded).toMatchObject({ label: 'FULL', graded: false });
+    expect(ungraded.line).toMatch(/^FULL WINDOW — DATA: REAL.*UNGRADED \(burn hold/);
+    expect(deriveLabel('REAL', 729, '   ').graded).toBe(false); // blank card = no card
+
+    const graded = deriveLabel('REAL', 365, 'AA-E4-4H-001');
+    expect(graded).toMatchObject({ label: 'FULL', graded: true });
+    expect(graded.line).toContain('GRADED under run card AA-E4-4H-001');
   });
 });
 
@@ -283,6 +321,7 @@ describe('E4 §6 — verdict logic', () => {
   function input(overrides: Partial<VerdictInput> = {}): VerdictInput {
     return {
       label: 'FULL',
+      graded: true,
       policy: E4_TF_POLICY['4h'],
       stamp: 'REAL',
       minExpectedTrades: 60,
@@ -293,29 +332,46 @@ describe('E4 §6 — verdict logic', () => {
     };
   }
 
-  it('GO-ELIGIBLE only when every hard gate passes on a FULL REAL window (4h)', () => {
+  it('GO-ELIGIBLE only when every hard gate passes on a GRADED FULL REAL window (4h)', () => {
     const v = evaluateVerdict(input());
     expect(v.verdict).toBe('GO-ELIGIBLE');
     expect(v.gates.filter((g) => g.hard).every((g) => g.status === 'pass')).toBe(true);
     expect(v.gates.find((g) => g.id === 't_stat_r')?.status).toBe('info');
+    expect(v.gates.find((g) => g.id === 'zero_fee_pf')?.label).toMatch(/LOCKED/);
   });
 
   it('SMOKE windows are never graded, even with perfect stats', () => {
-    const v = evaluateVerdict(input({ label: 'SMOKE' }));
+    const v = evaluateVerdict(input({ label: 'SMOKE', graded: false }));
     expect(v.verdict).toBe('SMOKE ONLY');
     expect(v.reasons.join(' ')).toMatch(/no grade issued/);
+  });
+
+  it('FULL window without a run card ⇒ UNGRADED (burn hold), stats + gate statuses kept as context', () => {
+    const perfect = evaluateVerdict(input({ graded: false }));
+    expect(perfect.verdict).toBe('UNGRADED');
+    expect(perfect.reasons[0]).toMatch(/burn hold/);
+    expect(perfect.reasons.join(' ')).toMatch(/--run-card/);
+    const failing = evaluateVerdict(input({ graded: false, fee: { ...input().fee!, stats: stats(80, 0.9) } }));
+    expect(failing.verdict).toBe('UNGRADED'); // never NO-GO without a card
+    expect(failing.reasons.some((r) => r.startsWith('(context) gate would fail: Fee-pass PF'))).toBe(true);
+    const stopped = evaluateVerdict(input({ graded: false, zeroFee: { n: 80, profitFactor: 1.2, threshold: 1.61, minTrades: 10, frequency: freq(80, 365.25) }, fee: null }));
+    expect(stopped.verdict).toBe('UNGRADED');
+    expect(stopped.reasons.some((r) => r.includes('STOP'))).toBe(true);
   });
 
   it('SYNTHETIC ⇒ VOID before anything else', () => {
     expect(evaluateVerdict(input({ stamp: 'SYNTHETIC' })).verdict).toBe('VOID');
   });
 
-  it('too few zero-fee trades ⇒ INCONCLUSIVE; zero-fee PF below threshold ⇒ NO-GO (fail-fast)', () => {
+  it('too few zero-fee trades ⇒ INCONCLUSIVE; zero-fee PF below the locked floor ⇒ NO-GO (STOP)', () => {
     expect(evaluateVerdict(input({ zeroFee: { n: 5, profitFactor: 9, threshold: 1.61, minTrades: 10, frequency: freq(5, 365.25) }, fee: null })).verdict).toBe('INCONCLUSIVE');
-    const ff = evaluateVerdict(input({ zeroFee: { n: 80, profitFactor: 1.2, threshold: 1.61, minTrades: 10, frequency: freq(80, 365.25) }, fee: null }));
+    const ff = evaluateVerdict(input({ zeroFee: { n: 80, profitFactor: 1.6, threshold: 1.61, minTrades: 10, frequency: freq(80, 365.25) }, fee: null }));
     expect(ff.verdict).toBe('NO-GO');
-    expect(ff.reasons[0]).toMatch(/fail-fast/);
+    expect(ff.reasons[0]).toMatch(/locked floor 1\.61.*STOP/);
     expect(ff.gates.find((g) => g.id === 'zero_fee_pf')?.status).toBe('fail');
+    // Exactly at the floor passes.
+    const at = evaluateVerdict(input({ zeroFee: { n: 80, profitFactor: 1.61, threshold: 1.61, minTrades: 10, frequency: freq(80, 365.25) } }));
+    expect(at.verdict).toBe('GO-ELIGIBLE');
   });
 
   it('hard gate failures on the fee pass ⇒ NO-GO (PF, E[n], maxDD, quarters, long-only)', () => {
@@ -351,7 +407,7 @@ describe('E4 §6 — verdict logic', () => {
     expect(rich.verdict).toBe('GO-ELIGIBLE');
   });
 
-  it('1H is demoted: passes everything ⇒ EXPLORATORY, never GO-ELIGIBLE; its fail-fast threshold is 2.25', () => {
+  it('1H is demoted: passes everything ⇒ EXPLORATORY, never GO-ELIGIBLE; its locked floor is 2.25', () => {
     const v = evaluateVerdict(input({
       policy: E4_TF_POLICY['1h'],
       zeroFee: { n: 200, profitFactor: 2.5, threshold: 2.25, minTrades: 10, frequency: freq(200, 365.25) },
@@ -373,7 +429,37 @@ describe('E4 §6 — verdict logic', () => {
   });
 });
 
-describe('E4 §7 — end-to-end on committed REAL fixtures (#47)', () => {
+describe('E4 §7 — data path: per-TF fixtures only, spot only', () => {
+  function prov(overrides: Partial<DataProvenance>): DataProvenance {
+    return {
+      symbol: 'BTC-USD', source: 'fixture', windowStart: '', windowEnd: '', granularitySeconds: 14_400,
+      candleCount: 2188, expectedCount: 2191, coverage: 0.999, firstBarTime: null, lastBarTime: null,
+      inferredBarMinutes: 240, loadTimeMs: 1, ...overrides,
+    };
+  }
+
+  it('accepts a native 4h fixture; refuses 15m gate fixtures, rolled-up series, non-fixture sources and mismatched widths', () => {
+    expect(() => assertFixtureTimeframe(prov({}), E4_TF_POLICY['4h'], 'x')).not.toThrow();
+    expect(() => assertFixtureTimeframe(prov({ granularitySeconds: 900, inferredBarMinutes: 15 }), E4_TF_POLICY['4h'], 'fixtures/bars')).toThrow(/E4_FIXTURE_TF_MISMATCH.*declared=15m.*needs native 240m/);
+    expect(() => assertFixtureTimeframe(prov({ aggregation: { targetMinutes: 240, sourceMinutes: 15, sourceCandleCount: 1, outputCandleCount: 1, subBarsPerBucket: 16, bucketsDropped: 0, partialBucketsKept: 0, minBucketFill: 0.5 } }), E4_TF_POLICY['4h'], 'x')).toThrow(/E4_FIXTURE_TF_MISMATCH/);
+    expect(() => assertFixtureTimeframe(prov({ source: 'supabase' }), E4_TF_POLICY['4h'], 'x')).toThrow(/E4_FIXTURE_TF_MISMATCH/);
+    expect(() => assertFixtureTimeframe(prov({}), E4_TF_POLICY['1d'], 'x')).toThrow(/needs native 1440m/);
+    try {
+      assertFixtureTimeframe(prov({ granularitySeconds: 900, inferredBarMinutes: 15 }), E4_TF_POLICY['4h'], 'fixtures/bars');
+    } catch (err) {
+      expect(isE4DataPathError(err)).toBe(true);
+      expect((err as Error).message).toContain('backtest-gate only');
+      expect((err as Error).message).toContain('pnpm backtest --bar-minutes');
+    }
+  });
+
+  it('refuses perps products (spot long-only; INTX parked)', () => {
+    expect(() => assertSpotProducts(['BTC-USD', 'ETH-USD', 'SOL-USD'])).not.toThrow();
+    expect(() => assertSpotProducts(['BTC-USD', 'ETH-PERP-INTX'])).toThrow(/E4_SPOT_ONLY.*ETH-PERP-INTX/);
+  });
+});
+
+describe('E4 §8 — end-to-end on committed REAL fixtures', () => {
   function request(overrides: Partial<E4Request>): E4Request {
     return {
       tf: '4h',
@@ -382,31 +468,33 @@ describe('E4 §7 — end-to-end on committed REAL fixtures (#47)', () => {
       products: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
       strategy: 'trend_follow',
       initialCapital: 1000,
-      feeTier: resolveE4FeeTier('4h', undefined, guardrails),
+      feeTier: resolveE4FeeTier(undefined, guardrails),
       evGateMode: 'enforce',
       regimeGates: true,
-      data: { minCoverage: 0.5, minBucketFill: 0.5 },
+      fixtureDir: FIXTURES_4H_SMOKE,
       mc: { runs: 200, block: 'month', seed: 20260910 },
-      minZeroFeeTrades: 10,
-      minFullWindowDays: 365,
       smokeRunAllStages: false,
       ...overrides,
     };
   }
 
-  it('4h Aug-2026 month-block ⇒ SMOKE ONLY on line 1, DATA: REAL, pooled n=3 (1/1/1), fee pass + MC skipped by fail-fast', async () => {
+  it('4h Aug-2026 month-block ⇒ SMOKE ONLY on line 1, DATA: REAL, pooled n=3 (1/1/1), fee pass + MC stopped by fail-fast', async () => {
     const resultsPath = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-e4-4h-'));
-    const runner = new BacktestRunner({ resultsPath, fixtureDir: FIXTURES_4H }, makeLogger());
+    const runner = new BacktestRunner({ resultsPath, fixtureDir: FIXTURES_4H_SMOKE }, makeLogger());
     const report = await runE4(request({}), runner, guardrails, makeLogger());
 
     expect(report.label).toBe('SMOKE');
+    expect(report.graded).toBe(false);
     expect(report.verdict).toBe('SMOKE ONLY');
     expect(report.data.stamp).toBe('REAL');
+    expect(report.thresholds).toMatchObject({ zeroFeePfFloor: 1.61, minZeroFeeTrades: 10, minExpectedTrades: 60, fullWindowMinDays: 365 });
+    expect(report.request.feeTier).toMatchObject({ makerBps: 25, takerBps: 40 });
     for (const p of Object.values(report.data.provenance)) {
       expect(p.source).toBe('fixture');
+      expect(p.granularitySeconds).toBe(14_400);
       expect(p.inferredBarMinutes).toBe(240);
       expect(p.candleCount).toBe(186);
-      expect(p.aggregation).toBeUndefined(); // fixture already is 4h — identity, no rollup record
+      expect(p.aggregation).toBeUndefined(); // native 4h fixture — nothing rolled up
     }
     expect(report.zeroFee!.stats.n).toBe(3);
     expect(report.zeroFee!.stats.bySymbol).toMatchObject({ 'BTC-USD': { n: 1 }, 'ETH-USD': { n: 1 }, 'SOL-USD': { n: 1 } });
@@ -421,36 +509,55 @@ describe('E4 §7 — end-to-end on committed REAL fixtures (#47)', () => {
     const lines = text.split('\n');
     expect(lines[0].startsWith('SMOKE ONLY — NOT screen, NOT holdout, NOT Beta hard-preflight')).toBe(true);
     expect(lines[1]).toBe('DATA: REAL');
+    expect(text).toContain('Locked thresholds: zero-fee PF floor ≥ 1.61 (STOP below)');
     expect(text).toContain('VERDICT: SMOKE ONLY');
-    expect(text).toContain('Stage 2 — fee pass: SKIPPED (zero-fee pass inconclusive)');
-    expect(text).toMatch(/E4_RESULT tf=4h label=SMOKE verdict="SMOKE ONLY" data=REAL zeroFeeN=3/);
+    expect(text).toContain('Stage 2 — fee pass: NOT RUN (STOP: zero-fee pass inconclusive)');
+    expect(text).toMatch(/E4_RESULT tf=4h label=SMOKE graded=false runCard=none verdict="SMOKE ONLY" data=REAL zeroFeeN=3/);
   });
 
-  it('--smoke-run-all-stages exercises the fee pass (EV gate rejects all 3 at intro1) and loads each series once', async () => {
+  it('--smoke-run-all-stages exercises the fee pass at FeeModel 40 and loads each series once; artefacts are distinct per pass', async () => {
     const resultsPath = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-e4-4h-all-'));
-    const runner = new BacktestRunner({ resultsPath, fixtureDir: FIXTURES_4H }, makeLogger());
+    const runner = new BacktestRunner({ resultsPath, fixtureDir: FIXTURES_4H_SMOKE }, makeLogger());
     const spy = vi.spyOn(runner, 'createDataProvider');
     const report = await runE4(request({ smokeRunAllStages: true }), runner, guardrails, makeLogger());
     expect(report.label).toBe('SMOKE');
     expect(report.verdict).toBe('SMOKE ONLY');
     expect(report.fee).not.toBeNull();
-    expect(report.fee!.metrics.evGate).toMatchObject({ mode: 'enforce', evaluated: 3, rejected: 3 });
-    expect(report.fee!.stats.n).toBe(0);
-    expect(report.monteCarlo).toBeNull(); // no fee-pass trades to bootstrap
+    expect(report.fee!.fees.routing).toBe('fee-model');
+    expect(report.fee!.fees.perVenue.spot).toEqual({ makerBps: 25, takerBps: 40 });
+    expect(report.fee!.metrics.evGate.mode).toBe('enforce');
+    expect(report.fee!.metrics.evGate.evaluated).toBe(3);
     expect(report.fee!.saved?.jsonPath).toMatch(/backtest_.*_e4-4h-fee\.json$/);
     expect(report.zeroFee!.saved?.jsonPath).toMatch(/backtest_.*_e4-4h-zero-fee\.json$/);
-    // Two passes in the same second must NOT overwrite each other's artefacts.
     expect(report.zeroFee!.saved!.jsonPath).not.toBe(report.fee!.saved!.jsonPath);
     expect(fs.existsSync(report.zeroFee!.saved!.jsonPath)).toBe(true);
     expect(fs.existsSync(report.fee!.saved!.jsonPath)).toBe(true);
     expect(JSON.parse(fs.readFileSync(report.zeroFee!.saved!.jsonPath, 'utf8')).fees.routing).toBe('flat-override');
-    expect(JSON.parse(fs.readFileSync(report.fee!.saved!.jsonPath, 'utf8')).fees.routing).toBe('fee-model');
     expect(spy).toHaveBeenCalledTimes(1);
+    expect(renderE4Report(report)).toContain('[SMOKE ONLY: ran past fail-fast via --smoke-run-all-stages]');
+  });
+
+  it('refuses the 15m gate fixtures for --tf 4h before any engine work (E4_FIXTURE_TF_MISMATCH)', async () => {
+    const resultsPath = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-e4-15m-'));
+    const runner = new BacktestRunner({ resultsPath, fixtureDir: FIXTURES_15M_GATE }, makeLogger());
+    await expect(
+      runE4(request({
+        fixtureDir: FIXTURES_15M_GATE, products: ['BTC-USD', 'ETH-USD'],
+        startDate: new Date('2026-09-03T00:00:00Z'), endDate: new Date('2026-09-10T00:00:00Z'),
+      }), runner, guardrails, makeLogger()),
+    ).rejects.toMatchObject({ code: 'E4_FIXTURE_TF_MISMATCH' });
+    expect(fs.readdirSync(resultsPath).length).toBe(0); // nothing ran, nothing saved
+  });
+
+  it('refuses perps products and a missing fixture dir', async () => {
+    const runner = new BacktestRunner({ resultsPath: os.tmpdir(), fixtureDir: FIXTURES_4H_SMOKE }, makeLogger());
+    await expect(runE4(request({ products: ['BTC-USD', 'BTC-PERP-INTX'] }), runner, guardrails, makeLogger())).rejects.toMatchObject({ code: 'E4_SPOT_ONLY' });
+    await expect(runE4(request({ fixtureDir: '' }), runner, guardrails, makeLogger())).rejects.toMatchObject({ code: 'E4_FIXTURE_DIR_REQUIRED' });
   });
 
   it('runner never overwrites a same-second run: collision guard appends -2, -3', async () => {
     const resultsPath = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-e4-collide-'));
-    const runner = new BacktestRunner({ resultsPath, fixtureDir: FIXTURES_4H }, makeLogger());
+    const runner = new BacktestRunner({ resultsPath, fixtureDir: FIXTURES_4H_SMOKE }, makeLogger());
     const cfg = {
       startDate: new Date('2026-08-01T00:00:00Z'), endDate: new Date('2026-09-01T00:00:00Z'), initialCapital: 1000, commission: 0,
       products: ['BTC-USD'],
@@ -487,45 +594,49 @@ describe('E4 §7 — end-to-end on committed REAL fixtures (#47)', () => {
     expect(calls).toEqual(['BTC-USD', 'ETH-USD', 'BTC-USD']);
   });
 
-  it('1d 24-month fixtures ⇒ FULL window, graded (never SMOKE ONLY), E[n] reported from the fee pass', async () => {
-    const resultsPath = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-e4-1d-'));
-    const runner = new BacktestRunner({ resultsPath, fixtureDir: FIXTURES_1D }, makeLogger());
-    const report = await runE4(
-      request({
-        tf: '1d',
-        startDate: new Date('2024-09-01T00:00:00Z'),
-        endDate: new Date('2026-08-31T00:00:00Z'),
-        products: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
-        feeTier: resolveE4FeeTier('1d', undefined, guardrails),
-        mc: { runs: 300, block: 'trade', seed: 20260910 },
-      }),
-      runner, guardrails, makeLogger(),
-    );
-    expect(report.label).toBe('FULL');
-    expect(report.data.stamp).toBe('REAL');
-    expect(['GO-ELIGIBLE', 'NO-GO', 'EXPLORATORY', 'INCONCLUSIVE']).toContain(report.verdict);
-    expect(report.verdict).not.toBe('SMOKE ONLY');
-    expect(report.request.windowDays).toBe(729);
-    for (const p of Object.values(report.data.provenance)) {
+  it('1d 24-month fixtures ⇒ FULL window: UNGRADED without a run card, graded with one (never SMOKE ONLY)', async () => {
+    const base = request({
+      tf: '1d',
+      startDate: new Date('2024-09-01T00:00:00Z'),
+      endDate: new Date('2026-08-31T00:00:00Z'),
+      fixtureDir: FIXTURES_1D,
+      mc: { runs: 300, block: 'trade', seed: 20260910 },
+    });
+
+    const held = await runE4(base, new BacktestRunner({ resultsPath: fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-e4-1d-')), fixtureDir: FIXTURES_1D }, makeLogger()), guardrails, makeLogger());
+    expect(held.label).toBe('FULL');
+    expect(held.graded).toBe(false);
+    expect(held.verdict).toBe('UNGRADED');
+    expect(held.data.stamp).toBe('REAL');
+    expect(held.request.windowDays).toBe(729);
+    expect(held.thresholds.zeroFeePfFloor).toBe(1.44);
+    for (const p of Object.values(held.data.provenance)) {
+      expect(p.granularitySeconds).toBe(86_400);
       expect(p.inferredBarMinutes).toBe(1440);
       expect(p.candleCount).toBe(730);
     }
-    expect(report.zeroFee!.stats.n).toBeGreaterThanOrEqual(10); // 17 on the committed fixtures
-    expect(report.zeroFee!.stats.shortEntries).toBe(0);
-    if (report.zeroFee!.failFast === 'none') {
-      expect(report.fee).not.toBeNull();
-      expect(report.fee!.frequency.expectedTrades12m).toBeCloseTo((report.fee!.stats.n * 365.25) / 729, 6);
-      expect(report.fee!.quartersEvaluable).toBe(true);
-      expect(report.gates.find((g) => g.id === 'expected_trades')).toBeDefined();
-      if (report.fee!.frequency.expectedTrades12m < 100) {
-        expect(report.verdict).toBe('EXPLORATORY');
-      }
-      if (report.fee!.stats.n > 0) {
-        expect(report.monteCarlo).toMatchObject({ block: 'trade', runs: 300, blocks: report.fee!.stats.n });
-      }
+    expect(held.zeroFee!.stats.n).toBeGreaterThanOrEqual(10); // 17 on the committed fixtures
+    expect(held.zeroFee!.stats.shortEntries).toBe(0);
+    // The STOP rule is independent of grading: fee pass runs iff the floor was cleared.
+    expect(held.fee !== null).toBe(held.zeroFee!.failFast === 'none');
+    const heldText = renderE4Report(held);
+    expect(heldText.split('\n')[0]).toMatch(/^FULL WINDOW — DATA: REAL, 729\.0d ≥ 365d — UNGRADED \(burn hold/);
+    expect(heldText).toContain('VERDICT: UNGRADED');
+    expect(heldText).toMatch(/E4_RESULT tf=1d label=FULL graded=false runCard=none verdict="UNGRADED"/);
+
+    const graded = await runE4({ ...base, runCard: 'TEST-CARD-UNIT' }, new BacktestRunner({ resultsPath: fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-e4-1d-g-')), fixtureDir: FIXTURES_1D }, makeLogger()), guardrails, makeLogger());
+    expect(graded.graded).toBe(true);
+    expect(graded.runCard).toBe('TEST-CARD-UNIT');
+    expect(['GO-ELIGIBLE', 'NO-GO', 'EXPLORATORY', 'INCONCLUSIVE']).toContain(graded.verdict);
+    // Same data, same stats — only the grading differs.
+    expect(graded.zeroFee!.stats.n).toBe(held.zeroFee!.stats.n);
+    expect(graded.fee?.stats.n).toBe(held.fee?.stats.n);
+    if (graded.fee) {
+      expect(graded.fee.frequency.expectedTrades12m).toBeCloseTo((graded.fee.stats.n * 365.25) / 729, 6);
+      expect(graded.fee.quartersEvaluable).toBe(true);
+      if (graded.fee.frequency.expectedTrades12m < 100) expect(graded.verdict).toBe('EXPLORATORY');
+      if (graded.fee.stats.n > 0) expect(graded.monteCarlo).toMatchObject({ block: 'trade', runs: 300, blocks: graded.fee.stats.n });
     }
-    const text = renderE4Report(report);
-    expect(text.split('\n')[0].startsWith('FULL WINDOW — DATA: REAL')).toBe(true);
-    expect(text).toContain('E4_RESULT tf=1d label=FULL');
-  }, 30_000);
+    expect(renderE4Report(graded).split('\n')[0]).toContain('GRADED under run card TEST-CARD-UNIT');
+  }, 60_000);
 });
