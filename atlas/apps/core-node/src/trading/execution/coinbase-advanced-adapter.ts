@@ -434,28 +434,37 @@ export class CoinbaseAdvancedExecutionAdapter extends EventEmitter implements IE
       try {
         const result = await this.client.createOrderRaw(body);
         if (result.ok) {
-          tracked.exchangeOrderId = result.orderId;
-          tracked.accepted = true;
-          tracked.status = request.type === 'market' ? 'pending' : 'open';
-          tracked.updatedAt = this.now();
-          this.exchangeToClient.set(result.orderId, request.clientOrderId);
-          this.emitEvent({
-            type: 'order_accepted',
-            clientOrderId: request.clientOrderId,
-            exchangeOrderId: result.orderId,
-            ts: this.now(),
-            raw: result.raw,
-          });
+          this.bindExchangeId(tracked, result.orderId);
+          // The user stream can deliver fills (even FILLED) before this response resolves;
+          // never emit a second order_accepted or regress a terminal status.
+          if (!tracked.accepted) {
+            tracked.accepted = true;
+            if (!TERMINAL.has(tracked.status)) {
+              tracked.status = request.type === 'market' ? 'pending' : 'open';
+            }
+            tracked.updatedAt = this.now();
+            this.emitEvent({
+              type: 'order_accepted',
+              clientOrderId: request.clientOrderId,
+              exchangeOrderId: result.orderId,
+              ts: this.now(),
+              raw: result.raw,
+            });
+          }
         } else {
           this.orders.delete(request.clientOrderId);
-          this.emitEvent({
-            type: 'order_rejected',
-            clientOrderId: request.clientOrderId,
-            reason: result.message,
-            code: result.code,
-            ts: this.now(),
-            raw: result.raw,
-          });
+          if (tracked.exchangeOrderId) this.exchangeToClient.delete(tracked.exchangeOrderId);
+          if (!TERMINAL.has(tracked.status)) {
+            tracked.status = 'rejected';
+            this.emitEvent({
+              type: 'order_rejected',
+              clientOrderId: request.clientOrderId,
+              reason: result.message,
+              code: result.code,
+              ts: this.now(),
+              raw: result.raw,
+            });
+          }
         }
         return;
       } catch (error) {
@@ -470,6 +479,19 @@ export class CoinbaseAdvancedExecutionAdapter extends EventEmitter implements IE
         }
         const code = error instanceof CoinbaseApiError ? error.coinbaseCode ?? error.kind : transient ? 'TRANSPORT_ERROR' : 'SUBMIT_ERROR';
         const message = error instanceof Error ? error.message : String(error);
+        this.logger.error('Advanced Trade order submit failed', {
+          clientOrderId: request.clientOrderId,
+          symbol: request.symbol,
+          code,
+          message,
+          attempt,
+          existsOnExchange: tracked.accepted,
+        });
+        if (tracked.accepted) {
+          // The user stream already proved the order exists (response was lost in transit);
+          // the accepted/fill events it produced are the truth — do not contradict them.
+          return;
+        }
         // The order may still exist on the exchange after a transport failure; keep the
         // tracked record so a later user-stream update can reconcile it (truth wins).
         tracked.status = 'rejected';
@@ -477,13 +499,6 @@ export class CoinbaseAdvancedExecutionAdapter extends EventEmitter implements IE
         if (!transient) {
           this.orders.delete(request.clientOrderId);
         }
-        this.logger.error('Advanced Trade order submit failed', {
-          clientOrderId: request.clientOrderId,
-          symbol: request.symbol,
-          code,
-          message,
-          attempt,
-        });
         this.emitEvent({
           type: 'order_rejected',
           clientOrderId: request.clientOrderId,
@@ -682,7 +697,7 @@ export class CoinbaseAdvancedExecutionAdapter extends EventEmitter implements IE
       return; // not placed by this session — boot reconciliation is TASK_013
     }
     this.bindExchangeId(tracked, update.orderId);
-    this.ensureAccepted(tracked, update.raw);
+    this.ensureAccepted(tracked, update.raw, update.status);
 
     if (decimalCompare(update.cumulativeQuantity, tracked.emittedQty) > 0) {
       const deltaQty = decimalSub(update.cumulativeQuantity, tracked.emittedQty);
@@ -838,9 +853,9 @@ export class CoinbaseAdvancedExecutionAdapter extends EventEmitter implements IE
     const tracked = this.findTracked(order.order_id, order.client_order_id);
     if (!tracked) return;
     this.bindExchangeId(tracked, order.order_id);
-    this.ensureAccepted(tracked, order);
-
     const status = (order.status ?? '').toUpperCase();
+    this.ensureAccepted(tracked, order, status);
+
     const filledSize = order.filled_size ?? '0';
     if (status === 'FILLED' && decimalCompare(filledSize, tracked.emittedQty) > 0) {
       tracked.filledLagPolls += 1;
@@ -1037,9 +1052,14 @@ export class CoinbaseAdvancedExecutionAdapter extends EventEmitter implements IE
     }
   }
 
-  /** Emit `order_accepted` for orders whose submit response was lost (transport failure). */
-  private ensureAccepted(tracked: TrackedOrder, raw: unknown): void {
+  /**
+   * Emit `order_accepted` for orders the exchange reports before/without a submit
+   * response (fast fills racing the HTTP reply, or a lost response after a transport
+   * failure). A first sighting that is already FAILED is not an acceptance.
+   */
+  private ensureAccepted(tracked: TrackedOrder, raw: unknown, exchangeStatus: string): void {
     if (tracked.accepted) return;
+    if (exchangeStatus === 'FAILED') return;
     if (tracked.status === 'rejected') {
       this.logger.warn('Order rejected locally after transport failure but EXISTS on exchange — recovering', {
         clientOrderId: tracked.clientOrderId,

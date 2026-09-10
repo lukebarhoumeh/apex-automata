@@ -927,6 +927,90 @@ describe('CoinbaseAdvancedExecutionAdapter — fills, cancels, reconciliation', 
   });
 });
 
+describe('CoinbaseAdvancedExecutionAdapter — stream racing the HTTP response', () => {
+  it('emits exactly one order_accepted and keeps FILLED when the user stream beats POST /orders', async () => {
+    const mock = createMockFetch();
+    const logger = createLogger();
+    let resolvePost!: (value: MockResponse) => void;
+    mock.on('POST', '/api/v3/brokerage/orders', () => new Promise<MockResponse>((resolve) => { resolvePost = resolve; }));
+    const adapter = new CoinbaseAdvancedExecutionAdapter({
+      logger,
+      client: makeClient(mock, logger, { maxRetries: 0 }),
+      symbols: ['ETH-USD'],
+      productSpecs: { 'ETH-USD': ETH_SPEC },
+      userStream: null,
+      fillPollIntervalMs: 60_000,
+    });
+    const events: BrokerOrderEvent[] = [];
+    adapter.onEvent((e) => events.push(e));
+    await adapter.start();
+
+    const placing = adapter.placeOrder({ clientOrderId: 'c-race', symbol: 'ETH-USD', side: 'buy', type: 'market', quantity: 0.01 });
+    await vi.waitFor(() => expect(mock.calls).toHaveLength(1));
+
+    // Fast IOC fill arrives on the user stream before the HTTP response.
+    adapter.handleUserOrderUpdate({
+      orderId: 'ex-race',
+      clientOrderId: 'c-race',
+      productId: 'ETH-USD',
+      status: 'FILLED',
+      side: 'buy',
+      orderType: 'Market',
+      cumulativeQuantity: '0.01',
+      leavesQuantity: '0',
+      avgPrice: '2469.55',
+      totalFees: '0.30',
+      postOnly: false,
+      creationTime: '2026-09-10T18:00:00Z',
+      eventType: 'update',
+      sequenceNum: 1,
+      timestamp: '2026-09-10T18:00:00.050Z',
+      raw: {},
+    });
+    expect(events.map((e) => e.type)).toEqual(['order_accepted', 'fill']);
+
+    resolvePost({ status: 200, body: { success: true, success_response: { order_id: 'ex-race', client_order_id: 'c-race' } } });
+    await placing;
+
+    expect(events.map((e) => e.type)).toEqual(['order_accepted', 'fill']); // no duplicate accepted
+    expect(events[0]).toMatchObject({ clientOrderId: 'c-race', exchangeOrderId: 'ex-race' });
+    expect(adapter.getHealth().pendingOrderCount).toBe(0); // FILLED not regressed to pending
+    await adapter.stop();
+  });
+
+  it('does not announce acceptance for an order whose first exchange status is FAILED', async () => {
+    const mock = createMockFetch();
+    const logger = createLogger();
+    let resolvePost!: (value: MockResponse) => void;
+    mock.on('POST', '/api/v3/brokerage/orders', () => new Promise<MockResponse>((resolve) => { resolvePost = resolve; }));
+    const adapter = new CoinbaseAdvancedExecutionAdapter({
+      logger,
+      client: makeClient(mock, logger, { maxRetries: 0 }),
+      symbols: ['ETH-USD'],
+      productSpecs: { 'ETH-USD': ETH_SPEC },
+      userStream: null,
+      fillPollIntervalMs: 60_000,
+    });
+    const events: BrokerOrderEvent[] = [];
+    adapter.onEvent((e) => events.push(e));
+    await adapter.start();
+
+    const placing = adapter.placeOrder({ ...LIMIT_REQUEST, clientOrderId: 'c-fail' });
+    await vi.waitFor(() => expect(mock.calls).toHaveLength(1));
+    adapter.handleUserOrderUpdate({
+      orderId: 'ex-fail', clientOrderId: 'c-fail', productId: 'ETH-USD', status: 'FAILED', side: 'buy', orderType: 'Limit',
+      cumulativeQuantity: '0', leavesQuantity: '0', avgPrice: '0', totalFees: '0', postOnly: false, rejectReason: 'INSUFFICIENT_FUNDS',
+      creationTime: '', eventType: 'update', sequenceNum: 1, timestamp: '', raw: {},
+    });
+    resolvePost({ status: 200, body: { success: false, error_response: { error: 'INSUFFICIENT_FUND', message: 'nope' } } });
+    await placing;
+
+    expect(events.map((e) => e.type)).toEqual(['order_rejected']); // once, never accepted
+    expect((events[0] as OrderRejectedEvent).code).toBe('INSUFFICIENT_FUNDS');
+    await adapter.stop();
+  });
+});
+
 describe('CoinbaseAdvancedExecutionAdapter — start() fail-closed on product specs', () => {
   it('refuses to start when a live symbol is missing or not tradable', async () => {
     const mock = createMockFetch();
