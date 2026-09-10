@@ -9,7 +9,7 @@
  *   4. Balances           — USD + USDC available/hold (live equity source of truth)
  *   5. Fee tier           — maker/taker rates (FeeModel + EV-gate inputs)
  *   6. Product specs      — increments, min sizes, trading status per symbol
- *   7. Repo client parity — AdvancedTradeRestClient.getAccounts() (its JWT variant)
+ *   7. Repo client parity — AdvancedTradeRestClient (the runtime live client) authenticates too
  *
  * NEVER places, modifies, or cancels orders. NEVER prints secrets or tokens.
  *
@@ -373,24 +373,42 @@ async function checkProducts(checks: Check[], auth: Auth, symbols: string[]): Pr
   }
 }
 
+/**
+ * Parity check for the runtime client the live adapter actually uses. Since TASK_010 the
+ * repo client mints the same spec-exact JWT as this CLI, paginates accounts and maps errors
+ * to `{status, code, message}` (never headers/JWTs), so a FAIL here means the live path
+ * would not authenticate either.
+ */
 async function checkRepoClient(checks: Check[], auth: Auth): Promise<void> {
-  const client = new AdvancedTradeRestClient(
-    { apiKey: auth.keyName, apiSecret: process.env.COINBASE_API_SECRET ?? '', environment: 'production' },
-    SILENT_LOGGER,
-  );
+  let client: AdvancedTradeRestClient;
   try {
-    const accounts = await client.getAccounts();
-    checks.push({
-      name: 'repo.AdvancedTradeRestClient',
-      verdict: 'PASS',
-      detail: `getAccounts() OK (${accounts.length} accounts on first page — client does not paginate)`,
-    });
+    client = new AdvancedTradeRestClient(
+      { apiKey: auth.keyName, apiSecret: process.env.COINBASE_API_SECRET ?? '', environment: 'production' },
+      SILENT_LOGGER,
+    );
   } catch (err) {
-    const status = (err as { response?: { status?: number } }).response?.status;
     checks.push({
       name: 'repo.AdvancedTradeRestClient',
       verdict: 'FAIL',
-      detail: `getAccounts() failed${status ? ` (HTTP ${status})` : ''} — its JWT variant (aud claim / DER→raw) is rejected`,
+      detail: `constructor rejected credentials: ${err instanceof Error ? err.message : String(err)}`,
+    });
+    return;
+  }
+  try {
+    const accounts = await client.getAccountsAll();
+    const permissions = await client.getKeyPermissions();
+    checks.push({
+      name: 'repo.AdvancedTradeRestClient',
+      verdict: permissions.can_trade ? 'PASS' : 'WARN',
+      detail: `getAccountsAll() OK (${accounts.length} accounts, all pages) · key_permissions can_trade=${permissions.can_trade}`,
+    });
+  } catch (err) {
+    const apiError = err as { httpStatus?: number; coinbaseCode?: string; coinbaseMessage?: string; message?: string };
+    const status = apiError.httpStatus ? ` (HTTP ${apiError.httpStatus}${apiError.coinbaseCode ? ` ${apiError.coinbaseCode}` : ''})` : '';
+    checks.push({
+      name: 'repo.AdvancedTradeRestClient',
+      verdict: 'FAIL',
+      detail: `getAccountsAll()/getKeyPermissions() failed${status}: ${apiError.coinbaseMessage ?? apiError.message ?? 'unknown error'} — the live adapter would not authenticate either`,
     });
   }
 }
