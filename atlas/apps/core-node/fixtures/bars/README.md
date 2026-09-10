@@ -9,6 +9,10 @@ Supabase secret **or** on a silent synthetic fallback (TASK_017 B1).
 | `BTC-USD.json` | BTC-USD | 15m (`FIFTEEN_MINUTE`) | 2026-09-03T00:00 → 2026-09-10T00:00 | 673 | Coinbase Advanced Trade public `GET /api/v3/brokerage/market/products/BTC-USD/candles` |
 | `ETH-USD.json` | ETH-USD | 15m (`FIFTEEN_MINUTE`) | 2026-09-03T00:00 → 2026-09-10T00:00 | 673 | same endpoint, ETH-USD |
 
+Multi-timeframe sets for E4 experiments (`4h/`, `1d/` — BTC, ETH, SOL) live in
+subdirectories and are documented in [`MULTI_TF.md`](./MULTI_TF.md); they are
+not read by the gate.
+
 Format: `BarFixtureFile` (`src/backtesting/data-loader.ts`) — `candles[].time`
 is epoch **seconds**, matching the `public.bars` convention. Each file records
 `fetchedAt`, `endpoint` and `source` for provenance; the loader logs the file
