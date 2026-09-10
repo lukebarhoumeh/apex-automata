@@ -26,7 +26,12 @@ import { MetricsTracker } from '../trading/metrics-tracker';
 import { SecretManager } from '../config/secrets';
 import { AdvancedTradeRestClient, loadAdvancedTradeAuth } from '../exchanges/coinbase/advanced-trade-client';
 import { CoinbaseApiError } from '../exchanges/coinbase/http/errors';
-import { LIVE_REQUIRES_ADVANCED_TRADE, assertLiveExecutionPathWired, getMarketDataUrls } from '../trading/execution/adapter-factory';
+import {
+  LIVE_REQUIRES_ADVANCED_TRADE,
+  assertLiveExecutionPathWired,
+  assertLiveStage0Complete,
+  getMarketDataUrls,
+} from '../trading/execution/adapter-factory';
 import { toLiveProductSpec } from '../trading/execution/coinbase-advanced-adapter';
 import { CoinbasePerpsAdapter } from '../exchanges/coinbase-perps-adapter';
 import { ExchangeRegistry } from '../exchanges/exchange-registry';
@@ -2408,6 +2413,15 @@ async function runLivePreflight(input: {
   products: string[];
 }): Promise<LivePreflightResult> {
   const warnings: string[] = [];
+
+  // Sprint 9 / Stage 0 gate (LIVE_STAGE0_INCOMPLETE): live is refused outright until
+  // TASK_011–016 verify green. Checked before anything else so the operator sees the
+  // real blocker instead of chasing credentials. Same gate guards createAdapters().
+  try {
+    assertLiveStage0Complete();
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error), warnings };
+  }
   
   // Validate API version and credentials
   const apiVersion = env.COINBASE_API_VERSION || 'exchange';

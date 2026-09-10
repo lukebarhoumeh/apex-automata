@@ -4,10 +4,14 @@
  * Creates the appropriate execution adapter and account provider based on configuration.
  * This is the single switch point for paper vs live mode.
  *
- * Live mode FAILS CLOSED: only `COINBASE_API_VERSION=advanced` (CDP key + ES256 JWT)
- * can produce a live adapter. Legacy Coinbase Exchange (HMAC + passphrase) keys cannot
- * authenticate this account, so requesting live with anything else throws
- * `LIVE_REQUIRES_ADVANCED_TRADE` instead of building a dead adapter.
+ * Live mode FAILS CLOSED, in this order:
+ *   1. `LIVE_STAGE0_INCOMPLETE` — Sprint 9 / Stage 0 (TASK_011–016) has not verified green
+ *      (see `live-stage0-gate.ts`; a code constant, no runtime override).
+ *   2. `LIVE_REQUIRES_ADVANCED_TRADE` — only `COINBASE_API_VERSION=advanced` (CDP key +
+ *      ES256 JWT) can produce a live adapter. Legacy Coinbase Exchange (HMAC + passphrase)
+ *      keys cannot authenticate this account.
+ *   3. `LIVE_CREDENTIALS_MISSING` — no CDP key name / EC P-256 PEM supplied.
+ * Each gate is independent; none replaces another. Paper mode consults none of them.
  */
 
 import { Logger } from '../../core/logger';
@@ -28,6 +32,7 @@ import {
 import { CoinbaseLiveExecutionAdapter, CoinbaseLiveAdapterConfig } from './coinbase-live-adapter';
 import { CoinbaseAdvancedExecutionAdapter } from './coinbase-advanced-adapter';
 import { PaperExecutionAdapter, PaperAdapterConfig } from './paper-adapter';
+import { assertLiveStage0Complete } from './live-stage0-gate';
 import { 
   IAccountProvider, 
   PaperAccountProvider, 
@@ -35,6 +40,16 @@ import {
   PaperAccountConfig,
   LiveAccountConfig,
 } from '../account/account-provider';
+
+// Stage-0 gate lives in its own module so the constant has exactly one definition;
+// re-exported here because this factory is the single paper/live switch point.
+export {
+  LIVE_STAGE0_INCOMPLETE,
+  LIVE_STAGE0_COMPLETE,
+  LIVE_STAGE0_REQUIRED_TASKS,
+  assertLiveStage0Complete,
+  isLiveStage0Complete,
+} from './live-stage0-gate';
 
 /** Error code thrown when live mode is requested without Advanced Trade (CDP) auth. */
 export const LIVE_REQUIRES_ADVANCED_TRADE = 'LIVE_REQUIRES_ADVANCED_TRADE';
@@ -132,8 +147,10 @@ export interface AdapterSet {
 /**
  * Create execution adapter and account provider based on config.
  *
- * Live: requires `coinbaseApiVersion === 'advanced'` and `liveCredentials`, otherwise
- * throws (`LIVE_REQUIRES_ADVANCED_TRADE` / `LIVE_CREDENTIALS_MISSING`). The legacy
+ * Live: refused outright with `LIVE_STAGE0_INCOMPLETE` until Sprint 9 / Stage 0
+ * (TASK_011–016) verifies green. Past that gate it requires
+ * `coinbaseApiVersion === 'advanced'` and `liveCredentials`, otherwise throws
+ * (`LIVE_REQUIRES_ADVANCED_TRADE` / `LIVE_CREDENTIALS_MISSING`). The legacy
  * `exchange` instance is NOT used for live execution any more — it remains a
  * parameter only for market data plumbing and paper-mode call sites.
  */
@@ -157,6 +174,11 @@ export function createAdapters(
   }
 
   if (config.executionMode === 'live') {
+    // Hard refuse first: nothing on the live branch — not even credential parsing —
+    // runs while Stage 0 is incomplete. The CDP/credential gates below remain in force
+    // once this one opens.
+    assertLiveStage0Complete();
+
     if (config.coinbaseApiVersion !== 'advanced') {
       throw new Error(
         `${LIVE_REQUIRES_ADVANCED_TRADE}: EXECUTION_MODE=live requires COINBASE_API_VERSION=advanced ` +
