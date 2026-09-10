@@ -67,6 +67,9 @@ risk:
   # to require a $0.50 minimum expected edge per trade. See
   # docs/research/2026-05-18_a1-hl-fee-aware-param-retune.md §5.4 and
   # docs/research/2026-05-18_f4-hl-backtest-validation.md §4.1.
+  # Desk pin (2026-09-10): 0 for the first 30 paper days. TODO: raise to 1
+  # (USD) once 30 days of paper EV data exist; an optional min_hold_bars gate
+  # is a separate follow-up. Enforced by `pnpm check:config` (config-drift.ts).
   min_ev_threshold: 0
 
 # Per-symbol risk limits and strategy parameter overrides
@@ -93,6 +96,14 @@ per_symbol:
         atrMultiplier: 2.0
         rsiOversold: 30
         rsiOverbought: 70
+      # Desk pin (2026-09-10): trend_follow runs on every symbol and had no
+      # override here, so it fell through to the plugin default
+      # takeProfitAtr=5.0 while every other symbol carries 2.5/6.0 (A1 HL
+      # fee-floor retune). Pinned explicitly; `pnpm check:config`
+      # fails if any symbol block loses this.
+      trend_follow:
+        stopAtr: 2.5
+        takeProfitAtr: 6.0
   ETH-USD:
     max_notional_usd: 3000
     max_daily_loss_usd: 200
@@ -136,6 +147,10 @@ per_symbol:
         atrMultiplier: 2.5
         rsiOversold: 30
         rsiOverbought: 70
+      # Desk pin (2026-09-10) — same rationale as BTC-USD above.
+      trend_follow:
+        stopAtr: 2.5
+        takeProfitAtr: 6.0
 
 strategy:
   mode: momentum_futures
@@ -153,6 +168,9 @@ strategy:
   # - Perps adapter ('coinbase-perps'): full long/short capability
   # - Strategies generate both long and short signals
   allow_short: true
+  # Desk pin: 15 — never <= 5. A 5-minute cooldown produced 2-5 minute
+  # entry->exit round-trips that lost $370+ in fees alone before any edge
+  # could show. Enforced by `pnpm check:config` (config-drift.ts).
   trade_cooldown_min: 15
 
 # Momentum strategy (RSI/MACD) — single source of truth for the
@@ -316,6 +334,9 @@ meta_filter:
       - BTC-PERP-INTX
 
 filters:
+  # Desk pin: 0.005 (0.5% ATR). H2 min-profitable-trade-size floor at HL fees
+  # (docs/research/2026-05-14_min-trade-size-hl-fees.md §2); the previous
+  # 0.0005 let sub-fee-floor chop through. Enforced by `pnpm check:config` (config-drift.ts).
   atr_volatility_min: 0.005
   atr_volatility_max: 0.05
   funding_bias_enabled: true
