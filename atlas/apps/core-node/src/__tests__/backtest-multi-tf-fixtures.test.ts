@@ -5,10 +5,10 @@
  *      decimal volume, complete-buckets-only, width validation.
  *   2. `buildFixture` — rolled-up fixtures are labelled by bucket width and
  *      carry a `rollup` provenance block; native fixtures are unchanged.
- *   3. Committed fixtures under fixtures/bars/4h and fixtures/bars/1d are
+ *   3. Committed fixtures under fixtures/bars/4h/smoke-aug2026 and fixtures/bars/1d are
  *      real, contiguous, UTC-aligned and declare their provenance.
  *   4. The fail-closed loader judges coverage against the fixture's declared
- *      bar width, so `--fixture-dir fixtures/bars/4h` works with the CLI's
+ *      bar width, so `--fixture-dir fixtures/bars/4h/smoke-aug2026` works with the CLI's
  *      15m default and reports honest coverage.
  */
 import { describe, it, expect, vi } from 'vitest';
@@ -189,9 +189,9 @@ describe('committed multi-TF fixtures are real, contiguous and self-describing',
     }
   }
 
-  it('4h/: BTC, ETH, SOL — Aug 2026 month-block, 186 true 4H bars rolled from ONE_HOUR', () => {
+  it('4h/smoke-aug2026/: BTC, ETH, SOL — Aug 2026 month-block, 186 true 4H bars rolled from ONE_HOUR (SMOKE ONLY)', () => {
     for (const symbol of TRIO) {
-      const file = JSON.parse(fs.readFileSync(path.join(FIXTURES, '4h', `${symbol}.json`), 'utf8')) as BarFixtureFile;
+      const file = JSON.parse(fs.readFileSync(path.join(FIXTURES, '4h', 'smoke-aug2026', `${symbol}.json`), 'utf8')) as BarFixtureFile;
       expect(file.symbol).toBe(symbol);
       expect(file.source).toBe('coinbase-advanced-trade-public');
       expect(file.source).not.toMatch(/synthetic/i);
@@ -229,7 +229,7 @@ describe('committed multi-TF fixtures are real, contiguous and self-describing',
 
   it('4h rolled to 1d reproduces the native 1d OHLC for August 2026 (internal consistency)', () => {
     for (const symbol of TRIO) {
-      const h4 = JSON.parse(fs.readFileSync(path.join(FIXTURES, '4h', `${symbol}.json`), 'utf8')) as BarFixtureFile;
+      const h4 = JSON.parse(fs.readFileSync(path.join(FIXTURES, '4h', 'smoke-aug2026', `${symbol}.json`), 'utf8')) as BarFixtureFile;
       const d1 = JSON.parse(fs.readFileSync(path.join(FIXTURES, '1d', `${symbol}.json`), 'utf8')) as BarFixtureFile;
       const rolled = rollupCandles(h4.candles.map((c) => ({ ...c, time: c.time * 1000 })), FOUR_H, DAY);
       expect(rolled.bucketsEmitted).toBe(31);
@@ -247,7 +247,7 @@ describe('committed multi-TF fixtures are real, contiguous and self-describing',
 
 describe('fail-closed loader honours the fixture-declared bar width', () => {
   it('loads 4h fixtures with the CLI default (900s) and reports coverage against 14400s bars', async () => {
-    const loader = new HistoricalDataLoader({ fixtureDir: path.join(FIXTURES, '4h') }, makeLogger());
+    const loader = new HistoricalDataLoader({ fixtureDir: path.join(FIXTURES, '4h', 'smoke-aug2026') }, makeLogger());
     for (const symbol of TRIO) {
       const res = await loader.loadCandles(symbol, new Date('2026-08-01T00:00:00Z'), new Date('2026-09-01T00:00:00Z'), 900);
       expect(res.source).toBe('fixture');
@@ -271,7 +271,7 @@ describe('fail-closed loader honours the fixture-declared bar width', () => {
   });
 
   it('a 4h fixture asked for a window it does not cover is still DATA_UNAVAILABLE', async () => {
-    const loader = new HistoricalDataLoader({ fixtureDir: path.join(FIXTURES, '4h') }, makeLogger());
+    const loader = new HistoricalDataLoader({ fixtureDir: path.join(FIXTURES, '4h', 'smoke-aug2026') }, makeLogger());
     await expect(
       loader.loadCandles('BTC-USD', new Date('2026-06-01T00:00:00Z'), new Date('2026-09-01T00:00:00Z'), 900),
     ).rejects.toMatchObject({ code: 'DATA_UNAVAILABLE' });
