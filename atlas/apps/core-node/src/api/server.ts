@@ -24,7 +24,10 @@ import { validateSchemaOrFail } from '../config/validateSchema';
 import { OrderRequest } from '../exchanges/coinbase';
 import { MetricsTracker } from '../trading/metrics-tracker';
 import { SecretManager } from '../config/secrets';
-import { CoinbaseExchange } from '../exchanges/coinbase';
+import { AdvancedTradeRestClient, loadAdvancedTradeAuth } from '../exchanges/coinbase/advanced-trade-client';
+import { CoinbaseApiError } from '../exchanges/coinbase/http/errors';
+import { LIVE_REQUIRES_ADVANCED_TRADE, getMarketDataUrls } from '../trading/execution/adapter-factory';
+import { toLiveProductSpec } from '../trading/execution/coinbase-advanced-adapter';
 import { CoinbasePerpsAdapter } from '../exchanges/coinbase-perps-adapter';
 import { ExchangeRegistry } from '../exchanges/exchange-registry';
 import { HyperliquidAdapter } from '../exchanges/hyperliquid';
@@ -1593,7 +1596,8 @@ app.post('/api/engine/start', async (req, res) => {
       try {
         const end = Math.floor(Date.now() / 1000);
         const start = end - (limit * 60);
-        const url = `https://api.exchange.coinbase.com/products/${symbol}/candles?granularity=60&start=${start}&end=${end}`;
+        const publicRestUrl = getMarketDataUrls('production').restUrl;
+        const url = `${publicRestUrl}/products/${symbol}/candles?granularity=60&start=${start}&end=${end}`;
         
         logger.info(`Loading historical candles from public API for ${symbol}`, { limit });
         
@@ -2392,6 +2396,13 @@ type LivePreflightResult =
   | { ok: true; warnings: string[] }
   | { ok: false; error: string; details?: Record<string, any>; warnings: string[] };
 
+/**
+ * Live preflight (Sprint 9 / TASK_010 minimum): every check runs against Coinbase
+ * Advanced Trade via the hardened JWT client. The legacy `CoinbaseExchange` (HMAC +
+ * passphrase against api.exchange.coinbase.com) is no longer used here — it cannot
+ * authenticate a CDP key, so `COINBASE_API_VERSION=exchange` fails closed.
+ * TASK_011 extends this with equity/fee-tier truth.
+ */
 async function runLivePreflight(input: {
   engineGuardrails: typeof guardrails;
   products: string[];
@@ -2409,27 +2420,27 @@ async function runLivePreflight(input: {
     };
   }
   
-  if (apiVersion === 'exchange' && !env.COINBASE_API_PASSPHRASE) {
+  if (apiVersion !== 'advanced') {
     return {
       ok: false,
-      error: 'Missing COINBASE_API_PASSPHRASE for live trading (required for legacy Coinbase Exchange API auth)',
+      error:
+        `${LIVE_REQUIRES_ADVANCED_TRADE}: EXECUTION_MODE=live requires COINBASE_API_VERSION=advanced ` +
+        `(CDP key + ES256 JWT). Got "${apiVersion}" — legacy Coinbase Exchange HMAC keys cannot authenticate this account.`,
       warnings,
     };
   }
   
-  if (apiVersion === 'advanced') {
-    // Advanced Trade API uses JWT with EC private key — validate key format
-    const secret = env.COINBASE_API_SECRET || '';
-    const cleanSecret = secret.replace(/\\n/g, '\n').trim();
-    if (!cleanSecret.includes('BEGIN EC PRIVATE KEY') && !cleanSecret.includes('BEGIN PRIVATE KEY')) {
-      return {
-        ok: false,
-        error: 'COINBASE_API_SECRET must be an EC private key in PEM format for Advanced Trade API',
-        warnings,
-      };
-    }
-    warnings.push('Using Coinbase Advanced Trade API (JWT auth with ES256)');
+  // Fail closed on credential SHAPE before touching the network (CDP key name + EC P-256 PEM).
+  try {
+    loadAdvancedTradeAuth(env.COINBASE_API_KEY, env.COINBASE_API_SECRET);
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Invalid Advanced Trade credentials: ${error instanceof Error ? error.message : String(error)}`,
+      warnings,
+    };
   }
+  warnings.push('Using Coinbase Advanced Trade API (JWT auth with ES256)');
   
   // Ensure exchange credentials are stored in Supabase (the trading engine loads secrets from Supabase).
   const secretManager = new SecretManager(
@@ -2486,49 +2497,108 @@ async function runLivePreflight(input: {
     return { ok: false, error: 'No Coinbase production credentials found', warnings };
   }
   
+  // Read-only checks against Advanced Trade (JWT). Nothing here places, edits or cancels orders.
+  let client: AdvancedTradeRestClient;
   try {
-    const exchange = new CoinbaseExchange(
-      {
-        apiKey: credentials.apiKey,
-        apiSecret: credentials.apiSecret,
-        apiPassphrase: credentials.apiPassphrase,
-        environment: 'production',
-        wsUrl: 'wss://ws-feed.exchange.coinbase.com',
-        restUrl: 'https://api.exchange.coinbase.com',
-      },
-      logger
+    client = new AdvancedTradeRestClient(
+      { apiKey: credentials.apiKey, apiSecret: credentials.apiSecret, environment: 'production' },
+      logger,
     );
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Stored Coinbase credentials are not valid Advanced Trade credentials: ${error instanceof Error ? error.message : String(error)}`,
+      warnings,
+    };
+  }
+  
+  try {
+    // 1. Clock skew — JWTs carry a 120s nbf/exp window.
+    try {
+      const skewSeconds = await client.getClockSkewSeconds();
+      if (skewSeconds > 30) {
+        return {
+          ok: false,
+          error: `Live preflight failed: clock skew ${skewSeconds.toFixed(1)}s vs Coinbase exceeds 30s (JWTs would be rejected)`,
+          warnings,
+        };
+      }
+      if (skewSeconds > 5) {
+        warnings.push(`Clock skew ${skewSeconds.toFixed(1)}s vs Coinbase (JWT window is 120s)`);
+      }
+    } catch (error) {
+      warnings.push(`Could not read Coinbase server time (${error instanceof Error ? error.message : String(error)})`);
+    }
     
-    // REST ping (safe): list accounts + validate required products exist
-    const accounts = await exchange.getAccounts();
-    const usd = accounts.find(a => a.currency === 'USD');
-    const usdBalance = usd ? Number.parseFloat(usd.balance) : NaN;
-    if (!Number.isFinite(usdBalance) || usdBalance <= 0) {
-      warnings.push('Could not determine positive USD balance from Coinbase accounts (equity sanity check skipped)');
+    // 2. Key permissions — the JWT must authenticate and the key must be allowed to trade.
+    const permissions = await client.getKeyPermissions();
+    if (!permissions.can_trade) {
+      return {
+        ok: false,
+        error: 'Live preflight failed: CDP key has can_trade=false — enable Trade on the key (View+Trade, no Transfer)',
+        warnings,
+      };
+    }
+    if (permissions.can_transfer) {
+      warnings.push('CDP key has can_transfer=true — a trading bot key should NOT be able to move funds');
+    }
+    
+    // 3. Balances — USD + USDC available (paginated), used to cap guardrails equity.
+    const accounts = await client.getAccountsAll();
+    const stableAvailable = accounts
+      .filter(a => a.currency === 'USD' || a.currency === 'USDC')
+      .reduce((sum, a) => sum + (Number.parseFloat(a.available_balance?.value ?? '0') || 0), 0);
+    if (!Number.isFinite(stableAvailable) || stableAvailable <= 0) {
+      warnings.push('Could not determine positive USD/USDC balance from Coinbase accounts (equity sanity check skipped)');
     } else {
       const configuredEquity = input.engineGuardrails.account.equity_usd;
-      if (usdBalance < configuredEquity * 0.95) {
+      if (stableAvailable < configuredEquity * 0.95) {
         // Safety: scale down equity to avoid over-risking the live account.
-        input.engineGuardrails.account.equity_usd = usdBalance;
-        warnings.push(`Guardrails equity_usd scaled down for live session (${configuredEquity} → ${usdBalance})`);
+        input.engineGuardrails.account.equity_usd = stableAvailable;
+        warnings.push(`Guardrails equity_usd scaled down for live session (${configuredEquity} → ${stableAvailable})`);
       }
     }
     
-    const products = await exchange.getProducts();
-    const productIds = new Set(products.map(p => p.id));
-    const missing = input.products.filter(p => !productIds.has(p));
-    if (missing.length > 0) {
+    // 4. Product specs — every live symbol must exist AND be tradable (real increments cached by the adapter at start()).
+    const missing: string[] = [];
+    const notTradable: string[] = [];
+    for (const symbol of input.products) {
+      try {
+        const spec = toLiveProductSpec(await client.getProduct(symbol));
+        if (!spec.tradable) {
+          notTradable.push(`${symbol} (status=${spec.status}${spec.cancelOnly ? ', cancel_only' : ''})`);
+        } else if (spec.limitOnly || spec.postOnly) {
+          warnings.push(`${symbol} is ${spec.limitOnly ? 'LIMIT-ONLY' : 'POST-ONLY'} right now`);
+        }
+      } catch (error) {
+        if (error instanceof CoinbaseApiError && error.kind === 'not_found') {
+          missing.push(symbol);
+        } else {
+          throw error;
+        }
+      }
+    }
+    if (missing.length > 0 || notTradable.length > 0) {
+      const parts = [
+        missing.length ? `missing products on Coinbase: ${missing.join(', ')}` : null,
+        notTradable.length ? `not tradable: ${notTradable.join(', ')}` : null,
+      ].filter(Boolean);
       return {
         ok: false,
-        error: `Live preflight failed: missing products on Coinbase: ${missing.join(', ')}`,
+        error: `Live preflight failed: ${parts.join('; ')}`,
         warnings,
       };
     }
   } catch (error) {
+    // Errors from the hardened client carry {status, code, message} only — never headers/JWTs.
+    const details =
+      error instanceof CoinbaseApiError
+        ? { status: error.httpStatus, code: error.coinbaseCode, message: error.coinbaseMessage ?? error.message }
+        : { message: error instanceof Error ? error.message : String(error) };
     return {
       ok: false,
-      error: 'Live preflight failed: Coinbase REST connectivity check failed',
-      details: { message: error instanceof Error ? error.message : String(error) },
+      error: 'Live preflight failed: Coinbase Advanced Trade connectivity check failed',
+      details,
       warnings,
     };
   }
