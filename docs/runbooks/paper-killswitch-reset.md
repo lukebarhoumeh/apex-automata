@@ -96,7 +96,11 @@ Preconditions — all of them:
 
 ```sql
 -- Paper kill-switch reset — LAST RESORT. Engine must be STOPPED first.
--- Scope: exactly one user_id. Touches ONLY risk_metrics + risk_events.
+-- Scope: exactly one user_id AND the paper rows only. Touches ONLY
+-- risk_metrics + risk_events. The `execution_mode = 'paper'` predicate keeps
+-- a live session's row/halts untouched (TASK_014 P5); if the column does not
+-- exist yet (migration 20260910205000_risk_state_execution_mode not applied)
+-- there is exactly one row per user and the predicate must be dropped.
 BEGIN;
 
 UPDATE public.risk_metrics
@@ -109,18 +113,20 @@ SET kill_switch_active   = false,
     -- restart (orderHistory is empty, so nothing recomputes it downward).
     error_rate           = 0,
     updated_at           = now()
-WHERE user_id = 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f';
+WHERE user_id = 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f'
+  AND execution_mode = 'paper';
 
 UPDATE public.risk_events
 SET active     = false,
     cleared_at = COALESCE(cleared_at, now())
 WHERE user_id = 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f'
+  AND execution_mode = 'paper'
   AND active = true;
 
 COMMIT;
 ```
 
-Expected row counts: `risk_metrics` -> 1 (the table has a `UNIQUE (user_id)` constraint), `risk_events` -> however many stale halts had accumulated (0 is fine).
+Expected row counts: `risk_metrics` -> 1 (one row per `(user_id, execution_mode)` once the migration is applied; `UNIQUE (user_id)` before it), `risk_events` -> however many stale paper halts had accumulated (0 is fine).
 
 Then restart the engine (Path 1 steps 4-6 without the flag) and run the verification checklist.
 
@@ -138,14 +144,16 @@ Run after any path. Read-only.
   Expect `killSwitchActive: false` and `consecutiveLosses: 0` from `/api/risk/status` immediately. In `/api/status`, `killSwitch.active` flips to `false` immediately; `risk.killSwitchActive` is refreshed from the 5-second metrics tick, so allow one tick before reading it.
 - **Supabase (read-only, Dashboard SQL editor or `psql`):**
   ```sql
-  SELECT kill_switch_active, consecutive_losses, daily_pnl, max_drawdown, error_rate, updated_at
+  SELECT execution_mode, kill_switch_active, consecutive_losses, daily_pnl, max_drawdown, error_rate, updated_at
   FROM public.risk_metrics
   WHERE user_id = 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f';
 
-  SELECT count(*) AS stale_active_halts
+  SELECT execution_mode, count(*) AS stale_active_halts
   FROM public.risk_events
-  WHERE user_id = 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f' AND active = true;
+  WHERE user_id = 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f' AND active = true
+  GROUP BY execution_mode;
   ```
+  (Drop the `execution_mode` column from both statements if the migration has not been applied yet.)
   Expect `kill_switch_active = false`, `consecutive_losses = 0`, `stale_active_halts = 0`, and `updated_at` within the last minute.
 - **Stability:** wait two metrics ticks (~10 s) and re-run the API check. If `killSwitchActive` flipped back to `true`, read the `KILL SWITCH TRIGGERED:` log line — it names the guardrail that is still genuinely breached (usually daily loss), which no reset path is meant to override.
 - **UI:** the kill-switch banner clears and the active risk-events list is empty after the next realtime event or a hard refresh.

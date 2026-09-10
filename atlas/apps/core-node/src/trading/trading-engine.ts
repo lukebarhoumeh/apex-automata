@@ -977,7 +977,9 @@ export class TradingEngine extends EventEmitter {
       // round-trip fees route per-symbol (spot vs perps_intx) instead
       // of using a flat default. Live overlays the real Coinbase tier (TASK_011).
       feeModel: this.resolveSessionFeeModel(),
-      // TASK_011: live sizing/EV semantics. Paper leaves all three undefined.
+      // TASK_011: live sizing/EV semantics. Paper leaves the last two undefined.
+      // executionMode also scopes persisted risk state (TASK_014 P5) so a paper
+      // kill switch or loss streak never leaks into a live session.
       executionMode: this.config.mode,
       liveAccountTruth: this.liveAccountTruth ?? undefined,
       evGateMode: this.config.mode === 'live' ? resolveLiveConfig(guardrails).ev_gate_mode : undefined,

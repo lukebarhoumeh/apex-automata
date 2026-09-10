@@ -32,6 +32,8 @@ import {
 } from './risk/ev-gate';
 import { FeeModel } from '../core/fee-model';
 import { ACCOUNT_TRUTH_STALE, ACCOUNT_TRUTH_UNAVAILABLE } from './account/live-account-truth';
+import { isMissingColumnError, isMissingTableError } from '../core/postgrest-errors';
+import { ExecutionModeScope, normalizeExecutionMode } from './risk/execution-mode-scope';
 
 /** Closed trades kept for the realized payoff (avg win / avg loss) used by the live EV gate. */
 export const REALIZED_PAYOFF_WINDOW = 50;
@@ -122,6 +124,11 @@ export interface RiskEngineConfig {
    * Execution mode. `live` requires `liveAccountTruth` (throws
    * `ACCOUNT_TRUTH_UNAVAILABLE` otherwise) and switches the EV gate to its
    * fail-closed live semantics. Default `paper` — behaviour unchanged.
+   *
+   * Also scopes persisted risk state (TASK_014 P5): every boot-time restore
+   * (`risk_metrics`, `daily_equity`, `account_metrics`, `risk_events`) is
+   * filtered to rows of this mode and every matching persist is stamped
+   * with it, so paper state never bleeds into live or vice versa.
    */
   executionMode?: 'paper' | 'live';
   /**
@@ -192,22 +199,6 @@ export interface RiskEngineEvents {
  */
 export type RiskStateResetSource = 'startup_reset' | 'day_boundary' | 'manual_resume';
 
-/**
- * PostgREST / Postgres signatures for "this column does not exist".
- * `42703` is the Postgres undefined_column SQLSTATE; `PGRST204` is what
- * PostgREST returns when an insert/update payload names a column that is
- * missing from its schema cache.
- */
-function isMissingColumnError(error: { code?: string; message?: string } | null | undefined): boolean {
-  if (!error) return false;
-  if (error.code === '42703' || error.code === 'PGRST204') return true;
-  return /column .*does not exist|could not find the '.*' column/i.test(error.message ?? '');
-}
-
-function isMissingTableError(error: { code?: string } | null | undefined): boolean {
-  return error?.code === 'PGRST205' || error?.code === '42P01';
-}
-
 export class RiskEngine extends EventEmitter {
   private config: RiskEngineConfig;
   private logger: Logger;
@@ -257,6 +248,9 @@ export class RiskEngine extends EventEmitter {
   /** Realized PnL of the most recent closed trades (newest last), bounded to REALIZED_PAYOFF_WINDOW. */
   private recentClosedTradePnls: number[] = [];
 
+  // TASK_014 P5: execution-mode scoping of persisted risk state (same mode as above).
+  private readonly modeScope: ExecutionModeScope;
+
   constructor(
     config: RiskEngineConfig,
     logger: Logger,
@@ -268,6 +262,7 @@ export class RiskEngine extends EventEmitter {
     this.positionTracker = positionTracker;
     this.supabase = createClient(config.supabaseUrl, config.supabaseKey);
     this.userId = config.userId;
+    this.modeScope = new ExecutionModeScope(normalizeExecutionMode(config.executionMode), logger);
 
     this.guardrails = config.guardrails;
     this.executionMode = config.executionMode ?? 'paper';
@@ -329,6 +324,7 @@ export class RiskEngine extends EventEmitter {
       supabaseUrl: config.supabaseUrl,
       supabaseKey: config.supabaseKey,
       userId: config.userId,
+      executionMode: this.modeScope.mode,
     });
     
     // Forward state machine events
@@ -471,22 +467,45 @@ export class RiskEngine extends EventEmitter {
   /**
    * Load persisted risk state from database on startup.
    * This ensures risk tracking continues across restarts.
+   *
+   * Every read is scoped to this session's `execution_mode` (TASK_014 P5):
+   * a `risk_metrics` row written by a paper session is invisible to a live
+   * boot and vice versa. Until the staged `execution_mode` migration has
+   * been applied the reads fall back to today's unscoped shape (with a
+   * one-time warn from ExecutionModeScope) so a paper deploy keeps working.
    */
   private async loadRiskState(): Promise<void> {
     try {
       const todayStr = new Date().toISOString().split('T')[0];
 
-      let query = this.supabase
-        .from('risk_metrics')
-        .select('*')
-        .order('updated_at', { ascending: false })
-        .limit(1);
+      const loadLatestMetrics = (scoped: boolean) => {
+        let query = this.supabase
+          .from('risk_metrics')
+          .select('*')
+          .order('updated_at', { ascending: false })
+          .limit(1);
 
-      if (this.userId) {
-        query = query.eq('user_id', this.userId);
+        if (this.userId) {
+          query = query.eq('user_id', this.userId);
+        }
+        if (scoped) {
+          query = query.eq('execution_mode', this.modeScope.mode);
+        }
+        return query.maybeSingle();
+      };
+
+      const { data: latestMetrics, error: metricsError } = await this.modeScope.query(
+        'risk_metrics',
+        'select',
+        () => loadLatestMetrics(true),
+        () => loadLatestMetrics(false),
+      );
+
+      if (this.modeScope.mode === 'live' && this.modeScope.isLegacy('risk_metrics')) {
+        this.logger.warn('Live risk state restored WITHOUT execution_mode isolation; paper rows may be visible', {
+          remediation: 'apply supabase/migrations/*_risk_state_execution_mode.sql',
+        });
       }
-
-      const { data: latestMetrics, error: metricsError } = await query.maybeSingle();
       
       if (metricsError && metricsError.code !== 'PGRST116') {
         this.logger.warn('Failed to load risk metrics state:', metricsError);
@@ -570,16 +589,30 @@ export class RiskEngine extends EventEmitter {
       // Load account metrics for today to get weekly tracking. Skip when
       // ignorePersistedKillSwitch is set — the reset block above already
       // anchored the weekly tracker to current equity for a clean session.
+      // `account_metrics.execution_mode` already exists on prod (Sprint-9 DB
+      // handoff #2 stamps + backfilled it), so both reads are mode-scoped.
       if (!this.config.ignorePersistedKillSwitch) {
-        let acctQuery = this.supabase
-          .from('account_metrics')
-          .select('*')
-          .eq('date', todayStr)
-          .limit(1);
-        if (this.userId) {
-          acctQuery = acctQuery.eq('user_id', this.userId);
-        }
-        const { data: accountMetrics, error: accountError } = await acctQuery.maybeSingle();
+        const loadTodayMetrics = (scoped: boolean) => {
+          let query = this.supabase
+            .from('account_metrics')
+            .select('*')
+            .eq('date', todayStr)
+            .limit(1);
+          if (this.userId) {
+            query = query.eq('user_id', this.userId);
+          }
+          if (scoped) {
+            query = query.eq('execution_mode', this.modeScope.mode);
+          }
+          return query.maybeSingle();
+        };
+
+        const { data: accountMetrics, error: accountError } = await this.modeScope.query(
+          'account_metrics',
+          'select',
+          () => loadTodayMetrics(true),
+          () => loadTodayMetrics(false),
+        );
 
         if (accountError && !['PGRST116', 'PGRST205', '42P01'].includes(accountError.code)) {
           this.logger.warn('Failed to load account metrics state:', accountError);
@@ -588,16 +621,29 @@ export class RiskEngine extends EventEmitter {
           const weekStart = new Date();
           weekStart.setDate(weekStart.getDate() - 7);
           weekStart.setHours(0, 0, 0, 0);
+          const weekStartDate = weekStart.toISOString().split('T')[0];
 
-          let weekQuery = this.supabase
-            .from('account_metrics')
-            .select('total_equity')
-            .eq('date', weekStart.toISOString().split('T')[0])
-            .limit(1);
-          if (this.userId) {
-            weekQuery = weekQuery.eq('user_id', this.userId);
-          }
-          const { data: weekStartMetrics } = await weekQuery.maybeSingle();
+          const loadWeekStartEquity = (scoped: boolean) => {
+            let query = this.supabase
+              .from('account_metrics')
+              .select('total_equity')
+              .eq('date', weekStartDate)
+              .limit(1);
+            if (this.userId) {
+              query = query.eq('user_id', this.userId);
+            }
+            if (scoped) {
+              query = query.eq('execution_mode', this.modeScope.mode);
+            }
+            return query.maybeSingle();
+          };
+
+          const { data: weekStartMetrics } = await this.modeScope.query(
+            'account_metrics',
+            'select',
+            () => loadWeekStartEquity(true),
+            () => loadWeekStartEquity(false),
+          );
 
           if (weekStartMetrics) {
             this.weeklyStartEquity = weekStartMetrics.total_equity;
@@ -705,13 +751,26 @@ export class RiskEngine extends EventEmitter {
       return;
     }
 
-    try {
-      const { data, error } = await this.supabase
+    const userId = this.userId;
+    const loadStartEquity = (scoped: boolean) => {
+      let query = this.supabase
         .from('daily_equity')
         .select('start_equity')
-        .eq('user_id', this.userId)
-        .eq('date', todayStr)
-        .maybeSingle();
+        .eq('user_id', userId)
+        .eq('date', todayStr);
+      if (scoped) {
+        query = query.eq('execution_mode', this.modeScope.mode);
+      }
+      return query.maybeSingle();
+    };
+
+    try {
+      const { data, error } = await this.modeScope.query(
+        'daily_equity',
+        'select',
+        () => loadStartEquity(true),
+        () => loadStartEquity(false),
+      );
 
       if (error) {
         if (error.code === 'PGRST205' || error.code === '42P01') {
@@ -738,21 +797,37 @@ export class RiskEngine extends EventEmitter {
     this.weeklyStartTimestamp = Date.now();
   }
 
+  /**
+   * Persist today's start-of-day equity, keyed by
+   * `(user_id, execution_mode, date)` so paper and live keep separate
+   * anchors. Pre-migration the legacy `(user_id, date)` key is used.
+   */
   private async saveDailyStartEquity(equity: number): Promise<void> {
     if (!this.userId) {
       return;
     }
 
     const todayStr = new Date().toISOString().split('T')[0];
+    const row = {
+      user_id: this.userId,
+      date: todayStr,
+      start_equity: equity,
+    };
 
     try {
-      const { error } = await this.supabase
-        .from('daily_equity')
-        .upsert({
-          user_id: this.userId,
-          date: todayStr,
-          start_equity: equity,
-        }, { onConflict: 'user_id,date' });
+      const { error } = await this.modeScope.query(
+        'daily_equity',
+        'upsert',
+        () => this.supabase
+          .from('daily_equity')
+          .upsert(
+            { ...row, execution_mode: this.modeScope.mode },
+            { onConflict: 'user_id,execution_mode,date' },
+          ),
+        () => this.supabase
+          .from('daily_equity')
+          .upsert(row, { onConflict: 'user_id,date' }),
+      );
       
       if (error) {
         if (error.code === 'PGRST205' || error.code === '42P01') {
@@ -1551,25 +1626,41 @@ export class RiskEngine extends EventEmitter {
     this.metrics.openOrderCount = count;
   }
 
-  // Persist metrics to database
+  /**
+   * Persist the risk_metrics snapshot. One row per `(user_id,
+   * execution_mode)` so a paper session and a live session never overwrite
+   * each other's kill switch / streak counters (TASK_014 P5). Pre-migration
+   * the legacy `(user_id)` key is used unchanged.
+   */
   private async persistMetrics(): Promise<void> {
     if (!this.userId) {
       this.logger.debug('Skipping risk_metrics persist: userId not provided');
       return;
     }
+    const row = {
+      user_id: this.userId,
+      daily_pnl: this.metrics.dailyPnL,
+      max_drawdown: this.metrics.maxDrawdown,
+      consecutive_losses: this.metrics.consecutiveLosses,
+      error_rate: this.metrics.errorRate,
+      kill_switch_active: this.metrics.killSwitchActive,
+      exposure_usd: this.metrics.currentExposure,
+      updated_at: this.metrics.lastUpdated.toISOString(),
+    };
     try {
-      const { error } = await this.supabase
-        .from('risk_metrics')
-        .upsert({
-          user_id: this.userId,
-          daily_pnl: this.metrics.dailyPnL,
-          max_drawdown: this.metrics.maxDrawdown,
-          consecutive_losses: this.metrics.consecutiveLosses,
-          error_rate: this.metrics.errorRate,
-          kill_switch_active: this.metrics.killSwitchActive,
-          exposure_usd: this.metrics.currentExposure,
-          updated_at: this.metrics.lastUpdated.toISOString(),
-        }, { onConflict: 'user_id' });
+      const { error } = await this.modeScope.query(
+        'risk_metrics',
+        'upsert',
+        () => this.supabase
+          .from('risk_metrics')
+          .upsert(
+            { ...row, execution_mode: this.modeScope.mode },
+            { onConflict: 'user_id,execution_mode' },
+          ),
+        () => this.supabase
+          .from('risk_metrics')
+          .upsert(row, { onConflict: 'user_id' }),
+      );
 
       if (error) {
         // Table doesn't exist is less severe, but still track it
@@ -1630,6 +1721,11 @@ export class RiskEngine extends EventEmitter {
    * rows accumulated forever — which is exactly what
    * `useActiveRiskEvents` and the Grafana "active halts" panel query.
    *
+   * Scoped to this session's `execution_mode` (TASK_014 P5): a paper
+   * `PAPER_RESET_RISK_STATE_ON_START` boot must never flip a live halt to
+   * `active=false`, and a live resume must not touch paper's audit trail.
+   * Pre-migration the update is unscoped, as before.
+   *
    * Schema-tolerant: if the deployed `risk_events` has no `active` column
    * (older snapshots), falls back to stamping `cleared_at` on rows where it
    * is still NULL.
@@ -1638,16 +1734,42 @@ export class RiskEngine extends EventEmitter {
     if (!this.userId) {
       return;
     }
+    const userId = this.userId;
     const clearedAt = new Date().toISOString();
-    try {
-      const { error } = await this.supabase
+
+    const clearActive = (scoped: boolean) => {
+      let query = this.supabase
         .from('risk_events')
         .update({ active: false, cleared_at: clearedAt })
-        .eq('user_id', this.userId)
+        .eq('user_id', userId)
         .eq('active', true);
+      if (scoped) {
+        query = query.eq('execution_mode', this.modeScope.mode);
+      }
+      return query;
+    };
+    const clearByClearedAt = (scoped: boolean) => {
+      let query = this.supabase
+        .from('risk_events')
+        .update({ cleared_at: clearedAt })
+        .eq('user_id', userId)
+        .is('cleared_at', null);
+      if (scoped) {
+        query = query.eq('execution_mode', this.modeScope.mode);
+      }
+      return query;
+    };
+
+    try {
+      const { error } = await this.modeScope.query(
+        'risk_events',
+        'update',
+        () => clearActive(true),
+        () => clearActive(false),
+      );
 
       if (!error) {
-        this.logger.info('Cleared stale active risk_events', { source });
+        this.logger.info('Cleared stale active risk_events', { source, mode: this.modeScope.mode });
         return;
       }
 
@@ -1661,11 +1783,12 @@ export class RiskEngine extends EventEmitter {
           code: error.code,
           message: error.message,
         });
-        const { error: fallbackError } = await this.supabase
-          .from('risk_events')
-          .update({ cleared_at: clearedAt })
-          .eq('user_id', this.userId)
-          .is('cleared_at', null);
+        const { error: fallbackError } = await this.modeScope.query(
+          'risk_events',
+          'update',
+          () => clearByClearedAt(true),
+          () => clearByClearedAt(false),
+        );
         if (fallbackError) {
           this.logger.error('Failed to clear stale risk_events (cleared_at fallback):', {
             code: fallbackError.code,

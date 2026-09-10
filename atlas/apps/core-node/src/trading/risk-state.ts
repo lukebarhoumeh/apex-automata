@@ -16,6 +16,8 @@ import { EventEmitter } from 'events';
 import { Counter, Gauge } from 'prom-client';
 import { Logger } from '../core/logger';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import type { ExecutionMode } from './risk/types';
+import { ExecutionModeScope, normalizeExecutionMode } from './risk/execution-mode-scope';
 
 /**
  * Halt reason codes (exhaustive list)
@@ -97,6 +99,12 @@ export interface RiskStateConfig {
   supabaseUrl?: string;
   supabaseKey?: string;
   userId?: string;
+  /**
+   * Execution mode stamped on every `risk_events` row this machine writes
+   * and used to scope every read/clear (TASK_014 P5). Defaults to `paper`
+   * so pre-existing callers keep today's behaviour.
+   */
+  executionMode?: ExecutionMode;
   /** Timezone for risk day (default: 'UTC') */
   riskDayTz?: string;
   /** Hour at which risk day rolls over (default: 0) */
@@ -123,6 +131,7 @@ export class RiskStateMachine extends EventEmitter {
   private userId?: string;
   private riskDayTz: string;
   private riskDayRolloverHour: number;
+  private readonly modeScope: ExecutionModeScope;
 
   private currentState: TradingState = { state: 'RUNNING' };
   private lastStateChange: number = Date.now();
@@ -134,6 +143,7 @@ export class RiskStateMachine extends EventEmitter {
     this.userId = config.userId;
     this.riskDayTz = config.riskDayTz || 'UTC';
     this.riskDayRolloverHour = config.riskDayRolloverHour ?? 0;
+    this.modeScope = new ExecutionModeScope(normalizeExecutionMode(config.executionMode), config.logger);
 
     if (config.supabaseUrl && config.supabaseKey) {
       this.supabase = createClient(config.supabaseUrl, config.supabaseKey);
@@ -391,7 +401,17 @@ export class RiskStateMachine extends EventEmitter {
   // ============ Persistence ============
 
   /**
-   * Persist a risk event to the database
+   * Execution mode this machine stamps on / scopes `risk_events` by.
+   */
+  public getExecutionMode(): ExecutionMode {
+    return this.modeScope.mode;
+  }
+
+  /**
+   * Persist a risk event to the database, stamped with the session's
+   * `execution_mode` so a paper reset never clears a live halt (and vice
+   * versa). Falls back to the legacy (unstamped) shape until the
+   * `execution_mode` migration has been applied.
    */
   private async persistRiskEvent(
     eventType: 'halt' | 'resume',
@@ -399,18 +419,29 @@ export class RiskStateMachine extends EventEmitter {
     context?: HaltContext
   ): Promise<void> {
     if (!this.supabase || !this.userId) return;
+    const supabase = this.supabase;
+
+    const row = {
+      user_id: this.userId,
+      event_type: reasonCode,
+      details: {
+        eventType,
+        reasonCode,
+        ...context,
+      },
+      triggered_at: new Date().toISOString(),
+    };
 
     try {
-      await this.supabase.from('risk_events').insert({
-        user_id: this.userId,
-        event_type: reasonCode,
-        details: {
-          eventType,
-          reasonCode,
-          ...context,
-        },
-        triggered_at: new Date().toISOString(),
-      });
+      const { error } = await this.modeScope.query(
+        'risk_events',
+        'insert',
+        () => supabase.from('risk_events').insert({ ...row, execution_mode: this.modeScope.mode }),
+        () => supabase.from('risk_events').insert(row),
+      );
+      if (error) {
+        this.logger.warn('Failed to persist risk event', { code: error.code, message: error.message });
+      }
     } catch (error) {
       // Log but don't throw - persistence failure shouldn't break trading
       this.logger.warn('Failed to persist risk event', { error });
@@ -418,41 +449,67 @@ export class RiskStateMachine extends EventEmitter {
   }
 
   /**
-   * Update cleared_at when a halt is cleared
+   * Update cleared_at when a halt is cleared (scoped to this session's
+   * execution mode; legacy unscoped fallback pre-migration).
    */
   private async persistRiskEventCleared(reasonCode?: string): Promise<void> {
     if (!this.supabase || !this.userId || !reasonCode) return;
+    const supabase = this.supabase;
+    const userId = this.userId;
+    const clearedAt = new Date().toISOString();
 
-    try {
-      await this.supabase
+    const clear = (scoped: boolean) => {
+      let query = supabase
         .from('risk_events')
-        .update({ cleared_at: new Date().toISOString() })
-        .eq('user_id', this.userId)
+        .update({ cleared_at: clearedAt })
+        .eq('user_id', userId)
         .eq('event_type', reasonCode)
         .is('cleared_at', null);
+      if (scoped) {
+        query = query.eq('execution_mode', this.modeScope.mode);
+      }
+      return query;
+    };
+
+    try {
+      const { error } = await this.modeScope.query('risk_events', 'update', () => clear(true), () => clear(false));
+      if (error) {
+        this.logger.warn('Failed to update risk event cleared_at', { code: error.code, message: error.message });
+      }
     } catch (error) {
       this.logger.warn('Failed to update risk event cleared_at', { error });
     }
   }
 
   /**
-   * Load persisted risk state on startup
+   * Load persisted risk state on startup. Only rows stamped with this
+   * session's `execution_mode` are considered (a paper halt must never be
+   * restored into a live session); pre-migration the read is unscoped, as
+   * before.
    */
   public async loadPersistedState(): Promise<void> {
     if (!this.supabase || !this.userId) return;
+    const supabase = this.supabase;
+    const userId = this.userId;
 
     try {
       // Check for unclearedhalt events from today
       const todayStr = this.getRiskDay();
-      
-      const { data, error } = await this.supabase
-        .from('risk_events')
-        .select('*')
-        .eq('user_id', this.userId)
-        .is('cleared_at', null)
-        .gte('triggered_at', `${todayStr}T00:00:00Z`)
-        .order('triggered_at', { ascending: false })
-        .limit(1);
+
+      const load = (scoped: boolean) => {
+        let query = supabase
+          .from('risk_events')
+          .select('*')
+          .eq('user_id', userId)
+          .is('cleared_at', null)
+          .gte('triggered_at', `${todayStr}T00:00:00Z`);
+        if (scoped) {
+          query = query.eq('execution_mode', this.modeScope.mode);
+        }
+        return query.order('triggered_at', { ascending: false }).limit(1);
+      };
+
+      const { data, error } = await this.modeScope.query('risk_events', 'select', () => load(true), () => load(false));
 
       if (error && error.code !== 'PGRST116') {
         this.logger.warn('Failed to load persisted risk state', { error });
