@@ -122,8 +122,11 @@ SELECT
   END as win_rate,
   CASE
     WHEN COALESCE(SUM(ABS(realized_pnl)) FILTER (WHERE outcome = 'loss'), 0) > 0
-    THEN ROUND(COALESCE(SUM(realized_pnl) FILTER (WHERE outcome = 'win'), 0) /
-         COALESCE(SUM(ABS(realized_pnl)) FILTER (WHERE outcome = 'loss'), 1), 2)
+    -- Fresh-replay guard (2026-09-10, Supabase Preview): realized_pnl is DOUBLE
+    -- PRECISION here and round(double precision, int) does not exist; cast to
+    -- NUMERIC exactly as the follow-up reconciliation 20260202192540 does.
+    THEN ROUND((COALESCE(SUM(realized_pnl) FILTER (WHERE outcome = 'win'), 0) /
+         COALESCE(SUM(ABS(realized_pnl)) FILTER (WHERE outcome = 'loss'), 1))::NUMERIC, 2)
     ELSE NULL
   END as profit_factor,
   ROUND(AVG(duration_seconds)::NUMERIC, 0) as avg_duration_seconds,
