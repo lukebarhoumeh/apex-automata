@@ -1,9 +1,15 @@
 /**
- * Coinbase Live Execution Adapter
+ * Coinbase Live Execution Adapter (LEGACY Coinbase Exchange HMAC auth)
  * 
  * Implements the ExecutionAdapter interface for live trading on Coinbase.
  * Uses the hardened REST layer (Step 3) for order placement.
  * Integrates with WS + REST reconciliation for fills.
+ *
+ * @deprecated Sprint 9 / TASK_010: this path signs with legacy Exchange HMAC +
+ * passphrase, which cannot authenticate the account's CDP key. `createAdapters`
+ * no longer constructs it for live mode (it throws `LIVE_REQUIRES_ADVANCED_TRADE`
+ * unless `COINBASE_API_VERSION=advanced`, in which case it builds
+ * `CoinbaseAdvancedExecutionAdapter`). Kept for reference only.
  */
 
 import { EventEmitter } from 'events';

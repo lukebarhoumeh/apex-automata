@@ -7,5 +7,6 @@
 
 export * from './execution-adapter';
 export * from './coinbase-live-adapter';
+export * from './coinbase-advanced-adapter';
 export * from './paper-adapter';
 export * from './adapter-factory';
