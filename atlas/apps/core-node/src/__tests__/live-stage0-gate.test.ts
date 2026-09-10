@@ -30,6 +30,7 @@ import {
 } from '../trading/execution/adapter-factory';
 import { PaperExecutionAdapter } from '../trading/execution/paper-adapter';
 import { PaperAccountProvider } from '../trading/account/account-provider';
+import type { CoinbaseExchange } from '../exchanges/coinbase';
 
 const TEST_FEES: FeesConfig = {
   coinbase: {
@@ -68,7 +69,8 @@ function untouchable<T extends object>(label: string): T {
   });
 }
 
-const fakeExchange = {} as any;
+// Market-data plumbing only; never touched on either branch of createAdapters().
+const fakeExchange = {} as unknown as CoinbaseExchange;
 const STAGE0_RE = new RegExp(`^${LIVE_STAGE0_INCOMPLETE}:`);
 
 describe('live-stage0-gate — constant and assertion', () => {
