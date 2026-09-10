@@ -16,18 +16,14 @@ const repoRoot = path.resolve(here, '..', '..', '..', '..', '..');
 
 const { violations, checked } = checkConfigDrift(repoRoot);
 
-// eslint-disable-next-line no-console
 console.log(`config-drift: inspected ${checked.length} file(s) under ${repoRoot}`);
 for (const file of checked) {
-  // eslint-disable-next-line no-console
   console.log(`  - ${file}`);
 }
 
 if (violations.length > 0) {
-  // eslint-disable-next-line no-console
   console.error(`\nconfig-drift: ${violations.length} violation(s)\n${formatViolations(violations)}`);
   process.exit(1);
 }
 
-// eslint-disable-next-line no-console
 console.log('config-drift: OK — single-source guardrails and desk pins intact');
