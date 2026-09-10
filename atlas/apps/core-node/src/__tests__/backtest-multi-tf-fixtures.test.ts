@@ -15,7 +15,7 @@
  *      holds no files and is DATA_UNAVAILABLE.
  *
  * 4h windows (see fixtures/bars/MULTI_TF.md):
- *   smoke-aug2026/           Aug 2026 month-block — SMOKE/SCREEN ONLY
+ *   smoke-aug2026/           Aug 2026 month-block — SMOKE ONLY, not hard-preflight
  *   holdout-2025-03_2026-03/ 2025-03-01 → 2026-03-01 — hard-preflight SoT
  *   tune-2023-03_2025-03/    2023-03-01 → 2025-03-01 — tuning window
  */

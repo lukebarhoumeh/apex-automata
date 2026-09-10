@@ -15,16 +15,16 @@ of this set — see `README.md` there.
 |---|---|---|---|---|---|---|
 | `4h/holdout-2025-03_2026-03/` | **HOLDOUT — hard-preflight source of truth** (counted E[n]) | BTC-USD, ETH-USD, SOL-USD | **2188** | 2025-03-01T00:00 → 2026-02-28T20:00 (12 months) | 4h (`FOUR_HOUR`, 14400 s) | 8755 native `ONE_HOUR` candles / symbol rolled up offline; 2188 / 2190 buckets (one upstream 8h gap, below) |
 | `4h/tune-2023-03_2025-03/` | **TUNE** — parameter fitting only; never out-of-sample evidence | BTC-USD, ETH-USD, SOL-USD | **4384** | 2023-03-01T00:00 → 2025-02-28T20:00 (24 months) | 4h | 17541 (BTC, ETH) / 17539 (SOL) native `ONE_HOUR` candles rolled up; 4384 / 4386 buckets (one upstream 8h gap, below) |
-| `4h/smoke-aug2026/` | **SMOKE / SCREEN ONLY — not hard-preflight** | BTC-USD, ETH-USD, SOL-USD | 186 | 2026-08-01T00:00 → 2026-08-31T20:00 (August 2026 month-block) | 4h | 744 native `ONE_HOUR` candles rolled up; 186 / 186 complete |
+| `4h/smoke-aug2026/` | **SMOKE ONLY — not hard-preflight** | BTC-USD, ETH-USD, SOL-USD | 186 | 2026-08-01T00:00 → 2026-08-31T20:00 (August 2026 month-block) | 4h | 744 native `ONE_HOUR` candles rolled up; 186 / 186 complete |
 | `1d/` | 1D experiments (E4 second pass) | BTC-USD, ETH-USD, SOL-USD | 730 | 2024-09-01 → 2026-08-31 (24 months) | 1d (`ONE_DAY`, 86400 s) | native `ONE_DAY` candles, no rollup |
 
 - Tune and holdout are **adjacent and disjoint**: the last tune bar is
   2025-02-28T20:00, the first holdout bar is 2025-03-01T00:00 (asserted by the
   unit test). Fit on tune, count on holdout, never the other way round.
 - **Aug 2026 (`smoke-aug2026/`) was vetoed as hard-preflight by the Algo
-  Creator.** A 31-day month-block is a harness smoke / quick screen. Any
-  result from it is a screen, not evidence, and must not be counted toward
-  E[n] or a go/no-go. It is kept only so the E4 harness has a fast fixture.
+  Creator.** A 31-day month-block is a harness smoke. Any result from it is
+  a smoke, not evidence, and must not be counted toward E[n] or a go/no-go.
+  It is kept only so the E4 harness has a fast fixture.
 - The bare `fixtures/bars/4h/` directory holds **no** fixture files. Passing it
   as `--fixture-dir` is `DATA_UNAVAILABLE` (exit 2) by design — a run has to
   name its window.
@@ -75,7 +75,7 @@ pnpm exec tsx src/cli/backtest.ts --fixture-dir fixtures/bars/4h/tune-2023-03_20
   --products BTC-USD ETH-USD SOL-USD \
   --start-date 2023-03-01 --end-date 2025-03-01
 
-# 4H SMOKE — harness smoke / screen only, NOT preflight (August 2026 month-block)
+# 4H SMOKE — harness smoke only, NOT hard-preflight (August 2026 month-block)
 pnpm exec tsx src/cli/backtest.ts --fixture-dir fixtures/bars/4h/smoke-aug2026 \
   --products BTC-USD ETH-USD SOL-USD \
   --start-date 2026-08-01 --end-date 2026-09-01
@@ -134,7 +134,7 @@ when every candle is identical — update this table when regenerating.)
 **Never** pass `--allow-synthetic` for an E4 / preflight run — any
 `DATA: SYNTHETIC` output is SMOKE/VOID and is not evidence of anything. Never
 commit synthetic output under `fixtures/`. A run on `smoke-aug2026/` is a
-screen even when it says `DATA: REAL`.
+smoke even when it says `DATA: REAL`.
 
 ## 4h rollup — how the bars were derived (and why)
 
@@ -270,7 +270,7 @@ Notes:
 - Never commit synthetic output here; never use `--allow-synthetic` for
   evidence (SMOKE/VOID).
 - Hard preflight / counted E[n] reads `4h/holdout-2025-03_2026-03/` only.
-  `4h/smoke-aug2026/` is a screen; `4h/tune-2023-03_2025-03/` is in-sample.
+  `4h/smoke-aug2026/` is SMOKE ONLY; `4h/tune-2023-03_2025-03/` is in-sample.
 - One timeframe and one window per directory; do not put 4h and 1d files, or
   two windows, in the same `--fixture-dir`.
 - Leave the 15m gate fixtures (`fixtures/bars/*.json`) and

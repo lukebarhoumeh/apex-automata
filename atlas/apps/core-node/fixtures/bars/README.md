@@ -16,7 +16,7 @@ not read by the gate:
 - `4h/holdout-2025-03_2026-03/` — 12-month 4h **holdout**; the hard-preflight
   source of truth for counted E[n].
 - `4h/tune-2023-03_2025-03/` — 24-month 4h **tune** window (in-sample only).
-- `4h/smoke-aug2026/` — August 2026 4h month-block, **SMOKE/SCREEN ONLY — not
+- `4h/smoke-aug2026/` — August 2026 4h month-block, **SMOKE ONLY — not
   hard-preflight**.
 - `1d/` — 24-month native daily bars.
 
