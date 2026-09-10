@@ -206,3 +206,58 @@ describe('evaluateEvGate — A3 pre-trade EV math', () => {
     expect(result.threshold).toBe(15);
   });
 });
+
+/**
+ * Live-tier fee plumbing (Sprint 9): when the FeeModel carries a runtime
+ * override the gate prices on that tier. Worked example behind the PR's
+ * fee-impact note: the marginal 3R / 50% WR spot signal that passes at the
+ * YAML 40 bps taker is rejected at Coinbase Intro 1 (120 bps).
+ */
+describe('evaluateEvGate — live-tier FeeModel override', () => {
+  const LIVE_TIER_MODEL = TEST_FEE_MODEL.withRuntimeOverride({
+    venue: 'coinbase',
+    product: 'spot',
+    makerBps: 60,
+    takerBps: 120,
+    source: 'coinbase:Intro 1',
+  });
+
+  it('YAML default: 40 bps per leg, $8 round trip, EV +$12 → allowed', () => {
+    const result = evaluateEvGate(baseInputs(), makeLogger());
+    expect(result.entryFeeRate).toBeCloseTo(0.004, 12);
+    expect(result.exitFeeRate).toBeCloseTo(0.004, 12);
+    expect(result.feeUsd).toBeCloseTo(8, 6);
+    expect(result.ev).toBeCloseTo(12, 6);
+    expect(result.allowed).toBe(true);
+  });
+
+  it('Intro-1 override: 120 bps per leg, $24 round trip, the SAME signal flips to reject (EV -$4)', () => {
+    const result = evaluateEvGate(baseInputs({ feeModel: LIVE_TIER_MODEL }), makeLogger());
+    expect(result.entryFeeRate).toBeCloseTo(0.012, 12);
+    expect(result.exitFeeRate).toBeCloseTo(0.012, 12);
+    expect(result.feeUsd).toBeCloseTo(24, 6);
+    expect(result.ev).toBeCloseTo(-4, 6);
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/feeRT=\$24\.00/);
+  });
+
+  it('override on the spot bucket leaves perps priced from YAML', () => {
+    const result = evaluateEvGate(
+      baseInputs({ symbol: 'ETH-PERP-INTX', feeModel: LIVE_TIER_MODEL }),
+      makeLogger(),
+    );
+    expect(result.exitFeeRate).toBeCloseTo(0.0005, 12);
+    expect(result.feeUsd).toBeCloseTo(1, 6);
+    expect(result.allowed).toBe(true);
+  });
+
+  it('explicit feeRateOverride still wins over a live-tier model', () => {
+    const result = evaluateEvGate(
+      baseInputs({ feeModel: LIVE_TIER_MODEL, feeRateOverride: 0.00045 }),
+      makeLogger(),
+    );
+    expect(result.entryFeeRate).toBeCloseTo(0.00045, 12);
+    expect(result.exitFeeRate).toBeCloseTo(0.00045, 12);
+    expect(result.feeUsd).toBeCloseTo(2 * 0.00045 * 1000, 6);
+  });
+});

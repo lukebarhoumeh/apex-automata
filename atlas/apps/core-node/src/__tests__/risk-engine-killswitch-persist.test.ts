@@ -319,8 +319,10 @@ describe('RiskEngine kill-switch reset persistence', () => {
         consecutive_losses: 0,
         daily_pnl: 0,
         max_drawdown: 0,
+        // TASK_014 P5: the row is keyed per execution mode (default paper).
+        execution_mode: 'paper',
       });
-      expect(upsert.options).toMatchObject({ onConflict: 'user_id' });
+      expect(upsert.options).toMatchObject({ onConflict: 'user_id,execution_mode' });
 
       const clears = riskEventClears();
       expect(clears).toHaveLength(1);
@@ -330,6 +332,7 @@ describe('RiskEngine kill-switch reset persistence', () => {
         expect.arrayContaining([
           ['eq', 'user_id', USER_ID],
           ['eq', 'active', true],
+          ['eq', 'execution_mode', 'paper'],
         ])
       );
 

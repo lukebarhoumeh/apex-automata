@@ -21,6 +21,7 @@ import client from 'prom-client';
 import { OHLCV } from '../indicators/technical';
 import { loadGuardrails, resolveLiveConfig } from '../config/loadGuardrails';
 import { FeeModel } from '../core/fee-model';
+import { isMissingColumnError } from '../core/postgrest-errors';
 import { validateSchemaOrFail } from '../config/validateSchema';
 import { OrderRequest } from '../exchanges/coinbase';
 import { MetricsTracker } from '../trading/metrics-tracker';
@@ -2769,16 +2770,30 @@ app.post('/api/engine/kill', async (req, res) => {
     runtimeState.killSwitch.reasons = [reason];
     runtimeState.killSwitch.since = Date.now();
 
-    // Update risk events in Supabase
-    await supabase
+    // Update risk events in Supabase. Stamped with the session's execution
+    // mode so RiskEngine's mode-scoped clears (paper reset / live resume)
+    // only ever touch their own rows; falls back to the legacy shape until
+    // the risk_state_execution_mode migration is applied.
+    const killEventRow = {
+      user_id: USER_ID,
+      event_type: 'kill_switch',
+      details: { reason },
+      active: true,
+      triggered_at: new Date().toISOString()
+    };
+    const killEventMode = tradingEngine?.getConfig().mode ?? runtimeState.sessionMode ?? 'paper';
+    let { error: killEventError } = await supabase
       .from('risk_events')
-      .insert({
-        user_id: USER_ID,
-        event_type: 'kill_switch',
-        details: { reason },
-        active: true,
-        triggered_at: new Date().toISOString()
+      .insert({ ...killEventRow, execution_mode: killEventMode });
+    if (killEventError && isMissingColumnError(killEventError, 'execution_mode')) {
+      ({ error: killEventError } = await supabase.from('risk_events').insert(killEventRow));
+    }
+    if (killEventError) {
+      logger.warn('Failed to record manual kill switch in risk_events', {
+        code: killEventError.code,
+        message: killEventError.message,
       });
+    }
 
     // Broadcast kill switch event
     broadcast({
