@@ -3,11 +3,18 @@
  * 
  * Creates the appropriate execution adapter and account provider based on configuration.
  * This is the single switch point for paper vs live mode.
+ *
+ * Live mode FAILS CLOSED: only `COINBASE_API_VERSION=advanced` (CDP key + ES256 JWT)
+ * can produce a live adapter. Legacy Coinbase Exchange (HMAC + passphrase) keys cannot
+ * authenticate this account, so requesting live with anything else throws
+ * `LIVE_REQUIRES_ADVANCED_TRADE` instead of building a dead adapter.
  */
 
 import { Logger } from '../../core/logger';
 import { FeeModel } from '../../core/fee-model';
 import { CoinbaseExchange } from '../../exchanges/coinbase';
+import { AdvancedTradeRestClient } from '../../exchanges/coinbase/advanced-trade-client';
+import { AdvancedTradeUserStream } from '../../exchanges/coinbase/advanced-trade-user-stream';
 import {
   IExecutionAdapter,
   ExecutionMode,
@@ -19,6 +26,7 @@ import {
   buildDefaultProductSpecs,
 } from './execution-adapter';
 import { CoinbaseLiveExecutionAdapter, CoinbaseLiveAdapterConfig } from './coinbase-live-adapter';
+import { CoinbaseAdvancedExecutionAdapter } from './coinbase-advanced-adapter';
 import { PaperExecutionAdapter, PaperAdapterConfig } from './paper-adapter';
 import { 
   IAccountProvider, 
@@ -27,6 +35,39 @@ import {
   PaperAccountConfig,
   LiveAccountConfig,
 } from '../account/account-provider';
+
+/** Error code thrown when live mode is requested without Advanced Trade (CDP) auth. */
+export const LIVE_REQUIRES_ADVANCED_TRADE = 'LIVE_REQUIRES_ADVANCED_TRADE';
+/** Error code thrown when live mode is requested without credentials. */
+export const LIVE_CREDENTIALS_MISSING = 'LIVE_CREDENTIALS_MISSING';
+/** Error code thrown while the engine's live order path is not yet routed through this factory. */
+export const LIVE_EXECUTION_PATH_NOT_WIRED = 'LIVE_EXECUTION_PATH_NOT_WIRED';
+
+/**
+ * Capability flag: `true` once `TradingEngine` routes live orders through
+ * `createAdapters()` → `CoinbaseAdvancedExecutionAdapter`. Today the engine still builds
+ * `OrderManager` on the legacy `CoinbaseExchange` (HMAC) — see
+ * `trading-engine.ts` `initializeOrderManager()` — so a live start would run with a dead
+ * order path and no exchange-side protection. The preflight refuses live until the wiring
+ * PR flips this to `true`.
+ */
+export const ENGINE_LIVE_EXECUTION_WIRED = false;
+
+/**
+ * Fail closed unless the engine's live order path actually uses the Advanced Trade adapter.
+ */
+export function assertLiveExecutionPathWired(): void {
+  if (!ENGINE_LIVE_EXECUTION_WIRED) {
+    throw new Error(
+      `${LIVE_EXECUTION_PATH_NOT_WIRED}: TradingEngine still routes live orders through the legacy ` +
+        'CoinbaseExchange (HMAC) client. Wire createAdapters()/CoinbaseAdvancedExecutionAdapter into ' +
+        'OrderManager and set ENGINE_LIVE_EXECUTION_WIRED=true before starting live.',
+    );
+  }
+}
+
+/** Coinbase REST API flavour. Only `advanced` can trade with CDP keys. */
+export type CoinbaseApiVersion = 'exchange' | 'advanced';
 
 /**
  * Runtime configuration (replaces scattered mode checks)
@@ -50,6 +91,24 @@ export interface RuntimeConfig {
   feeModel?: FeeModel;
   /** Paper adapter config overrides */
   paperConfig?: Partial<PaperAdapterConfig>;
+  /**
+   * Coinbase API flavour (from COINBASE_API_VERSION). Live mode requires `advanced`;
+   * absent/`exchange` makes `createAdapters` throw for live.
+   */
+  coinbaseApiVersion?: CoinbaseApiVersion;
+  /** Live credentials: CDP key name + EC P-256 PEM. Required in live mode. Never logged. */
+  liveCredentials?: { apiKey: string; apiSecret: string };
+  /** Symbols the live adapter loads product specs for at start() (defaults to productSpecs keys). */
+  liveSymbols?: string[];
+}
+
+/**
+ * Pre-built collaborators for the live adapter (tests / preflight reuse).
+ */
+export interface LiveAdapterDependencies {
+  advancedTradeClient?: AdvancedTradeRestClient;
+  /** Pass `null` to run without a user stream (polling only, reported as degraded). */
+  userStream?: AdvancedTradeUserStream | null;
 }
 
 /**
@@ -71,12 +130,18 @@ export interface AdapterSet {
 }
 
 /**
- * Create execution adapter and account provider based on config
+ * Create execution adapter and account provider based on config.
+ *
+ * Live: requires `coinbaseApiVersion === 'advanced'` and `liveCredentials`, otherwise
+ * throws (`LIVE_REQUIRES_ADVANCED_TRADE` / `LIVE_CREDENTIALS_MISSING`). The legacy
+ * `exchange` instance is NOT used for live execution any more — it remains a
+ * parameter only for market data plumbing and paper-mode call sites.
  */
 export function createAdapters(
   config: RuntimeConfig,
   exchange: CoinbaseExchange,
-  logger: Logger
+  logger: Logger,
+  deps: LiveAdapterDependencies = {},
 ): AdapterSet {
   // Resolve product specs once. Fees come from FeeModel (guardrails.yaml);
   // there is intentionally no static fallback for fee values.
@@ -92,17 +157,54 @@ export function createAdapters(
   }
 
   if (config.executionMode === 'live') {
-    logger.info('Creating live execution adapter and account provider');
+    if (config.coinbaseApiVersion !== 'advanced') {
+      throw new Error(
+        `${LIVE_REQUIRES_ADVANCED_TRADE}: EXECUTION_MODE=live requires COINBASE_API_VERSION=advanced ` +
+          `(CDP key + ES256 JWT). Got "${config.coinbaseApiVersion ?? 'exchange'}" — legacy Coinbase Exchange ` +
+          'HMAC keys cannot authenticate this account, so the live adapter refuses to start.',
+      );
+    }
 
-    const executionAdapter = new CoinbaseLiveExecutionAdapter({
-      logger,
-      exchange,
-      productSpecs,
+    let client = deps.advancedTradeClient;
+    if (!client) {
+      const apiKey = config.liveCredentials?.apiKey ?? '';
+      const apiSecret = config.liveCredentials?.apiSecret ?? '';
+      if (!apiKey || !apiSecret) {
+        throw new Error(
+          `${LIVE_CREDENTIALS_MISSING}: live mode requires COINBASE_API_KEY (CDP key name) and ` +
+            'COINBASE_API_SECRET (EC P-256 PEM).',
+        );
+      }
+      client = new AdvancedTradeRestClient(
+        { apiKey, apiSecret, environment: config.executionEnv === 'sandbox' ? 'sandbox' : 'production' },
+        logger,
+      );
+    }
+
+    const symbols = config.liveSymbols && config.liveSymbols.length > 0 ? config.liveSymbols : Object.keys(productSpecs);
+    const userStream =
+      deps.userStream === undefined
+        ? new AdvancedTradeUserStream({ logger, auth: client.getAuth(), productIds: symbols })
+        : deps.userStream;
+
+    logger.info('Creating Advanced Trade live execution adapter and account provider', {
+      symbols,
+      userStream: Boolean(userStream),
     });
 
+    const executionAdapter = new CoinbaseAdvancedExecutionAdapter({
+      logger,
+      client,
+      symbols,
+      userStream,
+    });
+
+    // The hardened client exposes the legacy `getAccounts()` shape (paginated), so the
+    // existing live account provider can consume it directly. TASK_011 replaces this
+    // with LiveAccountTruth (USD+USDC, fee tier).
     const accountProvider = new LiveAccountProvider({
       logger,
-      exchange,
+      exchange: client,
     });
 
     return { executionAdapter, accountProvider };
@@ -208,6 +310,12 @@ export function parseEnvConfig(): Partial<RuntimeConfig> {
   const executionEnv = process.env.EXECUTION_ENV?.toLowerCase();
   if (executionEnv === 'production' || executionEnv === 'sandbox') {
     config.executionEnv = executionEnv;
+  }
+
+  // Coinbase API flavour (live mode requires 'advanced')
+  const apiVersion = process.env.COINBASE_API_VERSION?.toLowerCase();
+  if (apiVersion === 'exchange' || apiVersion === 'advanced') {
+    config.coinbaseApiVersion = apiVersion;
   }
 
   // Initial equity
