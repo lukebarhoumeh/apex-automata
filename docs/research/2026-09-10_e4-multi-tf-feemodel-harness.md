@@ -1,120 +1,101 @@
-# E4 multi-TF FeeModel expectancy harness — Eng note for Algo
+# E4 multi-TF FeeModel expectancy harness — Eng handoff (Algo Creator Beta card)
 
-**Date:** 2026-09-10 · **Task:** TASK_018 E4 (TM-corrected order) · **PR:** #48 (harness) · data: #47 (merged), #49 (Dev Backtest fixtures, draft)
-**Authority:** Apex Engineer Fable greenlight; PR only, no merge. Never `CONFIRM_LIVE`; no live trading; no Intro-1 capital.
-**SoT:** `atlas/config/guardrails.yaml`. Paper GO = trend_follow spot+PERP, momentum spot. NO-GO = breakout, vwap_mr, momentum on PERP-INTX. **FeeModel 15m spot trend_follow = NO-GO; no 15m param tweaks. No E5. Spot long-only.**
+**Date:** 2026-09-10 · **Task:** TASK_018 E4 (TM-corrected order) · **Card:** Algo Creator Beta CLEAR 2026-09-10 (box brief) · **PRs:** #48 (merged, foundation), #51 (this: card alignment) · data: #47, #49 (Dev Backtest, merged)
+**Authority:** Algo Creator authorized Eng preflight + 4H screen path. **Still NOT a GO to TM.** Never `CONFIRM_LIVE`; no live trading; no Intro-1 capital.
+**SoT:** `atlas/config/guardrails.yaml`. Paper GO = trend_follow spot+PERP, momentum spot. NO-GO = breakout, vwap_mr, momentum on PERP-INTX. **15m out. No E5. Spot long-only. INTX/perps out.**
 
-**Burn hold (desk 2026-09-10):** this PR builds the harness only. No first 4H FeeModel burn has been run or scripted as evidence; the holdout burn waits for the Algo Alpha run card + Beta design clear. The harness enforces the hold (§2, "UNGRADED").
-
-Cited pre-registration docs `quant-prereg-atr-fee-floors.md` and `e4-timeframe-brief.md` are **not in the repo** (searched working tree and `origin/main`); the locked floors are therefore encoded in code (`E4_ZERO_FEE_PF_FLOOR`, frozen + unit-tested) and here. The desk spec `apex-research/2026-09-10_algo-alpha-e4-research-specs.md` is also absent; the harness follows the E4 kickoff, TASK_018 and the live-readiness audit §4.1.
+Cited pre-registration docs `quant-prereg-atr-fee-floors.md` and `e4-timeframe-brief.md` are **not in the repo** (searched working tree + `origin/main`); every threshold is encoded as a frozen constant in `src/backtesting/e4-harness.ts` and repeated here.
 
 ---
 
-## 1. What was built (PR #48)
+## 0. Counted E[n] preflight — REAL 4H holdout (eval window)
 
-| Piece | Path | Purpose |
+`pnpm exec tsx src/cli/backtest-e4.ts --tf 4h --window eval --run-card AlgoCreator-Beta-CLEAR-2026-09-10` · fixtures `fixtures/bars/4h/holdout-2025-03_2026-03` (#49) · `DATA: REAL`, `source=fixture`, declared 240 m, 2188/2191 bars per symbol (one documented Coinbase outage) · zero knobs verified (A1 2.5/6.0 per symbol, atr_volatility_min 0.005, EV gate enforce/min_ev_threshold 0, cooldown 1 × 4H bar, GO fee book 40 bps/side).
+
+| | pooled n | BTC-USD | ETH-USD | SOL-USD | window | counted E[n] (12 m) | gate |
+|---|---|---|---|---|---|---|---|
+| **fee book 40 bps/side, EV gate on** | **42** | **9** | **14** | **19** | 2025-03-01 → 2026-03-01 (365.0 d) | **42.0** | ≥ 100 ⇒ **RESEARCH SCREEN ONLY** |
+| raw (zero-fee, EV off) upper bound | 52 | 20 | 14 | 18 | same | 52.0 | — |
+
+Zero-fee PF on the holdout **0.94 < 1.61 ⇒ STOP** (no fee-sensitivity, no GO MC). Fee-book pass (informational): PF 0.53, net −$68.07 on $1,000, meanR −0.33 (t −1.79), max DD 6.87 %, EV gate rejected 34 of 76 entries, 59 SELLs blocked (spot), 2 same-bar exits ignored by the 1-bar cooldown, exits 21 signal / 15 stop / 6 TP; window quarters n = 14/15/12/1, PF 0.76/0.70/0.20/0.00. **Verdict: RESEARCH SCREEN ONLY** (no GO packaging). Eval ledger entry 1 of 1 for 4H (walk-forward rule: eval once).
+
+Tune diagnostic (`--window tune`, 2023-03-01 → 2025-03-01, never GO bars): fee-book n = 95 (BTC 22 / ETH 27 / SOL 46), E[n] 47.5; zero-fee n = 131, PF 1.17 < 1.61 ⇒ STOP; fee-book PF 0.82. Verdict TUNE DIAGNOSTIC.
+1D eval (`--tf 1d --window eval`): fee-book n = 6 (BTC 0 / ETH 4 / SOL 2), E[n] 6.0 < 100 ⇒ **EXPLORATORY**; zero-fee n = 6 < 10 ⇒ INCONCLUSIVE/STOP.
+
+These are the numbers the card asked for. They are Eng screen output, not a desk GO.
+
+## 1. What #51 changes (on top of merged #48)
+
+| Piece | Path | Card requirement |
 |---|---|---|
-| **E4 harness** | `src/backtesting/e4-harness.ts`, `src/cli/backtest-e4.ts`, `pnpm backtest:e4` | One TF per invocation on one **per-TF fixture directory**. Zero-fee PF fail-fast against the **locked floors** → FeeModel fee pass (default FeeModel 40) → Monte Carlo (month-block on 4H) → gates → derived label (SMOKE ONLY / FULL UNGRADED / FULL GRADED / VOID). JSON + Markdown artefacts. |
-| `pnpm backtest --bar-minutes 15\|60\|240\|1440` | `src/backtesting/bar-aggregation.ts`, `cli/backtest.ts` | TASK_017 step 5 / **B6** (confirmed not in #44): UTC-aligned OHLCV rollup of stored bars, fail-closed geometry, partial buckets dropped below `--min-bucket-fill` and counted. **Not used by the E4 harness** — E4 runs on Dev Backtest's per-TF fixtures. |
-| Shared config builder | `src/backtesting/backtest-cli-config.ts` | `pnpm backtest` and the harness build `BacktestConfig` through one function (fee tier → FeeModel, EV gate, per-symbol overrides, realism). |
-| Engine fix | `src/backtesting/backtest-engine.ts` | `--strategy trend_follow` silently also ran momentum (`BaseStrategy.enabled` defaults `true`; only trend_follow's toggle was applied). **Every single-strategy backtest before this was contaminated**; `--strategy all` and the CI gate are unchanged. |
-| Runner fix | `src/backtesting/backtest-runner.ts` | Per-pass `fileTag` + same-second collision guard (the fee pass was overwriting the zero-fee pass's `backtest_*.json`). |
-| Tests | `src/__tests__/e4-harness.test.ts` (30), `src/__tests__/bar-aggregation.test.ts` (14) | Locked floors, label/verdict order, data-path refusals, end-to-end on the committed REAL 4h/1d fixtures. |
+| Hard preflight print path | `e4-harness.ts` Stage P, `E4_PREFLIGHT` line | Counted pooled long-only E[n] + per-symbol n on the fee book (EV on), printed **first**; E[n] < 100 ⇒ RESEARCH SCREEN ONLY (4H) / EXPLORATORY (1D); raw zero-fee count printed as an upper bound |
+| Locked floors + bars | `E4_ZERO_FEE_PF_FLOOR` (4H 1.61 · 1D 1.44 · 1H 2.25), `E4_MIN_EXPECTED_TRADES` (100), `E4_BETA_BARS`, `E4_MC_SCREEN`; CLI is yargs-strict | zf PF < floor ⇒ STOP; no override flags exist |
+| Zero knobs asserted | `assertZeroKnobs` ⇒ `E4_ZERO_KNOBS_DRIFT` | trend_follow A1 stopAtr 2.5 / takeProfitAtr 6.0 per symbol (guardrails per_symbol pins), `filters.atr_volatility_min` 0.005, `risk.min_ev_threshold` 0, cooldown ≥ 1 bar; drift refuses the run |
+| Cooldown = 1 × 4H bar | engine `execution.minHoldBars` (new), `--cooldown-bars` (default 1) | Live `trade_cooldown_min` (15 min = 1 × 15m bar) was wall-clock and absent from the backtest; now a bar-clock min hold before an opposite-signal exit (`exit_position_too_young`); stops/TPs bypass it as live |
+| atr_volatility_min applied | engine `filters` (new), wired by the shared config builder for `pnpm backtest` too | Live pre-entry `atr_vol` filter was absent from the backtest; now parity. Note: the 15m backtest-gate run goes 15 → 11 trades (15m ATR% < 0.5 % rejections), still ≥ 5 / 0 shorts |
+| GO fee book | default fee pass = guardrails spot bucket (25/40 ⇒ **40 bps/side, 80 RT**); `--fee-tier` anything else ⇒ sensitivity run, capped at RESEARCH SCREEN ONLY | "FeeModel 40 bps/side only; never cherry-pick" |
+| Fee stress | `--fee-stress` (default on): separate 25 / 75 / 120 bps-per-side passes, printed in their own table, never graded | "Stress 25/75/Intro-1 separate" |
+| Walk-forward windows | `E4_WALK_FORWARD`, `--window eval\|tune`, `classifyWindow`, `window_eval` bar, eval ledger `E4_EVAL_LEDGER.jsonl` (WARNING on re-run) | tune 2023-03 → 2025-03 diagnostics; eval 2025-03 → 2026-03 once, GO bars only |
+| True 4H | `assertFixtureTimeframe` (declared width = TF, spacing = TF, no rollup) | "no silent ONE_MINUTE map"; 15m gate fixtures refused |
+| MC screen | `probPfGteScreen` in `runMonteCarlo`; INFO bar | 4H month-block default; P(PF ≥ 1.20) ≥ 0.60 is a screen, not GO |
+| Verdict vocabulary | `VOID · SMOKE ONLY · UNGRADED · TUNE DIAGNOSTIC · RESEARCH SCREEN ONLY · EXPLORATORY · INCONCLUSIVE · STOP · BETA BARS FAIL · BETA BARS PASS` | PASS is an Eng screen statement — printed with "NOT a desk GO (TM decides)" |
 
-No new dependencies. No guardrails change. No 15m parameter change. No E5 / A6 / maker-fill model.
+Unchanged from #48: `--bar-minutes` rollup on `pnpm backtest` (B6; not used by the harness), shared config builder, strategy-selector isolation fix, per-pass artefact tags + collision guard, fail-closed loader, no `--allow-synthetic` on the harness.
 
-## 2. Pipeline per run (STOP rules, in this order)
+## 2. Pipeline per run (order matches the card)
 
-0. **Data path** — `--fixture-dir` is **required** and must be a per-TF directory: every symbol's fixture must declare the TF's bar width (`granularitySeconds`) and step at that spacing. The 15m gate fixtures (`fixtures/bars/{BTC,ETH}-USD.json`, ~7 d) are **refused** (`E4_FIXTURE_TF_MISMATCH`, exit 2); nothing is rolled up on the fly. Perps symbols are refused (`E4_SPOT_ONLY`). Missing/short data is `DATA_UNAVAILABLE` (exit 2). There is **no `--allow-synthetic`**; `DATA: SYNTHETIC` ⇒ VOID.
-1. **Zero-fee pass** — `commission 0`, EV gate `off` ⇒ raw-signal PF against the **LOCKED floor**: **4H 1.61 · 1D 1.44 · 1H 2.25** (zero-fee PF needed for PF 1.2 at 40 bps, audit §4.1). **zf PF < floor ⇒ STOP** (fee pass and MC never run). Fewer than **10** zero-fee trades ⇒ INCONCLUSIVE, also STOP. No CLI override exists for either number.
-2. **Fee pass** — FeeModel at the tier. **Default = guardrails.yaml spot bucket = "FeeModel 40" (25/40 bps taker-charged)**, the first-burn spec. `--fee-tier intro1|t1k|custom:…` is for tier-consistent re-runs (TASK_018 E4, second step) and is printed on every line of output. EV gate `enforce` (live parity) by default. Stats: n, WR, PF, payoff, mean/sd/t of $ and R, fees ($/trade, % of gross wins), max DD, by symbol / strategy, exit reasons, **E[n] = n × 365.25 / windowDays**, 4 equal window-quarters by exit time.
-3. **Monte Carlo** — seeded (mulberry32, `--seed 20260910`) bootstrap of the fee-pass trades: `--mc-block month` (default 4H/1H; resamples calendar-month blocks by exit month) or `trade` (default 1D). Net $ / meanR / PF percentiles, max DD percentiles, P(net ≤ 0). Realized P&L path from initial capital; sizing not re-compounded (stated in the report).
+0. **Data path** — `--fixture-dir` (or `--window` preset) must be a per-TF directory; fixture declared width = TF; spot products only; missing data ⇒ `DATA_UNAVAILABLE` (exit 2); any SYNTHETIC ⇒ **VOID whole run**. Zero knobs asserted before any engine work.
+P. **HARD PREFLIGHT** — fee-book pass (40 bps/side, EV gate enforce, cooldown 1 bar) ⇒ counted pooled n, per-symbol n, E[n] = n × 365.25 / windowDays. `E4_PREFLIGHT …` machine-readable line. **E[n] < 100 ⇒ RESEARCH SCREEN ONLY (4H) / EXPLORATORY (1D): no GO packaging, MC informational.**
+1. **Zero-fee fail-fast** — commission 0, EV off. **PF < locked floor ⇒ STOP** (no fee-sensitivity, no GO MC). n < 10 ⇒ INCONCLUSIVE, also STOP.
+2. **FeeModel 40 expectancy** — stats from the preflight pass (PF, WR, payoff, mean/sd/t of $ and R, fees, max DD, exits, by symbol, 4 window-quarters by exit).
+3. **Monte Carlo** — month-block default on 4H (trade-block on 1D), seeded; net/meanR/PF/max-DD percentiles, P(net ≤ 0), **P(PF ≥ 1.20) screen (≥ 0.60 = screen met, not GO)**. Informational when preflight failed; not run after STOP.
+4. **Fee stress** — 25 / 75 / 120 bps per side, separate passes, own table. Not run after STOP.
 
-### Label lock + burn hold — derived, never operator-asserted
-
-Line 1 of stdout and of the `.md`:
+### Labels (derived) and Beta bars
 
 | Data | Window | `--run-card` | Line 1 | Grade |
 |---|---|---|---|---|
 | any SYNTHETIC | any | — | `VOID — DATA: SYNTHETIC …` | none |
-| REAL | < 365 d | — | `SMOKE ONLY — NOT screen, NOT holdout, NOT Beta hard-preflight (…; no grade issued)` | **none** |
-| REAL | ≥ 365 d | absent | `FULL WINDOW — DATA: REAL, … — UNGRADED (burn hold 2026-09-10: pass --run-card … after Beta design clear; stats only, no grade)` | **none** |
-| REAL | ≥ 365 d | present | `FULL WINDOW — DATA: REAL, … — GRADED under run card <id>` | GO-ELIGIBLE / NO-GO / EXPLORATORY / INCONCLUSIVE |
+| REAL | < 365 d | — | `SMOKE ONLY — NOT screen, NOT holdout, NOT Beta hard-preflight …` | none |
+| REAL | ≥ 365 d | absent | `FULL WINDOW — … — UNGRADED (burn hold …)` | none |
+| REAL | ≥ 365 d | present | `FULL WINDOW — … — GRADED under run card <id> (Eng screen; NOT a desk GO)` | see below |
 
-`fixtures/bars/4h/smoke-aug2026` (Aug 2026 month-block) is always **SMOKE ONLY**. The 4H holdout (`fixtures/bars/4h/holdout-2025-03_2026-03`, 2025-03-01 → 2026-03-01, exactly 365 d) is a FULL window: **UNGRADED until Algo passes the run card**. The STOP rules of §2 apply regardless of grading.
+Verdict order on a GRADED window: tune ⇒ `TUNE DIAGNOSTIC` → preflight E[n] < 100 ⇒ `RESEARCH SCREEN ONLY` / `EXPLORATORY` → zero-fee n < 10 ⇒ `INCONCLUSIVE` → zf PF < floor ⇒ `STOP` → not the eval window / fee book ≠ 40 / 1H ⇒ `RESEARCH SCREEN ONLY` → hard bars: fee PF ≥ 1.20, max DD ≤ 15 %, ≥ 3/4 window-quarters PF ≥ 1.0, long-only, REAL ⇒ `BETA BARS FAIL` / `BETA BARS PASS`. INFO (never gating): t-stat of mean R, MC P(net ≤ 0), MC P(PF ≥ 1.20) screen.
 
-### Gates and verdict (GRADED FULL windows only)
+## 3. How to run — separate 4H then 1D (from `atlas/apps/core-node`)
 
-Hard: data 100% REAL · zero-fee n ≥ 10 · zero-fee PF ≥ locked floor · fee-pass **PF ≥ 1.20** · **E[n] ≥ 60/12m (4H, 1H) / ≥ 100 (1D)** · **max DD ≤ 15%** · **≥ 3/4 window-quarters PF ≥ 1.0** · long-only spot (0 short entries). Info: t-stat of mean R (t ≈ 2 ≈ proof; PF 1.2 on 60 trades is a screen), MC P(net ≤ 0).
-
-Verdict order: `VOID` → `SMOKE ONLY` → `UNGRADED` (no run card) → `INCONCLUSIVE` (zero-fee n < 10) → **1D with E[n] < 100 ⇒ `EXPLORATORY`** (TM rule, unconditional; uses the zero-fee E[n] as an upper bound if the fee pass was stopped) → zero-fee floor `NO-GO` → any hard gate fail `NO-GO` → **1H ⇒ `EXPLORATORY`** (demoted; never GO-eligible until the multi-ATR/maker path is proven, E5/E6) → non-evaluable gate ⇒ `EXPLORATORY` → `GO-ELIGIBLE`. **Desk GO stays a human decision.**
-
-Last stdout line, machine-readable: `E4_RESULT tf=… label=… graded=… runCard=… verdict="…" data=… zeroFeeN=… zeroFeePF=… zeroFeeFloor=… feeN=… feePF=… feeMeanR=… E_n_12m=… maxDD=… mcProbLoss=… feeTier="…" fixtureDir=…`.
-
-## 3. Fixtures (Dev Backtest) and how Algo runs it
-
-One timeframe per `--fixture-dir`. Directories per #47 (merged) and #49 (draft; after it merges the bare `fixtures/bars/4h` is `DATA_UNAVAILABLE` by design):
-
-| `--fixture-dir` | Role | `--start-date` / `--end-date` | Bars/symbol | Harness label |
-|---|---|---|---|---|
-| `fixtures/bars/4h/holdout-2025-03_2026-03` | **4H HOLDOUT — hard-preflight SoT, counted E[n]** | `2025-03-01` / `2026-03-01` | 2188 (2 documented Coinbase outage buckets) | FULL → UNGRADED until `--run-card` |
-| `fixtures/bars/4h/tune-2023-03_2025-03` | 4H TUNE — in-sample fitting only | `2023-03-01` / `2025-03-01` | 4384 | FULL → UNGRADED/graded — **never a GO source** (in-sample) |
-| `fixtures/bars/4h/smoke-aug2026` (= `fixtures/bars/4h` before #49) | SMOKE ONLY | `2026-08-01` / `2026-09-01` | 186 | SMOKE ONLY |
-| `fixtures/bars/1d` | 1D, native ONE_DAY, 24 months | `2024-09-01` / `2026-08-31` | 730 | FULL → UNGRADED until `--run-card` |
-| `fixtures/bars/{BTC,ETH}-USD.json` (15m) | backtest-gate CI only | — | 673 | **refused** by the harness |
-
-All from `atlas/apps/core-node`. Use `pnpm exec tsx src/cli/backtest-e4.ts …` (or `pnpm backtest:e4 …` — never with `--` after `pnpm`). Set `ENCRYPTION_KEY` (any 64-hex dummy; several modules read it at import time).
-
-**First burn — 4H holdout. DO NOT RUN until the desk clears it (Algo Alpha run card + Beta design clear).** Spec: TF=4H, long-only, no synthetic, **FeeModel 40**, zero-fee fail-fast **@ 1.61**:
+Set `ENCRYPTION_KEY` (any 64-hex dummy). Use `pnpm exec tsx src/cli/backtest-e4.ts …` (or `pnpm backtest:e4 …`; never `--` after `pnpm`). Defaults **are** the card; the only inputs are TF, window and the run card.
 
 ```bash
-pnpm exec tsx src/cli/backtest-e4.ts --tf 4h \
-  --fixture-dir fixtures/bars/4h/holdout-2025-03_2026-03 \
-  --products BTC-USD ETH-USD SOL-USD --strategy trend_follow \
-  --start-date 2025-03-01 --end-date 2026-03-01 \
-  --run-card <ALGO-ALPHA-RUN-CARD-ID>
-# defaults already are the burn spec: fee pass = guardrails FeeModel (25/40 bps), --ev-gate enforce,
-# --mc-block month --mc-runs 2000 --seed 20260910 --initial-capital 1000. Without --run-card: UNGRADED.
+# 1) FeeModel 4H first — eval window, GO bars here only, run ONCE (ledger warns on repeats)
+pnpm exec tsx src/cli/backtest-e4.ts --tf 4h --window eval --run-card <card id>
+#    = --fixture-dir fixtures/bars/4h/holdout-2025-03_2026-03 --start-date 2025-03-01 --end-date 2026-03-01
+#      --products BTC-USD ETH-USD SOL-USD --strategy trend_follow --ev-gate enforce --cooldown-bars 1
+#      fee book 40 bps/side (guardrails) --fee-stress --mc-block month --mc-runs 2000 --seed 20260910
+
+# 1b) 4H tune window — diagnostics only, never GO bars
+pnpm exec tsx src/cli/backtest-e4.ts --tf 4h --window tune --run-card <card id>
+
+# 2) 1D — only if counted E[n] ≥ 100 else EXPLORATORY (same eval window sliced from fixtures/bars/1d)
+pnpm exec tsx src/cli/backtest-e4.ts --tf 1d --window eval --run-card <card id>
+
+# 3) 1H — demoted, do not lead (needs a per-TF native 1h fixture directory; capped at RESEARCH SCREEN ONLY)
 ```
 
-**Second — 1D** (EXPLORATORY unless E[n] ≥ 100):
+Without `--run-card` the same commands print everything and grade nothing (UNGRADED). `--fee-tier intro1|t1k|custom:…` turns the fee-book pass into a sensitivity run (capped at RESEARCH SCREEN ONLY; the 25/75/120 stress table is the sanctioned way to look at other fee books). `--smoke-run-all-stages` only acts on SMOKE windows. Artefacts: per-pass `backtest_<ts>_e4-<tf>-<window>-{feebook,zero-fee,stress-<bps>bps}.json` + `report_*.txt`, `e4_<tf>_<window>_<ts>.json/.md`, `E4_EVAL_LEDGER.jsonl` in `--results-path` (default `atlas/var/backtest_results/e4`).
 
-```bash
-pnpm exec tsx src/cli/backtest-e4.ts --tf 1d --fixture-dir fixtures/bars/1d \
-  --products BTC-USD ETH-USD SOL-USD --strategy trend_follow \
-  --start-date 2024-09-01 --end-date 2026-08-31 [--run-card <id>]
-```
+Refusals (exit 2 unless noted): 15m gate fixtures for `--tf 4h` (`E4_FIXTURE_TF_MISMATCH`); bare `fixtures/bars/4h` (`DATA_UNAVAILABLE`); perps symbols (`E4_SPOT_ONLY`); guardrails drift from A1 / atr min / EV 0 (`E4_ZERO_KNOBS_DRIFT`); `--tf 15m`, `--zero-fee-pf-min`, `--min-expected-trades`, `--allow-synthetic` (exit 1, unknown/refused).
 
-**Third — 1H (demoted).** Requires a per-TF 1h fixture directory (none committed); verdict capped at EXPLORATORY; floor 2.25.
+## 4. Engine caveats on wide bars (documented, not changed here)
 
-Tier-consistent re-runs (TASK_018 E4 second step): add `--fee-tier intro1` (4H/1D, $1K account) or `--fee-tier t1k`. `--ev-gate shadow` counts would-be EV rejects without removing them. `--mc-block none` skips MC. `--smoke-run-all-stages` only acts on SMOKE ONLY windows (runs the fee pass + MC past a STOP for pipeline validation; never evidence). Artefacts: per-pass `backtest_<ts>_e4-<tf>-zero-fee.json` / `…-fee.json` + `report_*.txt`, and `e4_<tf>_<ts>.json` / `.md` in `--results-path` (default `atlas/var/backtest_results/e4`).
+- **MTF collapse ≥ 1H.** `SignalProcessor` buckets incoming bars by clock into 5m/15m/1h groups; with ≥ 60 m bars each group holds one bar, so trend_follow's "1h" alignment degenerates to a same-TF check.
+- **Indicator periods stay in bars** (EMA 12/15, ATR 14, ADX on 4H bars = 12/15/14 × 4H). Intended frequency-lever semantics.
+- **Meta-filter time-of-day rule** (04–07 UTC penalty, 13–17 UTC bonus) was designed for 15m; on 4H every signal is at 00/04/08/12/16/20 UTC. No CLI flag here (TASK_018 rule 3: ex-ante justification needed).
+- **Stop-on-entry-bar.** A 15m-sized ATR stop can be hit inside the 4H entry bar (engine checks stop before TP — pessimistic). Exit redesign is E5, not E4.
+- **Upstream gaps.** The holdout has one 4-hour Coinbase outage (2025-10-25T16:00–20:59Z); the engine steps the union timeline (no fabricated bars).
+- **Q4 of the eval window has 1 trade** (n per quarter 14/15/12/1). Regime/EMA-crossover silence, not a data gap (bars are present to 2026-02-28T20:00Z). Reported, not interpreted.
 
-Per-strategy runs: `--strategy trend_follow` and `--strategy momentum` are genuinely isolated now (§1 engine fix). `--strategy all` pools both paper-GO strategies; the kill list still applies.
+## 5. Not done / not in scope
 
-## 4. Pipeline validation runs on committed fixtures (not research results, not a burn)
-
-| Run | Line 1 | Zero-fee pass | Fee pass @ FeeModel 40 | Verdict |
-|---|---|---|---|---|
-| `--tf 4h --fixture-dir <Aug-2026 4h>` 2026-08-01 → 2026-09-01, trend_follow, BTC/ETH/SOL | **SMOKE ONLY** (31 d) | n=3 (BTC 1 / ETH 1 / SOL 1), 5 SELLs blocked (spot) → INCONCLUSIVE, STOP | not run (with `--smoke-run-all-stages`: EV gate evaluates the 3 entries at 40 bps) | `SMOKE ONLY` (no grade) |
-| `--tf 1d --fixture-dir fixtures/bars/1d` 2024-09-01 → 2026-08-31, trend_follow, BTC/ETH/SOL, no run card | **FULL WINDOW — UNGRADED** (729 d) | n=17, zf PF 1.54 ≥ 1.44 floor → continue | n at 25/40 bps, E[n] = n × 365.25 / 729 reported; MC trade-block | `UNGRADED` (burn hold; stats only) |
-| `--tf 4h --fixture-dir fixtures/bars` (15m gate set) | — | — | — | refused, `E4_FIXTURE_TF_MISMATCH`, exit 2 |
-| `--tf 15m` | — | — | — | refused ("15m is NOT an E4 timeframe"), exit 1 |
-
-These validate the pipeline and the label/hold machinery. They use default (15m-tuned) parameters and are not E4 results; parameters are to be chosen on the tune window (2023-03 → 2025-03) and evaluated once on the holdout (2025-03 → 2026-03), TASK_018 anti-overfitting rules.
-
-## 5. Engine caveats on wide bars (documented, not changed here)
-
-- **MTF collapse ≥ 1H.** `SignalProcessor` buckets incoming bars by clock into 5m/15m/1h groups. With ≥ 60m base bars every group holds one bar, so the "1h" series (trend_follow `requireMtfAlignment`, `checkTimeframeFilter`) equals the base series — MTF alignment degenerates to a same-TF check.
-- **Indicator periods stay in bars.** EMA(12/15), ATR(14), ADX on 4H bars are 12/15/14 × 4H. That is the intended frequency-lever semantics; no rescaling.
-- **Warm-up.** Indicator/regime warm-up consumes the first tens of bars (7 days of 4H = 42 bars produce zero signals; 31 days = 186 bars produced 8 candidates). E[n] is annualized over the whole window, so short windows understate it; the 12-month holdout is the right denominator.
-- **Meta-filter time-of-day rule** (lo-liq 04–07 UTC penalty, 13–17 UTC bonus) was designed for 15m. On 4H bars every signal is at 00/04/08/12/16/20 UTC (04 penalised, 16 rewarded); on 1D every signal is at 00 UTC (neither). Disabling it needs ex-ante justification (TASK_018 rule 3); there is no CLI flag for it here.
-- **Stop-on-entry-bar.** A 15m-sized ATR stop can be hit inside the 4H entry bar (hold time 0; the engine checks stop before TP — pessimistic). Exit redesign is E5, not E4.
-- **Upstream gaps.** The holdout has one 4-hour Coinbase outage (2025-10-25T16:00–20:59Z); the engine steps the union timeline, so the missing buckets simply do not exist (no fabricated bars).
-- **Quarter gate** uses 4 equal window segments by exit time (not calendar quarters), so the holdout yields four comparable 91.25-day segments.
-
-## 6. Not in scope / explicitly not done
-
-- No first 4H burn, no evidence claim, no desk GO. `GO-ELIGIBLE` is a gate statement on a GRADED FULL REAL window; the desk decides.
-- No E5 exit redesign (G1/G3/G5), no A6, no maker-fill model (E6), no 15m runs, no re-enabling of disabled strategies, no perps/INTX path.
-- No synthetic data path on the harness; `pnpm backtest --allow-synthetic` still exists for SMOKE runs and stamps `DATA: SYNTHETIC`.
-- No hand-edited candles; nothing written under `fixtures/bars/**` by this PR.
+- No desk GO. `BETA BARS PASS` is an Eng screen statement; TM decides.
+- No E5 exit redesign, no A6, no maker-fill model, no 15m runs, no re-enabling of disabled strategies, no INTX/perps path, no synthetic data path, nothing written under `fixtures/bars/**`, no guardrails change.
