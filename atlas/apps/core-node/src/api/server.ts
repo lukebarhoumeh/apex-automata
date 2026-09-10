@@ -19,7 +19,7 @@ import path from 'path';
 import { loadAndValidateEnv } from '../core/env';
 import client from 'prom-client';
 import { OHLCV } from '../indicators/technical';
-import { loadGuardrails } from '../config/loadGuardrails';
+import { loadGuardrails, resolveLiveConfig } from '../config/loadGuardrails';
 import { FeeModel } from '../core/fee-model';
 import { validateSchemaOrFail } from '../config/validateSchema';
 import { OrderRequest } from '../exchanges/coinbase';
@@ -33,7 +33,13 @@ import {
   assertLiveStage0Complete,
   getMarketDataUrls,
 } from '../trading/execution/adapter-factory';
-import { toLiveProductSpec } from '../trading/execution/coinbase-advanced-adapter';
+import {
+  LiveAccountTruth,
+  LiveAccountSummary,
+  LivePreflightCheck,
+  LivePreflightReport,
+  runLiveAccountPreflight,
+} from '../trading/account';
 import { CoinbasePerpsAdapter } from '../exchanges/coinbase-perps-adapter';
 import { ExchangeRegistry } from '../exchanges/exchange-registry';
 import { HyperliquidAdapter } from '../exchanges/hyperliquid';
@@ -822,6 +828,30 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true, timestamp: Date.now() });
 });
 
+/**
+ * Live account block for `/api/status`, `/api/pnl` and the start response (TASK_011).
+ * `null` in paper or when no engine is running. Never falls back to yaml equity.
+ */
+function buildLiveAccountBlock(): Record<string, unknown> | null {
+  const truth = tradingEngine?.getLiveAccountTruth();
+  if (!truth) return null;
+  const snapshot = truth.getSnapshot();
+  const health = truth.getHealth();
+  if (!snapshot) {
+    return { equityUsd: null, quoteAvailableUsd: null, feeTier: null, fetchedAt: null, stale: true, health };
+  }
+  return {
+    equityUsd: snapshot.equityUsd,
+    quoteAvailableUsd: snapshot.quoteAvailableUsd,
+    quoteHoldUsd: snapshot.quoteHoldUsd,
+    feeTier: snapshot.feeTier,
+    fetchedAt: snapshot.fetchedAt,
+    stale: health.degraded,
+    health,
+    evGateMode: tradingEngine?.getRiskEngineInstance()?.getEvGateMode() ?? null,
+  };
+}
+
 // Build PnL snapshot from trading engine state for frontend consumption
 function buildPnLSnapshot(): Record<string, unknown> | null {
   if (!tradingEngine?.engineRunning) return null;
@@ -834,7 +864,11 @@ function buildPnLSnapshot(): Record<string, unknown> | null {
   const riskStatus = riskEngine.getRiskStatus();
   const portfolio = positionTracker.getPortfolioSummary();
   const config = tradingEngine.getConfig();
-  const accountEquity = config.guardrails?.account?.equity_usd ?? 50_000;
+  const isLive = config.mode === 'live';
+  // Session equity anchor: Coinbase snapshot at start in live (no yaml fallback), yaml in paper.
+  const accountEquity = isLive
+    ? riskEngine.getAccountEquity()
+    : (config.guardrails?.account?.equity_usd ?? 50_000);
   
   const totalEquity = riskEngine.getCurrentEquityForSizing();
   const dailyPnlUsd = riskMetrics.dailyPnL;
@@ -858,6 +892,8 @@ function buildPnLSnapshot(): Record<string, unknown> | null {
     openPositionsCount: portfolio.positionCount,
     exposureUsd: riskMetrics.currentExposure,
     maxDrawdownPct: riskMetrics.maxDrawdown,
+    // Live only (TASK_011): {equityUsd, quoteAvailableUsd, feeTier, fetchedAt, stale}.
+    liveAccount: isLive ? buildLiveAccountBlock() : null,
   };
 }
 
@@ -899,6 +935,8 @@ app.get('/api/status', (req, res) => {
     regime: runtimeState.regime,
     risk: runtimeState.risk,
     pnl: pnlSnapshot,
+    // Live only (TASK_011): the Coinbase account snapshot the session sizes from; null in paper.
+    liveAccount: isEngineRunning && tradingEngine!.getConfig().mode === 'live' ? buildLiveAccountBlock() : null,
     activeSymbols: tradingEngine?.getActiveSymbols() || [],
     warmupComplete: runtimeState.warmupComplete ?? false,
     candlesBuffered: runtimeState.candlesBuffered ?? {},
@@ -1129,22 +1167,40 @@ app.post('/api/engine/start', async (req, res) => {
       spotToPerpsMapping: Object.fromEntries(spotToPerpsMap),
     });
 
-    // Clone guardrails so live preflight can safely adjust session-specific parameters
+    // Clone guardrails so the engine session never mutates the process-wide config
     const engineGuardrails = structuredClone(guardrails);
 
-    // Live preflight checklist (fails fast with explicit errors)
+    // Live preflight checklist (fails fast with explicit errors). On success it hands
+    // back the LiveAccountTruth the engine MUST size from — equity/fees/specs never
+    // come from guardrails.account in live (TASK_011).
+    let liveAccountTruth: LiveAccountTruth | undefined;
+    let liveAccountSummary: LiveAccountSummary | undefined;
+    let livePreflightWarnings: string[] = [];
     if (mode === 'live') {
       const preflight = await runLivePreflight({
         engineGuardrails,
         products: engineProducts,
+        perpsSymbols,
       });
       if (!preflight.ok) {
         return res.status(400).json({
           error: preflight.error,
           details: preflight.details,
           warnings: preflight.warnings,
+          checks: preflight.checks,
+          liveAccount: preflight.account ?? null,
         });
       }
+      liveAccountTruth = preflight.truth;
+      liveAccountSummary = preflight.account;
+      livePreflightWarnings = preflight.warnings;
+      logger.warn('LIVE session will size from the Coinbase account snapshot (not guardrails.account.equity_usd)', {
+        equityUsd: preflight.account.equityUsd,
+        quoteAvailableUsd: preflight.account.quoteAvailableUsd,
+        feeTier: `${preflight.account.feeTier.name} ${preflight.account.feeTier.makerBps}/${preflight.account.feeTier.takerBps} bps`,
+        evGateMode: resolveLiveConfig(engineGuardrails).ev_gate_mode,
+        warnings: preflight.warnings,
+      });
     }
 
     // Step 4: Unified environment config
@@ -1174,7 +1230,9 @@ app.post('/api/engine/start', async (req, res) => {
         marketDataEnv: resolvedMarketDataEnv,
         executionEnv: mode === 'live' ? 'production' : 'production', // Paper ignores this
         paperInitialEquityUsd: engineGuardrails.account.equity_usd,
-      }
+      },
+      // Live-only: the engine refuses to start without it (ACCOUNT_TRUTH_UNAVAILABLE).
+      liveAccountTruth,
     };
 
     logger.info(`Starting trading engine in ${mode} mode`, {
@@ -2215,10 +2273,12 @@ app.post('/api/engine/start', async (req, res) => {
 
         // #A3 (2026-05-18): pre-trade fee-adjusted EV gate. Rejects
         // signals whose expected USD value [p*win - (1-p)*loss -
-        // 2*fee*notional] is below `risk.min_ev_threshold` (default 0
-        // = reject negative-EV). Cold-start safe: default-allows when
-        // MetaFilter has no perf data yet for the strategy. See
-        // docs/research/2026-05-18_f4-hl-backtest-validation.md §4.1.
+        // fees] is below `risk.min_ev_threshold` (default 0 = reject
+        // negative-EV). Paper: cold-start safe (default-allows when
+        // MetaFilter has no perf data yet). Live (TASK_011): Beta(12,18)
+        // prior instead of allow-by-default, live fee tier, maker entry
+        // leg only when post-only, enforce|shadow per live.ev_gate_mode.
+        // See docs/research/2026-05-18_f4-hl-backtest-validation.md §4.1.
         const strategyPerf = signalProcessor!.getStrategyPerformance(signal.strategy);
         const evGate = tradingEngine!.getRiskEngineInstance()?.evaluateSignalEv({
           symbol: signal.symbol,
@@ -2229,6 +2289,9 @@ app.post('/api/engine/start', async (req, res) => {
           takeProfit: typeof signal.takeProfit === 'number' ? signal.takeProfit : 0,
           size: computedSize,
           winRate: strategyPerf?.winRate ?? null,
+          sampleSize: strategyPerf?.totalTrades ?? 0,
+          // Paper keeps the legacy taker-both-sides assumption bit-for-bit.
+          entryLiquidity: mode === 'live' && orderType === 'limit' && postOnly ? 'maker' : 'taker',
         });
         if (evGate && !evGate.allowed) {
           logger.warn('Signal rejected by EV gate', {
@@ -2301,9 +2364,10 @@ app.post('/api/engine/start', async (req, res) => {
     supervisor.setActualState('running', 'engine_started');
 
     // Persist a trading_sessions row so the UI can scope this run's state.
+    // Live: the session's initial equity is the Coinbase snapshot, never the yaml value.
     const sessionId = await openTradingSession({
       mode: mode as 'paper' | 'live',
-      initialEquity: engineGuardrails.account.equity_usd,
+      initialEquity: liveAccountSummary ? liveAccountSummary.equityUsd : engineGuardrails.account.equity_usd,
     });
     
     // Load historical data for warmup (don't await - do in background)
@@ -2348,6 +2412,10 @@ app.post('/api/engine/start', async (req, res) => {
       activeSymbols,
       perpsSymbols: perpsSymbols,
       spotToPerpsMapping: Object.fromEntries(activeSpotToPerpsMap),
+      // Live only: what the session is actually sizing/charging from (TASK_011).
+      liveAccount: liveAccountSummary ?? null,
+      evGateMode: mode === 'live' ? resolveLiveConfig(engineGuardrails).ev_gate_mode : null,
+      warnings: livePreflightWarnings,
     });
 
   } catch (error) {
@@ -2399,19 +2467,39 @@ app.post('/api/engine/start', async (req, res) => {
 });
 
 type LivePreflightResult =
-  | { ok: true; warnings: string[] }
-  | { ok: false; error: string; details?: Record<string, any>; warnings: string[] };
+  | {
+      ok: true;
+      warnings: string[];
+      checks: LivePreflightCheck[];
+      /** Snapshot summary (equity, tier, specs) for the start response / dashboard. */
+      account: LiveAccountSummary;
+      /** The account truth the engine MUST size from (single source of truth for the session). */
+      truth: LiveAccountTruth;
+    }
+  | {
+      ok: false;
+      error: string;
+      details?: Record<string, any>;
+      warnings: string[];
+      checks?: LivePreflightCheck[];
+      account?: LiveAccountSummary | null;
+    };
 
 /**
- * Live preflight (Sprint 9 / TASK_010 minimum): every check runs against Coinbase
+ * Live preflight (Sprint 9 / TASK_010 + TASK_011): every check runs against Coinbase
  * Advanced Trade via the hardened JWT client. The legacy `CoinbaseExchange` (HMAC +
  * passphrase against api.exchange.coinbase.com) is no longer used here — it cannot
  * authenticate a CDP key, so `COINBASE_API_VERSION=exchange` fails closed.
- * TASK_011 extends this with equity/fee-tier truth.
+ *
+ * Equity, fee tier and product specs come from ONE `LiveAccountTruth` snapshot
+ * (USD+USDC, `/transaction_summary`, `/products/{id}`); any unknown ⇒ refuse to start.
+ * `guardrails.account.equity_usd` is never consulted in live. The check table lives in
+ * `trading/account/live-preflight.ts`.
  */
 async function runLivePreflight(input: {
   engineGuardrails: typeof guardrails;
   products: string[];
+  perpsSymbols?: string[];
 }): Promise<LivePreflightResult> {
   const warnings: string[] = [];
 
@@ -2535,89 +2623,41 @@ async function runLivePreflight(input: {
     };
   }
   
+  // Account truth for the session: equity (USD+USDC + marked bases), fee tier, product
+  // specs — refreshed every `live.account_refresh_sec` and after every fill once the
+  // engine owns it. Built here so the preflight verdict and the engine share ONE snapshot.
+  const liveConfig = resolveLiveConfig(input.engineGuardrails);
+  let truth: LiveAccountTruth;
   try {
-    // 1. Clock skew — JWTs carry a 120s nbf/exp window. Unreadable server time is a FAIL
-    //    (Sprint 9 §2: skew is a fail-closed condition, so it must be measured, not assumed).
-    let skewSeconds: number;
-    try {
-      skewSeconds = await client.getClockSkewSeconds();
-    } catch (error) {
-      return {
-        ok: false,
-        error: `Live preflight failed: could not measure clock skew against Coinbase (${error instanceof Error ? error.message : String(error)})`,
-        warnings,
-      };
-    }
-    if (!Number.isFinite(skewSeconds) || skewSeconds > 30) {
-      return {
-        ok: false,
-        error: `Live preflight failed: clock skew ${Number.isFinite(skewSeconds) ? skewSeconds.toFixed(1) : 'unknown'}s vs Coinbase exceeds 30s (JWTs would be rejected)`,
-        warnings,
-      };
-    }
-    if (skewSeconds > 5) {
-      warnings.push(`Clock skew ${skewSeconds.toFixed(1)}s vs Coinbase (JWT window is 120s)`);
-    }
-    
-    // 2. Key permissions — the JWT must authenticate and the key must be allowed to trade.
-    const permissions = await client.getKeyPermissions();
-    if (!permissions.can_trade) {
-      return {
-        ok: false,
-        error: 'Live preflight failed: CDP key has can_trade=false — enable Trade on the key (View+Trade, no Transfer)',
-        warnings,
-      };
-    }
-    if (permissions.can_transfer) {
-      warnings.push('CDP key has can_transfer=true — a trading bot key should NOT be able to move funds');
-    }
-    
-    // 3. Balances — USD + USDC available (paginated), used to cap guardrails equity.
-    const accounts = await client.getAccountsAll();
-    const stableAvailable = accounts
-      .filter(a => a.currency === 'USD' || a.currency === 'USDC')
-      .reduce((sum, a) => sum + (Number.parseFloat(a.available_balance?.value ?? '0') || 0), 0);
-    if (!Number.isFinite(stableAvailable) || stableAvailable <= 0) {
-      warnings.push('Could not determine positive USD/USDC balance from Coinbase accounts (equity sanity check skipped)');
-    } else {
-      const configuredEquity = input.engineGuardrails.account.equity_usd;
-      if (stableAvailable < configuredEquity * 0.95) {
-        // Safety: scale down equity to avoid over-risking the live account.
-        input.engineGuardrails.account.equity_usd = stableAvailable;
-        warnings.push(`Guardrails equity_usd scaled down for live session (${configuredEquity} → ${stableAvailable})`);
-      }
-    }
-    
-    // 4. Product specs — every live symbol must exist AND be tradable (real increments cached by the adapter at start()).
-    const missing: string[] = [];
-    const notTradable: string[] = [];
-    for (const symbol of input.products) {
-      try {
-        const spec = toLiveProductSpec(await client.getProduct(symbol));
-        if (!spec.tradable) {
-          notTradable.push(`${symbol} (status=${spec.status}${spec.cancelOnly ? ', cancel_only' : ''})`);
-        } else if (spec.limitOnly || spec.postOnly) {
-          warnings.push(`${symbol} is ${spec.limitOnly ? 'LIMIT-ONLY' : 'POST-ONLY'} right now`);
-        }
-      } catch (error) {
-        if (error instanceof CoinbaseApiError && error.kind === 'not_found') {
-          missing.push(symbol);
-        } else {
-          throw error;
-        }
-      }
-    }
-    if (missing.length > 0 || notTradable.length > 0) {
-      const parts = [
-        missing.length ? `missing products on Coinbase: ${missing.join(', ')}` : null,
-        notTradable.length ? `not tradable: ${notTradable.join(', ')}` : null,
-      ].filter(Boolean);
-      return {
-        ok: false,
-        error: `Live preflight failed: ${parts.join('; ')}`,
-        warnings,
-      };
-    }
+    truth = new LiveAccountTruth({
+      logger,
+      client,
+      symbols: input.products,
+      refreshIntervalSec: liveConfig.account_refresh_sec,
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Live preflight failed: ${error instanceof Error ? error.message : String(error)}`,
+      warnings,
+    };
+  }
+
+  // Read-only checks against Advanced Trade (JWT): clock skew, key permissions (View+Trade
+  // only), account truth (equity ≥ live.min_quote_usd, fee tier known, every live symbol
+  // tradable), order-shape preview (POST /orders/preview — validates, never executes) and
+  // no INTX perps. Nothing here places, edits or cancels orders.
+  let report: LivePreflightReport;
+  try {
+    report = await runLiveAccountPreflight({
+      logger,
+      client,
+      truth,
+      liveSymbols: input.products,
+      perpsSymbols: input.perpsSymbols ?? [],
+      apiVersion,
+      minQuoteUsd: liveConfig.min_quote_usd,
+    });
   } catch (error) {
     // Errors from the hardened client carry {status, code, message} only — never headers/JWTs.
     const details =
@@ -2631,8 +2671,20 @@ async function runLivePreflight(input: {
       warnings,
     };
   }
-  
-  return { ok: true, warnings };
+
+  warnings.push(...report.warnings);
+  if (!report.ok || !report.account) {
+    return {
+      ok: false,
+      error: report.error ?? 'Live preflight failed',
+      details: report.details,
+      warnings,
+      checks: report.checks,
+      account: report.account,
+    };
+  }
+
+  return { ok: true, warnings, checks: report.checks, account: report.account, truth };
 }
 
 // Stop trading engine
@@ -2922,11 +2974,16 @@ app.get('/api/analytics/equity-curve', (req, res) => {
   
   const curve = tradingEngine.getEquityCurve();
   const stats = tradingEngine.getSessionStats();
+  // Live: exchange truth (latest snapshot); paper: yaml start equity + session PnL.
+  const liveSnapshot = tradingEngine.getLiveAccountTruth()?.getSnapshot() ?? null;
+  const baseEquity = tradingEngine.getConfig().mode === 'live'
+    ? (tradingEngine.getRiskEngineInstance()?.getAccountEquity() ?? liveSnapshot?.equityUsd ?? 0)
+    : guardrails.account.equity_usd;
   
   res.json({
     equityCurve: curve,
     highWaterMark: stats?.highWaterMark ?? 0,
-    currentEquity: stats?.totalPnl ? guardrails.account.equity_usd + stats.totalPnl : guardrails.account.equity_usd,
+    currentEquity: liveSnapshot ? liveSnapshot.equityUsd : (stats?.totalPnl ? baseEquity + stats.totalPnl : baseEquity),
     maxDrawdown: stats?.maxDrawdown ?? 0,
   });
 });

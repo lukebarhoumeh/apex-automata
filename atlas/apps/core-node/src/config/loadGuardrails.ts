@@ -119,6 +119,31 @@ const MetaFilterYamlSchema = z
 
 export type CoinDeskSentimentConfig = z.infer<typeof CoinDeskSentimentSchema>;
 
+// Live-mode runtime knobs (Sprint 9 / TASK_011). Paper mode never reads this
+// block. Everything here has a fail-closed default so a missing block behaves
+// like the strictest setting:
+//   - account_refresh_sec: LiveAccountTruth refresh cadence (also refreshed
+//     after every fill). Snapshot older than 3x this => ACCOUNT_TRUTH_STALE.
+//   - min_quote_usd: preflight FAILs when USD+USDC available is below this.
+//   - ev_gate_mode: `enforce` rejects negative-EV entries; `shadow` allows them
+//     but logs EV_GATE_SHADOW_ALLOW for every would-be reject and prints a
+//     startup banner (Door B in docs/plans/SPRINT-9-LIVE-COINBASE.md).
+export const EvGateModeSchema = z.enum(['enforce', 'shadow']);
+export type EvGateMode = z.infer<typeof EvGateModeSchema>;
+
+const LiveConfigSchema = z.object({
+  account_refresh_sec: z.number().int().positive().default(60),
+  min_quote_usd: z.number().nonnegative().default(20),
+  ev_gate_mode: EvGateModeSchema.default('enforce'),
+});
+
+export type LiveConfig = z.infer<typeof LiveConfigSchema>;
+
+/** Effective live config: the parsed block or its fail-closed defaults when absent. */
+export function resolveLiveConfig(guardrails: { live?: LiveConfig }): LiveConfig {
+  return guardrails.live ?? LiveConfigSchema.parse({});
+}
+
 export const GuardrailsSchema = z.object({
   disabled_strategies: z.array(z.string()).optional().default([]),
   momentum: MomentumConfigSchema.optional(),
@@ -211,6 +236,9 @@ export const GuardrailsSchema = z.object({
   // Meta-filter config block. Only carries the CoinDesk sentiment rule today.
   // Strictly optional — when absent, MetaFilter defaults (rule disabled) apply.
   meta_filter: MetaFilterYamlSchema,
+  // Live-mode knobs (TASK_011). Optional; absent = fail-closed defaults via
+  // `resolveLiveConfig()`. Paper mode ignores this block entirely.
+  live: LiveConfigSchema.optional(),
   compliance: z.object({
     tax_method: z.string(),
     export_frequency_days: z.number().int().positive(),

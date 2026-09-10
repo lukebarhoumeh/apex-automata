@@ -21,8 +21,29 @@ import {
   computeDailyStopThresholdR,
 } from './risk-math';
 import { computeRiskBasedSize } from './risk/position-sizing';
-import { evaluateEvGate, type EvGateInputs, type EvGateResult } from './risk/ev-gate';
+import {
+  evaluateEvGate,
+  computeRealizedPayoffRatio,
+  LIVE_GEOMETRY_HAIRCUT,
+  LIVE_WIN_RATE_PRIOR,
+  type EvGateInputs,
+  type EvGateMode,
+  type EvGateResult,
+} from './risk/ev-gate';
 import { FeeModel } from '../core/fee-model';
+import { ACCOUNT_TRUTH_STALE, ACCOUNT_TRUTH_UNAVAILABLE } from './account/live-account-truth';
+
+/** Closed trades kept for the realized payoff (avg win / avg loss) used by the live EV gate. */
+export const REALIZED_PAYOFF_WINDOW = 50;
+
+/**
+ * Structural view of `LiveAccountTruth` that RiskEngine depends on (kept minimal so
+ * tests can stub it without the Advanced Trade client).
+ */
+export interface LiveAccountTruthSource {
+  getSnapshot(): { equityUsd: number; fetchedAt: number } | null;
+  isStale(): boolean;
+}
 
 // Prometheus metrics for risk engine reliability
 const riskMetricsWriteFailures = new Counter({
@@ -85,6 +106,11 @@ export interface RiskEngineConfig {
   riskPerTrade: number;            // Percentage of capital to risk per trade
   kellyFraction: number;           // Kelly criterion fraction (0.25 = quarter Kelly)
   guardrails: GuardrailConfig;
+  /**
+   * Session equity anchor for USD limits. Paper: `guardrails.account.equity_usd`.
+   * Live: ignored in favour of `liveAccountTruth`'s snapshot (TASK_011) — yaml is
+   * never a live fallback.
+   */
   accountEquity: number;
   /**
    * Optional FeeModel used by `evaluateSignalEv` (#A3) for round-trip
@@ -92,6 +118,20 @@ export interface RiskEngineConfig {
    * structured warn — never silently zeros fees.
    */
   feeModel?: FeeModel;
+  /**
+   * Execution mode. `live` requires `liveAccountTruth` (throws
+   * `ACCOUNT_TRUTH_UNAVAILABLE` otherwise) and switches the EV gate to its
+   * fail-closed live semantics. Default `paper` — behaviour unchanged.
+   */
+  executionMode?: 'paper' | 'live';
+  /**
+   * Live-only exchange account truth (TASK_011). Sizing equity is read from the
+   * latest snapshot on every call (no 0.5–2× clamp); a stale snapshot blocks new
+   * entries with `ACCOUNT_TRUTH_STALE`.
+   */
+  liveAccountTruth?: LiveAccountTruthSource;
+  /** Live-only EV gate mode (`guardrails.live.ev_gate_mode`). Default `enforce`. */
+  evGateMode?: EvGateMode;
   /**
    * Soft-launch safety clamps (intended for early live trading).
    * These are applied dynamically for the first N new positions opened.
@@ -210,6 +250,13 @@ export class RiskEngine extends EventEmitter {
   private feeModel: FeeModel | null;
   private minEvThreshold: number;
 
+  // TASK_011: live account truth + live EV-gate semantics
+  private readonly executionMode: 'paper' | 'live';
+  private readonly liveAccountTruth: LiveAccountTruthSource | null;
+  private readonly evGateMode: EvGateMode;
+  /** Realized PnL of the most recent closed trades (newest last), bounded to REALIZED_PAYOFF_WINDOW. */
+  private recentClosedTradePnls: number[] = [];
+
   constructor(
     config: RiskEngineConfig,
     logger: Logger,
@@ -223,7 +270,31 @@ export class RiskEngine extends EventEmitter {
     this.userId = config.userId;
 
     this.guardrails = config.guardrails;
-    this.accountEquity = config.accountEquity;
+    this.executionMode = config.executionMode ?? 'paper';
+    // Both knobs are live-only: paper never consults account truth or shadow mode,
+    // even if a caller passes them, so paper behaviour cannot drift.
+    this.evGateMode = this.executionMode === 'live' ? (config.evGateMode ?? 'enforce') : 'enforce';
+    this.liveAccountTruth = this.executionMode === 'live' ? (config.liveAccountTruth ?? null) : null;
+
+    if (this.executionMode === 'live') {
+      // Live sizes from the exchange, never from yaml. No snapshot => refuse to build.
+      const snapshot = this.liveAccountTruth?.getSnapshot() ?? null;
+      if (!snapshot || !Number.isFinite(snapshot.equityUsd) || snapshot.equityUsd < 0) {
+        throw new Error(
+          `${ACCOUNT_TRUTH_UNAVAILABLE}: RiskEngine cannot start in live mode without a Coinbase account ` +
+            'snapshot (LiveAccountTruth). guardrails.account.equity_usd is paper-only and is not used as a fallback.',
+        );
+      }
+      this.accountEquity = snapshot.equityUsd;
+      this.logger.info('RiskEngine live equity anchored from Coinbase account snapshot', {
+        equityUsd: snapshot.equityUsd,
+        fetchedAt: snapshot.fetchedAt,
+        configuredEquityIgnored: config.accountEquity,
+        evGateMode: this.evGateMode,
+      });
+    } else {
+      this.accountEquity = config.accountEquity;
+    }
     const riskCfg = this.guardrails.risk;
     const accountCfg = this.guardrails.account;
     const circuitCfg = this.guardrails.circuit_breakers;
@@ -380,6 +451,12 @@ export class RiskEngine extends EventEmitter {
     const realized = Number(position.realizedPnL ?? 0);
     if (!Number.isFinite(realized)) {
       return;
+    }
+
+    // Rolling window feeding the live EV gate's realized payoff (avg win / avg loss).
+    this.recentClosedTradePnls.push(realized);
+    if (this.recentClosedTradePnls.length > REALIZED_PAYOFF_WINDOW) {
+      this.recentClosedTradePnls.splice(0, this.recentClosedTradePnls.length - REALIZED_PAYOFF_WINDOW);
     }
     
     // Consecutive losses are based on CLOSED trade outcomes (not order placement success).
@@ -720,23 +797,85 @@ export class RiskEngine extends EventEmitter {
    * when rejected (rejected uses the separate `evGateRejected` counter).
    */
   public evaluateSignalEv(
-    args: Omit<EvGateInputs, 'feeModel' | 'minEvThreshold'>,
+    args: Omit<EvGateInputs, 'feeModel' | 'minEvThreshold' | 'mode'>,
   ): EvGateResult {
     const inputs: EvGateInputs = {
       ...args,
       feeModel: this.feeModel ?? undefined,
       minEvThreshold: this.minEvThreshold,
     };
+    if (this.executionMode === 'live') {
+      // TASK_011 live semantics: Beta(12,18) prior instead of allow-by-default,
+      // realized payoff (fallback: TP geometry × 0.6), live tier fee legs, and the
+      // configured enforce|shadow mode. Paper keeps the legacy cold-start behaviour.
+      inputs.winRatePrior = args.winRatePrior ?? LIVE_WIN_RATE_PRIOR;
+      inputs.geometryHaircut = args.geometryHaircut ?? LIVE_GEOMETRY_HAIRCUT;
+      inputs.realizedPayoffRatio = args.realizedPayoffRatio ?? this.getRealizedPayoffRatio();
+      inputs.entryLiquidity = args.entryLiquidity ?? 'taker';
+      inputs.mode = this.evGateMode;
+    }
     const result = evaluateEvGate(inputs, this.logger);
     const labelSymbol = args.symbol || 'unknown';
     const labelStrategy = args.strategy || 'unknown';
     if (!result.allowed) {
       evGateRejected.labels(labelStrategy, labelSymbol).inc();
     } else {
-      const path = result.reason ? 'default_allow' : 'priced';
+      const path = result.shadowed ? 'shadow_allow' : result.reason ? 'default_allow' : 'priced';
       evGateAccepted.labels(labelStrategy, labelSymbol, path).inc();
     }
     return result;
+  }
+
+  /**
+   * Realized payoff ratio (avg win / avg loss) over the last `REALIZED_PAYOFF_WINDOW`
+   * closed trades, or null when history is too thin/one-sided (EV gate then falls
+   * back to TP geometry with the live haircut).
+   */
+  public getRealizedPayoffRatio(): number | null {
+    return computeRealizedPayoffRatio(this.recentClosedTradePnls);
+  }
+
+  /**
+   * Swap the FeeModel behind the EV gate (live fee-tier transitions). The previous
+   * model is not mutated; callers receive the replaced instance for logging.
+   */
+  public setFeeModel(feeModel: FeeModel): FeeModel | null {
+    const previous = this.feeModel;
+    this.feeModel = feeModel;
+    return previous;
+  }
+
+  /** FeeModel currently used by the EV gate (null when none was configured). */
+  public getFeeModel(): FeeModel | null {
+    return this.feeModel;
+  }
+
+  /** Execution mode this engine was built for. */
+  public getExecutionMode(): 'paper' | 'live' {
+    return this.executionMode;
+  }
+
+  /** EV gate mode in force (`enforce` for paper; `live.ev_gate_mode` in live). */
+  public getEvGateMode(): EvGateMode {
+    return this.evGateMode;
+  }
+
+  /**
+   * Session equity anchor: the Coinbase snapshot equity at start in live,
+   * `guardrails.account.equity_usd` in paper.
+   */
+  public getAccountEquity(): number {
+    return this.accountEquity;
+  }
+
+  /** Latest live account snapshot (null in paper or before the first refresh). */
+  public getLiveAccountSnapshot(): { equityUsd: number; fetchedAt: number } | null {
+    return this.liveAccountTruth?.getSnapshot() ?? null;
+  }
+
+  /** True in live when the account snapshot is older than its staleness bound. */
+  public isAccountTruthStale(): boolean {
+    return this.liveAccountTruth ? this.liveAccountTruth.isStale() : false;
   }
 
   // Pre-trade risk check
@@ -795,6 +934,25 @@ export class RiskEngine extends EventEmitter {
       check.passed = false;
       check.reason = 'Kill switch is active (entries disabled)';
       check.checks.killSwitch = false;
+      this.emit('risk:check:failed', order.client_oid || '', check.reason);
+      return check;
+    }
+
+    // Live: a stale account snapshot means sizing equity is unknown — block new entries
+    // (reduce-only exits stay allowed) until LiveAccountTruth refreshes successfully.
+    if (this.liveAccountTruth && !isReduceOnly && this.liveAccountTruth.isStale()) {
+      const snapshot = this.liveAccountTruth.getSnapshot();
+      const ageSec = snapshot ? Math.round((Date.now() - snapshot.fetchedAt) / 1000) : null;
+      check.passed = false;
+      check.reason =
+        `${ACCOUNT_TRUTH_STALE}: live account snapshot is ${ageSec === null ? 'missing' : `${ageSec}s old`} — ` +
+        'entries blocked until Coinbase account truth refreshes';
+      check.checks.killSwitch = false;
+      this.logger.warn('Risk check blocked entry on stale account truth', {
+        symbol,
+        side: order.side,
+        ageSec,
+      });
       this.emit('risk:check:failed', order.client_oid || '', check.reason);
       return check;
     }
@@ -1021,12 +1179,25 @@ export class RiskEngine extends EventEmitter {
 
   /**
    * Get dynamic equity for position sizing (profit compounding).
-   * 
-   * Uses current equity (base + PnL) instead of static config value.
+   *
+   * Live: the latest Coinbase account snapshot's equity, used directly — no clamp.
+   * The exchange is the truth; clamping it to a yaml-derived band would re-introduce
+   * the fail-open sizing this replaces. Throws `ACCOUNT_TRUTH_UNAVAILABLE` if the
+   * snapshot vanished (cannot happen after a successful start).
+   *
+   * Paper: current equity (base + PnL) instead of the static config value.
    * Floors at 50% of initial equity to prevent over-shrinking after losses.
    * Caps at 200% of initial equity to prevent over-leveraging after big wins.
    */
   public getCurrentEquityForSizing(): number {
+    if (this.liveAccountTruth) {
+      const snapshot = this.liveAccountTruth.getSnapshot();
+      if (!snapshot || !Number.isFinite(snapshot.equityUsd)) {
+        throw new Error(`${ACCOUNT_TRUTH_UNAVAILABLE}: no live account snapshot available for sizing`);
+      }
+      return snapshot.equityUsd;
+    }
+
     const currentEquity = this.dailyStartEquity + this.metrics.dailyPnL;
     const floor = this.accountEquity * 0.5;   // Never size below 50% of initial
     const ceiling = this.accountEquity * 2.0;  // Never size above 200% of initial

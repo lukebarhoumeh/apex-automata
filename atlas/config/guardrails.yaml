@@ -1,4 +1,6 @@
 account:
+  # Paper-only starting equity. Live mode sizes from the Coinbase account
+  # (LiveAccountTruth, see `live:` below) and refuses to start if that is unknown.
   equity_usd: 10000
   risk_per_trade: 0.005
   max_open_positions: 4
@@ -350,6 +352,24 @@ filters:
   time_filter_enabled: false
   allowed_hours_utc:
     - 0
+
+# Live-mode runtime knobs (Sprint 9 / TASK_011). Paper mode never reads this block.
+# In live mode equity, fee tier and product specs come from Coinbase via
+# LiveAccountTruth (atlas/apps/core-node/src/trading/account/live-account-truth.ts);
+# `account.equity_usd` above is paper-only and is NEVER used as a live fallback.
+#
+# - account_refresh_sec: refresh cadence for /accounts + /transaction_summary +
+#   /products/{id}; also refreshed immediately after every fill. A snapshot older
+#   than 3x this interval marks the adapter degraded and blocks new entries
+#   (ACCOUNT_TRUTH_STALE).
+# - min_quote_usd: live preflight FAILs when USD+USDC available is below this.
+# - ev_gate_mode: enforce | shadow. `shadow` never blocks; it logs
+#   EV_GATE_SHADOW_ALLOW for every would-be reject and prints a startup banner.
+#   Only a live profile (TASK_012, Door B) should ever set `shadow`.
+live:
+  account_refresh_sec: 60
+  min_quote_usd: 20
+  ev_gate_mode: enforce
 
 compliance:
   tax_method: FIFO
