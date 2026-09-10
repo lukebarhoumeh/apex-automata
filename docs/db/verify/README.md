@@ -14,7 +14,8 @@ Trading Master go; see the handoff doc.
 | `00_stub_agentic_heartbeats.sql` | stub `20260902202325` | after merge, **before #3** | `version_recorded = t`, `public_table_exists = t`, `pass = t` |
 | `01_security_invoker_and_revoke.sql` | #1 (`20260910180000`, `20260910180100`) | after #1 | `security_invoker = t` ×3; `anon_exec = f` ×6; `auth_exec = t` only for `has_role` + `upsert_account_metrics`; `pass = t` |
 | `02_execution_mode_backfill.sql` | #2 (`20260910180200`) | immediately after #2 | `null_execution_mode_account_metrics = 0`, `null_execution_mode_trading_sessions = 0`, `pass = t` |
-| `03_quarantine_agentic_heartbeats.sql` | #3 (`20260910180300`) | after #3 (writers already retargeted) | `in_equity_only = t`, `policies_present = t`, `anon_no_access = t`, `row_count >= 43`, `pass = t` |
+| `03_quarantine_agentic_heartbeats.sql` | #3 (`20260910180300`) | after #3 (writers already retargeted) | `in_equity_only = t`, `policies_present = t`, `anon_no_access = t`, `row_count` ≈ 43 (informational), `pass = t` |
+| `04_repair_strategy_filter_analysis.sql` | #4 (`20260910180400`) | after #4 | `view_exists = t`, `security_invoker = t`, `fixed_definition = t`, `anon_select = f`, `pass = t` |
 
 ## How to run
 
@@ -43,6 +44,9 @@ statements print supporting detail.
   stays at the pre-apply value, the equity writer is still targeting
   `public.agentic_heartbeats` — see handoff risk R1. `row_count` is
   informational (~43 on prod, 0 on a Preview branch) and not part of `pass`.
+- `04_*` on prod today reports `view_exists = f` (the view was never created
+  there); on a Preview branch it reports `anon_select = t` until #4 runs in the
+  same chain. Both are expected pre-#4 baselines.
 - `01_*` on prod today reports `pass = f` because remote already applied
   `20260910175414_security_hardening` (not in this repo), which keeps
   `upsert_account_metrics` service_role-only. See handoff risk R9 before
