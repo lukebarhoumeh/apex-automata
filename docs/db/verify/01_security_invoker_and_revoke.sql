@@ -11,6 +11,13 @@
 --              auth_exec = t ONLY for has_role(uuid, app_role) and
 --              upsert_account_metrics(uuid); service_exec = t on all 6
 --   summary:   every column = t
+--
+-- NOTE (2026-09-10): remote already applied 20260910175414_security_hardening
+-- (not in this repo), whose privilege model keeps upsert_account_metrics(uuid)
+-- service_role-only (authenticated REVOKED). On prod today this script therefore
+-- reports auth_exec_only_has_role_and_upsert = f and pass = f — that is the
+-- hardening model, not a defect. If the DBE amends 1b/#2 to that model, change
+-- the expected auth_exec for upsert_account_metrics to f here (handoff doc R9).
 
 -- Detail: views
 SELECT c.relname                                                     AS view_name,

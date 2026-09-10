@@ -41,7 +41,12 @@ statements print supporting detail.
   session); only the two `null_execution_mode_*` counts must be 0.
 - `03_*`: `last_heartbeat_ts` must advance after the next writer cycle. If it
   stays at the pre-apply value, the equity writer is still targeting
-  `public.agentic_heartbeats` — see handoff risk R1.
+  `public.agentic_heartbeats` — see handoff risk R1. `row_count` is
+  informational (~43 on prod, 0 on a Preview branch) and not part of `pass`.
+- `01_*` on prod today reports `pass = f` because remote already applied
+  `20260910175414_security_hardening` (not in this repo), which keeps
+  `upsert_account_metrics` service_role-only. See handoff risk R9 before
+  reading that as a defect.
 - `03_*` detail matrix: `authenticated` may still show `ins/upd/del = t` until
   handoff gap G1 (revoke the stub's `GRANT ALL ... TO authenticated`) is
   addressed; RLS blocks those writes regardless, and the summary does not

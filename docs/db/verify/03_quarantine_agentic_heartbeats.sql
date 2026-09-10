@@ -13,7 +13,9 @@
 --   sequence_in_equity = t | rls_enabled = t | policies_present = t (both named policies)
 --   anon_no_access = t (no USAGE on schema equity, no table or sequence privilege)
 --   service_role_can_write = t | authenticated_can_select = t
---   row_count ~ 43 (43 as of 2026-09-10 15:40 UTC, plus any heartbeats written since)
+--   row_count ~ 43 on prod (43 as of 2026-09-10 15:40 UTC, plus any heartbeats
+--   written since); 0 on a Preview branch (fresh chain). Informational only —
+--   not part of pass, so the same script works on prod and Preview.
 --   pass = t
 
 -- Detail: location of table + sequence (expect both in equity)
@@ -73,6 +75,6 @@ WITH checks AS (
 )
 SELECT *,
        (in_equity_only AND sequence_in_equity AND rls_enabled AND policies_present
-        AND anon_no_access AND service_role_can_write AND authenticated_can_select
-        AND row_count >= 43)                                                   AS pass
+        AND anon_no_access AND service_role_can_write AND authenticated_can_select)
+                                                                               AS pass
 FROM checks;
