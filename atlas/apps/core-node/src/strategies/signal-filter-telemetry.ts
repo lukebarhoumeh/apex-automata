@@ -29,6 +29,10 @@
  *    11. atr_vol           — ATR volatility band gate
  *    12. funding_bias      — perps funding-rate exclusion
  *    13. sizing            — guardrail-sized order is zero/invalid
+ *    14. ev_gate           — fee-adjusted EV below risk.min_ev_threshold
+ *
+ *   Backtest engine only (until TASK_012 lands the live equivalent):
+ *    15. spot_short_blocked — SELL on a no-shorting venue with no long to exit
  *
  * The funnel-success companion counter `atlas_signal_funnel_total{stage}`
  * counts the survivors at the three checkpoints that bracket the rejection
@@ -65,7 +69,16 @@ export type SignalFilterStage =
   // hyperliquid_symbols}.<sym>.disabled_strategies. Checked at three sites:
   // signal-processor.processSignal, backtest-engine.handleSignal, and
   // api/server signal:generated handler (defense in depth).
-  | 'per_symbol_disable';
+  | 'per_symbol_disable'
+  // A3 (2026-05-18) fee-adjusted EV gate — reason slug 'ev_below_threshold'.
+  // Emitted by api/server.ts (live router) and backtest-engine (TASK_017 B3).
+  | 'ev_gate'
+  // Added 2026-09-10 (TASK_012 step 3 / TASK_017 B2) — a SELL signal on a
+  // venue without shorting capability (Coinbase spot) and no open long to
+  // exit. Reason slug 'venue_no_shorting'. Emitted by backtest-engine today;
+  // the live router adopts the same stage when TASK_012 lands so funnel
+  // comparisons line up.
+  | 'spot_short_blocked';
 
 const signalFilteredCounter = new Counter({
   name: 'atlas_signal_filtered_total',

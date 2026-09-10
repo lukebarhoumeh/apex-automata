@@ -12,10 +12,62 @@ import {
 } from '../strategies/per-symbol-disable';
 import { recordSignalFiltered } from '../strategies/signal-filter-telemetry';
 import { computeRiskBasedSize } from '../trading/risk/position-sizing';
+import {
+  evaluateEvGate,
+  estimateWinRateWithPrior,
+  DEFAULT_WIN_RATE_PRIOR,
+  type WinRatePrior,
+} from '../trading/risk/ev-gate';
+import {
+  isShortingAllowed,
+  venueForSymbol,
+  type MarketVenue,
+} from '../trading/execution/venue-capabilities';
 import { FeeModel, Exchange } from '../core/fee-model';
-import { marketForSymbol } from '../core/symbol-utils';
+import { describeSeries, inferBarMinutes, type DataProvenance } from './data-loader';
 
 type OrderSide = 'BUY' | 'SELL';
+
+/** EV-gate operating mode (TASK_017 B3). Mirrors `live.ev_gate_mode` + `off`. */
+export type EvGateMode = 'enforce' | 'shadow' | 'off';
+
+export interface BacktestEvGateConfig {
+  /**
+   * `enforce` (default) rejects negative-EV entries exactly like the live
+   * router; `shadow` lets them through but counts/logs the would-be
+   * rejects (`EV_GATE_SHADOW_ALLOW`); `off` skips the gate entirely
+   * (raw-signal-edge experiments only — never for go-live claims).
+   */
+  mode: EvGateMode;
+  /** Min EV in USD (guardrails `risk.min_ev_threshold`). Default 0. */
+  minEvThreshold?: number;
+  /** Beta prior for the p estimator. Default p0=0.40, n0=30 (TASK_011). */
+  prior?: WinRatePrior;
+}
+
+/**
+ * What a data provider hands the engine. Plain `OHLCV[]` is still accepted
+ * for programmatic callers/tests (tagged `source: 'in-memory'`); the CLI
+ * path always supplies provenance so reports can stamp the data source.
+ */
+export interface ProvidedSeries {
+  candles: OHLCV[];
+  provenance: DataProvenance;
+}
+export type DataProviderOutput = OHLCV[] | ProvidedSeries;
+
+/** Per-run EV-gate counters, surfaced in metrics + report. */
+export interface EvGateStats {
+  mode: EvGateMode;
+  evaluated: number;
+  allowed: number;
+  rejected: number;
+  /** Shadow mode only: entries that WOULD have been rejected in enforce. */
+  shadowWouldReject: number;
+  /** Entries allowed via a default-allow path (missing geometry etc.). */
+  defaultAllowed: number;
+  rejectedByStrategy: Record<string, number>;
+}
 
 /**
  * Optional per-strategy parameter override block read from guardrails.yaml.
@@ -105,9 +157,30 @@ export interface BacktestConfig {
   commission?: number;
   /**
    * @deprecated Use `realism.entrySlippageBps`. Kept on the type so older
-   * callers don't break, but the engine now reads bps directly.
+   * callers don't break, but the engine now reads bps directly. The CLI
+   * maps `--slippage <decimal>` onto `realism.entrySlippageBps`.
    */
-  slippage: number;
+  slippage?: number;
+  /**
+   * TASK_017 B2 — force every product onto one venue class. When unset the
+   * venue is inferred per symbol (`XXX-PERP-INTX` → perps, else spot).
+   * Drives BOTH fee routing (spot vs perps bucket) and shorting capability.
+   */
+  venueOverride?: MarketVenue;
+  /**
+   * `guardrails.strategy.allow_short`. Necessary but not sufficient: shorts
+   * additionally require the venue to support them (`isShortingAllowed`).
+   * Default true (mirrors current guardrails) — spot still never shorts.
+   */
+  allowShort?: boolean;
+  /** TASK_017 B3 — EV gate wiring. Default `{ mode: 'enforce' }`. */
+  evGate?: BacktestEvGateConfig;
+  /**
+   * Regime-gate toggle (RegimeFilter inside SignalProcessor). Default true.
+   * `false` disables regime/strategy compatibility filtering for the run —
+   * report prints the state either way.
+   */
+  regimeGates?: boolean;
   products: string[];
   signals: {
     breakout: BacktestStrategyToggle;
@@ -186,6 +259,19 @@ export interface BacktestTrade {
   stopLoss: number;
   /** Take-profit level used for exits. */
   takeProfit: number;
+  /** Venue class the fill was simulated on (drives fees + shorting). */
+  venue: MarketVenue;
+  /** Cash equity the position was sized from (initialCapital + realized). */
+  equityAtEntry: number;
+  /** EV-gate evaluation for this entry (absent when mode = off). */
+  evGate?: {
+    ev: number;
+    p: number;
+    feeUsd: number;
+    threshold: number;
+    /** True when enforce would have rejected (shadow mode only). */
+    shadowWouldReject?: boolean;
+  };
 }
 
 export interface BacktestPosition {
@@ -223,6 +309,7 @@ export interface BacktestMetrics {
   averageLoss: number;
   largestWin: number;
   largestLoss: number;
+  /** Mean entry→exit duration in minutes, bar-clock based (never negative). */
   averageHoldTime: number; // in minutes
   totalFees: number;
   finalCapital: number;
@@ -231,6 +318,38 @@ export interface BacktestMetrics {
   byStrategy: Record<string, BacktestStrategyMetrics>;
   /** Snapshot of which strategies actually ran (post disabled_strategies filter) */
   activeStrategies: string[];
+  /** Entries opened long (BUY). */
+  longEntries: number;
+  /** Entries opened short (SELL). Must be 0 on spot venues. */
+  shortEntries: number;
+  /** SELL signals that closed an open long on a no-shorting venue. */
+  sellSignalExits: number;
+  /** SELL signals dropped on a no-shorting venue with no long to exit. */
+  shortBlocked: number;
+  /** EV-gate counters for the run. */
+  evGate: EvGateStats;
+  /** Entries bucketed by the regime label the signal carried. */
+  entriesByRegime: Record<string, number>;
+}
+
+/** Regime-gate (RegimeFilter) state snapshot for the report. */
+export interface RegimeGateState {
+  enabled: boolean;
+  minCompatibilityScore: number;
+  minRegimeConfidence: number;
+  requireMTFAlignment: boolean;
+}
+
+/** Fee assumptions actually used for fills, for the report header. */
+export interface FeeAssumptions {
+  /** 'flat-override' when `commission` is set, else 'fee-model'. */
+  routing: 'flat-override' | 'fee-model';
+  /** Flat decimal rate when routing = flat-override. */
+  flatRate?: number;
+  /** Per-venue taker/maker bps when routing = fee-model. */
+  perVenue: Record<string, { makerBps: number; takerBps: number }>;
+  /** Exchange whose fee table was consulted. */
+  exchange: Exchange;
 }
 
 export interface BacktestResult {
@@ -239,6 +358,19 @@ export interface BacktestResult {
   metrics: BacktestMetrics;
   equityCurve: { timestamp: Date; equity: number; drawdown: number }[];
   dailyReturns: { date: string; returnPercent: number }[];
+  /** Per-symbol data provenance (source, coverage, bar spacing). */
+  dataProvenance: Record<string, DataProvenance>;
+  /**
+   * 'SYNTHETIC' when ANY product ran on generated candles — the whole run is
+   * SMOKE/VOID and reports must say so on line 1. Otherwise 'REAL'.
+   */
+  dataStamp: 'REAL' | 'SYNTHETIC';
+  /** Venue class resolved per product. */
+  venueBySymbol: Record<string, MarketVenue>;
+  /** Regime-gate state at run time. */
+  regimeGate: RegimeGateState;
+  /** Fee assumptions used for fills and the EV gate. */
+  fees: FeeAssumptions;
 }
 
 /**
@@ -262,6 +394,12 @@ const DEFAULT_REALISM: Required<BacktestRealismConfig> = {
 };
 
 const DEFAULT_DISABLED_STRATEGIES = ['vwap_mr', 'breakout'];
+
+/** Median bar spacing in seconds for an in-memory series; 900 (15m) if unknown. */
+function inferGranularitySeconds(candles: OHLCV[]): number {
+  const minutes = inferBarMinutes(candles);
+  return minutes && minutes > 0 ? Math.round(minutes * 60) : 900;
+}
 
 export class BacktestEngine extends EventEmitter {
   private config: BacktestConfig;
@@ -290,6 +428,21 @@ export class BacktestEngine extends EventEmitter {
   private lastSignalBarPerStrategy: Map<string, number> = new Map();
   private lastSignalTimestampPerStrategy: Map<string, Date> = new Map();
   private signalAdmittedPerStrategy: Map<string, number> = new Map();
+  // Bar clock: the timestamp of the bar currently being processed. Signal
+  // handlers use this instead of `signal.timestamp` (which plugins stamp
+  // with wall-clock `new Date()`) so entry/exit times — and therefore the
+  // hold-time metric — live on the same clock (TASK_017 B5).
+  private currentBarTime: Date | null = null;
+  private dataProvenance: Map<string, DataProvenance> = new Map();
+  private evGateMode: EvGateMode;
+  private evGateThreshold: number;
+  private evGatePrior: WinRatePrior;
+  private evGateStats: EvGateStats;
+  private longEntries: number = 0;
+  private shortEntries: number = 0;
+  private sellSignalExits: number = 0;
+  private shortBlocked: number = 0;
+  private entriesByRegime: Record<string, number> = {};
 
   constructor(config: BacktestConfig, logger: Logger) {
     super();
@@ -307,12 +460,43 @@ export class BacktestEngine extends EventEmitter {
     this.dailyStartEquity = config.initialCapital;
     this.realism = { ...DEFAULT_REALISM, ...(config.realism || {}) };
     this.disabledStrategies = new Set(config.disabledStrategies ?? DEFAULT_DISABLED_STRATEGIES);
+    this.evGateMode = config.evGate?.mode ?? 'enforce';
+    this.evGateThreshold = Number.isFinite(config.evGate?.minEvThreshold)
+      ? Number(config.evGate?.minEvThreshold)
+      : 0;
+    this.evGatePrior = config.evGate?.prior ?? DEFAULT_WIN_RATE_PRIOR;
+    this.evGateStats = {
+      mode: this.evGateMode,
+      evaluated: 0,
+      allowed: 0,
+      rejected: 0,
+      shadowWouldReject: 0,
+      defaultAllowed: 0,
+      rejectedByStrategy: {},
+    };
+  }
+
+  /**
+   * Venue class for a product: explicit `venueOverride` wins, otherwise
+   * inferred from the symbol. Used for fee routing and shorting capability
+   * so the two can never disagree.
+   */
+  public resolveVenue(symbol: string): MarketVenue {
+    return this.config.venueOverride ?? venueForSymbol(symbol);
+  }
+
+  /**
+   * Effective shorting permission for a product (TASK_017 B2):
+   * `allowShort` config AND venue capability. Spot is always long-only.
+   */
+  public isShortAllowed(symbol: string): boolean {
+    return isShortingAllowed(this.config.allowShort ?? true, this.resolveVenue(symbol));
   }
 
   /**
    * Resolve the fee RATE (decimal) for a fill on `symbol`. Precedence:
    *   1. `config.commission` flat override (sensitivity-analysis path)
-   *   2. `config.feeModel.getFeeRate(venue, marketForSymbol(symbol), 'taker')`
+   *   2. `config.feeModel.getFeeRate(exchange, resolveVenue(symbol), 'taker')`
    *
    * Backtest fills are assumed taker — same assumption the live/paper
    * simulator uses for market orders. Per-fill maker/taker split awaits
@@ -329,14 +513,44 @@ export class BacktestEngine extends EventEmitter {
     if (this.config.feeModel) {
       return this.config.feeModel.getFeeRate(
         this.config.venue ?? 'coinbase',
-        marketForSymbol(symbol),
+        this.resolveVenue(symbol),
         'taker',
       );
     }
     return 0;
   }
 
-  public async loadHistoricalData(dataProvider: (product: string, start: Date, end: Date) => Promise<OHLCV[]>): Promise<void> {
+  /** Fee assumptions used by this run, for the report header. */
+  private describeFees(): FeeAssumptions {
+    const exchange: Exchange = this.config.venue ?? 'coinbase';
+    if (this.config.commission !== undefined) {
+      return { routing: 'flat-override', flatRate: this.config.commission, perVenue: {}, exchange };
+    }
+    const perVenue: FeeAssumptions['perVenue'] = {};
+    const venues = new Set<MarketVenue>(this.config.products.map((p) => this.resolveVenue(p)));
+    for (const venue of venues) {
+      try {
+        perVenue[venue] = {
+          makerBps: this.config.feeModel!.getFeeBps(exchange, venue, 'maker'),
+          takerBps: this.config.feeModel!.getFeeBps(exchange, venue, 'taker'),
+        };
+      } catch (err) {
+        this.logger.warn('FeeModel has no bucket for venue', { exchange, venue, err: (err as Error)?.message });
+      }
+    }
+    return { routing: 'fee-model', perVenue, exchange };
+  }
+
+  /**
+   * Load candles for every product. The provider may return plain `OHLCV[]`
+   * (programmatic callers/tests → provenance `source: 'in-memory'`) or a
+   * `{ candles, provenance }` pair from `HistoricalDataLoader`. Any error
+   * from the provider — notably `DATA_UNAVAILABLE` — propagates: the engine
+   * never starts a run on data it did not receive.
+   */
+  public async loadHistoricalData(
+    dataProvider: (product: string, start: Date, end: Date) => Promise<DataProviderOutput>,
+  ): Promise<void> {
     this.logger.info('Loading historical data', {
       products: this.config.products,
       startDate: this.config.startDate,
@@ -344,10 +558,31 @@ export class BacktestEngine extends EventEmitter {
     });
 
     for (const product of this.config.products) {
-      const data = await dataProvider(product, this.config.startDate, this.config.endDate);
-      this.historicalData.set(product, data);
-      this.logger.info(`Loaded ${data.length} candles for ${product}`);
+      const loadStart = Date.now();
+      const output = await dataProvider(product, this.config.startDate, this.config.endDate);
+      const candles = Array.isArray(output) ? output : output.candles;
+      const provenance = Array.isArray(output)
+        ? describeSeries(
+            product, 'in-memory', candles, this.config.startDate, this.config.endDate,
+            inferGranularitySeconds(candles), Date.now() - loadStart,
+          )
+        : output.provenance;
+      this.historicalData.set(product, candles);
+      this.dataProvenance.set(product, provenance);
+      this.logger.info(`Loaded ${candles.length} candles for ${product}`, {
+        source: provenance.source,
+        coverage: provenance.coverage,
+        inferredBarMinutes: provenance.inferredBarMinutes,
+      });
+      if (provenance.source === 'synthetic') {
+        this.logger.warn(`DATA: SYNTHETIC for ${product} — this run is SMOKE/VOID`, { product });
+      }
     }
+  }
+
+  /** Per-symbol provenance captured by `loadHistoricalData`. */
+  public getDataProvenance(): Record<string, DataProvenance> {
+    return Object.fromEntries(this.dataProvenance);
   }
 
   /**
@@ -380,21 +615,42 @@ export class BacktestEngine extends EventEmitter {
     }
 
     const metrics = this.calculateMetrics();
+    const dataProvenance = this.getDataProvenance();
+    const anySynthetic = Object.values(dataProvenance).some((p) => p.source === 'synthetic');
+    const venueBySymbol: Record<string, MarketVenue> = {};
+    for (const product of this.config.products) {
+      venueBySymbol[product] = this.resolveVenue(product);
+    }
     const result: BacktestResult = {
       config: this.config,
       trades: this.closedTrades,
       metrics,
       equityCurve: this.equityCurve,
       dailyReturns: this.getDailyReturns(),
+      dataProvenance,
+      dataStamp: anySynthetic ? 'SYNTHETIC' : 'REAL',
+      venueBySymbol,
+      regimeGate: this.describeRegimeGate(),
+      fees: this.describeFees(),
     };
 
     this.logger.info('Backtest completed', {
+      dataStamp: result.dataStamp,
       totalTrades: metrics.totalTrades,
+      longEntries: metrics.longEntries,
+      shortEntries: metrics.shortEntries,
+      shortBlocked: metrics.shortBlocked,
+      evGate: metrics.evGate,
       netProfit: metrics.netProfit,
       returnPercent: metrics.returnPercent,
       activeStrategies: metrics.activeStrategies,
       byStrategy: metrics.byStrategy,
     });
+    if (anySynthetic) {
+      this.logger.warn('DATA: SYNTHETIC — run is SMOKE/VOID; do not cite these results', {
+        synthetic: Object.values(dataProvenance).filter((p) => p.source === 'synthetic').map((p) => p.symbol),
+      });
+    }
 
     await this.logFunnelDiagnostics();
 
@@ -543,6 +799,10 @@ export class BacktestEngine extends EventEmitter {
       this.signalProcessor.loadPerSymbolOverrides(this.config.perSymbolOverrides);
     }
 
+    if (this.config.regimeGates === false) {
+      this.signalProcessor.setRegimeFilterEnabled(false);
+    }
+
     // Snapshot the active strategy set AFTER the disabled filter so the
     // report can't lie about which strategies actually ran.
     const enabledPlugins = this.signalProcessor.getEnabledStrategies().map(s => s.id);
@@ -557,19 +817,36 @@ export class BacktestEngine extends EventEmitter {
     this.signalProcessor.on('signal:generated', this.handleSignal.bind(this));
   }
 
+  /** Regime-gate (RegimeFilter) state for the report. */
+  private describeRegimeGate(): RegimeGateState {
+    const stats = this.signalProcessor?.getRegimeFilterStats();
+    return {
+      enabled: stats?.enabled ?? this.config.regimeGates !== false,
+      minCompatibilityScore: stats?.config.minCompatibilityScore ?? NaN,
+      minRegimeConfidence: stats?.config.minRegimeConfidence ?? NaN,
+      requireMTFAlignment: stats?.config.requireMTFAlignment ?? false,
+    };
+  }
+
   /**
    * Drive each bar in the canonical order:
    *
-   *   1. Fill any pending entry from bar [i-1] at this bar's open.
+   *   1. Fill any pending entry from the previous bar at this bar's open.
    *   2. Mark-to-market open positions on this bar's close.
    *   3. Run stop/TP exits against this bar's high/low (with overshoot).
    *   4. Feed this bar's close to the signal processor; signals it emits
-   *      enter pendingFills for [i+1].
+   *      enter pendingFills for the next bar.
    *   5. Record equity at this bar's close.
    *
    * Defect #3 fix: a signal computed from bar [i]'s close can never fill
    * inside bar [i] — the earliest opportunity is bar [i+1]'s open. Without
    * this, every backtest trade gets a one-bar look-ahead advantage.
+   *
+   * TASK_017: products are stepped on a shared TIMESTAMP timeline (union of
+   * all series' bar times), not by array index. Index alignment silently
+   * truncated every product to the shortest series and paired bars from
+   * different points in time whenever one symbol had gaps or a later
+   * start (e.g. SOL-USD bars begin six months after BTC/ETH).
    */
   private async processTimeSteps(): Promise<void> {
     const processor = this.signalProcessor;
@@ -577,32 +854,37 @@ export class BacktestEngine extends EventEmitter {
       throw new Error('Signal processor not initialized');
     }
 
-    let minCandles = Infinity;
-    for (const data of this.historicalData.values()) {
-      minCandles = Math.min(minCandles, data.length);
+    const seriesByProduct = new Map<string, Map<number, OHLCV>>();
+    const timeSet = new Set<number>();
+    for (const [product, data] of this.historicalData.entries()) {
+      const byTime = new Map<number, OHLCV>();
+      for (const candle of data) {
+        byTime.set(candle.time, candle);
+        timeSet.add(candle.time);
+      }
+      seriesByProduct.set(product, byTime);
     }
 
-    const firstSeries = this.historicalData.values().next().value as OHLCV[] | undefined;
-    if (!firstSeries || !Number.isFinite(minCandles) || minCandles === Infinity) {
+    if (timeSet.size === 0) {
       this.logger.warn('No historical data available for backtest');
       return;
     }
 
-    for (let i = 50; i < minCandles; i++) {
-      const baseCandle = firstSeries[i];
-      if (!baseCandle) {
-        continue;
-      }
-      const timestamp = new Date(baseCandle.time);
-      this.barIndex = i;
+    const timeline = Array.from(timeSet).sort((a, b) => a - b);
 
-      for (const [product, data] of this.historicalData.entries()) {
-        const candle = data[i];
+    for (let step = 0; step < timeline.length; step++) {
+      const barTime = timeline[step];
+      const timestamp = new Date(barTime);
+      this.barIndex = step;
+      this.currentBarTime = timestamp;
+
+      for (const [product, byTime] of seriesByProduct.entries()) {
+        const candle = byTime.get(barTime);
         if (!candle) {
           continue;
         }
 
-        // Step 1: Fill pending entry queued at bar [i-1]. Look-ahead fix.
+        // Step 1: Fill pending entry queued at the previous bar. Look-ahead fix.
         if (this.realism.nextBarFill) {
           this.fillPendingAtOpen(product, candle, timestamp);
         }
@@ -632,8 +914,15 @@ export class BacktestEngine extends EventEmitter {
    * Defect #3: signals must NOT fill on the same bar they were observed on.
    * `handleSignal` only stages a pending fill — the actual position is
    * opened when the next bar arrives, in `fillPendingAtOpen`.
+   *
+   * TASK_017 B2: SELL signals on a venue without shorting capability
+   * (Coinbase spot) are exit-only — they close an open long or are dropped
+   * with `spot_short_blocked` telemetry. This mirrors the live router
+   * semantics (`shortAllowed = allow_short && capabilities.shorting`).
    */
   private handleSignal(signal: Signal): void {
+    // Bar clock, not wall clock — see `currentBarTime`.
+    const barTime = this.currentBarTime ?? signal.timestamp;
     // Per-(symbol, strategy) disable — narrower than the global kill list.
     // SignalProcessor.processSignal already gates this (with funnel
     // telemetry); we re-check here as defence-in-depth, matching the
@@ -673,7 +962,7 @@ export class BacktestEngine extends EventEmitter {
       (this.signalAdmittedPerStrategy.get(signal.strategy) ?? 0) + 1,
     );
     this.lastSignalBarPerStrategy.set(signal.strategy, this.barIndex);
-    this.lastSignalTimestampPerStrategy.set(signal.strategy, signal.timestamp);
+    this.lastSignalTimestampPerStrategy.set(signal.strategy, barTime);
 
     const position = this.positions.get(signal.symbol);
     if (position) {
@@ -682,8 +971,32 @@ export class BacktestEngine extends EventEmitter {
       const isOppositeOfLong = position.side === 'long' && signal.direction === 'sell';
       const isOppositeOfShort = position.side === 'short' && signal.direction === 'buy';
       if (isOppositeOfLong || isOppositeOfShort) {
-        this.closePosition(signal.symbol, signal.price, signal.timestamp, 'signal');
+        if (isOppositeOfLong && !this.isShortAllowed(signal.symbol)) {
+          this.sellSignalExits += 1;
+        }
+        this.closePosition(signal.symbol, signal.price, barTime, 'signal');
       }
+      return;
+    }
+
+    // No position: a SELL is a short ENTRY. Only venues with shorting
+    // capability may take it (TASK_017 B2 / TASK_012 step 3).
+    if (signal.direction === 'sell' && !this.isShortAllowed(signal.symbol)) {
+      this.shortBlocked += 1;
+      recordSignalFiltered(this.logger, {
+        stage: 'spot_short_blocked',
+        reason: 'venue_no_shorting',
+        symbol: signal.symbol,
+        strategy: signal.strategy,
+        signalId: signal.id,
+        direction: signal.direction,
+        strength: signal.strength,
+        context: {
+          source: 'backtest_engine',
+          venue: this.resolveVenue(signal.symbol),
+          allowShort: this.config.allowShort ?? true,
+        },
+      });
       return;
     }
 
@@ -692,11 +1005,11 @@ export class BacktestEngine extends EventEmitter {
         signal,
         stopLoss: signal.stopLoss,
         takeProfit: signal.takeProfit,
-        generatedAt: signal.timestamp,
+        generatedAt: barTime,
       });
     } else {
       // Legacy same-bar fill mode — kept only for parity testing.
-      this.openPositionAt(signal, signal.price, signal.timestamp);
+      this.openPositionAt(signal, signal.price, barTime);
     }
   }
 
@@ -730,6 +1043,19 @@ export class BacktestEngine extends EventEmitter {
     const stopLoss = this.resolveStopLoss(signal, stopLossOverride, fillPrice);
     const takeProfit = this.resolveTakeProfit(signal, takeProfitOverride, fillPrice);
 
+    // Defence in depth: a short can only reach here on a shorting venue
+    // (handleSignal already routes spot SELLs to exit-only).
+    if (signal.direction === 'sell' && !this.isShortAllowed(signal.symbol)) {
+      this.shortBlocked += 1;
+      this.logger.warn('Backtest: short entry blocked at fill (venue has no shorting)', {
+        symbol: signal.symbol,
+        strategy: signal.strategy,
+        venue: this.resolveVenue(signal.symbol),
+      });
+      return;
+    }
+
+    const equityAtEntry = this.capital;
     const positionSize = this.calculatePositionSize(signal, fillPrice, stopLoss);
     if (positionSize <= 0) {
       this.logger.debug('Backtest: position size 0, skipping', {
@@ -752,6 +1078,13 @@ export class BacktestEngine extends EventEmitter {
       return;
     }
 
+    // TASK_017 B3 — fee-adjusted EV gate at the same point the live router
+    // applies it (post-sizing, pre-order).
+    const evDecision = this.evaluateEntryEv(signal, fillPrice, stopLoss, takeProfit, positionSize);
+    if (!evDecision.allowed) {
+      return;
+    }
+
     const entryFeeRate = this.resolveCommissionRate(signal.symbol);
     const trade: BacktestTrade = {
       id: this.nextTradeId(signal.symbol),
@@ -765,7 +1098,18 @@ export class BacktestEngine extends EventEmitter {
       strategy: signal.strategy,
       stopLoss,
       takeProfit,
+      venue: this.resolveVenue(signal.symbol),
+      equityAtEntry,
+      ...(evDecision.record ? { evGate: evDecision.record } : {}),
     };
+
+    if (signal.direction === 'buy') {
+      this.longEntries += 1;
+    } else {
+      this.shortEntries += 1;
+    }
+    const regimeLabel = typeof signal.metadata?.regime === 'string' ? String(signal.metadata.regime) : 'unknown';
+    this.entriesByRegime[regimeLabel] = (this.entriesByRegime[regimeLabel] ?? 0) + 1;
 
     this.capital -= trade.entryFee;
 
@@ -817,18 +1161,118 @@ export class BacktestEngine extends EventEmitter {
   }
 
   /**
+   * TASK_017 B3 — evaluate the fee-adjusted EV gate for an entry about to
+   * fill. Uses the SAME pure `evaluateEvGate` the live RiskEngine wraps,
+   * the fee rate this engine will actually charge on the fill (so fee
+   * assumptions cannot drift between P&L and the gate), and the shared
+   * Beta-prior p estimator fed by the run's own MetaFilter outcomes.
+   *
+   * Returns `{ allowed }` plus the record to attach to the trade. In
+   * `shadow` mode a would-be reject is allowed but counted/logged
+   * (`EV_GATE_SHADOW_ALLOW`). `off` returns allowed without evaluating.
+   */
+  private evaluateEntryEv(
+    signal: Signal,
+    fillPrice: number,
+    stopLoss: number,
+    takeProfit: number,
+    size: number,
+  ): { allowed: boolean; record?: NonNullable<BacktestTrade['evGate']> } {
+    if (this.evGateMode === 'off') {
+      return { allowed: true };
+    }
+
+    const perf = this.signalProcessor?.getStrategyPerformance(signal.strategy);
+    const p = estimateWinRateWithPrior(
+      perf ? { wins: perf.wins, losses: perf.losses } : null,
+      this.evGatePrior,
+    );
+
+    const result = evaluateEvGate({
+      symbol: signal.symbol,
+      strategy: signal.strategy,
+      direction: signal.direction,
+      entryPrice: fillPrice,
+      stopPrice: stopLoss,
+      takeProfit,
+      size,
+      winRate: p,
+      feeRateOverride: this.resolveCommissionRate(signal.symbol),
+      minEvThreshold: this.evGateThreshold,
+      venue: this.config.venue ?? 'coinbase',
+    }, this.logger);
+
+    this.evGateStats.evaluated += 1;
+    const record: NonNullable<BacktestTrade['evGate']> = {
+      ev: result.ev,
+      p: result.p,
+      feeUsd: result.feeUsd,
+      threshold: result.threshold,
+    };
+
+    if (result.allowed) {
+      this.evGateStats.allowed += 1;
+      if (result.reason) {
+        this.evGateStats.defaultAllowed += 1;
+      }
+      return { allowed: true, record };
+    }
+
+    const rejectedContext = {
+      symbol: signal.symbol,
+      strategy: signal.strategy,
+      direction: signal.direction,
+      reason: result.reason,
+      ev: result.ev,
+      threshold: result.threshold,
+      p: result.p,
+      feeUsd: result.feeUsd,
+      notionalUsd: size * fillPrice,
+      mode: this.evGateMode,
+    };
+
+    if (this.evGateMode === 'shadow') {
+      this.evGateStats.allowed += 1;
+      this.evGateStats.shadowWouldReject += 1;
+      this.logger.warn('EV_GATE_SHADOW_ALLOW: entry would be rejected in enforce mode', rejectedContext);
+      return { allowed: true, record: { ...record, shadowWouldReject: true } };
+    }
+
+    this.evGateStats.rejected += 1;
+    this.evGateStats.rejectedByStrategy[signal.strategy] =
+      (this.evGateStats.rejectedByStrategy[signal.strategy] ?? 0) + 1;
+    recordSignalFiltered(this.logger, {
+      stage: 'ev_gate',
+      reason: 'ev_below_threshold',
+      symbol: signal.symbol,
+      strategy: signal.strategy,
+      signalId: signal.id,
+      direction: signal.direction,
+      strength: signal.strength,
+      context: { ...rejectedContext, source: 'backtest_engine' },
+    });
+    return { allowed: false, record };
+  }
+
+  /**
    * Defect #5 fix: replaces the old fixed $5k notional cap with the SAME
    * risk-based sizing the live engine uses (`computeRiskBasedSize`).
    *
    * size = (currentEquity * riskPerTrade) / |entry - stop|, capped by
    * maxPositionExposureUsd and config.risk.maxPositionSize.
+   *
+   * TASK_017 B4: `currentEquity` is the run's CASH equity
+   * (`initialCapital + realized P&L − fees`, i.e. `this.capital`), never
+   * the static `account.equityUsd`. That field is now only the reference
+   * the CLI seeds `initialCapital` from; sizing compounds and de-risks with
+   * the equity curve exactly like the live engine's dynamic equity.
    */
   private calculatePositionSize(signal: Signal, entryPrice: number, stopLoss: number): number {
     const account = this.config.account || {};
     const riskPerTrade = account.riskPerTrade ?? 0.005;
     const maxExposurePct = account.maxPositionExposurePct ?? 0.30;
     const minNotionalBuffer = account.minNotionalBuffer ?? 1.1;
-    const equityForSizing = account.equityUsd ?? this.calculateCurrentEquity();
+    const equityForSizing = this.capital;
 
     const accountExposureCap = equityForSizing * maxExposurePct;
     const exposureCapUsd = Math.min(accountExposureCap, this.config.risk.maxPositionSize);
@@ -1114,11 +1558,23 @@ export class BacktestEngine extends EventEmitter {
     const netProfit = grossProfit - grossLoss;
     const totalFees = trades.reduce((sum, t) => sum + t.entryFee + (t.exitFee ?? 0), 0);
 
+    // Hold time on the bar clock (entry fill bar → exit bar). Both stamps
+    // come from `processTimeSteps`' timeline, so a negative value is a
+    // bookkeeping bug, not a metric — log it and exclude the trade.
     let totalHoldTime = 0;
     let validTrades = 0;
     for (const trade of trades) {
       if (trade.exitTimestamp) {
-        totalHoldTime += (trade.exitTimestamp.getTime() - trade.timestamp.getTime()) / 60000;
+        const holdMinutes = (trade.exitTimestamp.getTime() - trade.timestamp.getTime()) / 60000;
+        if (holdMinutes < 0) {
+          this.logger.error('Backtest hold-time bookkeeping error (exit before entry)', {
+            tradeId: trade.id,
+            entry: trade.timestamp.toISOString(),
+            exit: trade.exitTimestamp.toISOString(),
+          });
+          continue;
+        }
+        totalHoldTime += holdMinutes;
         validTrades++;
       }
     }
@@ -1192,6 +1648,15 @@ export class BacktestEngine extends EventEmitter {
       returnPercent: ((finalCapital - this.config.initialCapital) / this.config.initialCapital) * 100,
       byStrategy,
       activeStrategies: this.activeStrategies,
+      longEntries: this.longEntries,
+      shortEntries: this.shortEntries,
+      sellSignalExits: this.sellSignalExits,
+      shortBlocked: this.shortBlocked,
+      evGate: {
+        ...this.evGateStats,
+        rejectedByStrategy: { ...this.evGateStats.rejectedByStrategy },
+      },
+      entriesByRegime: { ...this.entriesByRegime },
     };
   }
 

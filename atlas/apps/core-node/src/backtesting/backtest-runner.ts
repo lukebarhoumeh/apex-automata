@@ -1,19 +1,39 @@
 import { Logger } from '../core/logger';
 import { BacktestEngine, BacktestConfig, BacktestResult } from './backtest-engine';
-import { HistoricalDataLoader } from './data-loader';
+import { HistoricalDataLoader, LoadCandlesOptions, DataProvenance } from './data-loader';
 import fs from 'fs/promises';
 import path from 'path';
 
 export interface BacktestRunnerConfig {
   resultsPath: string;
-  supabaseUrl: string;
-  supabaseKey: string;
+  /** Optional when `fixtureDir` is set. */
+  supabaseUrl?: string;
+  supabaseKey?: string;
   coinbaseConfig?: {
     apiKey: string;
     apiSecret: string;
     apiPassphrase?: string;
     environment: 'production' | 'sandbox';
   };
+  /** Directory of `<SYMBOL>.json` bar fixtures (offline / CI source). */
+  fixtureDir?: string;
+}
+
+/** Per-run data options forwarded to the loader. */
+export interface BacktestDataOptions extends LoadCandlesOptions {
+  /** Granularity of the stored bars (default 900 = 15m). */
+  granularitySeconds?: number;
+}
+
+/** Fee-tier label + bps as resolved by the CLI, echoed into the report. */
+export interface FeeTierLabel {
+  name: string;
+  makerBps: number;
+  takerBps: number;
+}
+
+export interface BacktestReportOptions {
+  feeTier?: FeeTierLabel;
 }
 
 export class BacktestRunner {
@@ -29,25 +49,36 @@ export class BacktestRunner {
         supabaseUrl: config.supabaseUrl,
         supabaseKey: config.supabaseKey,
         coinbaseConfig: config.coinbaseConfig,
+        fixtureDir: config.fixtureDir,
       },
       logger,
     );
   }
 
   /**
-   * Run a backtest with the given configuration
+   * Run a backtest with the given configuration.
+   *
+   * Data loading is fail-closed: a `DATA_UNAVAILABLE` error from the loader
+   * propagates to the caller (no synthetic fallback unless
+   * `dataOptions.allowSynthetic` is true).
    */
-  public async runBacktest(config: BacktestConfig): Promise<BacktestResult> {
+  public async runBacktest(
+    config: BacktestConfig,
+    dataOptions: BacktestDataOptions = {},
+    reportOptions: BacktestReportOptions = {},
+  ): Promise<BacktestResult> {
     this.logger.info('Running backtest', {
       startDate: config.startDate,
       endDate: config.endDate,
-      products: config.products
+      products: config.products,
+      allowSynthetic: Boolean(dataOptions.allowSynthetic),
+      fixtureDir: this.config.fixtureDir,
     });
 
     const engine = new BacktestEngine(config, this.logger);
-    await engine.loadHistoricalData(this.dataLoader.createDataProvider());
+    await engine.loadHistoricalData(this.dataLoader.createDataProvider(dataOptions));
     const result = await engine.run();
-    await this.saveResults(result);
+    await this.saveResults(result, reportOptions);
 
     return result;
   }
@@ -55,26 +86,26 @@ export class BacktestRunner {
   /**
    * Save backtest results
    */
-  private async saveResults(result: BacktestResult): Promise<void> {
+  private async saveResults(result: BacktestResult, reportOptions: BacktestReportOptions): Promise<void> {
     try {
       // Ensure directory exists
       await fs.mkdir(this.config.resultsPath, { recursive: true });
-      
+
       // Generate filename with timestamp
       const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0];
       const filename = `backtest_${timestamp}.json`;
       const filepath = path.join(this.config.resultsPath, filename);
-      
+
       // Save full results
       await fs.writeFile(filepath, JSON.stringify(result, null, 2));
-      
+
       // Also save a summary report
       const reportFilename = `report_${timestamp}.txt`;
       const reportPath = path.join(this.config.resultsPath, reportFilename);
-      
-      const report = this.generateReport(result);
+
+      const report = this.generateReport(result, reportOptions);
       await fs.writeFile(reportPath, report);
-      
+
       this.logger.info(`Saved backtest results to ${filepath}`);
       this.logger.info(`Saved report to ${reportPath}`);
     } catch (error) {
@@ -83,9 +114,11 @@ export class BacktestRunner {
   }
 
   /**
-   * Generate human-readable report
+   * Human-readable report. Line 1 is ALWAYS the data stamp
+   * (`DATA: REAL` or `DATA: SYNTHETIC …`) so nobody can quote a number
+   * without seeing what it ran on.
    */
-  private generateReport(result: BacktestResult): string {
+  public generateReport(result: BacktestResult, reportOptions: BacktestReportOptions = {}): string {
     const { config, metrics, trades } = result;
 
     const realism = config.realism ?? {};
@@ -97,9 +130,46 @@ export class BacktestRunner {
       )
       .join('\n') || '(no closed trades)';
 
-    const report = `
+    const dataStampLine = result.dataStamp === 'SYNTHETIC'
+      ? 'DATA: SYNTHETIC — SMOKE/VOID. Random-walk candles were used for at least one symbol; nothing below is evidence.'
+      : 'DATA: REAL';
+
+    const provenanceLines = Object.values(result.dataProvenance ?? {})
+      .map((p) => describeProvenance(p))
+      .join('\n') || '(no data provenance recorded)';
+
+    const barMinutes = Array.from(
+      new Set(Object.values(result.dataProvenance ?? {}).map((p) => p.inferredBarMinutes ?? 'n/a')),
+    ).join(', ') || 'n/a';
+
+    const venueLines = Object.entries(result.venueBySymbol ?? {})
+      .map(([symbol, venue]) => `${symbol}: ${venue}${config.venueOverride ? ' (forced via --venue)' : ''}`)
+      .join(', ') || '(none)';
+
+    const feeLines = describeFees(result, reportOptions.feeTier);
+
+    const totalEntries = metrics.longEntries + metrics.shortEntries;
+    const longPct = totalEntries > 0 ? ((metrics.longEntries / totalEntries) * 100).toFixed(1) : '0.0';
+    const shortPct = totalEntries > 0 ? ((metrics.shortEntries / totalEntries) * 100).toFixed(1) : '0.0';
+
+    const ev = metrics.evGate;
+    const evRejectedByStrategy = Object.entries(ev.rejectedByStrategy ?? {})
+      .map(([s, n]) => `${s}=${n}`)
+      .join(', ') || 'none';
+
+    const regime = result.regimeGate;
+    const regimeEntries = Object.entries(metrics.entriesByRegime ?? {})
+      .map(([r, n]) => `${r}=${n}`)
+      .join(', ') || 'none';
+
+    const report = `${dataStampLine}
 BACKTEST REPORT
 ===============
+
+Data Provenance:
+----------------
+${provenanceLines}
+Bar timeframe: ${barMinutes} min (native stored bars; no aggregation)
 
 Configuration:
 --------------
@@ -107,7 +177,12 @@ Start Date: ${config.startDate.toISOString()}
 End Date: ${config.endDate.toISOString()}
 Initial Capital: $${config.initialCapital.toFixed(2)}
 Products: ${config.products.join(', ')}
-Commission: ${(config.commission * 100).toFixed(2)}%
+Venue per symbol: ${venueLines}
+Shorting: allow_short=${config.allowShort ?? true} (effective only on perps venues; spot SELL = exit-only)
+
+Fees (per side, taker assumed on every fill):
+---------------------------------------------
+${feeLines}
 
 Realism Model:
 --------------
@@ -117,10 +192,29 @@ Stop overshoot: ${(realism.stopOvershootBarRangePct ?? 0.20) * 100}% of bar rang
 
 Sizing Model:
 -------------
-Risk per trade: ${((account.riskPerTrade ?? 0.005) * 100).toFixed(3)}%
+Risk per trade: ${((account.riskPerTrade ?? 0.005) * 100).toFixed(3)}% of CURRENT cash equity (initial + realized)
 Max position exposure: ${((account.maxPositionExposurePct ?? 0.30) * 100).toFixed(1)}% of equity
 Active strategies: ${(metrics.activeStrategies ?? []).join(', ') || '(none)'}
 Disabled strategies: ${(config.disabledStrategies ?? []).join(', ') || '(none)'}
+
+Long/Short Split:
+-----------------
+Long entries: ${metrics.longEntries} (${longPct}%)
+Short entries: ${metrics.shortEntries} (${shortPct}%)
+SELL signals that exited a long: ${metrics.sellSignalExits}
+SELL signals dropped (no shorting on venue): ${metrics.shortBlocked}
+
+EV Gate:
+--------
+Mode: ${ev.mode}
+Evaluated: ${ev.evaluated}  Allowed: ${ev.allowed}  Rejected: ${ev.rejected}  Default-allowed: ${ev.defaultAllowed}
+Shadow would-reject: ${ev.shadowWouldReject}
+Rejected by strategy: ${evRejectedByStrategy}
+
+Regime Gate:
+------------
+Enabled: ${regime.enabled}  minCompatibilityScore=${regime.minCompatibilityScore}  minRegimeConfidence=${regime.minRegimeConfidence}  requireMTFAlignment=${regime.requireMTFAlignment}
+Entries by regime: ${regimeEntries}
 
 Performance Metrics:
 -------------------
@@ -157,7 +251,7 @@ Total Fees: $${metrics.totalFees.toFixed(2)}
 Trade Log (Last 10):
 -------------------
 ${trades.slice(-10).map(t =>
-  `${t.timestamp.toISOString()} ${t.product} ${t.strategy ?? 'unknown'} ${t.side} @ ${t.entryPrice.toFixed(2)} -> ${t.exitPrice?.toFixed(2) || 'OPEN'} | PnL: $${t.pnl?.toFixed(2) || 'N/A'} (${t.pnlPercent ? (t.pnlPercent * 100).toFixed(2) + '%' : 'N/A'}) [${t.exitReason ?? 'open'}]`,
+  `${t.timestamp.toISOString()} ${t.product} ${t.strategy ?? 'unknown'} ${t.side} @ ${t.entryPrice.toFixed(2)} -> ${t.exitPrice?.toFixed(2) || 'OPEN'} | PnL: $${t.pnl?.toFixed(2) || 'N/A'} (${t.pnlPercent ? (t.pnlPercent * 100).toFixed(2) + '%' : 'N/A'}) [${t.exitReason ?? 'open'}] eq@entry=$${t.equityAtEntry.toFixed(2)}`,
 ).join('\n')}
 `;
 
@@ -170,7 +264,8 @@ ${trades.slice(-10).map(t =>
   public async runOptimization(
     baseConfig: BacktestConfig,
     parameterRanges: Record<string, { min: number; max: number; step: number }>,
-    metric: keyof BacktestResult['metrics'] = 'sharpeRatio'
+    metric: keyof BacktestResult['metrics'] = 'sharpeRatio',
+    dataOptions: BacktestDataOptions = {},
   ): Promise<{ bestParams: any; bestMetric: number; allResults: any[] }> {
     this.logger.info('Starting parameter optimization');
 
@@ -184,10 +279,10 @@ ${trades.slice(-10).map(t =>
     for (const params of paramCombinations) {
       // Create config with current parameters
       const testConfig = this.applyParameters(baseConfig, params);
-      
+
       // Run backtest
-      const result = await this.runBacktest(testConfig);
-      
+      const result = await this.runBacktest(testConfig, dataOptions);
+
       // Track results
       const metricValue = result.metrics[metric] as number;
       allResults.push({
@@ -206,7 +301,7 @@ ${trades.slice(-10).map(t =>
     }
 
     this.logger.info(`Optimization complete. Best ${metric}: ${bestMetric}`);
-    
+
     return { bestParams, bestMetric, allResults };
   }
 
@@ -226,7 +321,7 @@ ${trades.slice(-10).map(t =>
         generate(index + 1, current);
         return;
       }
-      
+
       for (let value = range.min; value <= range.max; value += range.step) {
         current[key] = value;
         generate(index + 1, current);
@@ -238,24 +333,66 @@ ${trades.slice(-10).map(t =>
   }
 
   private applyParameters(baseConfig: BacktestConfig, params: any): BacktestConfig {
-    // Deep clone base config
-    const config = JSON.parse(JSON.stringify(baseConfig));
-    
-    // Apply parameters (this is a simplified version, you might need to handle nested params)
+    // Structured clone so Date instances and the FeeModel survive (a JSON
+    // round-trip turned dates into strings and dropped the FeeModel's
+    // prototype, which broke `config.startDate.toISOString()` downstream).
+    const config: BacktestConfig = {
+      ...baseConfig,
+      startDate: new Date(baseConfig.startDate),
+      endDate: new Date(baseConfig.endDate),
+      signals: JSON.parse(JSON.stringify(baseConfig.signals)),
+      risk: { ...baseConfig.risk },
+      account: baseConfig.account ? { ...baseConfig.account } : undefined,
+    };
+
+    // Apply parameters (dotted paths, e.g. 'risk.stopLossPercent')
     for (const [key, value] of Object.entries(params)) {
       const keys = key.split('.');
       let obj: any = config;
-      
+
       for (let i = 0; i < keys.length - 1; i++) {
         if (obj[keys[i]] === undefined) {
           obj[keys[i]] = {};
         }
         obj = obj[keys[i]];
       }
-      
+
       obj[keys[keys.length - 1]] = value;
     }
 
     return config;
   }
+}
+
+function describeProvenance(p: DataProvenance): string {
+  const coveragePct = `${(p.coverage * 100).toFixed(1)}%`;
+  const fixture = p.fixturePath ? `  fixture=${path.basename(p.fixturePath)} sha256=${(p.fixtureSha256 ?? '').slice(0, 12)}` : '';
+  const stamp = p.source === 'synthetic' ? '  [SYNTHETIC — VOID]' : '';
+  return (
+    `${p.symbol.padEnd(14)} source=${p.source.padEnd(9)} bars=${String(p.candleCount).padStart(6)}/${String(p.expectedCount).padEnd(6)} ` +
+    `coverage=${coveragePct.padStart(6)}  spacing=${p.inferredBarMinutes ?? 'n/a'}m  ` +
+    `first=${p.firstBarTime ?? 'n/a'} last=${p.lastBarTime ?? 'n/a'}${fixture}${stamp}`
+  );
+}
+
+function describeFees(result: BacktestResult, feeTier?: FeeTierLabel): string {
+  const fees = result.fees;
+  const lines: string[] = [];
+  if (fees.routing === 'flat-override') {
+    const bps = (fees.flatRate ?? 0) * 10_000;
+    lines.push(`Routing: flat --commission override = ${bps.toFixed(2)} bps/side on every fill (spot AND perps)`);
+    if (feeTier) {
+      lines.push(`Fee tier flag: ${feeTier.name} (${feeTier.makerBps}/${feeTier.takerBps} bps) — IGNORED because --commission is set`);
+    }
+  } else {
+    lines.push(`Routing: FeeModel per venue (exchange=${fees.exchange})`);
+    for (const [venue, b] of Object.entries(fees.perVenue)) {
+      lines.push(`  ${venue.padEnd(6)} maker=${b.makerBps} bps  taker=${b.takerBps} bps  (charged: taker)`);
+    }
+    if (feeTier) {
+      lines.push(`Fee tier: ${feeTier.name} (maker ${feeTier.makerBps} / taker ${feeTier.takerBps} bps) applied to coinbase.spot`);
+    }
+  }
+  lines.push('EV gate uses the same per-fill rate as P&L (round trip = 2 × taker).');
+  return lines.join('\n');
 }

@@ -5,11 +5,97 @@ dotenv.config({ path: path.resolve(process.cwd(), '../../../.env') });
 import yargs from 'yargs/yargs';
 import { hideBin } from 'yargs/helpers';
 import { createLogger } from '../core/logger';
-import { BacktestRunner, BacktestRunnerConfig } from '../backtesting/backtest-runner';
-import { BacktestConfig, PerSymbolStrategyOverrides } from '../backtesting/backtest-engine';
+import { BacktestRunner, BacktestRunnerConfig, FeeTierLabel } from '../backtesting/backtest-runner';
+import {
+  BacktestConfig,
+  BacktestResult,
+  EvGateMode,
+  PerSymbolStrategyOverrides,
+} from '../backtesting/backtest-engine';
+import { isDataUnavailableError } from '../backtesting/data-loader';
 import { loadGuardrails } from '../config/loadGuardrails';
 import { buildPerSymbolDisabledStrategies } from '../strategies/per-symbol-disable';
 import { FeeModel } from '../core/fee-model';
+import type { MarketVenue } from '../trading/execution/venue-capabilities';
+
+/**
+ * Coinbase Advanced Trade spot fee tiers (maker/taker bps), TASK_017 step 7.
+ *   intro1 — Intro 1 (< $1K 30d volume): 60 / 120
+ *   t1k    — $1K–$10K:                   35 / 75
+ *   t10k   — $10K–$50K:                  25 / 40  (guardrails.yaml default)
+ * `custom:<maker>,<taker>` sets arbitrary bps.
+ */
+const FEE_TIERS: Record<string, { makerBps: number; takerBps: number }> = {
+  intro1: { makerBps: 60, takerBps: 120 },
+  t1k: { makerBps: 35, takerBps: 75 },
+  t10k: { makerBps: 25, takerBps: 40 },
+};
+
+function resolveFeeTier(flag: string | undefined, guardrailsSpot: { maker_bps: number; taker_bps: number }): FeeTierLabel {
+  if (!flag) {
+    // Back-compat default: whatever guardrails.yaml says (25/40 = t10k today).
+    // Label it by matching the known table so the report names the tier.
+    const match = Object.entries(FEE_TIERS).find(
+      ([, t]) => t.makerBps === guardrailsSpot.maker_bps && t.takerBps === guardrailsSpot.taker_bps,
+    );
+    return {
+      name: `${match ? match[0] : 'custom'} (guardrails.yaml default)`,
+      makerBps: guardrailsSpot.maker_bps,
+      takerBps: guardrailsSpot.taker_bps,
+    };
+  }
+  if (flag.startsWith('custom:')) {
+    const [maker, taker] = flag.slice('custom:'.length).split(',').map((v) => Number(v));
+    if (!Number.isFinite(maker) || !Number.isFinite(taker) || maker < 0 || taker < 0) {
+      throw new Error(`--fee-tier custom:<maker>,<taker> expects two non-negative bps numbers, got "${flag}"`);
+    }
+    return { name: flag, makerBps: maker, takerBps: taker };
+  }
+  const tier = FEE_TIERS[flag];
+  if (!tier) {
+    throw new Error(`Unknown --fee-tier "${flag}". Use intro1|t1k|t10k|custom:<maker>,<taker>`);
+  }
+  return { name: flag, ...tier };
+}
+
+/** Print the CI-parsed summary. Line 1 is always the data stamp. */
+function printSummary(result: BacktestResult, feeTier: FeeTierLabel): void {
+  const m = result.metrics;
+  console.log('');
+  console.log(result.dataStamp === 'SYNTHETIC'
+    ? 'DATA: SYNTHETIC — SMOKE/VOID (random-walk candles; not evidence)'
+    : 'DATA: REAL');
+  console.log('Backtest Results:');
+  console.log('=================');
+  for (const p of Object.values(result.dataProvenance)) {
+    console.log(
+      `Data source ${p.symbol}: ${p.source} bars=${p.candleCount}/${p.expectedCount} ` +
+        `coverage=${(p.coverage * 100).toFixed(1)}% spacing=${p.inferredBarMinutes ?? 'n/a'}m` +
+        (p.source === 'synthetic' ? ' [SYNTHETIC — VOID]' : ''),
+    );
+  }
+  const spacing = Array.from(new Set(Object.values(result.dataProvenance).map((p) => p.inferredBarMinutes ?? 'n/a')));
+  console.log(`Bar timeframe: ${spacing.join(', ')} min (native stored bars)`);
+  console.log(`Venue: ${Object.entries(result.venueBySymbol).map(([s, v]) => `${s}=${v}`).join(', ')}`);
+  if (result.fees.routing === 'flat-override') {
+    console.log(`Fees: flat ${((result.fees.flatRate ?? 0) * 10_000).toFixed(2)} bps/side (--commission override; fee tier ${feeTier.name} ignored)`);
+  } else {
+    const per = Object.entries(result.fees.perVenue).map(([v, b]) => `${v} maker=${b.makerBps}/taker=${b.takerBps} bps`).join('; ');
+    console.log(`Fees: tier=${feeTier.name} → ${per}`);
+  }
+  console.log(`Long/Short entries: ${m.longEntries}/${m.shortEntries} (sell-exits=${m.sellSignalExits}, short-blocked=${m.shortBlocked})`);
+  console.log(`EV gate: mode=${m.evGate.mode} evaluated=${m.evGate.evaluated} rejected=${m.evGate.rejected} shadow-would-reject=${m.evGate.shadowWouldReject}`);
+  console.log(`Regime gate: enabled=${result.regimeGate.enabled} minCompat=${result.regimeGate.minCompatibilityScore} minConf=${result.regimeGate.minRegimeConfidence}`);
+  console.log(`Total Return: ${m.returnPercent.toFixed(2)}%`);
+  console.log(`Sharpe Ratio: ${m.sharpeRatio.toFixed(2)}`);
+  console.log(`Win Rate: ${(m.winRate * 100).toFixed(2)}%`);
+  console.log(`Profit Factor: ${m.profitFactor.toFixed(2)}`);
+  console.log(`Max Drawdown: ${(m.maxDrawdownPercent * 100).toFixed(2)}%`);
+  console.log(`Total Trades: ${m.totalTrades}`);
+  console.log(`Total Fees: $${m.totalFees.toFixed(2)}`);
+  console.log(`Average Hold Time: ${m.averageHoldTime.toFixed(1)} minutes`);
+  console.log(`Final Capital: $${m.finalCapital.toFixed(2)}`);
+}
 
 async function main() {
   // Single source of truth for fees — backtest must match paper/live or
@@ -20,7 +106,6 @@ async function main() {
   // override (e.g. simulate HL 4.5 bps on Coinbase candles).
   const atlasRoot = path.resolve(process.cwd(), '../..');
   const guardrails = loadGuardrails(atlasRoot);
-  const feeModel = FeeModel.fromGuardrails(guardrails);
 
   const argv = await yargs(hideBin(process.argv))
     .scriptName('atlas-backtest')
@@ -67,8 +152,55 @@ async function main() {
     })
     .option('slippage', {
       type: 'number',
-      describe: 'Slippage rate (e.g., 0.0005 for 5 bps)',
-      default: 0.0005,
+      describe:
+        'Entry/exit slippage as a decimal rate (0.0005 = 5 bps). Maps onto ' +
+        'realism.entrySlippageBps; when omitted guardrails.yaml backtest.entry_slippage_bps applies.',
+    })
+    .option('allow-synthetic', {
+      type: 'boolean',
+      describe:
+        'SMOKE ONLY. Permit random-walk synthetic candles when no real data exists. ' +
+        'Default false → exit 1 with DATA_UNAVAILABLE. Any synthetic run is stamped ' +
+        '"DATA: SYNTHETIC" and is VOID as evidence.',
+      default: false,
+    })
+    .option('fixture-dir', {
+      type: 'string',
+      describe:
+        'Load candles from <dir>/<SYMBOL>.json fixtures instead of Supabase (offline/CI). ' +
+        'Fixtures are the only source when set — a missing fixture is DATA_UNAVAILABLE.',
+    })
+    .option('min-coverage', {
+      type: 'number',
+      describe: 'Minimum bars-loaded / bars-expected ratio per symbol before DATA_UNAVAILABLE (0 disables).',
+      default: 0.5,
+    })
+    .option('venue', {
+      type: 'string',
+      choices: ['spot', 'perps'],
+      describe:
+        'Force every product onto one venue class (fee bucket + shorting capability). ' +
+        'Default: inferred per symbol (XXX-PERP-INTX → perps, else spot). Spot is long-only.',
+    })
+    .option('fee-tier', {
+      type: 'string',
+      describe:
+        'Coinbase spot fee tier: intro1 (60/120 bps) | t1k (35/75) | t10k (25/40) | custom:<maker>,<taker>. ' +
+        'Default: guardrails.yaml fees (t10k today). Ignored when --commission is set.',
+    })
+    .option('ev-gate', {
+      type: 'string',
+      choices: ['enforce', 'shadow', 'off'],
+      default: 'enforce',
+      describe:
+        'Fee-adjusted EV gate: enforce (reject negative-EV entries, live parity) | ' +
+        'shadow (allow but count would-be rejects) | off.',
+    })
+    .option('regime-gates', {
+      type: 'string',
+      choices: ['on', 'off'],
+      default: 'on',
+      describe: 'Regime/strategy compatibility filter (RegimeFilter). Default on.',
     })
     .option('optimize', {
       type: 'boolean',
@@ -80,18 +212,37 @@ async function main() {
 
   const logger = createLogger(path.join(process.cwd(), '../../var/logs/backtest.jsonl'));
 
-  // NOTE: `guardrails` and `feeModel` are loaded at the top of main()
-  // and passed into BacktestConfig below. Both backtest-engine
-  // (disabled_strategies, per-symbol overrides, account sizing) and
-  // the fee resolution path read from the same source of truth so
-  // backtest behaviour can't drift from paper/live.
+  // NOTE: `guardrails` is loaded at the top of main() and passed into
+  // BacktestConfig below. Both backtest-engine (disabled_strategies,
+  // per-symbol overrides, account sizing) and the fee resolution path
+  // read from the same source of truth so backtest behaviour can't
+  // drift from paper/live.
 
+  const fixtureDir = argv.fixtureDir ? path.resolve(process.cwd(), String(argv.fixtureDir)) : undefined;
   const SUPABASE_URL = process.env.SUPABASE_URL || '';
   const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-    console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY — backtest reads candles from public.bars');
+  if (!fixtureDir && (!SUPABASE_URL || !SUPABASE_SERVICE_KEY)) {
+    console.error(
+      'Missing SUPABASE_URL or SUPABASE_SERVICE_KEY — backtest reads candles from public.bars. ' +
+        'Pass --fixture-dir <dir> to run offline on committed fixtures.',
+    );
     process.exit(1);
   }
+
+  // Fee tier → FeeModel. The tier only rewrites the coinbase.spot bucket;
+  // perps buckets stay as configured in guardrails.yaml.
+  const feeTier = resolveFeeTier(argv.feeTier ? String(argv.feeTier) : undefined, guardrails.fees.coinbase.spot);
+  const feeModel = new FeeModel({
+    ...guardrails.fees,
+    coinbase: {
+      ...guardrails.fees.coinbase,
+      spot: { maker_bps: feeTier.makerBps, taker_bps: feeTier.takerBps },
+    },
+  });
+
+  const evGateMode = String(argv.evGate) as EvGateMode;
+  const venueOverride = argv.venue ? (String(argv.venue) as MarketVenue) : undefined;
+  const allowSynthetic = Boolean(argv.allowSynthetic);
 
   logger.info('Starting backtest', {
     startDate: argv.startDate,
@@ -100,12 +251,23 @@ async function main() {
     strategy: argv.strategy,
     feeRouting: argv.commission !== undefined ? 'flat-override' : 'per-symbol-feeModel',
     commissionOverride: argv.commission,
+    feeTier,
+    venueOverride: venueOverride ?? 'per-symbol',
+    evGateMode,
+    regimeGates: argv.regimeGates,
+    allowSynthetic,
+    fixtureDir,
+    dataSource: fixtureDir ? 'fixture' : 'supabase',
   });
+  if (allowSynthetic) {
+    console.warn('WARNING: --allow-synthetic set. If real data is missing, output is SMOKE/VOID and stamped DATA: SYNTHETIC.');
+  }
 
   const runnerConfig: BacktestRunnerConfig = {
     resultsPath: String(argv.resultsPath),
-    supabaseUrl: SUPABASE_URL,
-    supabaseKey: SUPABASE_SERVICE_KEY,
+    supabaseUrl: SUPABASE_URL || undefined,
+    supabaseKey: SUPABASE_SERVICE_KEY || undefined,
+    fixtureDir,
   };
 
   const runner = new BacktestRunner(runnerConfig, logger);
@@ -152,7 +314,14 @@ async function main() {
     feeModel,
     venue: 'coinbase',
     ...(commissionOverride !== undefined ? { commission: commissionOverride } : {}),
-    slippage: Number(argv.slippage),
+    // TASK_017 B2/B3: venue capability + EV gate + regime gate wiring.
+    venueOverride,
+    allowShort: guardrails.strategy.allow_short,
+    evGate: {
+      mode: evGateMode,
+      minEvThreshold: guardrails.risk.min_ev_threshold,
+    },
+    regimeGates: String(argv.regimeGates) !== 'off',
     products: argv.products as string[],
     // Strategy parameters mirror atlas/config/guardrails.yaml. trend_follow
     // is wired here too — defect #1: prior backtests silently dropped it.
@@ -216,15 +385,25 @@ async function main() {
     // Defect #1: forward per-symbol parameter overrides so trend_follow on
     // ETH-USD uses emaFast=12 / emaSlow=15, momentum on ETH uses rsi 10/40/55, etc.
     perSymbolOverrides,
-    realism: guardrails.backtest
-      ? {
-          nextBarFill: guardrails.backtest.next_bar_fill,
-          entrySlippageBps: guardrails.backtest.entry_slippage_bps,
-          stopOvershootBarRangePct: guardrails.backtest.stop_overshoot_bar_range_pct,
-          stopOvershootMinBps: guardrails.backtest.stop_overshoot_min_bps,
-          sizeDecimals: guardrails.backtest.size_decimals,
-        }
-      : undefined,
+    realism: {
+      ...(guardrails.backtest
+        ? {
+            nextBarFill: guardrails.backtest.next_bar_fill,
+            entrySlippageBps: guardrails.backtest.entry_slippage_bps,
+            stopOvershootBarRangePct: guardrails.backtest.stop_overshoot_bar_range_pct,
+            stopOvershootMinBps: guardrails.backtest.stop_overshoot_min_bps,
+            sizeDecimals: guardrails.backtest.size_decimals,
+          }
+        : {}),
+      // TASK_017 B5: `--slippage` (decimal) is now honoured — it overrides
+      // the guardrails bps when passed explicitly.
+      ...(argv.slippage !== undefined ? { entrySlippageBps: Number(argv.slippage) * 10_000 } : {}),
+    },
+  };
+
+  const dataOptions = {
+    allowSynthetic,
+    minCoverage: Number(argv.minCoverage),
   };
 
   try {
@@ -240,7 +419,7 @@ async function main() {
         'risk.takeProfitPercent': { min: 0.02, max: 0.06, step: 0.01 },
       };
 
-      const result = await runner.runOptimization(backtestConfig, parameterRanges, 'sharpeRatio');
+      const result = await runner.runOptimization(backtestConfig, parameterRanges, 'sharpeRatio', dataOptions);
 
       logger.info('Optimization complete', {
         bestParams: result.bestParams,
@@ -254,21 +433,20 @@ async function main() {
       console.log(JSON.stringify(result.bestParams, null, 2));
     } else {
       // Run single backtest
-      const result = await runner.runBacktest(backtestConfig);
-
-      // Print summary
-      console.log('\nBacktest Results:');
-      console.log('=================');
-      console.log(`Total Return: ${result.metrics.returnPercent.toFixed(2)}%`);
-      console.log(`Sharpe Ratio: ${result.metrics.sharpeRatio.toFixed(2)}`);
-      console.log(`Win Rate: ${(result.metrics.winRate * 100).toFixed(2)}%`);
-      console.log(`Profit Factor: ${result.metrics.profitFactor.toFixed(2)}`);
-      console.log(`Max Drawdown: ${(result.metrics.maxDrawdownPercent * 100).toFixed(2)}%`);
-      console.log(`Total Trades: ${result.metrics.totalTrades}`);
-      console.log(`Total Fees: $${result.metrics.totalFees.toFixed(2)}`);
-      console.log(`Final Capital: $${result.metrics.finalCapital.toFixed(2)}`);
+      const result = await runner.runBacktest(backtestConfig, dataOptions, { feeTier });
+      printSummary(result, feeTier);
     }
   } catch (error) {
+    if (isDataUnavailableError(error)) {
+      logger.error('Backtest aborted: DATA_UNAVAILABLE', {
+        symbol: error.symbol,
+        windowStart: error.windowStart.toISOString(),
+        windowEnd: error.windowEnd.toISOString(),
+        attempted: error.attempted,
+      });
+      console.error(`\n${error.message}`);
+      process.exit(2);
+    }
     logger.error('Backtest failed:', error);
     console.error('Backtest failed:', error);
     process.exit(1);
