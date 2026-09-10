@@ -1,0 +1,23 @@
+-- =============================================================================
+-- RECONCILIATION STUB — version 20260910213833
+-- (name: risk_state_execution_mode)
+-- =============================================================================
+-- This file is intentionally a no-op. It exists ONLY so that the local
+-- supabase/migrations/ manifest matches `supabase_migrations.schema_migrations`
+-- on the linked project, which records this version as applied on 2026-09-10
+-- 21:38:33 UTC (MCP apply-time re-stamp of the #46 migration).
+-- Without a file here, Supabase Preview refuses to run ("Remote migration
+-- versions not found in local migrations directory").
+--
+-- What it is: a DUPLICATE APPLY STAMP of 20260910205000. The TM-authorised MCP
+-- apply of `20260910205000_risk_state_execution_mode.sql` was recorded under
+-- apply-time version 213833 with the same name, in addition to the repo version
+-- (205000). Remote history holds BOTH stamps.
+--
+-- Source of truth for this DDL stays `20260910205000_*.sql`. DO NOT copy the
+-- SQL here. On prod the runner skips this version (already recorded); on a
+-- fresh chain it sorts after 205000 and is a no-op. Version stamp MUST stay
+-- 20260910213833; do not rename.
+-- =============================================================================
+
+SELECT 1;
