@@ -1,0 +1,62 @@
+name: config-drift
+
+# Single-source guardrails gate (desk decision 2026-09-10). Fails any PR that:
+#   - adds a second editable guardrails.yaml anywhere in the tree (only
+#     atlas/config/guardrails.yaml may carry runtime config; other copies
+#     must be DO_NOT_EDIT pointer stubs),
+#   - lets atlas/apps/core-node/config/strategies.json disagree with
+#     guardrails `disabled_strategies` or smuggle strategy parameters,
+#   - moves a desk-pinned value (see SCALAR_PINS / LIST_PINS / TREND_FOLLOW_PIN
+#     in atlas/apps/core-node/src/config/config-drift.ts).
+#
+# Cheap by design: no Supabase secrets, no backtest, no native binaries —
+# one workspace install and a tsx script. Same check runs locally via
+# `pnpm check:config` and inside `pnpm test` (config-drift.test.ts).
+
+on:
+  pull_request:
+    paths:
+      - '**/guardrails.yaml'
+      - '**/guardrails.yml'
+      - '**/strategies.json'
+      - 'atlas/config/**'
+      - 'atlas/apps/core-node/config/**'
+      - 'atlas/apps/core-node/src/config/**'
+      - 'atlas/apps/core-node/src/cli/check-config-drift.ts'
+      - '.github/workflows/config-drift.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: config-drift-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Single-source guardrails + desk pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+
+      - name: Install workspace deps
+        # Root pnpm-lock.yaml is the single source of truth and includes
+        # atlas/apps/core-node as a workspace member (see backtest-gate.yml).
+        run: pnpm install --frozen-lockfile
+
+      - name: Check config drift
+        working-directory: atlas/apps/core-node
+        run: pnpm check:config
