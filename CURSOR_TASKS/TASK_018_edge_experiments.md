@@ -32,6 +32,8 @@ Run from `atlas/apps/core-node`. **Never put `--` after `pnpm backtest`** (yargs
 | E5 | Exit redesign | ATR trailing stop + time stop wired (B7), no opposite-signal exits | payoff ≥ 2.2 at WR ≥ 38%; ≥ 30% exits via TP/trail |
 | E6 | Maker entries (upper bound) | `--fee-tier custom:25,40` and `custom:35,75` with post-only entry assumption | informational only (no fill model) |
 
+**E4 Eng support (2026-09-10, PR #48):** `pnpm backtest:e4 --tf 4h|1d|1h …` runs one timeframe per invocation in the TM-corrected order (4H month-block first → 1D, EXPLORATORY unless E[n] ≥ 100 → 1H demoted, zero-fee fail-fast 2.25), with the zero-fee PF fail-fast BEFORE the fee pass and Monte Carlo. Labels are derived (REAL + ≥ 12 months ⇒ graded; shorter ⇒ `SMOKE ONLY`, no grade). `--bar-minutes` on `pnpm backtest` is the underlying rollup. See `docs/research/2026-09-10_e4-multi-tf-feemodel-harness.md`.
+
 ## Deliverables
 
 - `docs/research/<date>_e1-e6-edge-experiments.md` — per-experiment table (trades, WR, PF, net, fees, max DD, t-stat, quarters), data provenance, verdict per gate.
