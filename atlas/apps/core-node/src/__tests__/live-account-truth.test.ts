@@ -164,7 +164,7 @@ interface RecordedCall {
   path: string;
   query: URLSearchParams;
   headers: Record<string, string>;
-  body: any;
+  body: unknown;
 }
 
 interface MockResponse {

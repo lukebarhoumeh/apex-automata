@@ -324,6 +324,8 @@ export class TradingEngine extends EventEmitter {
         startCount: this.startCount,
       });
     } catch (error) {
+      // Never leave the account-truth refresh timer running behind a failed start.
+      this.stopLiveAccountTruth();
       this.setEngineState('stopped', 'start_failed');
       this.logger.error('Failed to start trading engine:', error);
       this.emit('engine:error', error as Error);
