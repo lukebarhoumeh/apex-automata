@@ -1027,15 +1027,23 @@ export async function runE4(
     rawExpectedTrades12m: zeroFeeFrequency.expectedTrades12m,
   };
 
-  // Stages 3/4 — MC + fee stress only past the STOP (SMOKE ONLY may force them).
-  const pastStop = stamp === 'REAL' && (failFast === 'none' || (label === 'SMOKE' && request.smokeRunAllStages));
+  // Stages 3/4 — only past the STOP (SMOKE ONLY may force them). MC stays
+  // INFORMATIONAL when the preflight failed (card); the fee-stress passes are
+  // GO packaging and are NOT run when the preflight failed (AE: n < 100 ⇒ stop
+  // GO packaging).
+  const smokeForce = label === 'SMOKE' && request.smokeRunAllStages;
+  const pastStop = stamp === 'REAL' && (failFast === 'none' || smokeForce);
+  const packagingAllowed = preflight.passed || smokeForce;
   let monteCarlo: MonteCarloSummary | null = null;
   const stress: E4StressPass[] = [];
   if (pastStop) {
     if (failFast !== 'none') logger.warn('E4 harness: SMOKE ONLY run continuing past STOP because --smoke-run-all-stages is set', { failFast });
-    logger.info('E4 harness: stage 3 — Monte Carlo', { block: request.mc.block, runs: request.mc.runs, seed: request.mc.seed });
+    logger.info('E4 harness: stage 3 — Monte Carlo', { block: request.mc.block, runs: request.mc.runs, seed: request.mc.seed, informational: !preflight.passed });
     monteCarlo = runMonteCarlo(feeRun.result.trades, { ...request.mc, initialCapital: request.initialCapital });
-    if (request.feeStress) {
+    if (request.feeStress && !packagingAllowed) {
+      logger.warn('E4 harness: stage 4 — fee stress NOT run: preflight E[n] below gate ⇒ GO packaging stopped', { expectedTrades12m: preflight.expectedTrades12m, gate: preflight.gateMin });
+    }
+    if (request.feeStress && packagingAllowed) {
       for (const bps of E4_CARD.stressBpsPerSide) {
         logger.info('E4 harness: stage 4 — fee stress pass', { bpsPerSide: bps });
         const stressTier: FeeTierLabel = { name: `stress ${bps} bps/side`, makerBps: bps, takerBps: bps };
@@ -1183,7 +1191,7 @@ export function renderE4Report(report: E4Report): string {
   out.push('');
   out.push(...renderPassStats(`Stage 1 — zero-fee PF fail-fast (commission 0, EV gate off)   LOCKED floor PF ≥ ${z.threshold}  min trades ${t.minZeroFeeTrades}  → ${z.failFast === 'inconclusive' ? 'INCONCLUSIVE (too few trades) — STOP' : z.failFast === 'pf' ? 'BELOW FLOOR — STOP (no fee-sensitivity, no GO MC)' : 'PASS'}`, z));
   out.push('');
-  out.push(...renderPassStats(`Stage 2 — FeeModel expectancy @ ${r.feeTier.name} (${k.goFeeBook ? 'GO fee book' : 'NOT the GO fee book'}; EV gate ${r.evGateMode}; cooldown ${k.cooldownBars} bar)`, f));
+  out.push(...renderPassStats(`Stage 2 — FeeModel expectancy @ ${r.feeTier.name} (${k.goFeeBook ? 'GO fee book' : 'NOT the GO fee book'}; EV gate ${r.evGateMode}; cooldown ${k.cooldownBars} bar)${!p.passed ? '   [INFORMATIONAL — preflight E[n] below gate; GO packaging stopped]' : ''}`, f));
   out.push(`  E[n] (12m) = ${f.frequency.expectedTrades12m.toFixed(1)}  from n=${f.frequency.n} over ${f.frequency.windowDays.toFixed(1)} days (${f.frequency.tradesPerMonth.toFixed(2)} trades/month)   first trade ${f.frequency.firstTradeAt ?? 'n/a'}   last ${f.frequency.lastTradeAt ?? 'n/a'}`);
   out.push(`  window quarters (by exit): ${f.quarters.map((q) => `Q${q.index} ${q.start.slice(0, 10)}→${q.end.slice(0, 10)} n=${q.n} PF=${fmt(q.profitFactor)} net=$${q.netProfit.toFixed(2)}`).join(' | ')}${f.quartersEvaluable ? '' : '   [not evaluable: window < 12 months]'}`);
   out.push('');
@@ -1205,7 +1213,7 @@ export function renderE4Report(report: E4Report): string {
     }
     out.push('');
   } else if (r.feeStress) {
-    out.push('Stage 4 — Fee stress: NOT RUN (STOP or not past fail-fast)');
+    out.push(`Stage 4 — Fee stress: NOT RUN (${z.failFast !== 'none' ? 'STOP: not past the zero-fee fail-fast' : !p.passed ? 'preflight E[n] below gate ⇒ GO packaging stopped' : 'no fee-book trades'})`);
     out.push('');
   }
   if (report.evalLedger) {

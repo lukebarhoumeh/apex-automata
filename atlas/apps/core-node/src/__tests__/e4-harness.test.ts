@@ -498,6 +498,50 @@ describe('E4 §8 — end-to-end on committed REAL fixtures', () => {
     expect(text).toMatch(/E4_RESULT tf=4h window=custom label=SMOKE graded=false runCard=none verdict="SMOKE ONLY"/);
   });
 
+  it('preflight below gate ⇒ GO packaging stopped: fee stress never runs even when the zero-fee floor is cleared (MC informational only)', async () => {
+    // Drive the pure orchestration rule with a stubbed runner: preflight n=42 (< 100), zero-fee PF 2.0 (≥ 1.61).
+    const feeTrades = new Array(42).fill(0).map((_, i) => trade(i % 3 === 0 ? 30 : -10, { product: E4_CARD.products[i % 3], entry: `2025-0${1 + (i % 9)}-05T00:00:00Z`, exit: `2025-0${1 + (i % 9)}-06T00:00:00Z` }));
+    const zeroTrades = new Array(52).fill(0).map((_, i) => trade(i % 2 === 0 ? 30 : -10, { entry: `2025-0${1 + (i % 9)}-05T00:00:00Z`, exit: `2025-0${1 + (i % 9)}-06T00:00:00Z` }));
+    const provenance = (symbol: string): DataProvenance => ({
+      symbol, source: 'fixture', windowStart: E4_WALK_FORWARD.eval.start, windowEnd: E4_WALK_FORWARD.eval.end, granularitySeconds: 14_400,
+      candleCount: 2188, expectedCount: 2191, coverage: 0.999, firstBarTime: null, lastBarTime: null, inferredBarMinutes: 240, loadTimeMs: 1,
+    });
+    const resultFor = (trades: BacktestTrade[], commission?: number) => ({
+      trades, dataStamp: 'REAL' as const,
+      dataProvenance: Object.fromEntries(E4_CARD.products.map((p) => [p, provenance(p)])),
+      venueBySymbol: Object.fromEntries(E4_CARD.products.map((p) => [p, 'spot' as const])),
+      fees: commission !== undefined ? { routing: 'flat-override' as const, flatRate: commission, perVenue: {}, exchange: 'coinbase' as const } : { routing: 'fee-model' as const, perVenue: { spot: { makerBps: 25, takerBps: 40 } }, exchange: 'coinbase' as const },
+      metrics: {
+        totalTrades: trades.length, profitFactor: 1, winRate: 0.4, netProfit: 0, totalFees: 0, maxDrawdownPercent: 0.05, returnPercent: 0,
+        longEntries: trades.length, shortEntries: 0, shortBlocked: 0, sellSignalExits: 0, activeStrategies: ['trend_follow'],
+        evGate: { mode: commission === undefined ? 'enforce' : 'off', evaluated: 0, allowed: 0, rejected: 0, shadowWouldReject: 0, defaultAllowed: 0, rejectedByStrategy: {} },
+        atrFilterRejects: 0, exitsIgnoredMinHold: 0,
+      },
+    });
+    const stubRunner = {
+      createDataProvider: () => async (product: string) => ({ candles: [], provenance: provenance(product) }),
+      runBacktestDetailed: vi.fn(async (config: any) => ({ result: resultFor(config.commission === 0 ? zeroTrades : feeTrades, config.commission), saved: null })),
+    } as unknown as BacktestRunner;
+
+    const report = await runE4(request({
+      tf: '4h', startDate: new Date(E4_WALK_FORWARD.eval.start), endDate: new Date(E4_WALK_FORWARD.eval.end),
+      fixtureDir: '/stub/holdout', runCard: CARD, feeStress: true, mc: { runs: 100, block: 'month', seed: 1 },
+    }), stubRunner, guardrails, makeLogger());
+
+    expect(report.preflight).toMatchObject({ pooledN: 42, passed: false, gateMin: 100 });
+    expect(report.preflight.perSymbolN).toEqual({ 'BTC-USD': 14, 'ETH-USD': 14, 'SOL-USD': 14 });
+    expect(report.zeroFee.stats.profitFactor).toBeGreaterThanOrEqual(1.61);
+    expect(report.zeroFee.failFast).toBe('none');
+    expect(report.monteCarlo).not.toBeNull(); // informational
+    expect(report.stress).toEqual([]); // GO packaging stopped
+    expect((stubRunner.runBacktestDetailed as any).mock.calls.length).toBe(2); // fee book + zero-fee only
+    expect(report.verdict).toBe('RESEARCH SCREEN ONLY');
+    const text = renderE4Report(report);
+    expect(text).toContain('Stage 4 — Fee stress: NOT RUN (preflight E[n] below gate ⇒ GO packaging stopped)');
+    expect(text).toContain('[INFORMATIONAL — preflight E[n] below gate; GO packaging stopped]');
+    expect(text).toContain('[INFORMATIONAL — preflight E[n] below gate]');
+  });
+
   it('--smoke-run-all-stages forces MC + the 25/75/120 stress passes on a SMOKE window (pipeline validation only)', async () => {
     const resultsPath = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-e4-4h-all-'));
     const runner = new BacktestRunner({ resultsPath, fixtureDir: FIXTURES_4H_SMOKE }, makeLogger());
