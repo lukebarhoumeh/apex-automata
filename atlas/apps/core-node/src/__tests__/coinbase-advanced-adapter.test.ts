@@ -61,6 +61,21 @@ import {
 import { PaperExecutionAdapter } from '../trading/execution/paper-adapter';
 import { BrokerOrderEvent, FillEvent, OrderRejectedEvent, PlaceOrderRequest } from '../trading/execution/execution-adapter';
 
+// The Sprint 9 / Stage 0 gate (LIVE_STAGE0_INCOMPLETE) sits in front of every other
+// live check in createAdapters(). It is simulated as COMPLETE here — via vitest module
+// mocking only, there is no runtime switch — so the TASK_010 CDP/credential gates and
+// factory→adapter wiring below stay covered. The real gate is asserted in
+// live-stage0-gate.test.ts. Remove this mock when LIVE_STAGE0_COMPLETE flips for real.
+vi.mock('../trading/execution/live-stage0-gate', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../trading/execution/live-stage0-gate')>();
+  return {
+    ...actual,
+    LIVE_STAGE0_COMPLETE: true,
+    isLiveStage0Complete: () => true,
+    assertLiveStage0Complete: () => undefined,
+  };
+});
+
 // ============================================================================
 // Fixtures
 // ============================================================================

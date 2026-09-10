@@ -12,3 +12,4 @@
 
 export * from './supabase-writer';
 export * from './schema-capabilities';
+export * from './fill-row';

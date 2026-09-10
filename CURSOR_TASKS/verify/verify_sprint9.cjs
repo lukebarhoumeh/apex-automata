@@ -101,7 +101,12 @@ const TASKS = {
       ['Live persistence migration file', () => listFiles('supabase/migrations', /_live_persistence\.sql$/).length > 0],
       ['Positions upsert on id', () => has(`${core}/api/server.ts`, /from\('positions'\)[\s\S]{0,400}onConflict:\s*'id'/)],
       ['POSITIONS_HISTORY_PRESERVE gate removed', () => lacks(`${core}/api/server.ts`, 'POSITIONS_HISTORY_PRESERVE')],
-      ['Fill writes map order_id=client UUID + external_order_id', () => has(`${core}/api/server.ts`, /order_id:\s*order\.id/) && has(`${core}/api/server.ts`, /external_order_id:\s*fill\./)],
+      // P2: either inline in server.ts, or routed through the pure persistence/fill-row.ts mapper.
+      ['Fill writes map order_id=client UUID + external_order_id', () =>
+        (has(`${core}/api/server.ts`, /order_id:\s*order\.id/) && has(`${core}/api/server.ts`, /external_order_id:\s*fill\./)) ||
+        (has(`${core}/api/server.ts`, 'buildFillRow(') &&
+          has(`${core}/persistence/fill-row.ts`, /order_id:\s*order\.id/) &&
+          has(`${core}/persistence/fill-row.ts`, /external_order_id:\s*resolveFillExternalOrderId\(/))],
       ['Separate LIVE_USER_ID', () => anyFileContains(core, /\.ts$/, 'LIVE_USER_ID')],
       ['Risk restore filters by execution_mode', () => has(`${core}/trading/risk-engine.ts`, /\.eq\(\s*['"]execution_mode['"]/)],
       ['Persistence tests exist', () => exists(`${core}/__tests__/persistence-live-fixes.test.ts`)],

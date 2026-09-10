@@ -13,6 +13,7 @@ import {
   isSymbolStrategyDisabled,
 } from '../strategies/per-symbol-disable';
 import { computeRawEntryFillPrice } from '../trading/position-entry-vwap';
+import { buildFillRow, FILLS_UPSERT_ON_CONFLICT, FillRowFillRef, FillRowOrderRef } from '../persistence/fill-row';
 import { createClient } from '@supabase/supabase-js';
 import path from 'path';
 import { loadAndValidateEnv } from '../core/env';
@@ -26,7 +27,12 @@ import { MetricsTracker } from '../trading/metrics-tracker';
 import { SecretManager } from '../config/secrets';
 import { AdvancedTradeRestClient, loadAdvancedTradeAuth } from '../exchanges/coinbase/advanced-trade-client';
 import { CoinbaseApiError } from '../exchanges/coinbase/http/errors';
-import { LIVE_REQUIRES_ADVANCED_TRADE, assertLiveExecutionPathWired, getMarketDataUrls } from '../trading/execution/adapter-factory';
+import {
+  LIVE_REQUIRES_ADVANCED_TRADE,
+  assertLiveExecutionPathWired,
+  assertLiveStage0Complete,
+  getMarketDataUrls,
+} from '../trading/execution/adapter-factory';
 import { toLiveProductSpec } from '../trading/execution/coinbase-advanced-adapter';
 import { CoinbasePerpsAdapter } from '../exchanges/coinbase-perps-adapter';
 import { ExchangeRegistry } from '../exchanges/exchange-registry';
@@ -1390,7 +1396,7 @@ app.post('/api/engine/start', async (req, res) => {
         broadcast({ type: 'OrderUpdate', payload: order });
         broadcast({ type: 'Fill', payload: fill });
         await syncOrderToSupabase(order);
-        await syncFillToSupabase(fill);
+        await syncFillToSupabase(order, fill);
         // Update account metrics after fills
         await updateAccountMetrics();
       } catch (err) {
@@ -2408,6 +2414,15 @@ async function runLivePreflight(input: {
   products: string[];
 }): Promise<LivePreflightResult> {
   const warnings: string[] = [];
+
+  // Sprint 9 / Stage 0 gate (LIVE_STAGE0_INCOMPLETE): live is refused outright until
+  // TASK_011–016 verify green. Checked before anything else so the operator sees the
+  // real blocker instead of chasing credentials. Same gate guards createAdapters().
+  try {
+    assertLiveStage0Complete();
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error), warnings };
+  }
   
   // Validate API version and credentials
   const apiVersion = env.COINBASE_API_VERSION || 'exchange';
@@ -4303,21 +4318,17 @@ async function syncOrderToSupabase(order: any) {
   }
 }
 
-async function syncFillToSupabase(fill: any) {
+/**
+ * Persist a fill. TASK_014 P2: `fills.order_id` is the FK to `orders.id` (client UUID),
+ * so the row is built from the engine-side `order`, and the exchange's order id goes to
+ * `external_order_id` — see persistence/fill-row.ts for the mapping and its tests.
+ */
+async function syncFillToSupabase(order: FillRowOrderRef, fill: FillRowFillRef) {
   try {
+    const row = buildFillRow({ userId: USER_ID, order, fill });
     const { error } = await supabase
       .from('fills')
-      .upsert({
-        user_id: USER_ID,
-        order_id: fill.order_id,
-        trade_id: fill.trade_id !== undefined ? String(fill.trade_id) : null,
-        price: parseFloat(fill.price),
-        quantity: parseFloat(fill.size),
-        fee_currency: 'USD',
-        fee_amount: parseFloat(fill.fee),
-        maker: fill.liquidity === 'M',
-        filled_at: fill.created_at
-      }, { onConflict: 'user_id,trade_id' });
+      .upsert(row, { onConflict: FILLS_UPSERT_ON_CONFLICT });
 
     if (error) {
       logger.error('Failed to sync fill to Supabase:', error);
