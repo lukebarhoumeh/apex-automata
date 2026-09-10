@@ -135,7 +135,7 @@ Run after any path. Read-only.
   curl -s localhost:3001/api/risk/status | jq '{killSwitchActive, consecutiveLosses: .metrics.consecutiveLosses, dailyPnL: .metrics.dailyPnL}'
   curl -s localhost:3001/api/status | jq '{engineRunning, killSwitch, risk}'
   ```
-  Expect `killSwitchActive: false`, `consecutiveLosses: 0`, and `risk.tradingState: "RUNNING"`.
+  Expect `killSwitchActive: false` and `consecutiveLosses: 0` from `/api/risk/status` immediately. In `/api/status`, `killSwitch.active` flips to `false` immediately; `risk.killSwitchActive` is refreshed from the 5-second metrics tick, so allow one tick before reading it.
 - **Supabase (read-only, Dashboard SQL editor or `psql`):**
   ```sql
   SELECT kill_switch_active, consecutive_losses, daily_pnl, max_drawdown, error_rate, updated_at
