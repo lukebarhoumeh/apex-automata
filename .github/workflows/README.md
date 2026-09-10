@@ -1,5 +1,18 @@
 # GitHub Actions workflows
 
+## `config-drift.yml` — single-source guardrails gate
+
+**Triggers on PRs that touch any of:** `**/guardrails.yaml`, `**/guardrails.yml`, `**/strategies.json`, `atlas/config/**`, `atlas/apps/core-node/config/**`, `atlas/apps/core-node/src/config/**`, `atlas/apps/core-node/src/cli/check-config-drift.ts`, or the workflow itself. Also runnable via `workflow_dispatch`.
+
+**What it does.** Installs the workspace and runs `pnpm check:config` (`atlas/apps/core-node/src/cli/check-config-drift.ts` -> `src/config/config-drift.ts`). No secrets, no backtest, no native binaries; wall-clock is dominated by `pnpm install`. The gate **fails** if:
+
+1. `atlas/config/guardrails.yaml` is missing or fails `GuardrailsSchema` validation.
+2. Any other `guardrails.yaml` / `.yml` in the tree (outside `node_modules`, `dist`, `var`, `.git`) is not a `DO_NOT_EDIT: true` pointer stub. `atlas/apps/core-node/config/guardrails.yaml` used to be a real, divergent copy; it is now a stub and `loadGuardrails()` throws if pointed anywhere but the canonical file.
+3. `atlas/apps/core-node/config/strategies.json` (deprecated, not read by the runtime) claims `enabled` for a strategy in guardrails `disabled_strategies` (or vice versa), is missing a built-in strategy, or carries any key other than `enabled`.
+4. A desk-pinned value moved. Pins live in `SCALAR_PINS`, `LIST_PINS`, `TREND_FOLLOW_PIN`, `SPOT_MOMENTUM_TAKE_PROFIT_ATR` and `TRADE_COOLDOWN_FLOOR_EXCLUSIVE` in `config-drift.ts`. Changing a pin is intentionally a two-file diff (YAML + that list) so it shows up in review.
+
+The same check runs inside `pnpm test` (`src/__tests__/config-drift.test.ts`), so a red gate here reproduces locally with `cd atlas/apps/core-node && pnpm check:config`.
+
 ## `backtest-gate.yml` — backtest CI gate (I3)
 
 **Triggers on PRs that touch any of:**

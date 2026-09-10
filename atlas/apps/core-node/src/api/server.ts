@@ -1040,7 +1040,9 @@ app.post('/api/killswitch/deactivate', async (req, res) => {
     supervisor.deactivateKillSwitch();
     
     if (tradingEngine) {
-      tradingEngine.getRiskEngineInstance()?.deactivateKillSwitch();
+      // Awaited so the response only reports success once risk_metrics /
+      // risk_events have been persisted (see RiskEngine.deactivateKillSwitch).
+      await tradingEngine.getRiskEngineInstance()?.deactivateKillSwitch();
     }
     
     runtimeState.killSwitch.active = false;
@@ -3802,7 +3804,7 @@ app.get('/api/risk/soft-launch', (req, res) => {
 });
 
 // Toggle kill switch manually
-app.post('/api/risk/killswitch', (req, res) => {
+app.post('/api/risk/killswitch', async (req, res) => {
   const riskEngine = tradingEngine?.getRiskEngineInstance();
   if (!riskEngine) {
     return res.status(400).json({ error: 'Risk engine not running' });
@@ -3818,7 +3820,7 @@ app.post('/api/risk/killswitch', (req, res) => {
     riskEngine.activateKillSwitch(reason || 'Manual activation via API');
     logger.warn('Kill switch activated via API', { reason });
   } else {
-    riskEngine.deactivateKillSwitch();
+    await riskEngine.deactivateKillSwitch();
     logger.info('Kill switch deactivated via API');
   }
   

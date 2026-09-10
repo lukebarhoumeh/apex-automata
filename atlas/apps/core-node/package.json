@@ -22,7 +22,8 @@
     "api": "tsx src/api/server.ts",
     "diagnose": "tsx src/cli/diagnose.ts",
     "quick-check": "tsx src/cli/quick-check.ts",
-    "audit:trades": "tsx src/cli/audit-trades.ts"
+    "audit:trades": "tsx src/cli/audit-trades.ts",
+    "check:config": "tsx src/cli/check-config-drift.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",

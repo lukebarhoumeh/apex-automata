@@ -144,6 +144,30 @@ export interface RiskEngineEvents {
   'risk:metrics:update': (metrics: RiskMetrics) => void;
 }
 
+/**
+ * Why an in-memory risk reset happened. Logged alongside the eager
+ * `risk_metrics` write so a phantom-halt investigation can tell a
+ * deliberate `PAPER_RESET_RISK_STATE_ON_START` from a day-boundary
+ * discard or an operator `RESUME TRADING`.
+ */
+export type RiskStateResetSource = 'startup_reset' | 'day_boundary' | 'manual_resume';
+
+/**
+ * PostgREST / Postgres signatures for "this column does not exist".
+ * `42703` is the Postgres undefined_column SQLSTATE; `PGRST204` is what
+ * PostgREST returns when an insert/update payload names a column that is
+ * missing from its schema cache.
+ */
+function isMissingColumnError(error: { code?: string; message?: string } | null | undefined): boolean {
+  if (!error) return false;
+  if (error.code === '42703' || error.code === 'PGRST204') return true;
+  return /column .*does not exist|could not find the '.*' column/i.test(error.message ?? '');
+}
+
+function isMissingTableError(error: { code?: string } | null | undefined): boolean {
+  return error?.code === 'PGRST205' || error?.code === '42P01';
+}
+
 export class RiskEngine extends EventEmitter {
   private config: RiskEngineConfig;
   private logger: Logger;
@@ -394,6 +418,14 @@ export class RiskEngine extends EventEmitter {
         const metricsDate = latestMetrics.updated_at 
           ? new Date(latestMetrics.updated_at).toISOString().split('T')[0]
           : null;
+
+        // Tracks whether this startup discarded persisted state. Both reset
+        // branches below used to be memory-only: the DB row kept advertising
+        // kill_switch_active=true / consecutive_losses=N until the next 5s
+        // metrics tick happened to overwrite it (and never if the engine was
+        // stopped before then). Anything that reads risk_metrics or
+        // risk_events directly (UI, Grafana) saw a phantom halt.
+        let resetSource: RiskStateResetSource | null = null;
         
         if (metricsDate !== todayStr) {
           // Stale data from previous day - start fresh
@@ -407,6 +439,7 @@ export class RiskEngine extends EventEmitter {
           this.metrics.errorRate = 0;
           this.metrics.currentExposure = 0;
           this.metrics.killSwitchActive = false;
+          resetSource = 'day_boundary';
         } else {
           // Restore metrics from today
           this.metrics.dailyPnL = Number(latestMetrics.daily_pnl ?? 0);
@@ -449,6 +482,11 @@ export class RiskEngine extends EventEmitter {
           // history, so anchor the tracker to the current session.
           this.weeklyStartEquity = this.accountEquity;
           this.weeklyStartTimestamp = Date.now();
+          resetSource = 'startup_reset';
+        }
+
+        if (resetSource) {
+          await this.persistClearedRiskState(resetSource);
         }
       }
 
@@ -1381,6 +1419,120 @@ export class RiskEngine extends EventEmitter {
     }
   }
 
+  /**
+   * Eagerly persist the current (cleared) risk state instead of waiting for
+   * the next 5s metrics tick, then mark any still-active `risk_events` rows
+   * for this user as cleared.
+   *
+   * Every reset path in this class used to be memory-only. The engine would
+   * happily trade while `risk_metrics.kill_switch_active` and
+   * `risk_events.active` still said "halted" — and if the engine stopped
+   * before the next tick (or was never started, e.g. a paper reset followed
+   * by a crash) the phantom halt survived indefinitely. UI and Grafana read
+   * those tables directly, so they showed a kill switch the runtime was not
+   * honouring. Persistence failures are logged, counted, and swallowed: a DB
+   * hiccup must never turn a successful in-memory resume into an exception
+   * at an API boundary.
+   */
+  private async persistClearedRiskState(source: RiskStateResetSource): Promise<void> {
+    if (!this.userId) {
+      this.logger.debug('Skipping eager risk state persist: userId not provided', { source });
+      return;
+    }
+    this.metrics.lastUpdated = new Date();
+    this.logger.info('Eagerly persisting cleared risk state', {
+      source,
+      killSwitchActive: this.metrics.killSwitchActive,
+      consecutiveLosses: this.metrics.consecutiveLosses,
+      dailyPnL: this.metrics.dailyPnL,
+      maxDrawdown: this.metrics.maxDrawdown,
+    });
+    await this.persistMetrics();
+    await this.clearStaleRiskEvents(source);
+  }
+
+  /**
+   * Flip every still-active `risk_events` row for this user to
+   * `active=false` and stamp `cleared_at`. The state machine's own
+   * `persistRiskEventCleared` only ever set `cleared_at`, and the API's
+   * manual kill-switch insert never gets cleared at all, so `active=true`
+   * rows accumulated forever — which is exactly what
+   * `useActiveRiskEvents` and the Grafana "active halts" panel query.
+   *
+   * Schema-tolerant: if the deployed `risk_events` has no `active` column
+   * (older snapshots), falls back to stamping `cleared_at` on rows where it
+   * is still NULL.
+   */
+  private async clearStaleRiskEvents(source: RiskStateResetSource): Promise<void> {
+    if (!this.userId) {
+      return;
+    }
+    const clearedAt = new Date().toISOString();
+    try {
+      const { error } = await this.supabase
+        .from('risk_events')
+        .update({ active: false, cleared_at: clearedAt })
+        .eq('user_id', this.userId)
+        .eq('active', true);
+
+      if (!error) {
+        this.logger.info('Cleared stale active risk_events', { source });
+        return;
+      }
+
+      if (isMissingTableError(error)) {
+        this.logger.debug('risk_events table not available');
+        return;
+      }
+
+      if (isMissingColumnError(error)) {
+        this.logger.warn('risk_events.active column missing; clearing by cleared_at only', {
+          code: error.code,
+          message: error.message,
+        });
+        const { error: fallbackError } = await this.supabase
+          .from('risk_events')
+          .update({ cleared_at: clearedAt })
+          .eq('user_id', this.userId)
+          .is('cleared_at', null);
+        if (fallbackError) {
+          this.logger.error('Failed to clear stale risk_events (cleared_at fallback):', {
+            code: fallbackError.code,
+            message: fallbackError.message,
+            source,
+          });
+        }
+        return;
+      }
+
+      this.logger.error('Failed to clear stale risk_events:', {
+        code: error.code,
+        message: error.message,
+        details: error.details,
+        source,
+      });
+    } catch (error) {
+      this.logger.error('Error clearing stale risk_events:', error);
+    }
+  }
+
+  /**
+   * Zero the streak-style counters that drive kill-switch checks. Called on
+   * an operator-confirmed resume: without it `checkKillSwitches()` would see
+   * the same `consecutiveLosses >= limit` (or error-rate / latency window)
+   * on the very next 5s tick and silently re-halt, making the resume a
+   * no-op. Daily P&L and drawdown are deliberately left alone — they are
+   * recomputed from equity every tick, and overriding a daily stop is a
+   * separate decision that belongs to the day-rollover path.
+   */
+  private clearHaltCounters(): void {
+    this.metrics.consecutiveLosses = 0;
+    this.metrics.errorRate = 0;
+    this.metrics.averageLatency = 0;
+    this.orderHistory = [];
+    this.latencyHistory = [];
+  }
+
   // Get current risk metrics
   public getMetrics(): RiskMetrics {
     return { ...this.metrics };
@@ -1472,16 +1624,39 @@ export class RiskEngine extends EventEmitter {
     this.triggerKillSwitch(`Manual activation: ${reason}`);
   }
 
-  public deactivateKillSwitch(force: boolean = true): boolean {
+  /**
+   * Operator-confirmed resume (`POST /api/killswitch/deactivate` with the
+   * `RESUME TRADING` phrase, or `POST /api/risk/killswitch {active:false}`).
+   *
+   * On success this (1) clears the in-memory halt flags and streak counters,
+   * (2) eagerly upserts the cleared `risk_metrics` row, and (3) marks stale
+   * `risk_events` as cleared — all before resolving, so the HTTP response
+   * only reports "deactivated" once the DB agrees. Previously the DB kept
+   * `kill_switch_active=true` until the next 5s metrics tick, and because
+   * `consecutiveLosses` was never reset the next tick re-tripped the switch
+   * anyway when the halt reason was a losing streak.
+   *
+   * Persistence errors are logged and swallowed; the return value reflects
+   * only whether the in-memory resume succeeded.
+   *
+   * @param force Required (`true`) to resume from a non-daily HALTED state.
+   * @returns `true` if trading is RUNNING after the call.
+   */
+  public async deactivateKillSwitch(force: boolean = true): Promise<boolean> {
     const resumed = this.riskStateMachine.resume(force);
-    if (resumed) {
-      this.killSwitchActive = false;
-      this.metrics.killSwitchActive = false;
-      this.logger.info('Kill switch deactivated');
-    } else {
+    if (!resumed) {
       this.logger.warn('Failed to deactivate kill switch (requires force=true for non-daily halts)');
+      return false;
     }
-    return resumed;
+
+    const wasActive = this.killSwitchActive || this.metrics.killSwitchActive;
+    this.killSwitchActive = false;
+    this.metrics.killSwitchActive = false;
+    this.clearHaltCounters();
+    this.logger.info('Kill switch deactivated', { wasActive });
+
+    await this.persistClearedRiskState('manual_resume');
+    return true;
   }
 
   // Cleanup
