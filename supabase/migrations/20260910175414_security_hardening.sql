@@ -1,0 +1,39 @@
+-- =============================================================================
+-- RECONCILIATION STUB — version 20260910175414 (name: security_hardening)
+-- =============================================================================
+-- This file is intentionally a no-op. It exists ONLY so that the local
+-- supabase/migrations/ manifest matches `supabase_migrations.schema_migrations`
+-- on the linked project, which records this version as applied on 2026-09-10
+-- 17:54:14 UTC. It was applied out-of-band via the Supabase MCP by the
+-- Database Engineer and never had a file in this repo (same class of orphan as
+-- 20260902202325_agentic_heartbeats). Without a file here, `supabase db push`
+-- and Supabase Preview refuse to run ("Remote migration versions not found in
+-- local migrations directory").
+--
+-- What the remote migration did (descriptive only — see the recorded
+-- `statements` in schema_migrations for the exact SQL; do NOT re-create it here):
+--   * security_invoker = true on public.ml_training_data,
+--     public.strategy_regime_performance, public.daily_trade_summary, and
+--     REVOKE ALL on those views FROM anon.
+--   * SET search_path = public, pg_temp on the six public SECURITY DEFINER
+--     functions plus update_trade_outcomes_updated_at().
+--   * REVOKE EXECUTE FROM PUBLIC/anon/authenticated on the trigger functions
+--     and on upsert_account_metrics(uuid) (service_role only); has_role kept
+--     for authenticated + service_role; the four user_roles policies re-scoped
+--     TO authenticated; post-condition assertions.
+--
+-- Source of truth for the same security intent in this repo remains
+-- 20260910180000_fix_security_invoker_views.sql and
+-- 20260910180100_revoke_anon_execute_security_definer.sql (both idempotent).
+-- They overlap with what 20260910175414 already applied on prod — see
+-- docs/db/HANDOFF_2026-09-10.md (R9) before any MCP apply: do not double-apply
+-- carelessly; the only material differences are the upsert_account_metrics
+-- grant to authenticated (desk lock: keep it, needed for paper) and the
+-- search_path pin.
+--
+-- DO NOT add SQL here. Re-running this stub on a fresh database (Supabase
+-- Preview) is intentionally a no-op; the real hardening is applied there by
+-- 20260910180000 / 20260910180100 which sort after this version.
+-- =============================================================================
+
+SELECT 1;

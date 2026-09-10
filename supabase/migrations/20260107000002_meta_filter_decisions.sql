@@ -114,44 +114,51 @@ FROM public.meta_filter_decisions
 WHERE outcome IS NOT NULL;
 
 -- View for strategy performance analysis
-CREATE OR REPLACE VIEW public.strategy_filter_analysis AS
-SELECT
+CREATE OR REPLACE VIEW public.strategy_filter_analysis
+WITH (security_invoker = true)
+AS
+WITH hourly AS (
+  SELECT
     strategy,
-    COUNT(*) as total_decisions,
-    SUM(CASE WHEN passed THEN 1 ELSE 0 END) as signals_passed,
-    SUM(CASE WHEN NOT passed THEN 1 ELSE 0 END) as signals_blocked,
-    AVG(meta_score) as avg_meta_score,
-
-    -- Passed trades analysis
-    SUM(CASE WHEN passed AND outcome = 'win' THEN 1 ELSE 0 END) as passed_wins,
-    SUM(CASE WHEN passed AND outcome = 'loss' THEN 1 ELSE 0 END) as passed_losses,
-
-    -- Blocked trades analysis (what would have happened)
-    SUM(CASE WHEN NOT passed AND outcome = 'win' THEN 1 ELSE 0 END) as blocked_would_win,
-    SUM(CASE WHEN NOT passed AND outcome = 'loss' THEN 1 ELSE 0 END) as blocked_would_lose,
-
-    -- Win rate of passed trades
-    CASE
-        WHEN SUM(CASE WHEN passed AND outcome IS NOT NULL THEN 1 ELSE 0 END) > 0
-        THEN SUM(CASE WHEN passed AND outcome = 'win' THEN 1 ELSE 0 END)::DECIMAL /
-             SUM(CASE WHEN passed AND outcome IS NOT NULL THEN 1 ELSE 0 END)
-        ELSE NULL
-    END as passed_win_rate,
-
-    -- Value of blocked trades (negative = good filtering)
-    SUM(CASE WHEN NOT passed THEN pnl ELSE 0 END) as blocked_pnl,
-
-    -- Hourly breakdown
+    hour_of_day,
+    COUNT(*) AS total,
+    SUM(CASE WHEN passed THEN 1 ELSE 0 END) AS passed,
+    SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) AS wins
+  FROM public.meta_filter_decisions
+  WHERE hour_of_day IS NOT NULL
+  GROUP BY strategy, hour_of_day
+),
+hourly_json AS (
+  SELECT
+    strategy,
     jsonb_object_agg(
-        hour_of_day::TEXT,
-        jsonb_build_object(
-            'total', COUNT(*),
-            'passed', SUM(CASE WHEN passed THEN 1 ELSE 0 END),
-            'wins', SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END)
-        )
-    ) FILTER (WHERE hour_of_day IS NOT NULL) as hourly_stats
-FROM public.meta_filter_decisions
-GROUP BY strategy;
+      hour_of_day::TEXT,
+      jsonb_build_object('total', total, 'passed', passed, 'wins', wins)
+    ) AS hourly_stats
+  FROM hourly
+  GROUP BY strategy
+)
+SELECT
+  m.strategy,
+  COUNT(*) AS total_decisions,
+  SUM(CASE WHEN m.passed THEN 1 ELSE 0 END) AS signals_passed,
+  SUM(CASE WHEN NOT m.passed THEN 1 ELSE 0 END) AS signals_blocked,
+  AVG(m.meta_score) AS avg_meta_score,
+  SUM(CASE WHEN m.passed AND m.outcome = 'win' THEN 1 ELSE 0 END) AS passed_wins,
+  SUM(CASE WHEN m.passed AND m.outcome = 'loss' THEN 1 ELSE 0 END) AS passed_losses,
+  SUM(CASE WHEN NOT m.passed AND m.outcome = 'win' THEN 1 ELSE 0 END) AS blocked_would_win,
+  SUM(CASE WHEN NOT m.passed AND m.outcome = 'loss' THEN 1 ELSE 0 END) AS blocked_would_lose,
+  CASE
+    WHEN SUM(CASE WHEN m.passed AND m.outcome IS NOT NULL THEN 1 ELSE 0 END) > 0
+    THEN SUM(CASE WHEN m.passed AND m.outcome = 'win' THEN 1 ELSE 0 END)::DECIMAL
+         / SUM(CASE WHEN m.passed AND m.outcome IS NOT NULL THEN 1 ELSE 0 END)
+    ELSE NULL
+  END AS passed_win_rate,
+  SUM(CASE WHEN NOT m.passed THEN m.pnl ELSE 0 END) AS blocked_pnl,
+  h.hourly_stats
+FROM public.meta_filter_decisions m
+LEFT JOIN hourly_json h ON h.strategy = m.strategy
+GROUP BY m.strategy, h.hourly_stats;
 
 -- Comments
 COMMENT ON TABLE public.meta_filter_decisions IS 'Stores all meta-filter decisions for ML training and analysis';
