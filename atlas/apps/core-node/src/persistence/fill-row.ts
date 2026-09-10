@@ -18,13 +18,10 @@
  * previous inline writer (P3 trade-id collisions, mode stamping, etc. are
  * separate TASK_014 defects and intentionally not addressed here).
  *
- * Handoff — broader TASK_014 (P1, P3–P8) is owned separately. Extend here rather
- * than re-inlining the row in server.ts:
- *   - P3  trade_id policy: exchange trade_id (live) / `paper-${sessionId}-${seq}` (paper)
- *   - P5  stamping: add `execution_mode` / `session_id` inputs and columns
- *   - P6  durable writes: `server.ts` can hand the built row to `SupabaseWriter`
- * The P2 invariant (`order_id` = client UUID, exchange id only in `external_order_id`)
- * is pinned by `__tests__/fill-row.test.ts` and must survive those extensions.
+ * Ownership: this module fixes P2 only. The remaining TASK_014 defects (P1, P3–P8)
+ * are owned by a separate PR and are deliberately not designed for here. Whatever
+ * shape that work takes, the P2 invariant — `order_id` = client UUID, exchange id
+ * only ever in `external_order_id` — is pinned by `__tests__/fill-row.test.ts`.
  */
 
 /** The engine-side order the fill belongs to (`ManagedOrder` shape, structurally typed). */
