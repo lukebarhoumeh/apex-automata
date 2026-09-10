@@ -40,7 +40,11 @@ WITH checks AS (
         AND indexname IN ('agentic_heartbeats_ts_idx', 'agentic_heartbeats_cycle_ts_idx')) AS indexes_present,
     COALESCE((SELECT relrowsecurity FROM pg_class
       WHERE oid = to_regclass('public.agentic_heartbeats')), false)         AS rls_enabled,
-    to_regclass('equity.agentic_heartbeats') IS NOT NULL                    AS quarantined_to_equity
+    to_regclass('equity.agentic_heartbeats') IS NOT NULL                    AS quarantined_to_equity,
+    -- second orphan stub reconciled on this branch (informational; SELECT 1 file,
+    -- real hardening lives in 20260910180000 / 20260910180100)
+    (SELECT count(*) = 1 FROM supabase_migrations.schema_migrations
+      WHERE version = '20260910175414')                                     AS security_hardening_stamp_recorded
 )
 SELECT *,
        (version_recorded AND

@@ -11,7 +11,7 @@ Trading Master go; see the handoff doc.
 
 | Script | Verifies | Run when | Key expectation |
 |---|---|---|---|
-| `00_stub_agentic_heartbeats.sql` | stub `20260902202325` | after merge, **before #3** | `version_recorded = t`, `public_table_exists = t`, `pass = t` |
+| `00_stub_agentic_heartbeats.sql` | stub `20260902202325` (+ informational `security_hardening_stamp_recorded` for stub `20260910175414`) | after merge, **before #3** | `version_recorded = t`, `public_table_exists = t`, `pass = t` |
 | `01_security_invoker_and_revoke.sql` | #1 (`20260910180000`, `20260910180100`) | after #1 | `security_invoker = t` ×3; `anon_exec = f` ×6; `auth_exec = t` only for `has_role` + `upsert_account_metrics`; `pass = t` |
 | `02_execution_mode_backfill.sql` | #2 (`20260910180200`) | immediately after #2 | `null_execution_mode_account_metrics = 0`, `null_execution_mode_trading_sessions = 0`, `pass = t` |
 | `03_quarantine_agentic_heartbeats.sql` | #3 (`20260910180300`) | after #3 (writers already retargeted) | `in_equity_only = t`, `policies_present = t`, `anon_no_access = t`, `row_count` ≈ 43 (informational), `pass = t` |
