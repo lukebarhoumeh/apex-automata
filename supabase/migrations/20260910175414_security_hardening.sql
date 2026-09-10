@@ -28,7 +28,8 @@
 -- They overlap with what 20260910175414 already applied on prod — see
 -- docs/db/HANDOFF_2026-09-10.md (R9) before any MCP apply: do not double-apply
 -- carelessly; the only material differences are the upsert_account_metrics
--- grant to authenticated and the search_path pin.
+-- grant to authenticated (desk lock: keep it, needed for paper) and the
+-- search_path pin.
 --
 -- DO NOT add SQL here. Re-running this stub on a fresh database (Supabase
 -- Preview) is intentionally a no-op; the real hardening is applied there by

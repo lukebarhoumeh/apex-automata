@@ -48,9 +48,10 @@ statements print supporting detail.
   there); on a Preview branch it reports `anon_select = t` until #4 runs in the
   same chain. Both are expected pre-#4 baselines.
 - `01_*` on prod today reports `pass = f` because remote already applied
-  `20260910175414_security_hardening` (not in this repo), which keeps
-  `upsert_account_metrics` service_role-only. See handoff risk R9 before
-  reading that as a defect.
+  `20260910175414_security_hardening` (reconciled as a stub), which revoked
+  authenticated EXECUTE on `upsert_account_metrics`. Desk lock keeps that grant
+  (needed for paper), so `pass` flips to `t` once `20260910180100` or
+  `20260910180200` is applied. See handoff R9.
 - `03_*` detail matrix: `authenticated` may still show `ins/upd/del = t` until
   handoff gap G1 (revoke the stub's `GRANT ALL ... TO authenticated`) is
   addressed; RLS blocks those writes regardless, and the summary does not

@@ -13,11 +13,13 @@
 --   summary:   every column = t
 --
 -- NOTE (2026-09-10): remote already applied 20260910175414_security_hardening
--- (not in this repo), whose privilege model keeps upsert_account_metrics(uuid)
--- service_role-only (authenticated REVOKED). On prod today this script therefore
--- reports auth_exec_only_has_role_and_upsert = f and pass = f — that is the
--- hardening model, not a defect. If the DBE amends 1b/#2 to that model, change
--- the expected auth_exec for upsert_account_metrics to f here (handoff doc R9).
+-- (reconciled as a SELECT 1; stub), which REVOKED authenticated EXECUTE on
+-- upsert_account_metrics(uuid). Desk lock (TM, 18:48 UTC): the authenticated
+-- grant in 20260910180100 stays — it is needed for paper trading — so the
+-- expectation below (auth_exec = t for upsert_account_metrics) is the locked
+-- model. On prod today, before 1b or #2 has run, this script reports
+-- auth_exec_only_has_role_and_upsert = f and pass = f: expected baseline, not
+-- a defect. It flips to t once 20260910180100 or 20260910180200 is applied.
 
 -- Detail: views
 SELECT c.relname                                                     AS view_name,
