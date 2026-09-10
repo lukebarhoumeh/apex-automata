@@ -6,57 +6,12 @@ import yargs from 'yargs/yargs';
 import { hideBin } from 'yargs/helpers';
 import { createLogger } from '../core/logger';
 import { BacktestRunner, BacktestRunnerConfig, FeeTierLabel } from '../backtesting/backtest-runner';
-import {
-  BacktestConfig,
-  BacktestResult,
-  EvGateMode,
-  PerSymbolStrategyOverrides,
-} from '../backtesting/backtest-engine';
+import { BacktestResult, EvGateMode } from '../backtesting/backtest-engine';
 import { isDataUnavailableError } from '../backtesting/data-loader';
+import { SUPPORTED_BAR_MINUTES, describeBarTimeframe, isBarAggregationError } from '../backtesting/bar-aggregation';
+import { buildBacktestConfig, buildFeeModel, resolveFeeTier } from '../backtesting/backtest-cli-config';
 import { loadGuardrails } from '../config/loadGuardrails';
-import { buildPerSymbolDisabledStrategies } from '../strategies/per-symbol-disable';
-import { FeeModel } from '../core/fee-model';
 import type { MarketVenue } from '../trading/execution/venue-capabilities';
-
-/**
- * Coinbase Advanced Trade spot fee tiers (maker/taker bps), TASK_017 step 7.
- *   intro1 — Intro 1 (< $1K 30d volume): 60 / 120
- *   t1k    — $1K–$10K:                   35 / 75
- *   t10k   — $10K–$50K:                  25 / 40  (guardrails.yaml default)
- * `custom:<maker>,<taker>` sets arbitrary bps.
- */
-const FEE_TIERS: Record<string, { makerBps: number; takerBps: number }> = {
-  intro1: { makerBps: 60, takerBps: 120 },
-  t1k: { makerBps: 35, takerBps: 75 },
-  t10k: { makerBps: 25, takerBps: 40 },
-};
-
-function resolveFeeTier(flag: string | undefined, guardrailsSpot: { maker_bps: number; taker_bps: number }): FeeTierLabel {
-  if (!flag) {
-    // Back-compat default: whatever guardrails.yaml says (25/40 = t10k today).
-    // Label it by matching the known table so the report names the tier.
-    const match = Object.entries(FEE_TIERS).find(
-      ([, t]) => t.makerBps === guardrailsSpot.maker_bps && t.takerBps === guardrailsSpot.taker_bps,
-    );
-    return {
-      name: `${match ? match[0] : 'custom'} (guardrails.yaml default)`,
-      makerBps: guardrailsSpot.maker_bps,
-      takerBps: guardrailsSpot.taker_bps,
-    };
-  }
-  if (flag.startsWith('custom:')) {
-    const [maker, taker] = flag.slice('custom:'.length).split(',').map((v) => Number(v));
-    if (!Number.isFinite(maker) || !Number.isFinite(taker) || maker < 0 || taker < 0) {
-      throw new Error(`--fee-tier custom:<maker>,<taker> expects two non-negative bps numbers, got "${flag}"`);
-    }
-    return { name: flag, makerBps: maker, takerBps: taker };
-  }
-  const tier = FEE_TIERS[flag];
-  if (!tier) {
-    throw new Error(`Unknown --fee-tier "${flag}". Use intro1|t1k|t10k|custom:<maker>,<taker>`);
-  }
-  return { name: flag, ...tier };
-}
 
 /** Print the CI-parsed summary. Line 1 is always the data stamp. */
 function printSummary(result: BacktestResult, feeTier: FeeTierLabel): void {
@@ -68,14 +23,16 @@ function printSummary(result: BacktestResult, feeTier: FeeTierLabel): void {
   console.log('Backtest Results:');
   console.log('=================');
   for (const p of Object.values(result.dataProvenance)) {
+    const agg = p.aggregation && p.aggregation.subBarsPerBucket > 1
+      ? ` aggregated=${p.aggregation.sourceMinutes}m→${p.aggregation.targetMinutes}m(src=${p.aggregation.sourceCandleCount},dropped=${p.aggregation.bucketsDropped})`
+      : '';
     console.log(
       `Data source ${p.symbol}: ${p.source} bars=${p.candleCount}/${p.expectedCount} ` +
-        `coverage=${(p.coverage * 100).toFixed(1)}% spacing=${p.inferredBarMinutes ?? 'n/a'}m` +
+        `coverage=${(p.coverage * 100).toFixed(1)}% spacing=${p.inferredBarMinutes ?? 'n/a'}m${agg}` +
         (p.source === 'synthetic' ? ' [SYNTHETIC — VOID]' : ''),
     );
   }
-  const spacing = Array.from(new Set(Object.values(result.dataProvenance).map((p) => p.inferredBarMinutes ?? 'n/a')));
-  console.log(`Bar timeframe: ${spacing.join(', ')} min (native stored bars)`);
+  console.log(`Bar timeframe: ${describeBarTimeframe(Object.values(result.dataProvenance))}`);
   console.log(`Venue: ${Object.entries(result.venueBySymbol).map(([s, v]) => `${s}=${v}`).join(', ')}`);
   if (result.fees.routing === 'flat-override') {
     console.log(`Fees: flat ${((result.fees.flatRate ?? 0) * 10_000).toFixed(2)} bps/side (--commission override; fee tier ${feeTier.name} ignored)`);
@@ -175,6 +132,21 @@ async function main() {
       describe: 'Minimum bars-loaded / bars-expected ratio per symbol before DATA_UNAVAILABLE (0 disables).',
       default: 0.5,
     })
+    .option('bar-minutes', {
+      type: 'number',
+      choices: [...SUPPORTED_BAR_MINUTES],
+      default: 15,
+      describe:
+        'Bar size the engine runs on (TASK_017 step 5 / E4 frequency lever). 15 = native stored bars. ' +
+        '60|240|1440 roll the stored 15m bars up UTC-aligned (OHLCV: first open, max high, min low, last close, summed volume). ' +
+        'Indicator periods stay in BARS of the chosen size (EMA(15) on 240m = 15 × 4H bars). ' +
+        'Partial buckets below --min-bucket-fill are dropped and counted in the report.',
+    })
+    .option('min-bucket-fill', {
+      type: 'number',
+      default: 0.5,
+      describe: 'With --bar-minutes > 15: min fraction of expected sub-bars a rolled-up bar must contain to be kept (1 = complete buckets only).',
+    })
     .option('venue', {
       type: 'string',
       choices: ['spot', 'perps'],
@@ -232,17 +204,12 @@ async function main() {
   // Fee tier → FeeModel. The tier only rewrites the coinbase.spot bucket;
   // perps buckets stay as configured in guardrails.yaml.
   const feeTier = resolveFeeTier(argv.feeTier ? String(argv.feeTier) : undefined, guardrails.fees.coinbase.spot);
-  const feeModel = new FeeModel({
-    ...guardrails.fees,
-    coinbase: {
-      ...guardrails.fees.coinbase,
-      spot: { maker_bps: feeTier.makerBps, taker_bps: feeTier.takerBps },
-    },
-  });
+  const feeModel = buildFeeModel(guardrails, feeTier);
 
   const evGateMode = String(argv.evGate) as EvGateMode;
   const venueOverride = argv.venue ? (String(argv.venue) as MarketVenue) : undefined;
   const allowSynthetic = Boolean(argv.allowSynthetic);
+  const barMinutes = Number(argv.barMinutes);
 
   logger.info('Starting backtest', {
     startDate: argv.startDate,
@@ -255,6 +222,7 @@ async function main() {
     venueOverride: venueOverride ?? 'per-symbol',
     evGateMode,
     regimeGates: argv.regimeGates,
+    barMinutes,
     allowSynthetic,
     fixtureDir,
     dataSource: fixtureDir ? 'fixture' : 'supabase',
@@ -272,138 +240,39 @@ async function main() {
 
   const runner = new BacktestRunner(runnerConfig, logger);
 
-  // Build per-symbol overrides snapshot the same way live trading does
-  // (signal-processor.loadPerSymbolOverridesFromGuardrails called twice in
-  // api/server.ts:1631-1644 — once for per_symbol, once for perps_symbols).
-  // Backtest then forwards this verbatim to the strategy registry.
+  // Engine config is assembled by the shared builder
+  // (backtesting/backtest-cli-config.ts) so `pnpm backtest` and the E4
+  // harness cannot drift: strategy toggles, guardrails kill lists,
+  // per-symbol overrides (per_symbol + perps_symbols, F4 follow-up §3/§8),
+  // equity-based sizing and the realism block all come from one place.
   //
-  // F4 follow-up (2026-05-19): same backtest/live drift class as #11 — the
-  // CLI previously read only `guardrails.per_symbol` and silently dropped
-  // `guardrails.perps_symbols.*.strategy_overrides`, so YAML-side perps
-  // momentum/trend_follow tuning was invisible to backtests while live
-  // honoured it. Mirror the live dual-call here so the backtest sees the
-  // same per-symbol config the engine uses in paper/live. See
-  // docs/research/2026-05-19_f4-followup-perps-action.md §3.
-  const perSymbolOverrides: PerSymbolStrategyOverrides = {};
-  for (const [symbol, cfg] of Object.entries(guardrails.per_symbol ?? {})) {
-    if (cfg.strategy_overrides) {
-      perSymbolOverrides[symbol] = cfg.strategy_overrides as Record<string, Record<string, unknown>>;
-    }
-  }
-  for (const [symbol, cfg] of Object.entries(guardrails.perps_symbols ?? {})) {
-    if (cfg.strategy_overrides) {
-      perSymbolOverrides[symbol] = cfg.strategy_overrides as Record<string, Record<string, unknown>>;
-    }
-  }
-
-  const initialCapital = Number(argv.initialCapital);
-
-  // #11 (2026-05-18): only set `commission` when the user passed
+  // #11 (2026-05-18): `commission` is only set when the user passed
   // `--commission` explicitly. When omitted, the engine routes per-fill
   // via `feeModel.getFeeRate(venue, marketForSymbol(symbol), 'taker')`
   // so mixed --products lists (spot + perps) charge the correct tier
   // per symbol — the bug that 402e757 fixed in the paper path.
-  const commissionOverride =
-    argv.commission !== undefined ? Number(argv.commission) : undefined;
-
-  // Configure backtest
-  const backtestConfig: BacktestConfig = {
-    startDate: new Date(String(argv.startDate)),
-    endDate: new Date(String(argv.endDate)),
-    initialCapital,
-    feeModel,
-    venue: 'coinbase',
-    ...(commissionOverride !== undefined ? { commission: commissionOverride } : {}),
-    // TASK_017 B2/B3: venue capability + EV gate + regime gate wiring.
-    venueOverride,
-    allowShort: guardrails.strategy.allow_short,
-    evGate: {
-      mode: evGateMode,
-      minEvThreshold: guardrails.risk.min_ev_threshold,
+  const backtestConfig = buildBacktestConfig(
+    {
+      startDate: new Date(String(argv.startDate)),
+      endDate: new Date(String(argv.endDate)),
+      initialCapital: Number(argv.initialCapital),
+      products: argv.products as string[],
+      strategy: String(argv.strategy),
+      feeModel,
+      commissionOverride: argv.commission !== undefined ? Number(argv.commission) : undefined,
+      venueOverride,
+      evGateMode,
+      regimeGates: String(argv.regimeGates) !== 'off',
+      slippageRate: argv.slippage !== undefined ? Number(argv.slippage) : undefined,
     },
-    regimeGates: String(argv.regimeGates) !== 'off',
-    products: argv.products as string[],
-    // Strategy parameters mirror atlas/config/guardrails.yaml. trend_follow
-    // is wired here too — defect #1: prior backtests silently dropped it.
-    signals: {
-      breakout: {
-        enabled: argv.strategy === 'breakout' || argv.strategy === 'all',
-        parameters: {
-          period: 20,
-          atrPeriod: 14,
-          atrMultiplier: 2,
-          volumeThreshold: 1.5,
-        },
-      },
-      vwapMeanReversion: {
-        enabled: argv.strategy === 'vwap' || argv.strategy === 'all',
-        parameters: {
-          deviationEntry: 2,
-          deviationExit: 0.5,
-          minVolume: 1000,
-        },
-      },
-      momentum: {
-        enabled: argv.strategy === 'momentum' || argv.strategy === 'all',
-        parameters: {
-          // strategy-tuning: was 55/40 — restored to canonical 70/30 to
-          // match the plugin schema and guardrails.yaml.
-          rsiPeriod: 10,
-          rsiOverbought: 70,
-          rsiOversold: 30,
-          macdFast: 8,
-          macdSlow: 21,
-          macdSignal: 5,
-        },
-      },
-      trendFollow: {
-        enabled: argv.strategy === 'trend_follow' || argv.strategy === 'all',
-        parameters: {},
-      },
-    },
-    risk: {
-      // Hard ceiling on per-position notional. Risk-based sizing is now
-      // primary; this is a guardrail, not the sizing function (defect #5).
-      maxPositionSize: initialCapital * guardrails.risk.max_position_exposure_pct,
-      // Total exposure = equity × max_account_leverage (matches live).
-      maxTotalExposure: initialCapital * guardrails.account.max_account_leverage,
-      stopLossPercent: 0.02, // fallback only; signals carry ATR-based stops
-      takeProfitPercent: 0.04, // fallback only; signals carry ATR-based TPs
-    },
-    account: {
-      equityUsd: initialCapital,
-      riskPerTrade: guardrails.account.risk_per_trade,
-      maxPositionExposurePct: guardrails.risk.max_position_exposure_pct,
-      minNotionalBuffer: guardrails.account.min_notional_buffer,
-    },
-    // Defect #2: honour the same kill list live uses.
-    disabledStrategies: guardrails.disabled_strategies,
-    // F4 follow-up §8 (2026-05-19): same shape as the live API server reads
-    // — flatten per-(symbol, strategy) disable from per_symbol /
-    // perps_symbols / hyperliquid_symbols blocks into a single map.
-    perSymbolDisabledStrategies: buildPerSymbolDisabledStrategies(guardrails),
-    // Defect #1: forward per-symbol parameter overrides so trend_follow on
-    // ETH-USD uses emaFast=12 / emaSlow=15, momentum on ETH uses rsi 10/40/55, etc.
-    perSymbolOverrides,
-    realism: {
-      ...(guardrails.backtest
-        ? {
-            nextBarFill: guardrails.backtest.next_bar_fill,
-            entrySlippageBps: guardrails.backtest.entry_slippage_bps,
-            stopOvershootBarRangePct: guardrails.backtest.stop_overshoot_bar_range_pct,
-            stopOvershootMinBps: guardrails.backtest.stop_overshoot_min_bps,
-            sizeDecimals: guardrails.backtest.size_decimals,
-          }
-        : {}),
-      // TASK_017 B5: `--slippage` (decimal) is now honoured — it overrides
-      // the guardrails bps when passed explicitly.
-      ...(argv.slippage !== undefined ? { entrySlippageBps: Number(argv.slippage) * 10_000 } : {}),
-    },
-  };
+    guardrails,
+  );
 
   const dataOptions = {
     allowSynthetic,
     minCoverage: Number(argv.minCoverage),
+    barMinutes,
+    minBucketFill: Number(argv.minBucketFill),
   };
 
   try {
@@ -444,6 +313,11 @@ async function main() {
         windowEnd: error.windowEnd.toISOString(),
         attempted: error.attempted,
       });
+      console.error(`\n${error.message}`);
+      process.exit(2);
+    }
+    if (isBarAggregationError(error)) {
+      logger.error('Backtest aborted: BAR_AGGREGATION_INVALID', { message: error.message, barMinutes });
       console.error(`\n${error.message}`);
       process.exit(2);
     }
