@@ -1,0 +1,30 @@
+-- =============================================================================
+-- RECONCILIATION STUB — version 20260910203857
+-- (name: revoke_authenticated_upsert_account_metrics)
+-- =============================================================================
+-- This file is intentionally a no-op. It exists ONLY so that the local
+-- supabase/migrations/ manifest matches `supabase_migrations.schema_migrations`
+-- on the linked project, which records this version as applied on 2026-09-10
+-- 20:38:57 UTC (MCP apply-time re-stamp of the #40 migration). Without a file
+-- here, `supabase db push` and Supabase Preview refuse to run ("Remote
+-- migration versions not found in local migrations directory").
+--
+-- What it is: the APPLY STAMP of 20260910203300. The TM-authorised MCP apply
+-- of `20260910203300_revoke_authenticated_upsert_account_metrics.sql` was
+-- recorded by the Supabase MCP `apply_migration` under its own apply-time
+-- version (203857) with the same name. Unlike the 180200/185138 and
+-- 180300/185148 pairs, the remote history holds ONLY 203857 for this DDL —
+-- 203300 is NOT recorded on the linked project. Verified read-only on
+-- 2026-09-10 ~20:41 UTC: the recorded `statements` of 20260910203857 are
+-- identical to the repo file for 20260910203300 after stripping comments and
+-- whitespace (md5 0044a6f4954fc95fcde9a13883ab7341 on both sides).
+--
+-- Source of truth for this DDL stays `20260910203300_*.sql`. DO NOT copy the
+-- SQL here: two live bodies for the same DDL would re-run it on every fresh
+-- chain (Supabase Preview). On prod the runner skips this version (already
+-- recorded); on a fresh chain it sorts after 20260910203300 and is a no-op.
+-- Version stamp MUST stay 20260910203857 to match the remote history; do not
+-- rename.
+-- =============================================================================
+
+SELECT 1;
