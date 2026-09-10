@@ -49,7 +49,7 @@ P. **HARD PREFLIGHT** — fee-book pass (40 bps/side, EV gate enforce, cooldown 
 1. **Zero-fee fail-fast** — commission 0, EV off. **PF < locked floor ⇒ STOP** (no fee-sensitivity, no GO MC). n < 10 ⇒ INCONCLUSIVE, also STOP.
 2. **FeeModel 40 expectancy** — stats from the preflight pass (PF, WR, payoff, mean/sd/t of $ and R, fees, max DD, exits, by symbol, 4 window-quarters by exit).
 3. **Monte Carlo** — month-block default on 4H (trade-block on 1D), seeded; net/meanR/PF/max-DD percentiles, P(net ≤ 0), **P(PF ≥ 1.20) screen (≥ 0.60 = screen met, not GO)**. Informational when preflight failed; not run after STOP.
-4. **Fee stress** — 25 / 75 / 120 bps per side, separate passes, own table. Not run after STOP.
+4. **Fee stress** — 25 / 75 / 120 bps per side, separate passes, own table. GO packaging: not run after STOP and **not run when the preflight E[n] gate failed** (AE: n < 100 ⇒ stop GO packaging; MC stays informational).
 
 ### Labels (derived) and Beta bars
 
