@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
 import { z } from 'zod';
 
@@ -118,7 +119,7 @@ const MetaFilterYamlSchema = z
 
 export type CoinDeskSentimentConfig = z.infer<typeof CoinDeskSentimentSchema>;
 
-const GuardrailsSchema = z.object({
+export const GuardrailsSchema = z.object({
   disabled_strategies: z.array(z.string()).optional().default([]),
   momentum: MomentumConfigSchema.optional(),
   account: z.object({
@@ -243,9 +244,69 @@ const GuardrailsSchema = z.object({
 
 export type GuardrailConfig = z.infer<typeof GuardrailsSchema>;
 
-export function loadGuardrails(atlasRoot: string): GuardrailConfig {
-  const guardrailPath = path.join(atlasRoot, 'config', 'guardrails.yaml');
-  const raw = fs.readFileSync(guardrailPath, 'utf8');
+/**
+ * Repo-relative location of the ONLY guardrails file the runtime reads.
+ * Everything else named `guardrails.yaml` in the tree must be a
+ * `DO_NOT_EDIT` pointer stub (enforced by `pnpm check:config`, see `config-drift.ts`).
+ */
+export const CANONICAL_GUARDRAILS_REPO_PATH = 'atlas/config/guardrails.yaml';
+
+/**
+ * Absolute path of the canonical guardrails file, resolved from this
+ * module's own location rather than `process.cwd()` or a caller-supplied
+ * root. `src/config/` and `dist/config/` sit at the same depth under
+ * `atlas/apps/core-node/`, so four levels up is `atlas/` for both the tsx
+ * and the compiled entrypoints.
+ */
+export function resolveCanonicalGuardrailsPath(): string {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  return path.resolve(here, '..', '..', '..', '..', 'config', 'guardrails.yaml');
+}
+
+/**
+ * Best-effort canonicalisation for path equality: resolves symlinks and, on
+ * Windows, drive-letter / directory casing. Falls back to `path.resolve`
+ * when the path does not exist so the caller can still report it.
+ */
+function canonicalisePath(p: string): string {
+  try {
+    return fs.realpathSync.native(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/**
+ * Load and validate the runtime guardrails.
+ *
+ * Always reads `atlas/config/guardrails.yaml` (see
+ * `resolveCanonicalGuardrailsPath`). The optional `atlasRoot` is accepted
+ * for backwards compatibility with call sites that derive it from
+ * `process.cwd()` or a `--config` flag; if it points anywhere other than
+ * the canonical file this throws instead of silently loading a second,
+ * possibly divergent, copy — historically `atlas/apps/core-node/config/
+ * guardrails.yaml` carried different limits from the real file.
+ *
+ * @param atlasRoot Optional `atlas/` directory a caller believes it is
+ *   running under. Must resolve to the canonical file when provided.
+ * @throws Error when `atlasRoot` disagrees with the canonical location, or
+ *   when the YAML fails schema validation (zod error).
+ */
+export function loadGuardrails(atlasRoot?: string): GuardrailConfig {
+  const canonicalPath = resolveCanonicalGuardrailsPath();
+
+  if (atlasRoot !== undefined) {
+    const requestedPath = path.resolve(atlasRoot, 'config', 'guardrails.yaml');
+    if (canonicalisePath(requestedPath) !== canonicalisePath(canonicalPath)) {
+      throw new Error(
+        `loadGuardrails: refusing to read ${requestedPath}. ` +
+        `The only runtime guardrails file is ${CANONICAL_GUARDRAILS_REPO_PATH} (${canonicalPath}); ` +
+        'fix the caller\'s atlasRoot / cwd instead of adding a second YAML.'
+      );
+    }
+  }
+
+  const raw = fs.readFileSync(canonicalPath, 'utf8');
   const parsed = YAML.parse(raw);
   return GuardrailsSchema.parse(parsed);
 }

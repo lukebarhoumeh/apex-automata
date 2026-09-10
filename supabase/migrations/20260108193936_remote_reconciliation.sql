@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS public.exchange_credentials (
 
 ALTER TABLE public.exchange_credentials ENABLE ROW LEVEL SECURITY;
 
+-- Fresh-replay guard (2026-09-10, Supabase Preview): 20251013180000 created
+-- exchange_credentials WITHOUT user_id, so the CREATE TABLE above is a no-op and
+-- the policies below fail on a from-scratch chain. Prod has user_id uuid NOT NULL
+-- (added out-of-band before this version was recorded). No-op where it exists.
+ALTER TABLE public.exchange_credentials ADD COLUMN IF NOT EXISTS user_id UUID NOT NULL;
+
 CREATE POLICY "Allow individual read access" ON public.exchange_credentials FOR SELECT USING (auth.uid() = user_id);
 CREATE POLICY "Allow individual insert access" ON public.exchange_credentials FOR INSERT WITH CHECK (auth.uid() = user_id);
 CREATE POLICY "Allow individual update access" ON public.exchange_credentials FOR UPDATE USING (auth.uid() = user_id);

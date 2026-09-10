@@ -1,139 +1,19 @@
-account:
-  equity_usd: 50000
-  risk_per_trade: 0.01
-  max_open_positions: 5
-  max_account_leverage: 3.0
-  min_notional_buffer: 1.1
-
-risk:
-  # 3% daily = $1,500 — allows 3 full-risk losing trades before kill switch
-  # Previous value (-0.008 = 0.8% = $400) was LESS than risk_per_trade (1% = $500),
-  # meaning a single losing trade triggered the kill switch.
-  daily_loss_limit: -0.03
-  # 6% weekly = $3,000 — 2x daily limit
-  weekly_loss_limit: -0.06
-  max_drawdown_limit: -0.1
-  max_position_exposure_pct: 0.5
-  funding_cost_tolerance_bps: 20
-  slippage_estimate_bps: 3
-
-# Per-symbol risk limits and strategy parameter overrides
-per_symbol:
-  BTC-USD:
-    max_notional_usd: 30000
-    max_daily_loss_usd: 750
-    strategy_overrides:
-      breakout:
-        atrMultiplier: 1.8
-        volumeThreshold: 1.0
-  ETH-USD:
-    max_notional_usd: 25000
-    max_daily_loss_usd: 600
-    strategy_overrides:
-      breakout:
-        atrMultiplier: 2.0
-        volumeThreshold: 1.1
-  SOL-USD:
-    max_notional_usd: 20000
-    max_daily_loss_usd: 500
-    strategy_overrides:
-      breakout:
-        atrMultiplier: 2.5
-        volumeThreshold: 1.3
-
-strategy:
-  mode: momentum_futures
-  donchian_len: 20
-  ema_len_1h: 100
-  atr_len_15m: 20
-  atr_entry_band:
-    - 0.0005  # Allow lower volatility entries
-    - 0.05    # Allow higher volatility entries
-  stop_init_atr: 1.5
-  stop_trail_atr: 1.0
-  time_stop_bars: 96
-  # IMPORTANT: allow_short is false because Coinbase spot markets do not support shorting.
-  # This is a PLATFORM LIMITATION, not a strategy choice.
-  # - Strategies may still generate 'sell' signals for analytics/backtesting
-  # - 'sell' on a long position = close position (valid)
-  # - 'sell' on flat position = no action (cannot open short on Coinbase spot)
-  # To enable shorting, use an exchange that supports margin/futures (e.g., Binance Futures, dYdX)
-  allow_short: false
-  # 15 min cooldown prevents rapid entry→exit churn that gets destroyed by fees.
-  # Was reduced to 5 but that caused 2-5 minute round-trips losing $370+ in fees alone.
-  trade_cooldown_min: 15
-
-execution:
-  order_type: marketable_limit
-  price_offset_ticks: 2
-  max_slippage_bps: 5
-  order_timeout_sec: 5
-  retry_backoff_ms:
-    - 100
-    - 500
-    - 1000
-    - 5000
-    - 30000
-
-circuit_breakers:
-  # 1.5% = $750 in 10 minutes — previous value (-0.003 = $150) was triggered by normal market moves
-  rapid_loss_trigger: -0.015
-  fill_rate_collapse: 0.1
-  adverse_selection_spike: 0.6
-  correlation_spike: 0.8
-  vol_spike_atr: 0.03
-  data_gap_sec: 30  # Increased from 2s - brief gaps are normal, only trigger on sustained outage
-
-filters:
-  atr_volatility_min: 0.0005  # Lowered to allow more trades (0.05% ATR)
-  atr_volatility_max: 0.05    # Raised to allow higher volatility
-  funding_bias_enabled: true
-  # Crypto trades 24/7 — no hour restriction needed
-  time_filter_enabled: false
-  allowed_hours_utc:
-    - 0
-    - 1
-    - 2
-    - 3
-    - 4
-    - 5
-    - 6
-    - 7
-    - 8
-    - 9
-    - 10
-    - 11
-    - 12
-    - 13
-    - 14
-    - 15
-    - 16
-    - 17
-    - 18
-    - 19
-    - 20
-    - 21
-    - 22
-    - 23
-
-compliance:
-  tax_method: FIFO
-  export_frequency_days: 7
-  log_level: INFO
-  audit_trail_enabled: true
-  flatten_on_shutdown: true
-
-ui:
-  heartbeat_sec: 15
-  show_pnl_per_symbol: true
-  show_risk_status: true
-  kill_switch_button: true
-  alert_channels:
-    - telegram
-    - email
-
-go_live_criteria:
-  paper_parity_max_diff_bps: 20
-  min_profitable_days: 3
-  max_error_count_per_day: 0
-  manual_approval_required: true
+# DO NOT EDIT — this file is NOT read by the runtime.
+#
+# The single source of truth for every risk limit, fee schedule, filter and
+# strategy parameter is:
+#
+#     atlas/config/guardrails.yaml
+#
+# `loadGuardrails()` (atlas/apps/core-node/src/config/loadGuardrails.ts)
+# resolves that path relative to its own module location and throws if a
+# caller points it anywhere else, so any value placed in this file is never
+# loaded. This stub exists only so that anyone landing here from an old
+# bookmark, grep hit or muscle memory is redirected instead of editing a
+# copy that silently diverges (which is exactly what this file used to be).
+#
+# CI: `pnpm check:config` (src/config/config-drift.ts) fails if this file
+# gains any runtime keys, and if any other guardrails.yaml appears in the
+# tree that is not a stub like this one.
+DO_NOT_EDIT: true
+canonical: atlas/config/guardrails.yaml

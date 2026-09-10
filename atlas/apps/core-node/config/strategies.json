@@ -1,53 +1,31 @@
 {
   "$schema": "./strategies.schema.json",
-  "description": "AtlasBot Strategy Configuration",
-  "version": "1.0.0",
-  
+  "description": "DEPRECATED — NOT READ BY THE RUNTIME. Strategy enable/disable state and every strategy parameter live ONLY in atlas/config/guardrails.yaml (disabled_strategies, momentum, per_symbol/perps_symbols/hyperliquid_symbols strategy_overrides). The `enabled` flags below are a mirror kept for anyone who still opens this file; `pnpm check:config` (atlas/apps/core-node/src/config/config-drift.ts) fails CI if they disagree with guardrails.yaml or if any parameter key is added here.",
+  "version": "2.0.0",
+
   "strategies": {
-    "breakout": {
-      "enabled": true,
-      "period": 20,
-      "atrPeriod": 14,
-      "atrMultiplier": 2.0,
-      "volumeThreshold": 1.1,
-      "targetMultiplier": 2.0,
-      "confirmWithClose": true
-    },
-    
-    "vwap_mr": {
-      "enabled": true,
-      "deviationEntry": 2.0,
-      "deviationExit": 0.0,
-      "minVolume": 0,
-      "stopMultiplier": 1.0,
-      "useBollinger": false,
-      "maxDeviation": 4.0
-    },
-    
     "momentum": {
-      "enabled": true,
-      "rsiPeriod": 14,
-      "rsiOverbought": 70,
-      "rsiOversold": 30,
-      "macdFast": 12,
-      "macdSlow": 26,
-      "macdSignal": 9,
-      "requireMacdConfirm": true,
-      "requireMacdCrossover": false,
-      "atrMultiplier": 2.0,
-      "targetMultiplier": 2.0
+      "enabled": true
+    },
+    "trend_follow": {
+      "enabled": true
+    },
+    "vwap_mr": {
+      "enabled": false
+    },
+    "breakout": {
+      "enabled": false
     }
   },
-  
+
   "registry": {
     "maxErrorsBeforeDisable": 5,
     "signalDedupeWindowMs": 300000
   },
-  
+
   "global": {
     "parallelExecution": false,
     "logSignals": true,
     "persistSignals": true
   }
 }
-

@@ -14,6 +14,7 @@
     "start:windows": "node start.cjs",
     "backend": "cd atlas/apps/core-node && pnpm api",
     "backend:build": "cd atlas/apps/core-node && pnpm build",
+    "check:config": "cd atlas/apps/core-node && pnpm check:config",
     "install:all": "pnpm install && cd atlas/apps/core-node && pnpm install"
   },
   "dependencies": {

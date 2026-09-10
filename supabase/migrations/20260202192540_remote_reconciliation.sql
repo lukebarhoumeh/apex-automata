@@ -3,6 +3,11 @@
 -- Captures DDL applied directly to prod via dashboard/Lovable IDE.
 
 -- Daily summary view with proper NUMERIC casts
+-- Fresh-replay guard (2026-09-10, Supabase Preview): on a from-scratch chain the
+-- view already exists from 20260202190000 with DOUBLE PRECISION columns, and
+-- CREATE OR REPLACE VIEW cannot change a column's type. On prod the earlier
+-- CREATE never took effect, so this was a fresh create there; mirror that.
+DROP VIEW IF EXISTS public.daily_trade_summary;
 CREATE OR REPLACE VIEW public.daily_trade_summary AS
 SELECT
   user_id,
