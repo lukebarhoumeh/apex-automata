@@ -50,6 +50,12 @@ export interface FeeTierLabel {
 
 export interface BacktestReportOptions {
   feeTier?: FeeTierLabel;
+  /**
+   * Suffix for the saved `backtest_<ts>[_<tag>].json` / `report_…` files.
+   * Multi-pass harnesses set this so two passes in the same second cannot
+   * overwrite each other (the timestamp alone is second-resolution).
+   */
+  fileTag?: string;
 }
 
 export class BacktestRunner {
@@ -140,17 +146,18 @@ export class BacktestRunner {
       // Ensure directory exists
       await fs.mkdir(this.config.resultsPath, { recursive: true });
 
-      // Generate filename with timestamp
+      // Filename = second-resolution timestamp [+ caller tag]; a collision
+      // guard appends -2, -3, … so back-to-back runs never overwrite.
       const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0];
-      const filename = `backtest_${timestamp}.json`;
-      const filepath = path.join(this.config.resultsPath, filename);
+      const tag = reportOptions.fileTag ? `_${reportOptions.fileTag.replace(/[^A-Za-z0-9_-]+/g, '-')}` : '';
+      const stem = await this.uniqueStem(`${timestamp}${tag}`);
+      const filepath = path.join(this.config.resultsPath, `backtest_${stem}.json`);
 
       // Save full results
       await fs.writeFile(filepath, JSON.stringify(result, null, 2));
 
       // Also save a summary report
-      const reportFilename = `report_${timestamp}.txt`;
-      const reportPath = path.join(this.config.resultsPath, reportFilename);
+      const reportPath = path.join(this.config.resultsPath, `report_${stem}.txt`);
 
       const report = this.generateReport(result, reportOptions);
       await fs.writeFile(reportPath, report);
@@ -161,6 +168,19 @@ export class BacktestRunner {
     } catch (error) {
       this.logger.error('Failed to save backtest results:', error);
       return null;
+    }
+  }
+
+  /** First `stem`, `stem-2`, `stem-3`, … whose `backtest_<stem>.json` does not exist yet. */
+  private async uniqueStem(base: string): Promise<string> {
+    let stem = base;
+    for (let i = 2; ; i++) {
+      try {
+        await fs.access(path.join(this.config.resultsPath, `backtest_${stem}.json`));
+        stem = `${base}-${i}`;
+      } catch {
+        return stem;
+      }
     }
   }
 

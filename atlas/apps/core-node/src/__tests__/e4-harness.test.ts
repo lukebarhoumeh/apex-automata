@@ -437,8 +437,39 @@ describe('E4 §7 — end-to-end on committed REAL fixtures (#47)', () => {
     expect(report.fee!.metrics.evGate).toMatchObject({ mode: 'enforce', evaluated: 3, rejected: 3 });
     expect(report.fee!.stats.n).toBe(0);
     expect(report.monteCarlo).toBeNull(); // no fee-pass trades to bootstrap
-    expect(report.fee!.saved?.jsonPath).toMatch(/backtest_.*\.json$/);
+    expect(report.fee!.saved?.jsonPath).toMatch(/backtest_.*_e4-4h-fee\.json$/);
+    expect(report.zeroFee!.saved?.jsonPath).toMatch(/backtest_.*_e4-4h-zero-fee\.json$/);
+    // Two passes in the same second must NOT overwrite each other's artefacts.
+    expect(report.zeroFee!.saved!.jsonPath).not.toBe(report.fee!.saved!.jsonPath);
+    expect(fs.existsSync(report.zeroFee!.saved!.jsonPath)).toBe(true);
+    expect(fs.existsSync(report.fee!.saved!.jsonPath)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(report.zeroFee!.saved!.jsonPath, 'utf8')).fees.routing).toBe('flat-override');
+    expect(JSON.parse(fs.readFileSync(report.fee!.saved!.jsonPath, 'utf8')).fees.routing).toBe('fee-model');
     expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('runner never overwrites a same-second run: collision guard appends -2, -3', async () => {
+    const resultsPath = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-e4-collide-'));
+    const runner = new BacktestRunner({ resultsPath, fixtureDir: FIXTURES_4H }, makeLogger());
+    const cfg = {
+      startDate: new Date('2026-08-01T00:00:00Z'), endDate: new Date('2026-09-01T00:00:00Z'), initialCapital: 1000, commission: 0,
+      products: ['BTC-USD'],
+      signals: {
+        breakout: { enabled: false, parameters: {} }, vwapMeanReversion: { enabled: false, parameters: {} },
+        momentum: { enabled: false, parameters: {} }, trendFollow: { enabled: true, parameters: {} },
+      },
+      risk: { maxPositionSize: 300, maxTotalExposure: 3000, stopLossPercent: 0.02, takeProfitPercent: 0.04 },
+      disabledStrategies: ['vwap_mr', 'breakout'], evGate: { mode: 'off' as const },
+    };
+    const paths = new Set<string>();
+    for (let i = 0; i < 3; i++) {
+      const { saved } = await runner.runBacktestDetailed(cfg, {}, { fileTag: 'same tag!' });
+      paths.add(saved!.jsonPath);
+      // 'same tag!' sanitizes to 'same-tag-'; same-second collisions get '-2', '-3'.
+      expect(saved!.jsonPath).toMatch(/_same-tag-(-\d+)?\.json$/);
+    }
+    expect(paths.size).toBe(3);
+    expect(fs.readdirSync(resultsPath).filter((f) => f.startsWith('backtest_')).length).toBe(3);
   });
 
   it('memoizeProvider loads each (product, window) once across passes', async () => {

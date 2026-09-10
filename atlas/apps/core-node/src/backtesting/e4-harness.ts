@@ -724,7 +724,10 @@ export async function runE4(
     guardrails,
   );
   const zeroFeeRun = await runner.runBacktestDetailed(
-    zeroFeeConfig, dataOptions, { feeTier: { name: 'zero-fee pass (commission 0)', makerBps: 0, takerBps: 0 } }, provider,
+    zeroFeeConfig,
+    dataOptions,
+    { feeTier: { name: 'zero-fee pass (commission 0)', makerBps: 0, takerBps: 0 }, fileTag: `e4-${request.tf}-zero-fee` },
+    provider,
   );
   const stamp = zeroFeeRun.result.dataStamp;
   const { label, line: labelLine } = deriveLabel(stamp, windowDays, request.minFullWindowDays);
@@ -749,7 +752,9 @@ export async function runE4(
       { ...baseInput, feeModel, evGateMode: request.evGateMode },
       guardrails,
     );
-    const feeRun = await runner.runBacktestDetailed(feeConfig, dataOptions, { feeTier: request.feeTier }, provider);
+    const feeRun = await runner.runBacktestDetailed(
+      feeConfig, dataOptions, { feeTier: request.feeTier, fileTag: `e4-${request.tf}-fee` }, provider,
+    );
     const summary = summarizePass(feeRun.result, feeRun.saved);
     const quarters = computeWindowQuarters(feeRun.result.trades, request.startDate, request.endDate);
     fee = {
