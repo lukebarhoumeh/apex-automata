@@ -40,12 +40,20 @@ import {
 } from '../exchanges/coinbase/advanced-trade-user-stream';
 import {
   CoinbaseAdvancedExecutionAdapter,
+  FILL_ADJUSTMENT_SEEN,
+  INVALID_ORDER_METADATA,
   LIVE_PRODUCT_UNAVAILABLE,
   LiveProductSpec,
+  ORDER_STATE_UNKNOWN,
+  PROTECTION_UNSUPPORTED,
+  SUBMIT_UNCONFIRMED,
   toLiveProductSpec,
 } from '../trading/execution/coinbase-advanced-adapter';
 import {
   createAdapters,
+  assertLiveExecutionPathWired,
+  ENGINE_LIVE_EXECUTION_WIRED,
+  LIVE_EXECUTION_PATH_NOT_WIRED,
   LIVE_REQUIRES_ADVANCED_TRADE,
   LIVE_CREDENTIALS_MISSING,
   parseEnvConfig,
@@ -154,8 +162,11 @@ function createMockFetch() {
     fetchImpl,
     calls,
     on(method: string, pathOrPrefix: string, handler: Route) {
+      // GET routes prefix-match (ids in the path); POST routes match exactly so
+      // `/orders` never swallows `/orders/batch_cancel` or `/orders/preview`.
       routes.unshift({
-        match: (c) => c.method === method && (c.path === pathOrPrefix || c.path.startsWith(`${pathOrPrefix}/`)),
+        match: (c) =>
+          c.method === method && (c.path === pathOrPrefix || (method === 'GET' && c.path.startsWith(`${pathOrPrefix}/`))),
         handler,
       });
     },
@@ -326,6 +337,23 @@ describe('AdvancedTradeRestClient — JWT (spec-exact)', () => {
     expect(() => loadAdvancedTradeAuth(KEY_NAME, ed)).toThrow(/P-256/);
     expect(() => loadAdvancedTradeAuth(KEY_NAME, 'not a pem')).toThrow(/PEM/);
     expect(() => new AdvancedTradeRestClient({ apiKey: 'bad', apiSecret: PRIVATE_PEM, environment: 'production' }, createLogger())).toThrow();
+  });
+
+  it('uses the sandbox host in the uri claim when environment=sandbox', async () => {
+    const mock = createMockFetch();
+    mock.on('GET', '/api/v3/brokerage/key_permissions', () => ({ status: 200, body: { can_view: true, can_trade: true, can_transfer: false, portfolio_uuid: 'p', portfolio_type: 'DEFAULT' } }));
+    const client = makeClient(mock, createLogger(), { environment: 'sandbox' });
+    await client.getKeyPermissions();
+    expect(mock.calls[0].url.startsWith('https://api-sandbox.coinbase.com/')).toBe(true);
+    const { claims } = decodeJwt(mock.calls[0].headers.Authorization.slice('Bearer '.length));
+    expect(claims.uri).toBe('GET api-sandbox.coinbase.com/api/v3/brokerage/key_permissions');
+  });
+
+  it('getClockSkewSeconds throws on an unusable server-time body instead of returning NaN', async () => {
+    const mock = createMockFetch();
+    mock.on('GET', '/api/v3/brokerage/time', () => ({ status: 200, body: { iso: 'x' } }));
+    const client = makeClient(mock, createLogger());
+    await expect(client.getClockSkewSeconds()).rejects.toThrow(/unparseable/);
   });
 
   it('does not attach Authorization to public endpoints', async () => {
@@ -671,7 +699,7 @@ describe('CoinbaseAdvancedExecutionAdapter — order placement', () => {
     expect(events.map((e) => e.type)).toEqual(['order_rejected', 'order_accepted']);
   });
 
-  it('maps market buys (base_size or quoteSize metadata), stop orders and attached brackets to Advanced Trade shapes', async () => {
+  it('maps market buys (base_size or quoteSize metadata) and stop orders; prices round side-conservatively', async () => {
     mock.on('POST', '/api/v3/brokerage/orders', (call) => ({
       status: 200,
       body: { success: true, success_response: { order_id: `ex-${call.body.client_order_id}`, client_order_id: call.body.client_order_id } },
@@ -681,27 +709,99 @@ describe('CoinbaseAdvancedExecutionAdapter — order placement', () => {
     await adapter.placeOrder({ clientOrderId: 'm1', symbol: 'ETH-USD', side: 'buy', type: 'market', quantity: 0.01 });
     await adapter.placeOrder({ clientOrderId: 'm2', symbol: 'ETH-USD', side: 'buy', type: 'market', quantity: 0.01, metadata: { quoteSize: '25.999' } });
     await adapter.placeOrder({ clientOrderId: 's1', symbol: 'ETH-USD', side: 'sell', type: 'stop', quantity: 0.5, price: 1900.004, stopPrice: 1910.006 });
+    await adapter.placeOrder({ clientOrderId: 'l-sell', symbol: 'ETH-USD', side: 'sell', type: 'limit', quantity: 0.5, price: 2469.551 });
+
+    const [m1, m2, s1, lSell] = mock.calls.map((c) => c.body);
+    expect(m1.order_configuration).toEqual({ market_market_ioc: { base_size: '0.01000000' } });
+    expect(m2.order_configuration).toEqual({ market_market_ioc: { quote_size: '25.99' } });
+    expect(s1.side).toBe('SELL');
+    // Sell: limit price rounds UP (never receive less), stop trigger rounds UP (triggers no later).
+    expect(s1.order_configuration).toEqual({
+      stop_limit_stop_limit_gtc: { base_size: '0.50000000', limit_price: '1900.01', stop_price: '1910.01', stop_direction: 'STOP_DIRECTION_STOP_DOWN' },
+    });
+    expect(lSell.order_configuration).toEqual({ limit_limit_gtc: { base_size: '0.50000000', limit_price: '2469.56', post_only: false } });
+    expect(events.filter((e) => e.type === 'order_accepted')).toHaveLength(4);
+  });
+
+  it('rejects metadata.protection locally while attached brackets are disabled (default) — zero HTTP', async () => {
     await adapter.placeOrder({
+      clientOrderId: 'b0',
+      symbol: 'ETH-USD',
+      side: 'buy',
+      type: 'limit',
+      quantity: 0.5,
+      price: 2000,
+      metadata: { protection: { takeProfit: 2200, stopTrigger: 1900 } },
+    });
+    expect(mock.calls).toHaveLength(0);
+    expect(events).toEqual([expect.objectContaining({ type: 'order_rejected', clientOrderId: 'b0', code: PROTECTION_UNSUPPORTED })]);
+  });
+
+  it('with attached protection enabled: sends trigger_bracket_gtc (no base_size) and tracks the child so its exit fills are surfaced', async () => {
+    const bracketAdapter = new CoinbaseAdvancedExecutionAdapter({
+      logger,
+      client: makeClient(mock, logger, { maxRetries: 0 }),
+      symbols: ['ETH-USD'],
+      productSpecs: { 'ETH-USD': ETH_SPEC },
+      userStream: null,
+      fillPollIntervalMs: 60_000,
+      enableAttachedProtection: true,
+    });
+    const bracketEvents: BrokerOrderEvent[] = [];
+    bracketAdapter.onEvent((e) => bracketEvents.push(e));
+    await bracketAdapter.start();
+    mock.on('POST', '/api/v3/brokerage/orders', (call) => ({
+      status: 200,
+      body: { success: true, success_response: { order_id: 'ex-b1', client_order_id: call.body.client_order_id, attached_order_id: 'ex-b1-child' } },
+    }));
+
+    await bracketAdapter.placeOrder({
       clientOrderId: 'b1',
       symbol: 'ETH-USD',
       side: 'buy',
       type: 'limit',
       quantity: 0.5,
       price: 2000,
-      metadata: { protection: { takeProfit: 2200.004, stopTrigger: 1900.006 } },
+      metadata: { protection: { takeProfit: 2200.004, stopTrigger: 1900.004 } },
     });
 
-    const [m1, m2, s1, b1] = mock.calls.map((c) => c.body);
-    expect(m1.order_configuration).toEqual({ market_market_ioc: { base_size: '0.01000000' } });
-    expect(m2.order_configuration).toEqual({ market_market_ioc: { quote_size: '25.99' } });
-    expect(s1.side).toBe('SELL');
-    expect(s1.order_configuration).toEqual({
-      stop_limit_stop_limit_gtc: { base_size: '0.50000000', limit_price: '1900.00', stop_price: '1910.01', stop_direction: 'STOP_DIRECTION_STOP_DOWN' },
-    });
+    const b1 = mock.calls[0].body;
     expect(b1.order_configuration).toEqual({ limit_limit_gtc: { base_size: '0.50000000', limit_price: '2000.00', post_only: false } });
+    // Exit is a SELL: TP rounds down (fills no later), stop trigger rounds up (triggers no later).
     expect(b1.attached_order_configuration).toEqual({ trigger_bracket_gtc: { limit_price: '2200.00', stop_trigger_price: '1900.01' } });
     expect(b1.attached_order_configuration.trigger_bracket_gtc.base_size).toBeUndefined();
-    expect(events.filter((e) => e.type === 'order_accepted')).toHaveLength(4);
+    expect(bracketEvents.map((e) => [e.type, e.clientOrderId])).toEqual([
+      ['order_accepted', 'b1'],
+      ['order_accepted', 'b1:protection'],
+    ]);
+
+    // The bracket child fills (position exit) — routed under the derived client id, not dropped.
+    bracketAdapter.handleUserOrderUpdate({
+      orderId: 'ex-b1-child', clientOrderId: 'cb-generated', productId: 'ETH-USD', status: 'FILLED', side: 'sell', orderType: 'Stop Limit',
+      cumulativeQuantity: '0.5', leavesQuantity: '0', avgPrice: '1899.50', totalFees: '1.14', postOnly: false,
+      creationTime: '', eventType: 'update', sequenceNum: 2, timestamp: '2026-09-10T18:10:00Z', raw: {},
+    });
+    const exit = bracketEvents.find((e): e is FillEvent => e.type === 'fill');
+    expect(exit).toMatchObject({ clientOrderId: 'b1:protection', exchangeOrderId: 'ex-b1-child', size: 0.5, price: 1899.5, fee: 1.14 });
+    await bracketAdapter.stop();
+  });
+
+  it('rejects malformed metadata locally instead of throwing (adapter contract)', async () => {
+    await adapter.placeOrder({ clientOrderId: 'bad-q', symbol: 'ETH-USD', side: 'buy', type: 'market', quantity: 0.01, metadata: { quoteSize: 'abc' } });
+    expect(mock.calls).toHaveLength(0);
+    expect(events).toEqual([expect.objectContaining({ type: 'order_rejected', clientOrderId: 'bad-q', code: INVALID_ORDER_METADATA })]);
+  });
+
+  it('ignores a duplicate placeOrder while the same clientOrderId is in flight (single POST)', async () => {
+    let resolvePost!: (value: MockResponse) => void;
+    mock.on('POST', '/api/v3/brokerage/orders', () => new Promise<MockResponse>((resolve) => { resolvePost = resolve; }));
+    const first = adapter.placeOrder(LIMIT_REQUEST);
+    await vi.waitFor(() => expect(mock.calls).toHaveLength(1));
+    await adapter.placeOrder(LIMIT_REQUEST); // duplicate while in flight → no-op
+    expect(mock.calls).toHaveLength(1);
+    resolvePost({ status: 200, body: { success: true, success_response: { order_id: 'ex-1', client_order_id: 'c-1' } } });
+    await first;
+    expect(events.map((e) => e.type)).toEqual(['order_accepted']);
   });
 
   it('guards spot sells against the available base balance when a lookup is wired', async () => {
@@ -924,6 +1024,234 @@ describe('CoinbaseAdvancedExecutionAdapter — fills, cancels, reconciliation', 
       expect.objectContaining({ tradeId: 'tr-7', orderId: 'ex-1', clientOrderId: 'c-1', symbol: 'ETH-USD', side: 'sell', fee: 0.42, feeCurrency: 'USD', liquidity: 'maker', price: 2000, size: 0.4 }),
     ]);
     expect(mock.calls.at(-1)?.query.get('start_sequence_timestamp')).toBe(new Date(since).toISOString());
+  });
+});
+
+describe('CoinbaseAdvancedExecutionAdapter — unknown submit outcome, settlement, quote-sized fills', () => {
+  let mock: ReturnType<typeof createMockFetch>;
+  let logger: ReturnType<typeof createLogger>;
+  let adapter: CoinbaseAdvancedExecutionAdapter;
+  let events: BrokerOrderEvent[];
+
+  function build(extra: Partial<ConstructorParameters<typeof CoinbaseAdvancedExecutionAdapter>[0]> = {}) {
+    const built = new CoinbaseAdvancedExecutionAdapter({
+      logger,
+      client: makeClient(mock, logger, { maxRetries: 0 }),
+      symbols: ['ETH-USD'],
+      productSpecs: { 'ETH-USD': ETH_SPEC },
+      userStream: null,
+      fillPollIntervalMs: 5_000,
+      placeOrderTransportRetries: 1,
+      ...extra,
+    });
+    built.onEvent((e) => events.push(e));
+    return built;
+  }
+
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    mock = createMockFetch();
+    logger = createLogger();
+    events = [];
+    adapter = build();
+    await adapter.start();
+  });
+
+  afterEach(async () => {
+    await adapter.stop();
+    vi.useRealTimers();
+  });
+
+  it('transport failure on every attempt ⇒ NO order_rejected; REST finds the order by client_order_id and recovers it (accepted + fills)', async () => {
+    mock.on('POST', '/api/v3/brokerage/orders', async () => {
+      throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    });
+    await adapter.placeOrder({ ...LIMIT_REQUEST, clientOrderId: 'c-unk' });
+
+    expect(mock.calls.filter((c) => c.method === 'POST')).toHaveLength(2); // 1 + 1 retry, identical client_order_id
+    expect(new Set(mock.calls.map((c) => c.body.client_order_id))).toEqual(new Set(['c-unk']));
+    expect(events).toEqual([]); // outcome unknown → nothing emitted yet
+    expect(adapter.getHealth()).toMatchObject({ degraded: true, reasonCodes: expect.arrayContaining([ORDER_STATE_UNKNOWN]), pendingOrderCount: 1 });
+
+    // The order DID reach Coinbase. REST lists it with our client_order_id.
+    mock.on('GET', '/api/v3/brokerage/orders/historical/batch', (call) => {
+      if (call.query.getAll('product_ids').includes('ETH-USD') && call.query.get('start_date')) {
+        return { status: 200, body: { orders: [atOrder({ order_id: 'ex-unk', client_order_id: 'c-unk', status: 'FILLED', filled_size: '1', average_filled_price: '2000', total_fees: '2' })], has_next: false, cursor: '' } };
+      }
+      return { status: 200, body: { orders: [atOrder({ order_id: 'ex-unk', client_order_id: 'c-unk', status: 'FILLED', filled_size: '1', average_filled_price: '2000', total_fees: '2' })], has_next: false, cursor: '' } };
+    });
+    mock.on('GET', '/api/v3/brokerage/orders/historical/fills', () => ({
+      status: 200,
+      body: { fills: [atFill({ trade_id: 't-unk', order_id: 'ex-unk', size: '1', price: '2000', commission: '2' })], cursor: '' },
+    }));
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(events.map((e) => e.type)).toEqual(['order_accepted', 'fill']);
+    expect(events[0]).toMatchObject({ clientOrderId: 'c-unk', exchangeOrderId: 'ex-unk' });
+    expect(events[1]).toMatchObject({ clientOrderId: 'c-unk', tradeId: 't-unk', size: 1, fee: 2 });
+    expect(adapter.getHealth().reasonCodes).not.toContain(ORDER_STATE_UNKNOWN);
+    const lookup = mock.calls.find((c) => c.path.endsWith('/historical/batch') && c.query.get('start_date'));
+    expect(lookup?.query.getAll('product_ids')).toEqual(['ETH-USD']);
+    expect(events.some((e) => e.type === 'order_rejected')).toBe(false);
+  });
+
+  it('unknown submit that the exchange never received ⇒ order_rejected(SUBMIT_UNCONFIRMED) only after 3 REST misses', async () => {
+    mock.on('POST', '/api/v3/brokerage/orders', async () => {
+      throw Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' });
+    });
+    mock.on('GET', '/api/v3/brokerage/orders/historical/batch', () => ({ status: 200, body: { orders: [], has_next: false, cursor: '' } }));
+    await adapter.placeOrder({ ...LIMIT_REQUEST, clientOrderId: 'c-ghost' });
+    expect(events).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(events).toEqual([]); // 2 misses: still unresolved
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(events).toEqual([expect.objectContaining({ type: 'order_rejected', clientOrderId: 'c-ghost', code: SUBMIT_UNCONFIRMED })]);
+    expect(adapter.getHealth().pendingOrderCount).toBe(0);
+  });
+
+  it('body-read failure after a delivered POST is an unknown outcome (network error), not a rejection', async () => {
+    const fetchImpl: FetchLike = async () => ({
+      status: 200,
+      ok: true,
+      headers: { get: () => null },
+      text: async () => {
+        throw new Error('terminated');
+      },
+    });
+    const brokenClient = new AdvancedTradeRestClient({ apiKey: KEY_NAME, apiSecret: PRIVATE_PEM, environment: 'production', fetchImpl, maxRetries: 0 }, logger);
+    await expect(brokenClient.createOrderRaw({ client_order_id: 'x', product_id: 'ETH-USD', side: 'BUY', order_configuration: {} })).rejects.toBeInstanceOf(CoinbaseNetworkError);
+
+    const brokenAdapter = build({ client: brokenClient, placeOrderTransportRetries: 0 });
+    await brokenAdapter.start();
+    await brokenAdapter.placeOrder({ ...LIMIT_REQUEST, clientOrderId: 'c-body' });
+    expect(events).toEqual([]); // unknown, resolved via REST — never a definitive reject
+    expect(brokenAdapter.getHealth().reasonCodes).toContain(ORDER_STATE_UNKNOWN);
+    await brokenAdapter.stop();
+  });
+
+  it('a refusal before processing (401) is rejected immediately with the exchange code', async () => {
+    mock.on('POST', '/api/v3/brokerage/orders', () => ({ status: 401, body: { error: 'UNAUTHENTICATED', message: 'bad jwt' } }));
+    await adapter.placeOrder({ ...LIMIT_REQUEST, clientOrderId: 'c-401' });
+    expect(events).toEqual([expect.objectContaining({ type: 'order_rejected', clientOrderId: 'c-401', code: 'UNAUTHENTICATED' })]);
+    expect(adapter.getHealth().pendingOrderCount).toBe(0);
+  });
+
+  it('confirmed cancel keeps reconciling until REST filled_size matches — a fill that landed just before the cancel is surfaced', async () => {
+    mock.on('POST', '/api/v3/brokerage/orders', (call) => ({
+      status: 200,
+      body: { success: true, success_response: { order_id: 'ex-c', client_order_id: call.body.client_order_id } },
+    }));
+    mock.on('POST', '/api/v3/brokerage/orders/batch_cancel', () => ({ status: 200, body: { results: [{ success: true, order_id: 'ex-c' }] } }));
+    await adapter.placeOrder({ ...LIMIT_REQUEST, clientOrderId: 'c-c' });
+    await adapter.cancelOrder('c-c');
+    expect(events.map((e) => e.type)).toEqual(['order_accepted', 'order_canceled']);
+
+    // Exchange truth: 0.3 filled before the cancel took effect.
+    mock.on('GET', '/api/v3/brokerage/orders/historical/fills', () => ({
+      status: 200,
+      body: { fills: [atFill({ trade_id: 't-pre', order_id: 'ex-c', size: '0.3', price: '2000', commission: '0.6' })], cursor: '' },
+    }));
+    mock.on('GET', '/api/v3/brokerage/orders/historical/batch', () => ({
+      status: 200,
+      body: { orders: [atOrder({ order_id: 'ex-c', client_order_id: 'c-c', status: 'CANCELLED', filled_size: '0.3', total_fees: '0.6' })], has_next: false, cursor: '' },
+    }));
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(events.map((e) => e.type)).toEqual(['order_accepted', 'order_canceled', 'fill']);
+    expect(events[2]).toMatchObject({ clientOrderId: 'c-c', tradeId: 't-pre', size: 0.3, fee: 0.6 });
+
+    // Settled: no further polling traffic for this order.
+    const before = mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(mock.calls.length).toBe(before);
+  });
+
+  it('converts size_in_quote fills to base quantity (poll and getFillsSince)', async () => {
+    mock.on('POST', '/api/v3/brokerage/orders', (call) => ({
+      status: 200,
+      body: { success: true, success_response: { order_id: 'ex-q', client_order_id: call.body.client_order_id } },
+    }));
+    await adapter.placeOrder({ clientOrderId: 'c-q', symbol: 'ETH-USD', side: 'buy', type: 'market', quantity: 0.01, metadata: { quoteSize: '25' } });
+    mock.on('GET', '/api/v3/brokerage/orders/historical/fills', () => ({
+      status: 200,
+      body: { fills: [atFill({ trade_id: 't-q', order_id: 'ex-q', size: '25', price: '2500', commission: '0.30', size_in_quote: true })], cursor: '' },
+    }));
+    mock.on('GET', '/api/v3/brokerage/orders/historical/batch', () => ({
+      status: 200,
+      body: { orders: [atOrder({ order_id: 'ex-q', client_order_id: 'c-q', status: 'FILLED', filled_size: '0.01', size_in_quote: true })], has_next: false, cursor: '' },
+    }));
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const fill = events.find((e): e is FillEvent => e.type === 'fill');
+    expect(fill).toMatchObject({ clientOrderId: 'c-q', tradeId: 't-q', size: 0.01, price: 2500, fee: 0.3 }); // 25 USD / 2500 = 0.01 ETH, not 25
+    const records = await adapter.getFillsSince(0);
+    expect(records[0]).toMatchObject({ tradeId: 't-q', size: 0.01 });
+    expect(adapter.getHealth().pendingOrderCount).toBe(0);
+  });
+
+  it('REVERSAL fills mark health FILL_ADJUSTMENT_SEEN and defer to order truth', async () => {
+    mock.on('POST', '/api/v3/brokerage/orders', (call) => ({
+      status: 200,
+      body: { success: true, success_response: { order_id: 'ex-r', client_order_id: call.body.client_order_id } },
+    }));
+    await adapter.placeOrder({ ...LIMIT_REQUEST, clientOrderId: 'c-r' });
+    mock.on('GET', '/api/v3/brokerage/orders/historical/fills', () => ({
+      status: 200,
+      body: { fills: [atFill({ trade_id: 't-r1', order_id: 'ex-r', size: '1', price: '2000', commission: '2' }), atFill({ trade_id: 't-r2', order_id: 'ex-r', size: '0.4', trade_type: 'REVERSAL' })], cursor: '' },
+    }));
+    mock.on('GET', '/api/v3/brokerage/orders/historical/batch', () => ({
+      status: 200,
+      body: { orders: [atOrder({ order_id: 'ex-r', client_order_id: 'c-r', status: 'FILLED', filled_size: '1', total_fees: '2' })], has_next: false, cursor: '' },
+    }));
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(events.filter((e) => e.type === 'fill')).toHaveLength(1);
+    expect(adapter.getHealth().reasonCodes).toContain(FILL_ADJUSTMENT_SEEN);
+    expect(logger.error).toHaveBeenCalledWith('Fill adjustment received — REST fill sum no longer authoritative', expect.objectContaining({ tradeType: 'REVERSAL' }));
+  });
+
+  it('cancelAllOrders is scoped to the adapter symbols and emits only for tracked orders', async () => {
+    mock.on('POST', '/api/v3/brokerage/orders', (call) => ({
+      status: 200,
+      body: { success: true, success_response: { order_id: 'ex-1', client_order_id: call.body.client_order_id } },
+    }));
+    await adapter.placeOrder(LIMIT_REQUEST);
+    mock.on('GET', '/api/v3/brokerage/orders/historical/batch', () => ({
+      status: 200,
+      body: { orders: [atOrder({ order_id: 'ex-foreign', client_order_id: 'someone-else' })], has_next: false, cursor: '' },
+    }));
+    mock.on('POST', '/api/v3/brokerage/orders/batch_cancel', (call) => ({
+      status: 200,
+      body: { results: call.body.order_ids.map((id: string) => ({ order_id: id, success: true })) },
+    }));
+    await adapter.cancelAllOrders();
+    const listing = mock.calls.find((c) => c.path.endsWith('/historical/batch'));
+    expect(listing?.query.getAll('product_ids')).toEqual(['ETH-USD']); // never the whole account
+    expect(events.filter((e) => e.type === 'order_canceled').map((e) => e.clientOrderId)).toEqual(['c-1']);
+  });
+
+  it('stop() cancels non-terminal tracked orders (confirmed) but never protection children', async () => {
+    const bracketAdapter = build({ enableAttachedProtection: true, fillPollIntervalMs: 60_000 });
+    await bracketAdapter.start();
+    mock.on('POST', '/api/v3/brokerage/orders', (call) => ({
+      status: 200,
+      body: { success: true, success_response: { order_id: `ex-${call.body.client_order_id}`, client_order_id: call.body.client_order_id, ...(call.body.attached_order_configuration ? { attached_order_id: `ex-${call.body.client_order_id}-child` } : {}) } },
+    }));
+    await bracketAdapter.placeOrder({ ...LIMIT_REQUEST, clientOrderId: 'resting' });
+    await bracketAdapter.placeOrder({ ...LIMIT_REQUEST, clientOrderId: 'entry', metadata: { protection: { takeProfit: 2200, stopTrigger: 1900 } } });
+    mock.on('POST', '/api/v3/brokerage/orders/batch_cancel', (call) => ({
+      status: 200,
+      body: { results: call.body.order_ids.map((id: string) => ({ order_id: id, success: true })) },
+    }));
+
+    await bracketAdapter.stop();
+
+    const cancel = mock.calls.find((c) => c.path.endsWith('/batch_cancel'));
+    expect(cancel?.body.order_ids.sort()).toEqual(['ex-entry', 'ex-resting']); // child ex-entry-child left resting
+    expect(events.filter((e) => e.type === 'order_canceled').map((e) => e.clientOrderId).sort()).toEqual(['entry', 'resting']);
+    expect(logger.warn).toHaveBeenCalledWith('stop(): leaving exchange-side protection orders resting (not cancelled)', expect.anything());
   });
 });
 
@@ -1245,6 +1573,11 @@ describe('createAdapters — live fails closed without Advanced Trade', () => {
       logger,
     );
     expect(executionAdapter).toBeInstanceOf(PaperExecutionAdapter);
+  });
+
+  it('refuses live while the engine order path is not wired through the factory (LIVE_EXECUTION_PATH_NOT_WIRED)', () => {
+    expect(ENGINE_LIVE_EXECUTION_WIRED).toBe(false);
+    expect(() => assertLiveExecutionPathWired()).toThrow(new RegExp(LIVE_EXECUTION_PATH_NOT_WIRED));
   });
 
   it('parseEnvConfig picks up COINBASE_API_VERSION', () => {

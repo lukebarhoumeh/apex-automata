@@ -507,6 +507,8 @@ const GRANULARITY_MAP: Record<number, string> = {
 export class AdvancedTradeRestClient {
   private readonly logger: Logger;
   private readonly baseUrl: string;
+  /** Host used in the JWT `uri` claim — must match the host the request is sent to. */
+  private readonly host: string;
   private readonly fetchImpl: FetchLike;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
@@ -517,6 +519,7 @@ export class AdvancedTradeRestClient {
   constructor(config: AdvancedTradeConfig, logger: Logger) {
     this.logger = logger;
     this.baseUrl = config.environment === 'production' ? ADVANCED_TRADE_BASE_URL : ADVANCED_TRADE_SANDBOX_BASE_URL;
+    this.host = new URL(this.baseUrl).host;
     this.fetchImpl = config.fetchImpl ?? ((url, init) => globalThis.fetch(url, init) as Promise<FetchResponseLike>);
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxRetries = Math.max(0, config.maxRetries ?? DEFAULT_MAX_RETRIES);
@@ -545,10 +548,13 @@ export class AdvancedTradeRestClient {
     return this.request<AtServerTime>('GET', `${BROKERAGE}/time`, { auth: false });
   }
 
-  /** Clock skew between this host and Coinbase, in seconds (absolute). */
+  /** Clock skew between this host and Coinbase, in seconds (absolute). Throws if the server time is unusable. */
   public async getClockSkewSeconds(): Promise<number> {
     const time = await this.getServerTime();
-    const serverMs = time.epochMillis ? Number(time.epochMillis) : Number(time.epochSeconds) * 1000;
+    const serverMs = time?.epochMillis ? Number(time.epochMillis) : Number(time?.epochSeconds) * 1000;
+    if (!Number.isFinite(serverMs) || serverMs <= 0) {
+      throw new Error('Coinbase server time response was unparseable');
+    }
     return Math.abs(Date.now() - serverMs) / 1000;
   }
 
@@ -920,10 +926,11 @@ export class AdvancedTradeRestClient {
         'User-Agent': this.userAgent,
       };
       if (options.auth !== false && this.auth) {
-        headers.Authorization = `Bearer ${signAdvancedTradeJwt(this.auth, { method, path })}`;
+        headers.Authorization = `Bearer ${signAdvancedTradeJwt(this.auth, { method, path, host: this.host })}`;
       }
 
       let response: FetchResponseLike;
+      let text: string;
       try {
         response = await this.fetchImpl(url, {
           method,
@@ -931,6 +938,10 @@ export class AdvancedTradeRestClient {
           body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
           signal: AbortSignal.timeout(this.timeoutMs),
         });
+        // Reading the body can fail after the server has already processed the request
+        // (stream reset, abort). Surface that as a NETWORK error so callers treat the
+        // outcome as unknown rather than as a definitive rejection.
+        text = await response.text();
       } catch (error) {
         const netError = toNetworkError(error, path, method);
         if (idempotent && attempt < maxAttempts) {
@@ -948,7 +959,6 @@ export class AdvancedTradeRestClient {
         throw netError;
       }
 
-      const text = await response.text();
       let body: unknown = null;
       if (text) {
         try {

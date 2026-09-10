@@ -119,6 +119,23 @@ export function decimalMul(a: string | number, b: string | number): string {
   return formatDecimal({ units: da.units * db.units, scale: da.scale + db.scale });
 }
 
+/**
+ * a / b rendered with exactly `scale` fractional digits (truncated toward zero).
+ * Throws on division by zero.
+ */
+export function decimalDiv(a: string | number, b: string | number, scale = 12): string {
+  const da = parseDecimal(a);
+  const db = parseDecimal(b);
+  if (db.units === 0n) {
+    throw new Error('Division by zero');
+  }
+  // (a.units / 10^a.scale) / (b.units / 10^b.scale) * 10^scale
+  //   = a.units * 10^(scale + b.scale) / (b.units * 10^a.scale)
+  const numerator = da.units * 10n ** BigInt(scale + db.scale);
+  const denominator = db.units * 10n ** BigInt(da.scale);
+  return formatDecimal({ units: numerator / denominator, scale });
+}
+
 /** True when the decimal string is exactly zero. */
 export function decimalIsZero(value: string | number): boolean {
   return parseDecimal(value).units === 0n;

@@ -26,7 +26,7 @@ import { MetricsTracker } from '../trading/metrics-tracker';
 import { SecretManager } from '../config/secrets';
 import { AdvancedTradeRestClient, loadAdvancedTradeAuth } from '../exchanges/coinbase/advanced-trade-client';
 import { CoinbaseApiError } from '../exchanges/coinbase/http/errors';
-import { LIVE_REQUIRES_ADVANCED_TRADE, getMarketDataUrls } from '../trading/execution/adapter-factory';
+import { LIVE_REQUIRES_ADVANCED_TRADE, assertLiveExecutionPathWired, getMarketDataUrls } from '../trading/execution/adapter-factory';
 import { toLiveProductSpec } from '../trading/execution/coinbase-advanced-adapter';
 import { CoinbasePerpsAdapter } from '../exchanges/coinbase-perps-adapter';
 import { ExchangeRegistry } from '../exchanges/exchange-registry';
@@ -2430,6 +2430,14 @@ async function runLivePreflight(input: {
     };
   }
   
+  // Fail closed while the engine's order path is not routed through the Advanced Trade adapter
+  // (a "live" engine on the legacy HMAC client would run with a dead order path).
+  try {
+    assertLiveExecutionPathWired();
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error), warnings };
+  }
+  
   // Fail closed on credential SHAPE before touching the network (CDP key name + EC P-256 PEM).
   try {
     loadAdvancedTradeAuth(env.COINBASE_API_KEY, env.COINBASE_API_SECRET);
@@ -2513,21 +2521,27 @@ async function runLivePreflight(input: {
   }
   
   try {
-    // 1. Clock skew — JWTs carry a 120s nbf/exp window.
+    // 1. Clock skew — JWTs carry a 120s nbf/exp window. Unreadable server time is a FAIL
+    //    (Sprint 9 §2: skew is a fail-closed condition, so it must be measured, not assumed).
+    let skewSeconds: number;
     try {
-      const skewSeconds = await client.getClockSkewSeconds();
-      if (skewSeconds > 30) {
-        return {
-          ok: false,
-          error: `Live preflight failed: clock skew ${skewSeconds.toFixed(1)}s vs Coinbase exceeds 30s (JWTs would be rejected)`,
-          warnings,
-        };
-      }
-      if (skewSeconds > 5) {
-        warnings.push(`Clock skew ${skewSeconds.toFixed(1)}s vs Coinbase (JWT window is 120s)`);
-      }
+      skewSeconds = await client.getClockSkewSeconds();
     } catch (error) {
-      warnings.push(`Could not read Coinbase server time (${error instanceof Error ? error.message : String(error)})`);
+      return {
+        ok: false,
+        error: `Live preflight failed: could not measure clock skew against Coinbase (${error instanceof Error ? error.message : String(error)})`,
+        warnings,
+      };
+    }
+    if (!Number.isFinite(skewSeconds) || skewSeconds > 30) {
+      return {
+        ok: false,
+        error: `Live preflight failed: clock skew ${Number.isFinite(skewSeconds) ? skewSeconds.toFixed(1) : 'unknown'}s vs Coinbase exceeds 30s (JWTs would be rejected)`,
+        warnings,
+      };
+    }
+    if (skewSeconds > 5) {
+      warnings.push(`Clock skew ${skewSeconds.toFixed(1)}s vs Coinbase (JWT window is 120s)`);
     }
     
     // 2. Key permissions — the JWT must authenticate and the key must be allowed to trade.

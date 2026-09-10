@@ -6,6 +6,7 @@ import { describe, it, expect } from 'vitest';
 import {
   decimalAdd,
   decimalCompare,
+  decimalDiv,
   decimalIsPositive,
   decimalIsZero,
   decimalMul,
@@ -66,5 +67,13 @@ describe('decimal helpers', () => {
     expect(decimalIsPositive('0.000001')).toBe(true);
     expect(decimalScaleOf('0.001')).toBe(3);
     expect(decimalToNumber('0.6')).toBe(0.6);
+  });
+
+  it('divides exactly at a fixed scale (quote-sized fills → base quantity)', () => {
+    expect(decimalDiv('25', '2500', 8)).toBe('0.01000000');
+    expect(decimalDiv('25', '2469.55', 12)).toBe('0.010123301816');
+    expect(decimalDiv('1', '3', 6)).toBe('0.333333');
+    expect(decimalRoundToIncrement(decimalDiv('25', '2469.55', 12), '0.00000001', 'nearest')).toBe('0.01012330');
+    expect(() => decimalDiv('1', '0')).toThrow(/zero/);
   });
 });

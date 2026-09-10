@@ -40,6 +40,31 @@ import {
 export const LIVE_REQUIRES_ADVANCED_TRADE = 'LIVE_REQUIRES_ADVANCED_TRADE';
 /** Error code thrown when live mode is requested without credentials. */
 export const LIVE_CREDENTIALS_MISSING = 'LIVE_CREDENTIALS_MISSING';
+/** Error code thrown while the engine's live order path is not yet routed through this factory. */
+export const LIVE_EXECUTION_PATH_NOT_WIRED = 'LIVE_EXECUTION_PATH_NOT_WIRED';
+
+/**
+ * Capability flag: `true` once `TradingEngine` routes live orders through
+ * `createAdapters()` → `CoinbaseAdvancedExecutionAdapter`. Today the engine still builds
+ * `OrderManager` on the legacy `CoinbaseExchange` (HMAC) — see
+ * `trading-engine.ts` `initializeOrderManager()` — so a live start would run with a dead
+ * order path and no exchange-side protection. The preflight refuses live until the wiring
+ * PR flips this to `true`.
+ */
+export const ENGINE_LIVE_EXECUTION_WIRED = false;
+
+/**
+ * Fail closed unless the engine's live order path actually uses the Advanced Trade adapter.
+ */
+export function assertLiveExecutionPathWired(): void {
+  if (!ENGINE_LIVE_EXECUTION_WIRED) {
+    throw new Error(
+      `${LIVE_EXECUTION_PATH_NOT_WIRED}: TradingEngine still routes live orders through the legacy ` +
+        'CoinbaseExchange (HMAC) client. Wire createAdapters()/CoinbaseAdvancedExecutionAdapter into ' +
+        'OrderManager and set ENGINE_LIVE_EXECUTION_WIRED=true before starting live.',
+    );
+  }
+}
 
 /** Coinbase REST API flavour. Only `advanced` can trade with CDP keys. */
 export type CoinbaseApiVersion = 'exchange' | 'advanced';
