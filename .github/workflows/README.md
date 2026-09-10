@@ -23,29 +23,27 @@ The same check runs inside `pnpm test` (`src/__tests__/config-drift.test.ts`), s
 - `atlas/config/guardrails.yaml`
 - `.github/workflows/backtest-gate.yml` (so changes to the gate itself are exercised before merge)
 
-**What it does.** Spins up Node 20, installs all deps, restores the `@rollup/rollup-linux-x64-gnu` native binary that `core-node/.npmrc optional=false` blocks, then runs:
+**What it does.** Spins up Node 20, installs all deps, restores the `@rollup/rollup-linux-x64-gnu` native binary that `core-node/.npmrc optional=false` blocks, verifies the committed real-candle fixtures exist, then runs:
 
 ```bash
-pnpm backtest -- \
-  --start-date <today-7> --end-date <today> \
-  --products ETH-USD ETH-PERP-INTX \
+pnpm exec tsx src/cli/backtest.ts \
+  --start-date 2026-09-03 --end-date 2026-09-10 \
+  --products BTC-USD ETH-USD --fixture-dir fixtures/bars \
   --commission 0.00045 --slippage 0.0005 --strategy all
 ```
 
-The window is rolling 7 days (Hyperliquid taker fees, 5 bps slippage). The gate **fails** if:
+The window is the committed fixture window (`atlas/apps/core-node/fixtures/bars/*.json` — Coinbase Advanced Trade public 15m candles; see that folder's README to regenerate). Hyperliquid taker fees, 5 bps slippage. The gate **fails** if:
 
-1. The backtest CLI exits non-zero, OR
-2. The reported `Total Trades` count is < 5 over the 7-day window. Five is a structural smoke threshold; the typical signal-arbiter funnel produces 30+ signals/day across two products, so under five trades total in seven days strongly indicates a regression upstream (SPRINT-PLAN-FINAL.md F1: today's funnel-latch bug caps backtests at 12 signals total regardless of window).
+1. The backtest CLI exits non-zero (a missing/short fixture is `DATA_UNAVAILABLE`, exit 2 — the loader is fail-closed since TASK_017 and never falls back to synthetic candles without `--allow-synthetic`), OR
+2. Stdout does not carry the `DATA: REAL` stamp, or carries `DATA: SYNTHETIC`, or either symbol did not load from the `fixture` source, OR
+3. The reported `Total Trades` count is < 5 over the 7-day window (structural smoke threshold; the committed fixtures produced 15 at the time of TASK_017), OR
+4. Any short entry was opened (spot is long-only by venue capability).
 
-Wall-clock target: < 3 minutes per run.
+Wall-clock target: < 3 minutes per run (the backtest itself takes ~3 s; install dominates).
 
-### Required GitHub Actions secrets (manual setup — must be added via Settings → Secrets and variables → Actions)
+### GitHub Actions secrets
 
-| Secret | Why | Where to get it |
-|---|---|---|
-| `SUPABASE_URL` | Backtest CLI exits 1 without it (reads candles from `public.bars`). | Supabase Dashboard → Project Settings → API → Project URL. |
-| `SUPABASE_SERVICE_KEY` | Same — needed for service-role read of `bars`. | Supabase Dashboard → Project Settings → API → `service_role` secret. |
-| `ENCRYPTION_KEY` *(optional)* | Some modules read it at import-time. The workflow falls back to a deterministic dummy 64-hex-char value if the secret is unset; the backtest CLI does not exercise encryption paths. | `openssl rand -hex 32` (or set to anything 64 hex chars long for CI). |
+None are required any more — the gate runs entirely on committed fixtures. `ENCRYPTION_KEY` is optional (some modules read it at import-time; the workflow falls back to a deterministic dummy 64-hex-char value). `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` are only needed for local runs against `public.bars`.
 
 ### How the gate is enforced
 
@@ -62,16 +60,14 @@ If/when branch protection is re-introduced (Wave 3+), make this check `Required`
 
 ### Local reproduction
 
-To run the same check locally before pushing:
+To run the same check locally before pushing (never put `--` after `pnpm backtest` — yargs drops the flags):
 
 ```bash
-START=$(date -u -d '7 days ago' +%Y-%m-%d)
-END=$(date -u +%Y-%m-%d)
 cd atlas/apps/core-node
-pnpm backtest -- \
-  --start-date "$START" --end-date "$END" \
-  --products ETH-USD ETH-PERP-INTX \
+pnpm exec tsx src/cli/backtest.ts \
+  --start-date 2026-09-03 --end-date 2026-09-10 \
+  --products BTC-USD ETH-USD --fixture-dir fixtures/bars \
   --commission 0.00045 --slippage 0.0005 --strategy all
 ```
 
-Then check `atlas/var/backtest_results/backtest_*.json` for the trade count.
+Line 1 of the summary is the data stamp (`DATA: REAL`); `atlas/var/backtest_results/report_*.txt` carries the same stamp on its first line plus per-symbol provenance.

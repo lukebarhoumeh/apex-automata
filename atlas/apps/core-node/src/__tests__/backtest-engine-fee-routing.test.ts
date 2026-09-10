@@ -128,6 +128,12 @@ function feeRoutingConfig(
       stopOvershootMinBps: 5,
       sizeDecimals: 6,
     },
+    // These tests assert the fee CHARGED per fill, not entry admission. With
+    // the TASK_017 EV gate enforced (default), a 40 bps spot taker rate
+    // rejects every entry on this synthetic series (correctly — it is
+    // negative-EV at p0 = 0.40), leaving nothing to assert on. The gate has
+    // its own coverage in backtest-integrity-task017.test.ts.
+    evGate: { mode: 'off' },
     ...overrides,
   };
 }

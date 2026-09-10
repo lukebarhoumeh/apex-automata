@@ -74,6 +74,46 @@ export interface EvGateInputs {
   venue?: Exchange;
 }
 
+/**
+ * Beta-prior parameters for the win-rate estimator (TASK_011 step 2):
+ * `p0 = 0.40` with pseudo-count `n0 = 30` is Beta(12, 18). With no
+ * history the estimate is exactly 0.40; each observed outcome moves it by
+ * ~1/31 so a handful of early wins cannot talk the gate into allowing a
+ * fee-negative setup.
+ */
+export interface WinRatePrior {
+  /** Prior mean win rate. */
+  p0: number;
+  /** Prior pseudo-count (strength of the prior in trades). */
+  n0: number;
+}
+
+export const DEFAULT_WIN_RATE_PRIOR: WinRatePrior = { p0: 0.40, n0: 30 };
+
+/**
+ * Posterior-mean win rate under a Beta prior:
+ *
+ *   p̂ = (wins + p0 · n0) / (wins + losses + n0)
+ *
+ * Breakeven trades are excluded from both counts. Pass `null` when no
+ * performance record exists yet — the estimate collapses to `p0`, so the
+ * caller never has to default-allow on cold start. Pure; shared by the
+ * backtest engine and (per TASK_011) the live router so the two use one
+ * p estimator.
+ */
+export function estimateWinRateWithPrior(
+  perf: { wins: number; losses: number } | null | undefined,
+  prior: WinRatePrior = DEFAULT_WIN_RATE_PRIOR,
+): number {
+  const wins = Math.max(0, Number(perf?.wins) || 0);
+  const losses = Math.max(0, Number(perf?.losses) || 0);
+  const n0 = Math.max(0, prior.n0);
+  const p0 = Math.min(1, Math.max(0, prior.p0));
+  const denominator = wins + losses + n0;
+  if (denominator <= 0) return p0;
+  return (wins + p0 * n0) / denominator;
+}
+
 export interface EvGateResult {
   allowed: boolean;
   /** Human-readable reason; populated on reject AND on default-allow paths. */

@@ -18,6 +18,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "backtest": "tsx src/cli/backtest.ts",
+    "backtest:backfill": "tsx src/cli/backtest-backfill.ts",
     "paper-test": "tsx src/cli/paper-test.ts",
     "api": "tsx src/api/server.ts",
     "diagnose": "tsx src/cli/diagnose.ts",

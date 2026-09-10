@@ -1,31 +1,159 @@
 /**
  * Historical Data Loader for Backtesting
- * 
- * Provides functions to load real historical candle data from:
- * 1. Supabase `bars` table (preferred for speed)
- * 2. Coinbase Exchange API (fallback)
+ *
+ * Loads real historical candle data from, in precedence order:
+ *   1. Local JSON fixtures (`fixtureDir/<SYMBOL>.json`) when configured —
+ *      deterministic, offline, used by the backtest-gate CI workflow.
+ *   2. Supabase `bars` table (15m OHLCV, epoch-second `time`).
+ *   3. Coinbase Exchange REST API (only when credentials are configured).
+ *
+ * TASK_017 (B1) — FAIL-CLOSED. When none of the real sources yields data
+ * for a (symbol, window) the loader throws {@link DataUnavailableError}
+ * (`code = 'DATA_UNAVAILABLE'`). Synthetic random-walk candles are only
+ * generated when the caller passes `allowSynthetic: true` explicitly, and
+ * every result carries a {@link DataProvenance} record so downstream
+ * reports can stamp `DATA: SYNTHETIC` on line 1 and tag the run VOID.
+ *
+ * Every loaded series is validated (OHLC sanity), sorted by time and
+ * de-duplicated on `time` so downstream consumers never see out-of-order
+ * or duplicate bars regardless of the source.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { Logger } from '../core/logger';
 import { OHLCV } from '../indicators/technical';
 import { CoinbaseRestClient } from '../exchanges/coinbase/rest-client';
+import type { Granularity } from '../exchanges/coinbase/types';
+
+/**
+ * Where a series came from. `in-memory` is used by the engine for series
+ * handed in programmatically (tests / embedding callers) — it is real data
+ * as far as the loader knows, but carries no external provenance.
+ */
+export type DataSource = 'supabase' | 'exchange' | 'fixture' | 'synthetic' | 'in-memory';
+
+const EXCHANGE_GRANULARITIES: readonly number[] = [60, 300, 900, 3600, 21600, 86400];
 
 export interface DataLoaderConfig {
-  supabaseUrl: string;
-  supabaseKey: string;
+  /** Supabase project URL. Optional when `fixtureDir` is set. */
+  supabaseUrl?: string;
+  /** Supabase service-role key. Optional when `fixtureDir` is set. */
+  supabaseKey?: string;
   coinbaseConfig?: {
     apiKey: string;
     apiSecret: string;
     apiPassphrase?: string;
     environment: 'production' | 'sandbox';
   };
+  /**
+   * Directory containing `<SYMBOL>.json` fixture files (see
+   * {@link BarFixtureFile}). When set, fixtures are the ONLY real source —
+   * a missing fixture for a requested symbol is DATA_UNAVAILABLE, never a
+   * silent fall-through to Supabase or synthetic data.
+   */
+  fixtureDir?: string;
+}
+
+export interface LoadCandlesOptions {
+  /**
+   * Opt-in synthetic fallback. Default false → DATA_UNAVAILABLE on missing
+   * data. When true the loader generates a random walk and stamps
+   * `provenance.source = 'synthetic'`; reports must surface this as
+   * SMOKE/VOID. Never use synthetic output as evidence of edge.
+   */
+  allowSynthetic?: boolean;
+  /**
+   * Minimum acceptable coverage (loaded bars / expected bars for the
+   * window at the requested granularity). Below this the loader throws
+   * DATA_UNAVAILABLE naming the coverage. Default 0.5. Set 0 to disable.
+   */
+  minCoverage?: number;
+}
+
+/**
+ * Provenance for one loaded series. Surfaced verbatim in backtest results
+ * and reports so every number in a report can be traced to its data.
+ */
+export interface DataProvenance {
+  symbol: string;
+  source: DataSource;
+  windowStart: string;
+  windowEnd: string;
+  granularitySeconds: number;
+  candleCount: number;
+  /** Bars the window would contain at `granularitySeconds` if fully covered. */
+  expectedCount: number;
+  /** `candleCount / expectedCount` (may exceed 1 if the store holds finer bars). */
+  coverage: number;
+  firstBarTime: string | null;
+  lastBarTime: string | null;
+  /** Median spacing between consecutive bars, in minutes (null if < 2 bars). */
+  inferredBarMinutes: number | null;
+  fixturePath?: string;
+  fixtureSha256?: string;
+  loadTimeMs: number;
 }
 
 export interface DataLoaderResult {
   candles: OHLCV[];
-  source: 'supabase' | 'exchange' | 'synthetic';
+  source: DataSource;
   loadTime: number;
+  provenance: DataProvenance;
+}
+
+/** On-disk fixture format written by `pnpm backtest:backfill --out-dir`. */
+export interface BarFixtureFile {
+  symbol: string;
+  exchange: string;
+  granularity: string;
+  granularitySeconds: number;
+  source: string;
+  endpoint?: string;
+  fetchedAt: string;
+  start: string;
+  end: string;
+  /** `time` is epoch SECONDS (same convention as the `bars` table). */
+  candles: Array<{ time: number; open: number; high: number; low: number; close: number; volume: number }>;
+}
+
+/**
+ * Thrown when no real data exists for a (symbol, window) and synthetic
+ * data was not explicitly allowed. `code` is stable for programmatic
+ * matching; the message names the symbol and window for humans.
+ */
+export class DataUnavailableError extends Error {
+  public readonly code = 'DATA_UNAVAILABLE' as const;
+  public readonly symbol: string;
+  public readonly windowStart: Date;
+  public readonly windowEnd: Date;
+  public readonly attempted: DataSource[];
+
+  constructor(symbol: string, windowStart: Date, windowEnd: Date, attempted: DataSource[], detail?: string) {
+    const tried = attempted.length > 0 ? attempted.join(' → ') : 'none';
+    super(
+      `DATA_UNAVAILABLE: no real candles for ${symbol} in ` +
+        `${windowStart.toISOString()} → ${windowEnd.toISOString()} ` +
+        `(sources tried: ${tried})${detail ? `: ${detail}` : ''}. ` +
+        'Backfill the window (pnpm backtest:backfill) or pass --allow-synthetic ' +
+        'for a SMOKE/VOID run.',
+    );
+    this.name = 'DataUnavailableError';
+    this.symbol = symbol;
+    this.windowStart = windowStart;
+    this.windowEnd = windowEnd;
+    this.attempted = attempted;
+  }
+}
+
+/**
+ * Type guard for {@link DataUnavailableError} that also matches errors
+ * re-thrown across module boundaries (checks the stable `code`).
+ */
+export function isDataUnavailableError(err: unknown): err is DataUnavailableError {
+  return Boolean(err) && typeof err === 'object' && (err as { code?: string }).code === 'DATA_UNAVAILABLE';
 }
 
 /**
@@ -33,6 +161,10 @@ export interface DataLoaderResult {
  * Returns true if the candle has valid OHLCV values.
  */
 export function validateCandle(candle: OHLCV): boolean {
+  if (!Number.isFinite(candle.time) || candle.time <= 0) return false;
+  if (!Number.isFinite(candle.open) || !Number.isFinite(candle.high)) return false;
+  if (!Number.isFinite(candle.low) || !Number.isFinite(candle.close)) return false;
+  if (!Number.isFinite(candle.volume)) return false;
   if (candle.open <= 0 || candle.close <= 0) return false;
   if (candle.high < candle.low) return false;
   if (candle.volume < 0) return false;
@@ -66,19 +198,82 @@ function filterValidCandles(candles: OHLCV[], product: string, logger: Logger): 
   return valid;
 }
 
+/** Sort ascending by time and drop duplicate timestamps (last wins). */
+export function normalizeCandles(candles: OHLCV[]): OHLCV[] {
+  const byTime = new Map<number, OHLCV>();
+  for (const c of candles) byTime.set(c.time, c);
+  return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+}
+
+/** Median spacing between consecutive bars in minutes; null when < 2 bars. */
+export function inferBarMinutes(candles: OHLCV[]): number | null {
+  if (candles.length < 2) return null;
+  const gaps: number[] = [];
+  for (let i = 1; i < candles.length; i++) {
+    const gap = candles[i].time - candles[i - 1].time;
+    if (gap > 0) gaps.push(gap);
+  }
+  if (gaps.length === 0) return null;
+  gaps.sort((a, b) => a - b);
+  const mid = Math.floor(gaps.length / 2);
+  const medianMs = gaps.length % 2 === 0 ? (gaps[mid - 1] + gaps[mid]) / 2 : gaps[mid];
+  return Math.round((medianMs / 60_000) * 1000) / 1000;
+}
+
+/**
+ * Build the provenance record for a loaded series. Pure — exported so the
+ * engine/tests can describe in-memory series the same way.
+ */
+export function describeSeries(
+  symbol: string,
+  source: DataSource,
+  candles: OHLCV[],
+  windowStart: Date,
+  windowEnd: Date,
+  granularitySeconds: number,
+  loadTimeMs: number,
+  extra: Partial<Pick<DataProvenance, 'fixturePath' | 'fixtureSha256'>> = {},
+): DataProvenance {
+  const spanMs = Math.max(0, windowEnd.getTime() - windowStart.getTime());
+  const expectedCount = granularitySeconds > 0 ? Math.floor(spanMs / (granularitySeconds * 1000)) + 1 : 0;
+  const coverage = expectedCount > 0 ? candles.length / expectedCount : 0;
+  return {
+    symbol,
+    source,
+    windowStart: windowStart.toISOString(),
+    windowEnd: windowEnd.toISOString(),
+    granularitySeconds,
+    candleCount: candles.length,
+    expectedCount,
+    coverage,
+    firstBarTime: candles.length > 0 ? new Date(candles[0].time).toISOString() : null,
+    lastBarTime: candles.length > 0 ? new Date(candles[candles.length - 1].time).toISOString() : null,
+    inferredBarMinutes: inferBarMinutes(candles),
+    loadTimeMs,
+    ...extra,
+  };
+}
+
+/** Default granularity: the `bars` table stores 15-minute candles. */
+export const DEFAULT_GRANULARITY_SECONDS = 900;
+const DEFAULT_MIN_COVERAGE = 0.5;
+
 /**
  * HistoricalDataLoader loads candle data from various sources.
  */
 export class HistoricalDataLoader {
   private config: DataLoaderConfig;
   private logger: Logger;
-  private supabase: SupabaseClient;
+  private supabase: SupabaseClient | null = null;
   private coinbaseClient: CoinbaseRestClient | null = null;
 
   constructor(config: DataLoaderConfig, logger: Logger) {
     this.config = config;
     this.logger = logger;
-    this.supabase = createClient(config.supabaseUrl, config.supabaseKey);
+
+    if (config.supabaseUrl && config.supabaseKey) {
+      this.supabase = createClient(config.supabaseUrl, config.supabaseKey);
+    }
 
     // Initialize Coinbase client if config provided
     if (config.coinbaseConfig) {
@@ -97,59 +292,153 @@ export class HistoricalDataLoader {
 
   /**
    * Load historical candles for a product within a date range.
-   * Tries Supabase first, then exchange API, then synthetic data.
+   *
+   * Precedence: fixture (if `fixtureDir` configured) → Supabase → exchange.
+   * Throws {@link DataUnavailableError} when no real source has data unless
+   * `options.allowSynthetic` is true, in which case a synthetic random walk
+   * is returned with `source: 'synthetic'` (SMOKE/VOID — never evidence).
    */
   async loadCandles(
     product: string,
     startDate: Date,
     endDate: Date,
-    granularitySeconds: number = 60
+    granularitySeconds: number = DEFAULT_GRANULARITY_SECONDS,
+    options: LoadCandlesOptions = {},
   ): Promise<DataLoaderResult> {
     const startTime = Date.now();
+    const attempted: DataSource[] = [];
+    const minCoverage = options.minCoverage ?? DEFAULT_MIN_COVERAGE;
 
-    // Try Supabase first
-    const supabaseData = await this.loadFromSupabase(product, startDate, endDate);
-    if (supabaseData.length > 0) {
-      return {
-        candles: supabaseData,
-        source: 'supabase',
-        loadTime: Date.now() - startTime,
-      };
+    const finish = (
+      source: DataSource,
+      candles: OHLCV[],
+      extra: Partial<Pick<DataProvenance, 'fixturePath' | 'fixtureSha256'>> = {},
+    ): DataLoaderResult => {
+      const normalized = normalizeCandles(candles);
+      const loadTime = Date.now() - startTime;
+      const provenance = describeSeries(
+        product, source, normalized, startDate, endDate, granularitySeconds, loadTime, extra,
+      );
+      if (source !== 'synthetic' && minCoverage > 0 && provenance.coverage < minCoverage) {
+        throw new DataUnavailableError(
+          product, startDate, endDate, attempted,
+          `coverage ${(provenance.coverage * 100).toFixed(1)}% (${provenance.candleCount}/${provenance.expectedCount} bars) ` +
+            `below minimum ${(minCoverage * 100).toFixed(0)}%`,
+        );
+      }
+      this.logger.info(`Loaded ${normalized.length} candles for ${product} from ${source}`, {
+        coverage: `${(provenance.coverage * 100).toFixed(1)}%`,
+        expected: provenance.expectedCount,
+        inferredBarMinutes: provenance.inferredBarMinutes,
+        firstBarTime: provenance.firstBarTime,
+        lastBarTime: provenance.lastBarTime,
+      });
+      return { candles: normalized, source, loadTime, provenance };
+    };
+
+    if (this.config.fixtureDir) {
+      attempted.push('fixture');
+      const fixture = this.loadFromFixture(product, startDate, endDate);
+      if (fixture.candles.length > 0) {
+        return finish('fixture', fixture.candles, { fixturePath: fixture.path, fixtureSha256: fixture.sha256 });
+      }
+      // Fixtures are an explicit, closed source: never fall through.
+      if (options.allowSynthetic) {
+        return finish('synthetic', this.generateSyntheticData(product, startDate, endDate, granularitySeconds));
+      }
+      throw new DataUnavailableError(
+        product, startDate, endDate, attempted,
+        fixture.path ? `fixture ${fixture.path} has no bars in window` : `no fixture file in ${this.config.fixtureDir}`,
+      );
     }
 
-    // Try exchange API
-    if (this.coinbaseClient) {
-      const exchangeData = await this.loadFromExchange(
-        product,
-        startDate,
-        endDate,
-        granularitySeconds
-      );
-      if (exchangeData.length > 0) {
-        return {
-          candles: exchangeData,
-          source: 'exchange',
-          loadTime: Date.now() - startTime,
-        };
+    if (this.supabase) {
+      attempted.push('supabase');
+      const supabaseData = await this.loadFromSupabase(product, startDate, endDate);
+      if (supabaseData.length > 0) {
+        return finish('supabase', supabaseData);
       }
     }
 
-    // Fall back to synthetic data
-    this.logger.warn(`No real data available for ${product}, generating synthetic data`);
-    const syntheticData = this.generateSyntheticData(product, startDate, endDate, granularitySeconds);
-    
-    return {
-      candles: syntheticData,
-      source: 'synthetic',
-      loadTime: Date.now() - startTime,
-    };
+    if (this.coinbaseClient) {
+      attempted.push('exchange');
+      const exchangeData = await this.loadFromExchange(product, startDate, endDate, granularitySeconds);
+      if (exchangeData.length > 0) {
+        return finish('exchange', exchangeData);
+      }
+    }
+
+    if (options.allowSynthetic) {
+      this.logger.warn(
+        `SMOKE/VOID: no real data for ${product} — generating SYNTHETIC candles because --allow-synthetic was passed. ` +
+          'Results are not evidence of anything.',
+        { symbol: product, start: startDate.toISOString(), end: endDate.toISOString(), attempted },
+      );
+      return finish('synthetic', this.generateSyntheticData(product, startDate, endDate, granularitySeconds));
+    }
+
+    throw new DataUnavailableError(product, startDate, endDate, attempted);
+  }
+
+  /**
+   * Load candles from a local fixture file `<fixtureDir>/<SYMBOL>.json`.
+   * Returns an empty candle list when the file is missing (caller decides
+   * how to fail); throws on a malformed file since that is a repo bug.
+   */
+  private loadFromFixture(
+    product: string,
+    startDate: Date,
+    endDate: Date,
+  ): { candles: OHLCV[]; path?: string; sha256?: string } {
+    const dir = this.config.fixtureDir as string;
+    const filePath = path.resolve(dir, `${product}.json`);
+    if (!fs.existsSync(filePath)) {
+      this.logger.warn(`No fixture file for ${product}`, { expected: filePath });
+      return { candles: [] };
+    }
+
+    const raw = fs.readFileSync(filePath);
+    const sha256 = createHash('sha256').update(raw).digest('hex');
+    const parsed = JSON.parse(raw.toString('utf8')) as Partial<BarFixtureFile>;
+    if (!parsed || !Array.isArray(parsed.candles)) {
+      throw new Error(`Malformed bar fixture ${filePath}: missing candles[]`);
+    }
+    if (parsed.symbol && parsed.symbol !== product) {
+      throw new Error(`Bar fixture ${filePath} is for ${parsed.symbol}, not ${product}`);
+    }
+
+    const startSec = Math.floor(startDate.getTime() / 1000);
+    const endSec = Math.floor(endDate.getTime() / 1000);
+    const candles: OHLCV[] = [];
+    for (const c of parsed.candles) {
+      const t = Number(c.time);
+      if (t < startSec || t > endSec) continue;
+      candles.push({
+        time: t * 1000,
+        open: Number(c.open),
+        high: Number(c.high),
+        low: Number(c.low),
+        close: Number(c.close),
+        volume: Number(c.volume),
+      });
+    }
+
+    this.logger.info(`Loading ${product} data from fixture`, {
+      path: filePath,
+      sha256,
+      fixtureSource: parsed.source,
+      fetchedAt: parsed.fetchedAt,
+      inWindow: candles.length,
+      inFile: parsed.candles.length,
+    });
+    return { candles: filterValidCandles(candles, product, this.logger), path: filePath, sha256 };
   }
 
   /**
    * Load candles from Supabase bars table.
    *
    * The bars.time column is BIGINT epoch-seconds (per migration
-   * 20260308_phase2a_create_bars_table.sql). Filters and the returned
+   * 20260305015154_create_bars_table.sql). Filters and the returned
    * OHLCV.time field need to convert between seconds (DB) and millis (engine).
    */
   private async loadFromSupabase(
@@ -157,6 +446,7 @@ export class HistoricalDataLoader {
     startDate: Date,
     endDate: Date
   ): Promise<OHLCV[]> {
+    if (!this.supabase) return [];
     try {
       this.logger.info(`Loading ${product} data from Supabase`, {
         start: startDate.toISOString(),
@@ -169,7 +459,7 @@ export class HistoricalDataLoader {
       // Supabase JS client defaults to 1000 rows per response. Page via .range
       // so longer windows (90d × 15m bars × multiple symbols) load fully.
       const PAGE_SIZE = 1000;
-      const allRows: any[] = [];
+      const allRows: Array<Record<string, unknown>> = [];
       let offset = 0;
       while (true) {
         const { data, error } = await this.supabase
@@ -190,7 +480,7 @@ export class HistoricalDataLoader {
         }
 
         if (!data || data.length === 0) break;
-        allRows.push(...data);
+        allRows.push(...(data as Array<Record<string, unknown>>));
         if (data.length < PAGE_SIZE) break;
         offset += PAGE_SIZE;
       }
@@ -200,15 +490,13 @@ export class HistoricalDataLoader {
         return [];
       }
 
-      this.logger.info(`Loaded ${allRows.length} candles from Supabase for ${product}`);
-
-      const candles = allRows.map((row: any) => ({
+      const candles = allRows.map((row) => ({
         time: Number(row.time) * 1000,
-        open: parseFloat(row.open),
-        high: parseFloat(row.high),
-        low: parseFloat(row.low),
-        close: parseFloat(row.close),
-        volume: parseFloat(row.volume),
+        open: parseFloat(String(row.open)),
+        high: parseFloat(String(row.high)),
+        low: parseFloat(String(row.low)),
+        close: parseFloat(String(row.close)),
+        volume: parseFloat(String(row.volume)),
       }));
       return filterValidCandles(candles, product, this.logger);
     } catch (error) {
@@ -230,6 +518,13 @@ export class HistoricalDataLoader {
     if (!this.coinbaseClient) {
       return [];
     }
+    if (!EXCHANGE_GRANULARITIES.includes(granularitySeconds)) {
+      this.logger.warn(`Exchange API does not support granularity ${granularitySeconds}s — skipping exchange source`, {
+        product,
+        supported: EXCHANGE_GRANULARITIES,
+      });
+      return [];
+    }
 
     try {
       this.logger.info(`Loading ${product} data from exchange`, {
@@ -243,7 +538,6 @@ export class HistoricalDataLoader {
       const intervalMs = granularitySeconds * 1000;
 
       while (currentStart < endDate) {
-        // Calculate end of this batch
         const batchEnd = new Date(
           Math.min(
             currentStart.getTime() + maxCandlesPerRequest * intervalMs,
@@ -255,20 +549,17 @@ export class HistoricalDataLoader {
           const candles = await this.coinbaseClient.getProductCandles(product, {
             start: currentStart.toISOString(),
             end: batchEnd.toISOString(),
-            granularity: granularitySeconds,
+            granularity: granularitySeconds as Granularity,
           });
 
-          // Convert to OHLCV format
-          const formattedCandles = candles.map(c => ({
+          allCandles.push(...candles.map(c => ({
             time: c.time * 1000, // Convert to milliseconds
             open: c.open,
             high: c.high,
             low: c.low,
             close: c.close,
             volume: c.volume,
-          }));
-
-          allCandles.push(...formattedCandles);
+          })));
 
           // Rate limiting
           await new Promise(r => setTimeout(r, 100));
@@ -276,11 +567,9 @@ export class HistoricalDataLoader {
           this.logger.warn(`Failed to fetch batch from exchange:`, error);
         }
 
-        // Move to next batch
         currentStart = new Date(batchEnd.getTime() + intervalMs);
       }
 
-      // Sort by time
       allCandles.sort((a, b) => a.time - b.time);
 
       const validated = filterValidCandles(allCandles, product, this.logger);
@@ -293,8 +582,9 @@ export class HistoricalDataLoader {
   }
 
   /**
-   * Generate synthetic candlestick data for testing.
-   * Uses random walk with realistic properties.
+   * Generate synthetic candlestick data for SMOKE runs only.
+   * Uses a random walk with loosely realistic properties. Output is tagged
+   * `source: 'synthetic'` by the caller and must never be used as evidence.
    */
   private generateSyntheticData(
     product: string,
@@ -313,21 +603,17 @@ export class HistoricalDataLoader {
     let currentTime = startDate.getTime();
 
     while (currentTime <= endDate.getTime()) {
-      // Random walk
       const change = (Math.random() - 0.5) * 2 * volatility + drift;
       const open = price;
-      
-      // Intra-candle movements
+
       const intraVolatility = volatility * 2;
       const high = open * (1 + Math.random() * intraVolatility);
       const low = open * (1 - Math.random() * intraVolatility);
       const close = open * (1 + change);
-      
-      // Ensure high/low bounds
+
       const actualHigh = Math.max(open, close, high);
       const actualLow = Math.min(open, close, low);
-      
-      // Random volume
+
       const baseVolume = product.startsWith('BTC') ? 100 : product.startsWith('ETH') ? 500 : 10000;
       const volume = baseVolume * (0.5 + Math.random() * 1.5);
 
@@ -345,60 +631,68 @@ export class HistoricalDataLoader {
     }
 
     const validated = filterValidCandles(candles, product, this.logger);
-    this.logger.info(`Generated ${validated.length} synthetic candles for ${product}`);
+    this.logger.warn(`Generated ${validated.length} SYNTHETIC candles for ${product} (SMOKE/VOID)`);
     return validated;
   }
 
   /**
-   * Create a data provider function for the backtest engine.
+   * Create a data provider function for the backtest engine. The provider
+   * returns candles AND provenance so the engine can stamp reports.
+   * Propagates {@link DataUnavailableError} — the engine must not start on
+   * missing data.
    */
-  createDataProvider(): (product: string, start: Date, end: Date) => Promise<OHLCV[]> {
-    return async (product: string, start: Date, end: Date): Promise<OHLCV[]> => {
-      const result = await this.loadCandles(product, start, end);
+  createDataProvider(
+    options: LoadCandlesOptions & { granularitySeconds?: number } = {},
+  ): (product: string, start: Date, end: Date) => Promise<DataLoaderResult> {
+    const { granularitySeconds = DEFAULT_GRANULARITY_SECONDS, ...loadOptions } = options;
+    return async (product: string, start: Date, end: Date): Promise<DataLoaderResult> => {
+      const result = await this.loadCandles(product, start, end, granularitySeconds, loadOptions);
       this.logger.info(`Data provider loaded ${result.candles.length} candles from ${result.source}`, {
         product,
         loadTime: result.loadTime,
+        coverage: result.provenance.coverage,
       });
-      return result.candles;
+      return result;
     };
   }
 
   /**
-   * Save candles to Supabase for future use.
+   * Save candles to Supabase `bars` for future use. Idempotent upsert on
+   * the table's unique key `(symbol, time, exchange)`.
    */
-  async saveToSupabase(product: string, candles: OHLCV[]): Promise<void> {
+  async saveToSupabase(product: string, candles: OHLCV[], exchange: string = 'coinbase'): Promise<void> {
     if (candles.length === 0) {
       return;
     }
-
-    try {
-      // bars.time is BIGINT epoch-seconds; OHLCV.time is millis.
-      const rows = candles.map(c => ({
-        symbol: product,
-        time: Math.floor(c.time / 1000),
-        open: c.open,
-        high: c.high,
-        low: c.low,
-        close: c.close,
-        volume: c.volume,
-      }));
-
-      // Batch insert in chunks
-      const chunkSize = 1000;
-      for (let i = 0; i < rows.length; i += chunkSize) {
-        const chunk = rows.slice(i, i + chunkSize);
-        const { error } = await this.supabase.from('bars').upsert(chunk, {
-          onConflict: 'symbol,time',
-        });
-
-        if (error) {
-          this.logger.warn(`Failed to save candles batch:`, error);
-        }
-      }
-
-      this.logger.info(`Saved ${candles.length} candles to Supabase for ${product}`);
-    } catch (error) {
-      this.logger.error(`Failed to save candles to Supabase:`, error);
+    if (!this.supabase) {
+      throw new Error('saveToSupabase: Supabase client not configured (SUPABASE_URL / SUPABASE_SERVICE_KEY)');
     }
+
+    // bars.time is BIGINT epoch-seconds; OHLCV.time is millis.
+    const rows = candles.map(c => ({
+      symbol: product,
+      exchange,
+      time: Math.floor(c.time / 1000),
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      volume: c.volume,
+    }));
+
+    const chunkSize = 1000;
+    for (let i = 0; i < rows.length; i += chunkSize) {
+      const chunk = rows.slice(i, i + chunkSize);
+      const { error } = await this.supabase.from('bars').upsert(chunk, {
+        onConflict: 'symbol,time,exchange',
+      });
+
+      if (error) {
+        this.logger.error(`Failed to save candles batch for ${product}`, error);
+        throw new Error(`bars upsert failed for ${product}: ${error.message}`);
+      }
+    }
+
+    this.logger.info(`Saved ${candles.length} candles to Supabase for ${product}`);
   }
 }
