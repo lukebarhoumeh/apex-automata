@@ -9,7 +9,7 @@ import { SecretManager, SecretConfig } from '../config/secrets';
 import { PaperTradingSimulator, PaperTradingConfig } from './paper-trading-simulator';
 import { PositionMonitor, PositionMonitorConfig } from './position-monitor';
 import { TradeAnalytics, TradeAnalyticsConfig, SessionStats, TradeRecord } from './trade-analytics';
-import { GuardrailConfig } from '../config/loadGuardrails';
+import { GuardrailConfig, resolveLiveConfig } from '../config/loadGuardrails';
 import { FeeModel } from '../core/fee-model';
 import { reanchorStopAndTakeProfit } from './reanchor-stop-tp';
 import { v4 as uuidv4 } from 'uuid';
@@ -23,7 +23,14 @@ import {
   RuntimeConfig,
   buildRuntimeConfig,
 } from './execution/adapter-factory';
-import { IAccountProvider } from './account';
+import {
+  IAccountProvider,
+  LiveAccountTruth,
+  LiveFeeTier,
+  ACCOUNT_TRUTH_UNAVAILABLE,
+  FEE_TIER_CHANGED,
+  buildLiveFeeModel,
+} from './account';
 
 export interface TradingEngineConfig {
   mode: 'paper' | 'live';
@@ -55,6 +62,14 @@ export interface TradingEngineConfig {
     /** Initial equity for paper mode in USD */
     paperInitialEquityUsd?: number;
   };
+
+  /**
+   * Live-only (TASK_011): the exchange account truth built and refreshed by the live
+   * preflight. REQUIRED when `mode === 'live'` and must already hold a snapshot —
+   * `start()` throws `ACCOUNT_TRUTH_UNAVAILABLE` otherwise. Equity, fee tier and
+   * product specs for the session come from here, never from `guardrails.account`.
+   */
+  liveAccountTruth?: LiveAccountTruth;
 }
 
 export interface TradingEngineEvents {
@@ -122,6 +137,10 @@ export class TradingEngine extends EventEmitter {
   private executionAdapter: IExecutionAdapter | null = null;
   private accountProvider: IAccountProvider | null = null;
   private runtimeConfig: RuntimeConfig;
+
+  // TASK_011: live account truth (null in paper)
+  private readonly liveAccountTruth: LiveAccountTruth | null;
+  private liveFeeTierHandler: ((change: { previous: LiveFeeTier; next: LiveFeeTier }) => void) | null = null;
   
   // Order timing for latency tracking
   private orderTimestamps: Map<string, number> = new Map();
@@ -149,6 +168,8 @@ export class TradingEngine extends EventEmitter {
     this.config = config;
     this.logger = logger;
     this.guardrails = config.guardrails;
+    // Account truth is live-only; paper never sees it even if a caller passes one.
+    this.liveAccountTruth = config.mode === 'live' ? (config.liveAccountTruth ?? null) : null;
 
     // Build unified runtime config (Step 4)
     // This decouples market data env from execution mode
@@ -213,6 +234,11 @@ export class TradingEngine extends EventEmitter {
         startCount: this.startCount,
       });
 
+      // Live fails closed before touching anything: no Coinbase account snapshot => no start.
+      if (this.config.mode === 'live') {
+        this.assertLiveAccountTruth();
+      }
+
       // Initialize paper trading simulator if in paper mode
       if (this.config.mode === 'paper') {
         this.initializePaperSimulator();
@@ -227,6 +253,12 @@ export class TradingEngine extends EventEmitter {
       this.initializeRiskEngine();
       this.initializePositionMonitor();
       this.initializeTradeAnalytics();
+
+      // Live: keep the account truth refreshing for the session (60s cadence + after fills),
+      // mark bases at the engine's feed mid, and swap the FeeModel on tier transitions.
+      if (this.config.mode === 'live') {
+        await this.startLiveAccountTruth();
+      }
 
       // Wire Coinbase resilience components (reconciler + gap filler).
       // These are created here — they survive WS drops because they poll REST.
@@ -299,6 +331,95 @@ export class TradingEngine extends EventEmitter {
     } finally {
       this.startInFlight = false;
     }
+  }
+
+  /**
+   * Live guard: the session needs a Coinbase account snapshot (equity, fee tier, specs)
+   * before any component is built. Throws `ACCOUNT_TRUTH_UNAVAILABLE`; there is
+   * deliberately no fallback to `guardrails.account.equity_usd`.
+   */
+  private assertLiveAccountTruth(): LiveAccountTruth {
+    if (!this.liveAccountTruth) {
+      throw new Error(
+        `${ACCOUNT_TRUTH_UNAVAILABLE}: live mode requires a LiveAccountTruth (built by the live preflight); ` +
+          'refusing to start on guardrails.account.equity_usd.',
+      );
+    }
+    // Throws ACCOUNT_TRUTH_UNAVAILABLE when no refresh has ever succeeded.
+    this.liveAccountTruth.requireSnapshot();
+    return this.liveAccountTruth;
+  }
+
+  /**
+   * Session equity anchor for position limits, risk limits and analytics.
+   * Live: the Coinbase snapshot's equity. Paper: `guardrails.account.equity_usd`.
+   */
+  private resolveSessionEquityUsd(): number {
+    if (this.config.mode === 'live') {
+      return this.assertLiveAccountTruth().requireSnapshot().equityUsd;
+    }
+    return this.guardrails.account.equity_usd;
+  }
+
+  /**
+   * Session FeeModel. Live overlays the account's real Coinbase spot tier on the yaml
+   * model; paper/backtest keep the yaml assumption so the three layers stay comparable.
+   */
+  private resolveSessionFeeModel(): FeeModel {
+    const base = FeeModel.fromGuardrails(this.guardrails);
+    if (this.config.mode !== 'live') return base;
+    return buildLiveFeeModel(base, this.assertLiveAccountTruth().requireSnapshot().feeTier);
+  }
+
+  /** Live account truth for this session (null in paper). */
+  public getLiveAccountTruth(): LiveAccountTruth | null {
+    return this.liveAccountTruth;
+  }
+
+  private async startLiveAccountTruth(): Promise<void> {
+    const truth = this.assertLiveAccountTruth();
+    truth.setPriceSource((symbol) => this.marketPrices.get(symbol));
+
+    this.liveFeeTierHandler = ({ previous, next }) => {
+      const riskEngine = this.riskEngine;
+      if (!riskEngine) return;
+      const replaced = riskEngine.setFeeModel(buildLiveFeeModel(FeeModel.fromGuardrails(this.guardrails), next));
+      this.logger.warn(`${FEE_TIER_CHANGED}: swapped session FeeModel to the new Coinbase tier`, {
+        previous: `${previous.name} ${previous.makerBps}/${previous.takerBps} bps`,
+        next: `${next.name} ${next.makerBps}/${next.takerBps} bps`,
+        hadModel: Boolean(replaced),
+      });
+      // Risk event: surfaces on the dashboard (RiskEvent broadcast) and in alerts.
+      this.emit('risk:alert', {
+        type: FEE_TIER_CHANGED,
+        severity: 'warning',
+        message: `Coinbase fee tier changed: ${previous.name} (${previous.makerBps}/${previous.takerBps} bps) → ${next.name} (${next.makerBps}/${next.takerBps} bps)`,
+        previous,
+        next,
+        timestamp: Date.now(),
+      });
+    };
+    truth.on('fee_tier_changed', this.liveFeeTierHandler);
+
+    await truth.start();
+
+    const evGateMode = resolveLiveConfig(this.guardrails).ev_gate_mode;
+    if (evGateMode === 'shadow') {
+      this.logger.warn(
+        '*** EV GATE IN SHADOW MODE *** negative-EV entries are LOGGED (EV_GATE_SHADOW_ALLOW) but NOT blocked. ' +
+          'This is Door B (docs/plans/SPRINT-9-LIVE-COINBASE.md §3). Set live.ev_gate_mode: enforce to block.',
+        { evGateMode },
+      );
+    }
+  }
+
+  private stopLiveAccountTruth(): void {
+    if (!this.liveAccountTruth) return;
+    if (this.liveFeeTierHandler) {
+      this.liveAccountTruth.off('fee_tier_changed', this.liveFeeTierHandler);
+      this.liveFeeTierHandler = null;
+    }
+    this.liveAccountTruth.stop();
   }
 
   /**
@@ -473,6 +594,8 @@ export class TradingEngine extends EventEmitter {
       if (this.riskEngine) {
         this.riskEngine.stop();
       }
+
+      this.stopLiveAccountTruth();
       
       if (this.positionMonitor) {
         this.positionMonitor.stop();
@@ -703,8 +826,8 @@ export class TradingEngine extends EventEmitter {
   }
 
   private initializePositionTracker(): void {
-    // Calculate risk limits from guardrails
-    const accountEquity = this.guardrails.account.equity_usd;
+    // Calculate risk limits from guardrails; equity anchor is the live snapshot in live mode.
+    const accountEquity = this.resolveSessionEquityUsd();
     const maxPositionValue = accountEquity * this.guardrails.risk.max_position_exposure_pct;
     const maxUnrealizedLoss = accountEquity * Math.abs(this.guardrails.risk.daily_loss_limit);
     const maxDrawdownPct = Math.abs(this.guardrails.risk.max_drawdown_limit) * 100;
@@ -757,7 +880,8 @@ export class TradingEngine extends EventEmitter {
 
   private initializeRiskEngine(): void {
     const guardrails = this.config.guardrails;
-    const accountEquity = guardrails.account.equity_usd;
+    // Live: Coinbase snapshot equity (TASK_011). Paper: guardrails.account.equity_usd.
+    const accountEquity = this.resolveSessionEquityUsd();
     const maxPositionSizeUsd = accountEquity * guardrails.risk.max_position_exposure_pct;
     const maxDailyLossUsd = Math.abs(guardrails.risk.daily_loss_limit) * accountEquity;
     const maxDrawdownPercent = Math.abs(guardrails.risk.max_drawdown_limit) * 100;
@@ -849,8 +973,12 @@ export class TradingEngine extends EventEmitter {
       softLaunch,
       // #A3 (2026-05-18): wire FeeModel for the pre-trade EV gate so
       // round-trip fees route per-symbol (spot vs perps_intx) instead
-      // of using a flat default.
-      feeModel: FeeModel.fromGuardrails(guardrails),
+      // of using a flat default. Live overlays the real Coinbase tier (TASK_011).
+      feeModel: this.resolveSessionFeeModel(),
+      // TASK_011: live sizing/EV semantics. Paper leaves all three undefined.
+      executionMode: this.config.mode,
+      liveAccountTruth: this.liveAccountTruth ?? undefined,
+      evGateMode: this.config.mode === 'live' ? resolveLiveConfig(guardrails).ev_gate_mode : undefined,
     };
 
     this.riskEngine = new RiskEngine(config, this.logger, this.positionTracker!);
@@ -906,11 +1034,12 @@ export class TradingEngine extends EventEmitter {
   }
   
   private initializeTradeAnalytics(): void {
+    const initialEquity = this.resolveSessionEquityUsd();
     const analyticsConfig: TradeAnalyticsConfig = {
       supabaseUrl: this.config.supabase.url,
       supabaseKey: this.config.supabase.serviceKey,
       userId: this.config.supabase.userId,
-      initialEquity: this.guardrails.account.equity_usd,
+      initialEquity,
       mode: this.config.mode,
       equitySampleIntervalMs: 60_000, // Sample equity every minute
     };
@@ -979,7 +1108,7 @@ export class TradingEngine extends EventEmitter {
     
     this.logger.info('TradeAnalytics initialized', {
       mode: this.config.mode,
-      initialEquity: this.guardrails.account.equity_usd,
+      initialEquity,
     });
   }
 
@@ -1491,6 +1620,9 @@ export class TradingEngine extends EventEmitter {
     // Update open order count after fills (both paper + live)
     const activeOrders = this.orderManager?.getActiveOrders() || [];
     this.riskEngine!.updateOpenOrderCount(activeOrders.length);
+
+    // Live: balances just moved — refresh account truth immediately (never throws).
+    this.liveAccountTruth?.refreshAfterFill();
   }
 
   // Public API for placing orders

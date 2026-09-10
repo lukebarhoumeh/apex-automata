@@ -6,6 +6,10 @@
  * Values are loaded from `guardrails.yaml -> fees:`; there is no
  * fallback constant in any call site (by design).
  *
+ * Live mode layers the account's REAL fee tier on top via
+ * `withRuntimeOverride()` (immutable: returns a new model), so the yaml
+ * numbers are only ever an assumption for paper/backtest.
+ *
  * Units: basis points (bps) at the storage layer (1 bps = 0.01%).
  *        Decimal rate helper exposed for callers that need a ratio.
  */
@@ -22,11 +26,28 @@ interface FeeBucket {
   taker_bps: number;
 }
 
+/**
+ * Runtime override for one (venue, product) bucket — used in live mode to
+ * replace the yaml assumption with the fee tier Coinbase actually reports
+ * (`/transaction_summary`). `product` uses the market vocabulary (`spot` |
+ * `perps`) so it composes with `getFeeBps()` / `marketForSymbol()`.
+ */
+export interface FeeRuntimeOverride {
+  venue: Exchange;
+  product: Market;
+  makerBps: number;
+  takerBps: number;
+  /** Optional provenance for logs (e.g. Coinbase `pricing_tier`). */
+  source?: string;
+}
+
 export class FeeModel {
   private readonly fees: FeesConfig;
+  private readonly overrides: readonly FeeRuntimeOverride[];
 
-  constructor(fees: FeesConfig) {
+  constructor(fees: FeesConfig, overrides: readonly FeeRuntimeOverride[] = []) {
     this.fees = fees;
+    this.overrides = overrides;
   }
 
   /**
@@ -35,6 +56,50 @@ export class FeeModel {
    */
   static fromGuardrails(guardrails: GuardrailConfig): FeeModel {
     return new FeeModel(guardrails.fees);
+  }
+
+  /**
+   * Return a NEW FeeModel whose (venue, product) bucket carries the given
+   * runtime rates. The receiver is never mutated — callers swap the instance
+   * they hold, so every consumer sees one consistent model at a time.
+   *
+   * Rates must be finite; maker may be negative (rebate), taker may not.
+   *
+   * Example (Coinbase Intro 1 tier, 60/120 bps):
+   *   base.withRuntimeOverride({ venue: 'coinbase', product: 'spot', makerBps: 60, takerBps: 120 })
+   */
+  withRuntimeOverride(override: FeeRuntimeOverride): FeeModel {
+    if (!Number.isFinite(override.makerBps) || !Number.isFinite(override.takerBps) || override.takerBps < 0) {
+      throw new Error(
+        `FeeModel.withRuntimeOverride: invalid rates for ${override.venue}/${override.product} ` +
+          `(maker=${override.makerBps} taker=${override.takerBps} bps)`,
+      );
+    }
+    // Unknown (venue, product) combinations throw here, before anything is cloned.
+    this.resolveBucket(override.venue, override.product);
+    const bucketOverride: FeeBucket = { maker_bps: override.makerBps, taker_bps: override.takerBps };
+    const fees = structuredClone(this.fees) as FeesConfig;
+    switch (override.venue) {
+      case 'coinbase':
+        if (override.product === 'spot') fees.coinbase.spot = bucketOverride;
+        else fees.coinbase.perps_intx = bucketOverride;
+        break;
+      case 'hyperliquid':
+        fees.hyperliquid.perps = bucketOverride;
+        break;
+    }
+    const next = this.overrides.filter((o) => !(o.venue === override.venue && o.product === override.product));
+    return new FeeModel(fees, [...next, { ...override }]);
+  }
+
+  /** Runtime overrides applied to this model (empty for a pure-yaml model). */
+  getRuntimeOverrides(): readonly FeeRuntimeOverride[] {
+    return this.overrides;
+  }
+
+  /** True when the (venue, product) bucket comes from a runtime override rather than yaml. */
+  hasRuntimeOverride(venue: Exchange | string, product: Market): boolean {
+    return this.overrides.some((o) => o.venue === venue && o.product === product);
   }
 
   /**

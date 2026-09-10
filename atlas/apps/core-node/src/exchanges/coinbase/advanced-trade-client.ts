@@ -12,7 +12,7 @@
  * - `createOrderRaw()` returns a discriminated union — `success:false` is a business
  *   rejection (`ok:false`), never a synthesized "pending" order and never a throw.
  * - Real product increments (`getProduct`), paginated accounts/orders/fills, batch cancel,
- *   order preview, key permissions, server time.
+ *   order preview, key permissions, server time, live fee tier (`getTransactionSummary`).
  * - Central `request()`: 15s timeout, bounded 429 retries honouring `Retry-After`,
  *   idempotent GET retries on 5xx/network, and safe error mapping — request headers
  *   (the bearer JWT) are never attached to errors or logs.
@@ -404,6 +404,28 @@ export interface AtServerTime {
   epochMillis: string;
 }
 
+/** `fee_tier` block of GET /transaction_summary. Rates are decimal strings (0.012 = 120 bps). */
+export interface AtFeeTier {
+  pricing_tier: string;
+  usd_from?: string;
+  usd_to?: string;
+  taker_fee_rate: string;
+  maker_fee_rate: string;
+  aop_from?: string;
+  aop_to?: string;
+}
+
+/** GET /transaction_summary — the account's live fee tier and 30-day volume. */
+export interface AtTransactionSummary {
+  /** 30-day trailing volume in USD (Coinbase returns a JSON number). */
+  total_volume: number;
+  total_fees: number;
+  fee_tier: AtFeeTier;
+  advanced_trade_only_volume?: number;
+  advanced_trade_only_fees?: number;
+  raw: unknown;
+}
+
 // ============================================================================
 // Internal helpers
 // ============================================================================
@@ -561,6 +583,43 @@ export class AdvancedTradeRestClient {
   /** GET /key_permissions — what this CDP key may do. */
   public async getKeyPermissions(): Promise<AtKeyPermissions> {
     return this.request<AtKeyPermissions>('GET', `${BROKERAGE}/key_permissions`);
+  }
+
+  /**
+   * GET /transaction_summary — the account's CURRENT fee tier (maker/taker rates) and
+   * 30-day volume. Throws when the response carries no parseable `fee_tier`, so callers
+   * can never mistake an unknown tier for a known one (fail closed).
+   */
+  public async getTransactionSummary(): Promise<AtTransactionSummary> {
+    const raw = await this.request<Record<string, unknown>>('GET', `${BROKERAGE}/transaction_summary`);
+    const tier = asRecord(raw.fee_tier);
+    const makerRate = Number.parseFloat(String(tier.maker_fee_rate ?? ''));
+    const takerRate = Number.parseFloat(String(tier.taker_fee_rate ?? ''));
+    if (!Number.isFinite(makerRate) || !Number.isFinite(takerRate) || makerRate < 0 || takerRate < 0) {
+      throw new Error(
+        'Coinbase transaction_summary response carried no parseable fee_tier (maker_fee_rate/taker_fee_rate)',
+      );
+    }
+    const toNumber = (value: unknown): number => {
+      const parsed = typeof value === 'number' ? value : Number.parseFloat(String(value ?? ''));
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+    return {
+      total_volume: toNumber(raw.total_volume),
+      total_fees: toNumber(raw.total_fees),
+      fee_tier: {
+        pricing_tier: str(tier.pricing_tier) ?? 'unknown',
+        usd_from: str(tier.usd_from),
+        usd_to: str(tier.usd_to),
+        taker_fee_rate: String(tier.taker_fee_rate),
+        maker_fee_rate: String(tier.maker_fee_rate),
+        aop_from: str(tier.aop_from),
+        aop_to: str(tier.aop_to),
+      },
+      advanced_trade_only_volume: raw.advanced_trade_only_volume !== undefined ? toNumber(raw.advanced_trade_only_volume) : undefined,
+      advanced_trade_only_fees: raw.advanced_trade_only_fees !== undefined ? toNumber(raw.advanced_trade_only_fees) : undefined,
+      raw,
+    };
   }
 
   /** GET /accounts — all pages (limit 250, follows `cursor` while `has_next`). */
