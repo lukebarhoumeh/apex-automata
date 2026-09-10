@@ -104,6 +104,32 @@ export interface DataLoaderResult {
   provenance: DataProvenance;
 }
 
+/**
+ * Provenance for a fixture whose bars were derived offline from finer
+ * native candles (`pnpm backtest:backfill --rollup-minutes N`). Present only
+ * on rolled-up fixtures; native fixtures (e.g. the 15m backtest-gate set)
+ * omit it.
+ */
+export interface BarFixtureRollup {
+  /** Aggregation method identifier. */
+  method: 'utc-aligned-ohlcv';
+  /** Coinbase granularity enum the source candles were fetched at. */
+  sourceGranularity: string;
+  sourceGranularitySeconds: number;
+  /** Width of one output bar; equals the fixture's `granularitySeconds`. */
+  bucketSeconds: number;
+  /** `bucketSeconds / sourceGranularitySeconds` — bars required per bucket. */
+  sourceBarsPerBucket: number;
+  /** Validated source candles that entered the rollup. */
+  sourceBars: number;
+  /** Buckets written to `candles[]` (complete buckets only). */
+  bucketsEmitted: number;
+  /** Buckets dropped because they had fewer than `sourceBarsPerBucket` source bars. */
+  bucketsDroppedIncomplete: number;
+  /** Human-readable statement of the aggregation rules. */
+  rules: string;
+}
+
 /** On-disk fixture format written by `pnpm backtest:backfill --out-dir`. */
 export interface BarFixtureFile {
   symbol: string;
@@ -115,6 +141,8 @@ export interface BarFixtureFile {
   fetchedAt: string;
   start: string;
   end: string;
+  /** Set when the bars were rolled up offline from finer native candles. */
+  rollup?: BarFixtureRollup;
   /** `time` is epoch SECONDS (same convention as the `bars` table). */
   candles: Array<{ time: number; open: number; high: number; low: number; close: number; volume: number }>;
 }
@@ -313,11 +341,12 @@ export class HistoricalDataLoader {
       source: DataSource,
       candles: OHLCV[],
       extra: Partial<Pick<DataProvenance, 'fixturePath' | 'fixtureSha256'>> = {},
+      barSeconds: number = granularitySeconds,
     ): DataLoaderResult => {
       const normalized = normalizeCandles(candles);
       const loadTime = Date.now() - startTime;
       const provenance = describeSeries(
-        product, source, normalized, startDate, endDate, granularitySeconds, loadTime, extra,
+        product, source, normalized, startDate, endDate, barSeconds, loadTime, extra,
       );
       if (source !== 'synthetic' && minCoverage > 0 && provenance.coverage < minCoverage) {
         throw new DataUnavailableError(
@@ -340,7 +369,20 @@ export class HistoricalDataLoader {
       attempted.push('fixture');
       const fixture = this.loadFromFixture(product, startDate, endDate);
       if (fixture.candles.length > 0) {
-        return finish('fixture', fixture.candles, { fixturePath: fixture.path, fixtureSha256: fixture.sha256 });
+        // A fixture declares its own bar width (15m gate set, 4h/1d multi-TF
+        // sets). Coverage must be judged against THAT width, not the 15m
+        // `bars`-table default the caller assumes — otherwise a complete 4h
+        // fixture reads as ~6% covered and trips the DATA_UNAVAILABLE floor.
+        const barSeconds = fixture.granularitySeconds ?? granularitySeconds;
+        if (barSeconds !== granularitySeconds) {
+          this.logger.info(`Fixture for ${product} declares ${barSeconds}s bars; using that for coverage/provenance`, {
+            requestedGranularitySeconds: granularitySeconds,
+            fixtureGranularitySeconds: barSeconds,
+          });
+        }
+        return finish(
+          'fixture', fixture.candles, { fixturePath: fixture.path, fixtureSha256: fixture.sha256 }, barSeconds,
+        );
       }
       // Fixtures are an explicit, closed source: never fall through.
       if (options.allowSynthetic) {
@@ -389,7 +431,7 @@ export class HistoricalDataLoader {
     product: string,
     startDate: Date,
     endDate: Date,
-  ): { candles: OHLCV[]; path?: string; sha256?: string } {
+  ): { candles: OHLCV[]; path?: string; sha256?: string; granularitySeconds?: number } {
     const dir = this.config.fixtureDir as string;
     const filePath = path.resolve(dir, `${product}.json`);
     if (!fs.existsSync(filePath)) {
@@ -406,6 +448,9 @@ export class HistoricalDataLoader {
     if (parsed.symbol && parsed.symbol !== product) {
       throw new Error(`Bar fixture ${filePath} is for ${parsed.symbol}, not ${product}`);
     }
+    const declaredSeconds = Number(parsed.granularitySeconds);
+    const granularitySeconds =
+      Number.isFinite(declaredSeconds) && declaredSeconds > 0 ? declaredSeconds : undefined;
 
     const startSec = Math.floor(startDate.getTime() / 1000);
     const endSec = Math.floor(endDate.getTime() / 1000);
@@ -428,10 +473,13 @@ export class HistoricalDataLoader {
       sha256,
       fixtureSource: parsed.source,
       fetchedAt: parsed.fetchedAt,
+      granularity: parsed.granularity,
+      granularitySeconds,
+      rollup: parsed.rollup ? `${parsed.rollup.sourceGranularity} → ${parsed.rollup.bucketSeconds}s` : undefined,
       inWindow: candles.length,
       inFile: parsed.candles.length,
     });
-    return { candles: filterValidCandles(candles, product, this.logger), path: filePath, sha256 };
+    return { candles: filterValidCandles(candles, product, this.logger), path: filePath, sha256, granularitySeconds };
   }
 
   /**
