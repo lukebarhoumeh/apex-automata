@@ -9,6 +9,7 @@ import { RiskLimitsSection } from "@/components/apex/settings/sections/RiskLimit
 import { NotificationsSection } from "@/components/apex/settings/sections/NotificationsSection";
 import { AdvancedSection } from "@/components/apex/settings/sections/AdvancedSection";
 import { useSettings } from "@/hooks/apex/useSettingsData";
+import { DemoDataBanner } from "@/components/apex/DemoDataBanner";
 import type { NotificationChannel, RiskLimits } from "@/types/settings";
 
 export default function Settings() {
@@ -37,6 +38,7 @@ export default function Settings() {
       />
 
       <div className="flex flex-col gap-4">
+        <DemoDataBanner subject="account, venue keys, notification channels and risk-limit forms" />
         {section === "account" && <AccountSection account={S.account} />}
         {section === "venues" && <VenuesSection venues={S.venues} />}
         {section === "risk" && (
