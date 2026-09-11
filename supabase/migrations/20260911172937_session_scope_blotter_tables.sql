@@ -1,0 +1,25 @@
+-- =============================================================================
+-- RECONCILIATION STUB — version 20260911172937
+-- (name: session_scope_blotter_tables)
+-- =============================================================================
+-- This file is intentionally a no-op. It exists ONLY so that the local
+-- supabase/migrations/ manifest matches `supabase_migrations.schema_migrations`
+-- on the linked project, which records this version as applied on 2026-09-11
+-- 17:29:37 UTC (MCP apply-time re-stamp of the session_scope_blotter_tables
+-- migration from #64).
+-- Without a file here, Supabase Preview refuses to run ("Remote migration
+-- versions not found in local migrations directory").
+--
+-- What it is: a DUPLICATE APPLY STAMP of 20260911170000. The MCP apply of
+-- `20260911170000_session_scope_blotter_tables.sql` was recorded under
+-- apply-time version 172937 with the same name, in addition to the repo
+-- version (170000). Remote history holds BOTH stamps.
+--
+-- Source of truth for this DDL stays `20260911170000_*.sql`. DO NOT copy the
+-- SQL here: two live bodies would re-run the DDL on every fresh chain.
+-- On prod the runner skips this version (already recorded); on a fresh chain
+-- it sorts after 170000 and is a no-op. Version stamp MUST stay 20260911172937;
+-- do not rename.
+-- =============================================================================
+
+SELECT 1;
