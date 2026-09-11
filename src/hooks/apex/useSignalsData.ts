@@ -14,7 +14,7 @@ import {
   type BackendTradeRecord,
 } from "@/services/apexDashboardApi";
 import { mergeStrategyPolicy } from "@/lib/strategy-policy";
-import { hasActiveSession, sessionKey, sessionSinceIso, type SessionScope } from "@/lib/session-scope";
+import { hasActiveSession, sessionKey, sessionWindow, type SessionScope } from "@/lib/session-scope";
 import { useActiveSession } from "@/runtime/session";
 
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
@@ -95,13 +95,14 @@ export function mapSignalRecord(row: SignalRow, killed: ReadonlySet<string> = ne
  * time window; with no session the stream is empty, never last run's rows.
  */
 export async function fetchSessionSignalStream(scope: SessionScope, limit = 60): Promise<SignalRecord[]> {
-  const since = sessionSinceIso(scope);
-  if (!since) return [];
+  const window = sessionWindow(scope);
+  if (!window) return [];
   const [{ data, error }, policy] = await Promise.all([
     supabase
       .from("signals")
       .select("id,symbol,strategy,decided_at,side,score,confidence,meta_prob,allowed,reason")
-      .gte("decided_at", since)
+      .gte("decided_at", window.since)
+      .lte("decided_at", window.until)
       .order("decided_at", { ascending: false })
       .limit(limit),
     fetchStrategyPolicy(),

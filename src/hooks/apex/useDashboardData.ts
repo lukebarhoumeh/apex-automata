@@ -8,7 +8,7 @@ import type { EquityPoint, EquityRange } from "@/types/equity";
 import type { KpiTile } from "@/types/kpi";
 import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
 import { mergeStrategyPolicy } from "@/lib/strategy-policy";
-import { hasActiveSession, sessionKey, sessionSinceIso, type SessionScope } from "@/lib/session-scope";
+import { hasActiveSession, sessionKey, sessionWindow, type SessionScope } from "@/lib/session-scope";
 import { useActiveSession } from "@/runtime/session";
 import { supabase } from "@/integrations/supabase/client";
 import {
@@ -402,13 +402,14 @@ export function recordToFeedEvent(r: SignalRecord): FeedEvent {
  * earlier run wrote.
  */
 async function fetchSessionSignals(limit: number, scope: SessionScope): Promise<SignalRecord[]> {
-  const since = sessionSinceIso(scope);
-  if (!since) return [];
+  const window = sessionWindow(scope);
+  if (!window) return [];
   const [{ data, error }, policy] = await Promise.all([
     supabase
       .from("signals")
       .select("id,symbol,strategy,decided_at,side,score,confidence,meta_prob,allowed,reason")
-      .gte("decided_at", since)
+      .gte("decided_at", window.since)
+      .lte("decided_at", window.until)
       .order("decided_at", { ascending: false })
       .limit(limit),
     fetchStrategyPolicy(),

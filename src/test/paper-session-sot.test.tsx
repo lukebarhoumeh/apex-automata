@@ -34,7 +34,9 @@ import {
   sessionKey,
   sessionOpenedLabel,
   sessionSinceIso,
+  sessionWindow,
   shortSessionId,
+  SESSION_WINDOW_SKEW_MS,
 } from "@/lib/session-scope";
 import { deriveFooterSessionText } from "@/components/apex/shell/footer-chips";
 import { DEMO_PATHS, NAV } from "@/components/apex/shell/nav-config";
@@ -149,6 +151,16 @@ describe("session scope — time window from /api/status, empty without a sessio
     // Older backend: id but no start time → must not query (would be unscoped).
     expect(sessionSinceIso({ sessionId: "sess_x", sessionStartedAt: null })).toBeNull();
     expect(sessionSinceIso({ sessionId: "sess_x", sessionStartedAt: 0 })).toBeNull();
+  });
+
+  it("bounds the window above by now + skew so future-dated fixture rows cannot leak in", () => {
+    const now = SCOPE_ACTIVE.sessionStartedAt + 60_000;
+    const w = sessionWindow(SCOPE_ACTIVE, now)!;
+    expect(w.since).toBe("2026-09-11T15:30:00.000Z");
+    expect(w.until).toBe(new Date(now + SESSION_WINDOW_SKEW_MS).toISOString());
+    // The real DB holds a breakout signal decided_at 2099-01-01 — it must fall outside.
+    expect("2099-01-01T00:00:00.000Z" > w.until).toBe(true);
+    expect(sessionWindow(SCOPE_NONE, now)).toBeNull();
   });
 
   it("keys caches per session and labels the session tail", () => {

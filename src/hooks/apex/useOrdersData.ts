@@ -9,7 +9,7 @@ import type {
   OrderStats,
 } from "@/types/orders";
 import { supabase } from "@/integrations/supabase/client";
-import { hasActiveSession, sessionKey, sessionSinceIso, type SessionScope } from "@/lib/session-scope";
+import { hasActiveSession, sessionKey, sessionWindow, type SessionScope } from "@/lib/session-scope";
 import { useActiveSession } from "@/runtime/session";
 
 // ============================================================
@@ -111,12 +111,13 @@ function mapOrder(row: OrderRow): OrderRecord {
 
 /** Orders created since the active session opened; `[]` with no session. */
 export async function fetchSessionOrders(scope: SessionScope, limit = 100): Promise<OrderRecord[]> {
-  const since = sessionSinceIso(scope);
-  if (!since) return [];
+  const window = sessionWindow(scope);
+  if (!window) return [];
   const { data, error } = await supabase
     .from("orders")
     .select("id,external_order_id,symbol,side,type,status,price,quantity,strategy,created_at,updated_at")
-    .gte("created_at", since)
+    .gte("created_at", window.since)
+    .lte("created_at", window.until)
     .order("created_at", { ascending: false })
     .limit(limit);
   if (error) throw new Error(`orders fetch: ${error.message}`);
@@ -164,12 +165,13 @@ function mapFill(row: FillRow): FillRecord {
 
 /** Fills stamped since the active session opened; `[]` with no session. */
 export async function fetchSessionFills(scope: SessionScope, limit = 50): Promise<FillRecord[]> {
-  const since = sessionSinceIso(scope);
-  if (!since) return [];
+  const window = sessionWindow(scope);
+  if (!window) return [];
   const { data, error } = await supabase
     .from("fills")
     .select("id,order_id,price,quantity,fee_amount,slippage_bps,filled_at,orders!inner(symbol,side)")
-    .gte("filled_at", since)
+    .gte("filled_at", window.since)
+    .lte("filled_at", window.until)
     .order("filled_at", { ascending: false })
     .limit(limit);
   if (error) throw new Error(`fills fetch: ${error.message}`);

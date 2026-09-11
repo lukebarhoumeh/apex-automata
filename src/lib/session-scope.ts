@@ -40,6 +40,31 @@ export function sessionSinceIso(scope: SessionScope): string | null {
   return new Date(startedAt).toISOString();
 }
 
+/**
+ * Tolerance for backend/DB clock skew on the upper bound of the window.
+ * The project DB contains future-dated fixture rows (e.g. a `breakout` signal
+ * with decided_at 2099-01-01); without an upper bound `>= sessionStartedAt`
+ * lets them into every session.
+ */
+export const SESSION_WINDOW_SKEW_MS = 5 * 60_000;
+
+export interface SessionWindow {
+  /** ISO lower bound (inclusive): session start. */
+  since: string;
+  /** ISO upper bound (inclusive): now + skew — excludes future-dated rows. */
+  until: string;
+}
+
+/**
+ * `[sessionStartedAt, now + skew]` for `created_at` / `filled_at` /
+ * `decided_at` filters, or `null` when there is nothing to attribute rows to.
+ */
+export function sessionWindow(scope: SessionScope, now: number = Date.now()): SessionWindow | null {
+  const since = sessionSinceIso(scope);
+  if (!since) return null;
+  return { since, until: new Date(now + SESSION_WINDOW_SKEW_MS).toISOString() };
+}
+
 /** React Query key fragment so each session gets its own cache entry. */
 export function sessionKey(scope: SessionScope): string {
   return hasActiveSession(scope) ? (scope.sessionId as string) : "no-session";
