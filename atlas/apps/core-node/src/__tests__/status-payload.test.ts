@@ -15,6 +15,8 @@ import { buildPnlSnapshotPayload } from '../api/pnl-snapshot';
 const NOW = Date.parse('2026-09-11T17:30:00.000Z');
 const SESSION_ID = 'sess_1757606400000_ab12cd';
 const STARTED_AT = Date.parse('2026-09-11T16:00:00.000Z');
+/** FE PR1 #4: `sessionStartedAt` is an ISO-8601 UTC string on the wire, never epoch ms. */
+const STARTED_AT_ISO = '2026-09-11T16:00:00.000Z';
 
 const KILL_SWITCH_OFF = { active: false, reasons: [], since: null };
 
@@ -104,8 +106,9 @@ describe('buildStatusPayload', () => {
     });
 
     expect(payload.sessionId).toBe(SESSION_ID);
-    expect(payload.sessionStartedAt).toBe(STARTED_AT);
-    expect(payload.session).toEqual({ id: SESSION_ID, startedAt: STARTED_AT, mode: 'paper', initialEquityUsd: 10_000 });
+    expect(payload.sessionStartedAt).toBe(STARTED_AT_ISO);
+    expect(typeof payload.sessionStartedAt).toBe('string');
+    expect(payload.session).toEqual({ id: SESSION_ID, startedAt: STARTED_AT_ISO, mode: 'paper', initialEquityUsd: 10_000 });
     expect(payload.pnl?.sessionId).toBe(payload.sessionId);
     expect(payload.pnl?.sessionStartedAt).toBe(payload.sessionStartedAt);
     expect(payload.pnl?.totalEquityUsd).toBe(10_042.5);
@@ -160,7 +163,22 @@ describe('buildStatusPayload', () => {
     expect(paused.paused).toBe(true);
     expect(resumed.paused).toBe(false);
     expect([paused.sessionId, resumed.sessionId]).toEqual([SESSION_ID, SESSION_ID]);
-    expect([paused.sessionStartedAt, resumed.sessionStartedAt]).toEqual([STARTED_AT, STARTED_AT]);
+    expect([paused.sessionStartedAt, resumed.sessionStartedAt]).toEqual([STARTED_AT_ISO, STARTED_AT_ISO]);
     expect(Object.keys(paused).sort()).toEqual(Object.keys(resumed).sort());
+  });
+
+  it('exposes the pnl block fields the FE types (realizedPnlUsd, unrealizedPnlUsd, totalEquityUsd, dailyPnlUsd, dailyPnlR, openPositionsCount, exposureUsd)', () => {
+    const payload = buildStatusPayload({
+      runtime: runtime({ sessionId: SESSION_ID, sessionStartedAt: STARTED_AT, sessionMode: 'paper', sessionInitialEquity: 10_000 }),
+      supervisor: supervisor(),
+      engine: { running: true, mode: 'paper', engineState: 'running', activeSymbols: [] },
+      pnl: pnl(SESSION_ID, STARTED_AT),
+      liveAccount: null,
+      now: NOW,
+    });
+    for (const key of ['realizedPnlUsd', 'unrealizedPnlUsd', 'totalEquityUsd', 'dailyPnlUsd', 'dailyPnlR', 'openPositionsCount', 'exposureUsd'] as const) {
+      expect(typeof payload.pnl?.[key], key).toBe('number');
+    }
+    expect(payload.pnl?.totalEquityUsd).toBe(10_042.5);
   });
 });

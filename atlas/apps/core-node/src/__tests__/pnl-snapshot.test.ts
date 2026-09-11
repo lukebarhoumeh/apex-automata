@@ -36,7 +36,7 @@ describe('buildPnlSnapshotPayload', () => {
     const snap = buildPnlSnapshotPayload(inputs());
 
     expect(snap.sessionId).toBe(SESSION.sessionId);
-    expect(snap.sessionStartedAt).toBe(SESSION.sessionStartedAt);
+    expect(snap.sessionStartedAt).toBe('2026-09-11T16:00:00.000Z'); // ISO string, not ms (FE PR1 #4)
     expect(snap.sessionId).not.toMatch(/^paper-\d{4}-\d{2}-\d{2}$/);
     expect(snap.executionMode).toBe('paper');
     expect(snap.riskDay).toBe('2026-09-11');

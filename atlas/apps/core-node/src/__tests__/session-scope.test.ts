@@ -85,8 +85,15 @@ describe('parseSessionScopeQuery', () => {
   it('only honours status when the endpoint allows it (positions)', () => {
     const ignored = parseSessionScopeQuery({ status: 'open' });
     expect(ignored.ok && ignored.query.status).toBe('all');
-    const honoured = parseSessionScopeQuery({ status: 'open' }, { allowStatus: true });
-    expect(honoured.ok && honoured.query.status).toBe('open');
+    const honoured = parseSessionScopeQuery({ status: 'closed' }, { allowStatus: true });
+    expect(honoured.ok && honoured.query.status).toBe('closed');
+  });
+
+  it('positions default to open-only (FE PR1 #1) unless status is passed', () => {
+    const defaulted = parseSessionScopeQuery({}, { allowStatus: true, defaultStatus: 'open' });
+    expect(defaulted.ok && defaulted.query.status).toBe('open');
+    const overridden = parseSessionScopeQuery({ status: 'all' }, { allowStatus: true, defaultStatus: 'open' });
+    expect(overridden.ok && overridden.query.status).toBe('all');
   });
 
   it('takes the first value of repeated query params', () => {
@@ -240,7 +247,7 @@ describe('buildSessionScopeMeta', () => {
     expect(meta).toMatchObject({
       sessionId: ACTIVE.sessionId,
       executionMode: 'paper',
-      sessionStartedAt: STARTED_AT,
+      sessionStartedAt: '2026-09-11T16:00:00.000Z', // ISO string (FE PR1 #4), usable directly in created_at >= filters
       sessionEndedAt: null,
       isActive: true,
       filter: 'session_id',
@@ -249,6 +256,14 @@ describe('buildSessionScopeMeta', () => {
     });
     expect(meta).not.toHaveProperty('status');
     expect(meta.note).toMatch(/session_id/);
+  });
+
+  it('past sessions carry an ISO sessionEndedAt', () => {
+    const past: SessionWindow = { ...ACTIVE, sessionId: 'sess_old', endedAt: ENDED_AT, isActive: false };
+    const meta = buildSessionScopeMeta(past, 'time_window', 'orders', { limit: 100, status: 'all' });
+    expect(meta.sessionStartedAt).toBe('2026-09-11T16:00:00.000Z');
+    expect(meta.sessionEndedAt).toBe('2026-09-11T18:30:00.000Z');
+    expect(meta.isActive).toBe(false);
   });
 
   it('is explicit when nothing is scoped', () => {

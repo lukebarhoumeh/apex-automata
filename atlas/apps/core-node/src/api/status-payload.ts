@@ -21,7 +21,7 @@
 
 import type { EngineState } from '../trading/trading-engine';
 import type { EngineState as SupervisorEngineState } from '../runtime/engine-supervisor';
-import type { ExecutionMode } from '../runtime/session-context';
+import { toIsoOrNull, type ExecutionMode } from '../runtime/session-context';
 import type { PnlSnapshot } from './pnl-snapshot';
 
 export interface StatusKillSwitch {
@@ -87,8 +87,8 @@ export interface StatusPayloadInputs {
 
 export interface StatusSessionBlock {
   id: string | null;
-  /** Epoch ms. */
-  startedAt: number | null;
+  /** ISO-8601 UTC. */
+  startedAt: string | null;
   mode: ExecutionMode | null;
   /** `trading_sessions.initial_equity`; the paper capital the session opened with. */
   initialEquityUsd: number | null;
@@ -99,8 +99,11 @@ export interface StatusPayload {
   mode: ExecutionMode | null;
   /** Active `trading_sessions.session_id`; `null` when no session is open. ALWAYS present. */
   sessionId: string | null;
-  /** Epoch ms the session opened; `null` when no session is open. ALWAYS present. */
-  sessionStartedAt: number | null;
+  /**
+   * ISO-8601 UTC the session opened (e.g. `2026-09-11T15:02:00.000Z`); `null` when no
+   * session is open. ALWAYS present and stable for the life of a session (FE PR1 #4).
+   */
+  sessionStartedAt: string | null;
   /** Same identity, grouped, plus the session's mode and opening equity. */
   session: StatusSessionBlock;
   paused: boolean;
@@ -149,15 +152,16 @@ export function buildStatusPayload(inputs: StatusPayloadInputs): StatusPayload {
   const { runtime, supervisor, engine } = inputs;
   const now = inputs.now ?? Date.now();
   const pnl = engine.running ? inputs.pnl : null;
+  const sessionStartedAt = toIsoOrNull(runtime.sessionStartedAt);
 
   return {
     engineRunning: engine.running,
     mode: engine.running ? engine.mode : null,
     sessionId: runtime.sessionId,
-    sessionStartedAt: runtime.sessionStartedAt,
+    sessionStartedAt,
     session: {
       id: runtime.sessionId,
-      startedAt: runtime.sessionStartedAt,
+      startedAt: sessionStartedAt,
       mode: runtime.sessionMode,
       initialEquityUsd: runtime.sessionInitialEquity,
     },

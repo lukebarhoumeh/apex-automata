@@ -17,7 +17,7 @@
  * unit-testable without a running engine.
  */
 
-import type { ExecutionMode } from '../runtime/session-context';
+import { toIsoOrNull, type ExecutionMode } from '../runtime/session-context';
 
 /** Field names the UI must read equity from (documented for FE; see PR body). */
 export const EQUITY_SOT_FIELDS = {
@@ -60,8 +60,8 @@ export interface PnlSnapshot {
   userId: string;
   /** Runtime `trading_sessions.session_id`; `null` only in the start/stop window where no row is open. */
   sessionId: string | null;
-  /** Epoch ms; same value as `/api/status.sessionStartedAt`. */
-  sessionStartedAt: number | null;
+  /** ISO-8601 UTC; same value as `/api/status.sessionStartedAt`. */
+  sessionStartedAt: string | null;
   executionMode: ExecutionMode;
   /** UTC calendar day used for `dailyPnlUsd`. */
   riskDay: string;
@@ -134,7 +134,7 @@ export function buildPnlSnapshotPayload(inputs: PnlSnapshotInputs): PnlSnapshot 
     ts: now,
     userId: inputs.userId,
     sessionId: inputs.session.sessionId,
-    sessionStartedAt: inputs.session.sessionStartedAt,
+    sessionStartedAt: toIsoOrNull(inputs.session.sessionStartedAt),
     executionMode: inputs.mode,
     riskDay: new Date(now).toISOString().slice(0, 10),
     sessionStartEquityUsd,

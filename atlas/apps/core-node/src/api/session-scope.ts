@@ -24,7 +24,7 @@
  */
 
 import type { PostgrestErrorLike } from '../core/postgrest-errors';
-import type { ExecutionMode } from '../runtime/session-context';
+import { toIsoOrNull, type ExecutionMode } from '../runtime/session-context';
 import {
   SESSION_SCOPED_TABLES,
   SessionColumnSupport,
@@ -81,7 +81,7 @@ function firstString(value: unknown): string | undefined {
  */
 export function parseSessionScopeQuery(
   raw: Record<string, unknown>,
-  options: { defaultLimit?: number; maxLimit?: number; allowStatus?: boolean } = {},
+  options: { defaultLimit?: number; maxLimit?: number; allowStatus?: boolean; defaultStatus?: PositionStatusFilter } = {},
 ): SessionScopeParseResult {
   const defaultLimit = options.defaultLimit ?? SESSION_SCOPE_DEFAULT_LIMIT;
   const maxLimit = options.maxLimit ?? SESSION_SCOPE_MAX_LIMIT;
@@ -115,7 +115,8 @@ export function parseSessionScopeQuery(
   }
 
   const statusRaw = firstString(raw.status);
-  let status: PositionStatusFilter = 'all';
+  // FE PR1 #1: /api/positions is "open only" by default; closed/all are opt-in.
+  let status: PositionStatusFilter = options.defaultStatus ?? 'all';
   if (options.allowStatus && statusRaw !== undefined && statusRaw !== '') {
     if (statusRaw !== 'open' && statusRaw !== 'closed' && statusRaw !== 'all') {
       return { ok: false, status: 400, error: "Invalid status (expected 'open', 'closed' or 'all')" };
@@ -195,9 +196,10 @@ export type SessionScopeFilterKind = 'session_id' | 'time_window' | 'none';
 export interface SessionScopeMeta {
   sessionId: string | null;
   executionMode: ExecutionMode | null;
-  /** Epoch ms; mirrors `/api/status.sessionStartedAt` for the active session. */
-  sessionStartedAt: number | null;
-  sessionEndedAt: number | null;
+  /** ISO-8601 UTC; mirrors `/api/status.sessionStartedAt` for the active session. */
+  sessionStartedAt: string | null;
+  /** ISO-8601 UTC; set for past sessions only. */
+  sessionEndedAt: string | null;
   isActive: boolean;
   filter: SessionScopeFilterKind;
   /** Column the window filter and ordering use for this table. */
@@ -233,8 +235,8 @@ export function buildSessionScopeMeta(
   return {
     sessionId: window?.sessionId ?? null,
     executionMode: window?.executionMode ?? null,
-    sessionStartedAt: window?.startedAt ?? null,
-    sessionEndedAt: window?.endedAt ?? null,
+    sessionStartedAt: toIsoOrNull(window?.startedAt),
+    sessionEndedAt: toIsoOrNull(window?.endedAt),
     isActive: window?.isActive ?? false,
     filter,
     timeColumn: SESSION_SCOPE_TIME_COLUMN[table],

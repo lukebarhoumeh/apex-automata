@@ -53,6 +53,16 @@ export function formatTimestamp(date: Date = new Date()): string {
 }
 
 /**
+ * Epoch-ms → ISO-8601 UTC string for API payloads (`sessionStartedAt` is an ISO
+ * string on every REST / WS surface per the FE PR1 contract); `null` passes
+ * through and non-finite input is treated as "unknown" rather than thrown.
+ */
+export function toIsoOrNull(ms: number | null | undefined): string | null {
+  if (ms === null || ms === undefined || !Number.isFinite(ms)) return null;
+  return new Date(ms).toISOString();
+}
+
+/**
  * Create a new session context
  */
 export function createSessionContext(options: {

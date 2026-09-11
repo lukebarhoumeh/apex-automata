@@ -28,7 +28,8 @@ import {
   SessionScopeQuery,
   SessionWindow,
 } from './session-scope';
-import { buildStrategySessionStats, StrategySessionStats } from './strategy-session-stats';
+import { buildStrategySessionStats, StrategyDescriptorLike, StrategySessionStats } from './strategy-session-stats';
+import { toIsoOrNull } from '../runtime/session-context';
 import { buildPnlSnapshotPayload, PnlSnapshot } from './pnl-snapshot';
 import { buildStatusPayload, StatusPayload } from './status-payload';
 import { createClient } from '@supabase/supabase-js';
@@ -2461,7 +2462,8 @@ app.post('/api/engine/start', async (req, res) => {
       success: true,
       message: `Trading engine started in ${mode} mode`,
       sessionId,
-      sessionStartedAt: runtimeState.sessionStartedAt,
+      // ISO-8601 UTC — same value /api/status and StatusUpdate report (FE PR1 #4).
+      sessionStartedAt: toIsoOrNull(runtimeState.sessionStartedAt),
       activeSymbols,
       perpsSymbols: perpsSymbols,
       spotToPerpsMapping: Object.fromEntries(activeSpotToPerpsMap),
@@ -3029,9 +3031,48 @@ app.post('/api/config/signals', (req, res) => {
 function activeSessionBlock() {
   return {
     sessionId: runtimeState.sessionId,
+    /** ISO-8601 UTC (FE PR1 #4) — identical to `/api/status.sessionStartedAt`. */
+    sessionStartedAt: toIsoOrNull(runtimeState.sessionStartedAt),
+    executionMode: runtimeState.sessionMode,
+  };
+}
+
+/** Same identity with `sessionStartedAt` in epoch ms — the input shape of the pure builders. */
+function activeSessionBlockMs() {
+  return {
+    sessionId: runtimeState.sessionId,
     sessionStartedAt: runtimeState.sessionStartedAt,
     executionMode: runtimeState.sessionMode,
   };
+}
+
+/**
+ * Strategies the session report lists: every registered plugin (registry
+ * order, live `enabled` flag) followed by shelved builtins from guardrails
+ * policy (`disabled_strategies`) so Dashboard cards can render all ids — FE
+ * PR1 #3 "include shelved ids with zeros".
+ */
+function strategyDescriptorsForSession(): StrategyDescriptorLike[] {
+  const policy = buildStrategyPolicy(guardrails);
+  const policyById = new Map(policy.strategies.map((p) => [p.id, p]));
+  const registered = signalProcessor?.getRegisteredStrategies() ?? [];
+  const seen = new Set<string>();
+  const descriptors: StrategyDescriptorLike[] = [];
+
+  for (const plugin of registered) {
+    seen.add(plugin.id);
+    descriptors.push({
+      id: plugin.id,
+      name: plugin.name,
+      enabled: plugin.enabled,
+      disabledByGuardrails: policyById.get(plugin.id)?.disabledByGuardrails ?? false,
+    });
+  }
+  for (const entry of policy.strategies) {
+    if (seen.has(entry.id)) continue;
+    descriptors.push({ id: entry.id, name: entry.name, enabled: false, disabledByGuardrails: entry.disabledByGuardrails });
+  }
+  return descriptors;
 }
 
 // Get session statistics — always the ACTIVE session (TradeAnalytics is rebuilt per engine start).
@@ -3052,9 +3093,9 @@ app.get('/api/analytics/session', (req, res) => {
     ...statsWithoutCurve,
     // Runtime session identity wins over the analytics' own label so the UI
     // can key caches on one id; they are equal whenever the engine was
-    // started through this API.
+    // started through this API. `startTime` (ISO) is the FE-typed field.
     sessionId: session.sessionId ?? stats.sessionId,
-    sessionStartedAt: session.sessionStartedAt ?? stats.startTime.getTime(),
+    sessionStartedAt: session.sessionStartedAt ?? stats.startTime.toISOString(),
     executionMode: session.executionMode ?? stats.mode,
   });
 });
@@ -3095,19 +3136,18 @@ app.get('/api/analytics/trades', (req, res) => {
 });
 
 /**
- * Session-scoped per-strategy trade stats (FE contract #3).
+ * Session-scoped per-strategy trade stats (FE PR1 contract #3 — Dashboard cards).
  *
- * GET /api/analytics/strategies[?session_id=<active id>]
- *   → { sessionId, sessionStartedAt, executionMode, engineRunning, riskDay,
- *       strategies: [{ strategyId, name, enabled, closedTrades, openTrades, wins, losses,
- *                      breakeven, winRate|null, realizedPnlUsd, pnlToday, closedTradesToday,
- *                      avgTradeUsd|null, feesUsd, lastTradeAt|null, signalsGenerated|null }],
- *       totals, notes }
+ * GET /api/analytics/strategies?session_id=<active id>[&execution_mode=]
+ *   → { sessionId, strategies: [{ strategyId, closedTrades, pnlToday, winRate, ...extras }],
+ *       sessionStartedAt (ISO), executionMode, engineRunning, riskDay, generatedAt, totals, notes }
  *
- * Always 200 while the request is well-formed: with no engine session the list
- * is empty and `sessionId` is null (render "—"). A `session_id` that is not
- * the active session is refused with 404 — closed trades live in memory for the
- * active session only; history is in `trade_log` (`/api/analytics/trade-history`).
+ * `closedTrades` is closed trades THIS session (never `signalsGenerated`);
+ * `pnlToday` / `winRate` are 0 when there are truly zero closed trades. Shelved
+ * ids from guardrails are listed with zeros. With no active session the list is
+ * empty and `sessionId` is null (stats are unknown, not zero). A `session_id`
+ * that is not the active session is refused with 404 — closed trades live in
+ * memory for the active session only; history is in `trade_log`.
  */
 app.get('/api/analytics/strategies', (req, res) => {
   const parsed = parseSessionScopeQuery(req.query as Record<string, unknown>);
@@ -3129,18 +3169,12 @@ app.get('/api/analytics/strategies', (req, res) => {
   }
 
   const engineRunning = tradingEngine !== null && tradingEngine.engineRunning;
+  const hasSession = runtimeState.sessionId !== null;
   res.json(buildStrategySessionStats({
     closedTrades: engineRunning ? tradingEngine!.getClosedTrades() : [],
     openTrades: engineRunning ? tradingEngine!.getOpenTrades() : [],
-    strategies: signalProcessor
-      ? signalProcessor.getRegisteredStrategies().map((s) => ({
-          id: s.id,
-          name: s.name,
-          enabled: s.enabled,
-          signalsGenerated: s.getStats?.()?.signalsGenerated ?? null,
-        }))
-      : [],
-    session: activeSessionBlock(),
+    strategies: hasSession ? strategyDescriptorsForSession() : [],
+    session: activeSessionBlockMs(),
     engineRunning,
   }));
 });
@@ -3281,13 +3315,14 @@ app.get('/api/analytics/system-metrics', (req, res) => {
 //   GET /api/orders    ?session_id=&execution_mode=&limit=
 //   GET /api/fills     ?session_id=&execution_mode=&limit=
 //   GET /api/signals   ?session_id=&execution_mode=&limit=
-//   GET /api/positions ?session_id=&execution_mode=&status=open|closed|all&limit=
+//   GET /api/positions ?session_id=&execution_mode=&status=open|closed|all&limit=   (default: open)
 //
 // Response: { <table>: Row[], count, scope: { sessionId, executionMode,
-// sessionStartedAt, sessionEndedAt, isActive, filter: 'session_id' |
-// 'time_window' | 'none', timeColumn, limit, note } }. `/api/positions` for the
-// active session also carries `engineOpenPositions` (the in-memory truth the
-// PnL snapshot is computed from).
+// sessionStartedAt (ISO), sessionEndedAt (ISO), isActive, filter: 'session_id' |
+// 'time_window' | 'none', timeColumn, limit, note } }. Rows keep their Supabase
+// column names (FE maps them today). `/api/positions` for the active session
+// also carries `engineOpenPositions` (the in-memory truth the PnL snapshot is
+// computed from, incl. positions hydrated from prior sessions).
 //
 // No `session_id` => the active session. No active session => 200 with empty
 // rows and `scope.filter = 'none'` (the UI renders "—", never stale rows).
@@ -3373,7 +3408,11 @@ function mapEnginePosition(p: Position) {
 
 function registerBlotterEndpoint(table: SessionScopedTable, route: string): void {
   app.get(route, async (req, res) => {
-    const parsed = parseSessionScopeQuery(req.query as Record<string, unknown>, { allowStatus: table === 'positions' });
+    // FE PR1 #1: /api/positions is "open only" unless status=closed|all is passed.
+    const parsed = parseSessionScopeQuery(req.query as Record<string, unknown>, {
+      allowStatus: table === 'positions',
+      defaultStatus: table === 'positions' ? 'open' : 'all',
+    });
     if (!parsed.ok) {
       return res.status(parsed.status).json({ error: parsed.error });
     }
@@ -3751,13 +3790,8 @@ app.get('/api/strategies', (req, res) => {
   const sessionReport = buildStrategySessionStats({
     closedTrades: engineRunning ? tradingEngine!.getClosedTrades() : [],
     openTrades: engineRunning ? tradingEngine!.getOpenTrades() : [],
-    strategies: strategies.map((s) => ({
-      id: s.id,
-      name: s.name,
-      enabled: s.enabled,
-      signalsGenerated: s.getStats?.()?.signalsGenerated ?? null,
-    })),
-    session: activeSessionBlock(),
+    strategies: strategyDescriptorsForSession(),
+    session: activeSessionBlockMs(),
     engineRunning,
   });
   const sessionStatsById = new Map<string, StrategySessionStats>(
