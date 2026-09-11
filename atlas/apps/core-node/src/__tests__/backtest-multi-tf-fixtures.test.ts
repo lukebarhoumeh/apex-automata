@@ -18,6 +18,11 @@
  *   smoke-aug2026/           Aug 2026 month-block — SMOKE ONLY, not hard-preflight
  *   holdout-2025-03_2026-03/ 2025-03-01 → 2026-03-01 — hard-preflight SoT
  *   tune-2023-03_2025-03/    2023-03-01 → 2025-03-01 — tuning window
+ *   tune-2019-01_2023-03/    2019-01-01 → 2023-03-01 — deep-history tuning window (BTC, ETH)
+ *
+ * 1d windows:
+ *   1d/                      2024-09-01 → 2026-08-31 — sealed HO-H1-DAILY source (BTC, ETH, SOL)
+ *   1d/tune-2017-01_2025-03/ 2017-01-01 → 2025-02-28 — deep-history tuning window (BTC, ETH)
  */
 import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
@@ -47,6 +52,12 @@ const SMOKE_4H = path.join(FIXTURES, '4h', 'smoke-aug2026');
 const HOLDOUT_4H = path.join(FIXTURES, '4h', 'holdout-2025-03_2026-03');
 const TUNE_4H = path.join(FIXTURES, '4h', 'tune-2023-03_2025-03');
 
+/** Deep-history tune windows (TM P0 backfill) — BTC + ETH only. */
+const PAIR = ['BTC-USD', 'ETH-USD'];
+const TUNE_4H_2019 = path.join(FIXTURES, '4h', 'tune-2019-01_2023-03');
+const TUNE_1D_2017 = path.join(FIXTURES, '1d', 'tune-2017-01_2025-03');
+const SEALED_1D = path.join(FIXTURES, '1d');
+
 /**
  * 4h bucket starts that Coinbase's own public candle series cannot fill
  * (exchange outages — no ONE_HOUR / FIFTEEN_MINUTE candles exist upstream).
@@ -54,6 +65,37 @@ const TUNE_4H = path.join(FIXTURES, '4h', 'tune-2023-03_2025-03');
  */
 const HOLDOUT_GAPS = [Date.UTC(2025, 9, 25, 16) / 1000, Date.UTC(2025, 9, 25, 20) / 1000];
 const TUNE_GAPS = [Date.UTC(2023, 2, 4, 16) / 1000, Date.UTC(2023, 2, 4, 20) / 1000];
+
+/**
+ * tune-2019-01_2023-03/: six (BTC) / four (ETH) single 4h buckets, each
+ * missing one native ONE_HOUR candle upstream (two on ETH 2019-06-20) —
+ * re-queried at ONE_HOUR and FIFTEEN_MINUTE at generation, the candles do
+ * not exist on Coinbase. 2019-04-11 and 2019-10-31 are BTC-only holes.
+ */
+const TUNE_2019_GAPS: Record<string, number[]> = {
+  'BTC-USD': [
+    Date.UTC(2019, 3, 11, 12) / 1000, // 13:00 missing
+    Date.UTC(2019, 5, 20, 12) / 1000, // 15:00 missing
+    Date.UTC(2019, 9, 31, 20) / 1000, // 20:00 missing
+    Date.UTC(2020, 0, 30, 16) / 1000, // 17:00 missing
+    Date.UTC(2020, 8, 4, 20) / 1000, // 23:00 missing
+    Date.UTC(2020, 9, 20, 20) / 1000, // 20:00 missing
+  ],
+  'ETH-USD': [
+    Date.UTC(2019, 5, 20, 12) / 1000, // 14:00 + 15:00 missing
+    Date.UTC(2020, 0, 30, 16) / 1000, // 17:00 missing
+    Date.UTC(2020, 8, 4, 20) / 1000, // 23:00 missing
+    Date.UTC(2020, 9, 20, 20) / 1000, // 20:00 missing
+  ],
+};
+
+/**
+ * The one day in 2019-01 → 2023-03 where Coinbase's native ONE_DAY volume
+ * disagrees with the sum of its own 24 ONE_HOUR candles by more than 0.1 %
+ * (BTC +2.6 %, ETH +2.8 %; the 17:00Z hourly candle under-reports volume
+ * versus its own four FIFTEEN_MINUTE candles). OHLC is exact on that day.
+ */
+const TUNE_2019_VOLUME_OUTLIER_DAYS = [Date.UTC(2021, 10, 24) / 1000];
 
 function readFixture(dir: string, symbol: string): BarFixtureFile {
   return JSON.parse(fs.readFileSync(path.join(dir, `${symbol}.json`), 'utf8')) as BarFixtureFile;
@@ -346,6 +388,166 @@ describe('committed multi-TF fixtures are real, contiguous and self-describing',
   });
 });
 
+describe('deep-history tune fixtures (TM P0 backfill): 4h/tune-2019-01_2023-03 and 1d/tune-2017-01_2025-03', () => {
+  const HO_H1_DAILY_START = Date.UTC(2025, 2, 1) / 1000; // sealed HO-H1-DAILY window begins 2025-03-01
+
+  function assertContiguous(file: BarFixtureFile, step: number, knownGaps: number[] = []): void {
+    const found: number[] = [];
+    for (let i = 0; i < file.candles.length; i++) {
+      const c = file.candles[i];
+      expect(c.time % step).toBe(0);
+      if (i > 0) {
+        for (let t = file.candles[i - 1].time + step; t < c.time; t += step) found.push(t);
+      }
+      expect(c.low).toBeGreaterThan(0);
+      expect(c.low).toBeLessThanOrEqual(Math.min(c.open, c.close));
+      expect(c.high).toBeGreaterThanOrEqual(Math.max(c.open, c.close));
+      expect(c.volume).toBeGreaterThan(0);
+    }
+    expect(found).toEqual(knownGaps);
+  }
+
+  function assertRealProvenance(file: BarFixtureFile, symbol: string): void {
+    expect(file.symbol).toBe(symbol);
+    expect(file.exchange).toBe('coinbase');
+    expect(file.source).toBe('coinbase-advanced-trade-public');
+    expect(file.source).not.toMatch(/synthetic/i);
+    expect(file.endpoint).toBe(`https://api.coinbase.com/api/v3/brokerage/market/products/${symbol}/candles`);
+    expect(new Date(file.start).getTime() / 1000).toBe(file.candles[0].time);
+    expect(new Date(file.end).getTime() / 1000).toBe(file.candles[file.candles.length - 1].time);
+  }
+
+  it('4h/tune-2019-01_2023-03/: BTC 9114 / ETH 9116 true 4H bars rolled from ONE_HOUR, 2019-01-01 → 2023-03-01, only the documented single-bucket holes', () => {
+    // 1520 days × 6 = 9120 buckets. Each hole is one bucket with 1–2 native hours missing upstream.
+    const expected: Record<string, { sourceBars: number; bucketsEmitted: number; bucketsDroppedIncomplete: number }> = {
+      'BTC-USD': { sourceBars: 36474, bucketsEmitted: 9114, bucketsDroppedIncomplete: 6 },
+      'ETH-USD': { sourceBars: 36475, bucketsEmitted: 9116, bucketsDroppedIncomplete: 4 },
+    };
+    for (const symbol of PAIR) {
+      const file = readFixture(TUNE_4H_2019, symbol);
+      assertRealProvenance(file, symbol);
+      expect(file.granularity).toBe('FOUR_HOUR');
+      expect(file.granularitySeconds).toBe(FOUR_H);
+      expect(file.rollup).toMatchObject({
+        method: 'utc-aligned-ohlcv',
+        sourceGranularity: 'ONE_HOUR',
+        sourceGranularitySeconds: 3600,
+        bucketSeconds: FOUR_H,
+        sourceBarsPerBucket: 4,
+        ...expected[symbol],
+      });
+      expect(file.candles).toHaveLength(expected[symbol].bucketsEmitted);
+      expect(file.rollup!.bucketsEmitted).toBe(file.candles.length);
+      expect(9120 - file.candles.length).toBe(TUNE_2019_GAPS[symbol].length);
+      expect(file.candles[0].time).toBe(Date.UTC(2019, 0, 1) / 1000);
+      expect(file.candles[file.candles.length - 1].time).toBe(Date.UTC(2023, 1, 28, 20) / 1000);
+      assertContiguous(file, FOUR_H, TUNE_2019_GAPS[symbol]);
+    }
+  });
+
+  it('4h/tune-2019-01_2023-03/ is not in the directory for SOL-USD (BTC + ETH only)', () => {
+    expect(fs.existsSync(path.join(TUNE_4H_2019, 'SOL-USD.json'))).toBe(false);
+    expect(fs.existsSync(path.join(TUNE_1D_2017, 'SOL-USD.json'))).toBe(false);
+  });
+
+  it('4h tune windows are adjacent and disjoint: 2019-01_2023-03 ends where 2023-03_2025-03 begins', () => {
+    for (const symbol of PAIR) {
+      const older = readFixture(TUNE_4H_2019, symbol);
+      const newer = readFixture(TUNE_4H, symbol);
+      expect(older.candles[older.candles.length - 1].time + FOUR_H).toBe(newer.candles[0].time);
+      expect(older.candles[older.candles.length - 1].time).toBeLessThan(readFixture(HOLDOUT_4H, symbol).candles[0].time);
+    }
+  });
+
+  it('1d/tune-2017-01_2025-03/: BTC, ETH — 2981 native ONE_DAY bars 2017-01-01 → 2025-02-28, no upstream gaps', () => {
+    for (const symbol of PAIR) {
+      const file = readFixture(TUNE_1D_2017, symbol);
+      assertRealProvenance(file, symbol);
+      expect(file.granularity).toBe('ONE_DAY');
+      expect(file.granularitySeconds).toBe(DAY);
+      expect(file.rollup).toBeUndefined();
+      expect(file.candles).toHaveLength(2981);
+      expect(file.candles[0].time).toBe(Date.UTC(2017, 0, 1) / 1000);
+      expect(file.candles[2980].time).toBe(Date.UTC(2025, 1, 28) / 1000);
+      assertContiguous(file, DAY);
+    }
+  });
+
+  it('1d/tune-2017-01_2025-03/ ends the day before the sealed HO-H1-DAILY window and never serves a holdout bar', () => {
+    for (const symbol of PAIR) {
+      const tune = readFixture(TUNE_1D_2017, symbol);
+      const last = tune.candles[tune.candles.length - 1].time;
+      expect(last + DAY).toBe(HO_H1_DAILY_START);
+      expect(tune.candles.some((c) => c.time >= HO_H1_DAILY_START)).toBe(false);
+    }
+  });
+
+  it('1d/tune-2017-01_2025-03/ is byte-identical to the sealed 1d/ files on the 181 days both cover (2024-09-01 → 2025-02-28)', () => {
+    // Same public endpoint, same native ONE_DAY candles; Coinbase serves stable history.
+    // The sealed files themselves are not touched by this set — this only reads them.
+    for (const symbol of PAIR) {
+      const tune = new Map(readFixture(TUNE_1D_2017, symbol).candles.map((c) => [c.time, c]));
+      const sealed = readFixture(SEALED_1D, symbol);
+      let compared = 0;
+      for (const s of sealed.candles) {
+        const t = tune.get(s.time);
+        if (!t) continue;
+        compared++;
+        expect(t).toEqual(s);
+      }
+      expect(compared).toBe(181);
+    }
+  });
+
+  /**
+   * Roll a 4h fixture → 1d and compare with a native ONE_DAY fixture on every
+   * day both cover. OHLC must be exact on every day. Volume must be within
+   * 0.1 % on every day except the documented `volumeOutlierDays`, where
+   * Coinbase's own granularities disagree (MULTI_TF.md); the set of days over
+   * 0.1 % must equal that list exactly, so a new divergence fails the suite.
+   */
+  function expectFourHourReproducesDaily(
+    dir4h: string,
+    dir1d: string,
+    symbol: string,
+    expectedDays: number,
+    expectedDroppedDays: number,
+    volumeOutlierDays: number[] = [],
+  ): void {
+    const h4 = readFixture(dir4h, symbol);
+    const d1 = readFixture(dir1d, symbol);
+    const rolled = rollupCandles(h4.candles.map((c) => ({ ...c, time: c.time * 1000 })), FOUR_H, DAY);
+    expect(rolled.bucketsDroppedIncomplete).toBe(expectedDroppedDays);
+    const native = new Map(d1.candles.map((c) => [c.time * 1000, c]));
+    let compared = 0;
+    const volumeOutliers: number[] = [];
+    for (const day of rolled.candles) {
+      const n = native.get(day.time);
+      if (!n) continue;
+      compared++;
+      expect([day.open, day.high, day.low, day.close]).toEqual([n.open, n.high, n.low, n.close]);
+      const rel = Math.abs(day.volume - n.volume) / n.volume;
+      if (rel >= 0.001) {
+        volumeOutliers.push(day.time / 1000);
+        expect(rel).toBeLessThan(0.03);
+      }
+    }
+    expect(compared).toBe(expectedDays);
+    expect(volumeOutliers).toEqual(volumeOutlierDays);
+  }
+
+  it('new 4h tune rolled to 1d reproduces the new daily tune OHLC exactly on all 1514 (BTC) / 1516 (ETH) complete days', () => {
+    // 1520 days; each single-bucket hole makes its day 5/6 buckets → dropped, not compared.
+    expectFourHourReproducesDaily(TUNE_4H_2019, TUNE_1D_2017, 'BTC-USD', 1514, 6, TUNE_2019_VOLUME_OUTLIER_DAYS);
+    expectFourHourReproducesDaily(TUNE_4H_2019, TUNE_1D_2017, 'ETH-USD', 1516, 4, TUNE_2019_VOLUME_OUTLIER_DAYS);
+  });
+
+  it('existing 4h/tune-2023-03_2025-03 rolled to 1d reproduces the new daily tune OHLC on all 730 complete days', () => {
+    // 731 days; 2023-03-04 is 4/6 buckets after the upstream gap and is dropped, not compared.
+    for (const symbol of PAIR) expectFourHourReproducesDaily(TUNE_4H, TUNE_1D_2017, symbol, 730, 1);
+  });
+});
+
 describe('fail-closed loader honours the fixture-declared bar width', () => {
   it('loads the smoke 4h fixtures with the CLI default (900s) and reports coverage against 14400s bars', async () => {
     const loader = new HistoricalDataLoader({ fixtureDir: SMOKE_4H }, makeLogger());
@@ -429,6 +631,70 @@ describe('fail-closed loader honours the fixture-declared bar width', () => {
     ).rejects.toMatchObject({ code: 'DATA_UNAVAILABLE' });
     await expect(
       loader.loadCandles('SOL-USD', new Date('2026-07-01T00:00:00Z'), new Date('2026-07-31T00:00:00Z'), 900),
+    ).rejects.toMatchObject({ code: 'DATA_UNAVAILABLE' });
+  });
+
+  it('loads the deep-history 4h tune (2019-01-01 → 2023-03-01) as REAL fixture data with honest coverage', async () => {
+    const loader = new HistoricalDataLoader({ fixtureDir: TUNE_4H_2019 }, makeLogger());
+    const bars: Record<string, number> = { 'BTC-USD': 9114, 'ETH-USD': 9116 };
+    for (const symbol of PAIR) {
+      const res = await loader.loadCandles(symbol, new Date('2019-01-01T00:00:00Z'), new Date('2023-03-01T00:00:00Z'), 900);
+      expect(res.source).toBe('fixture');
+      expect(res.candles).toHaveLength(bars[symbol]);
+      expect(res.provenance.granularitySeconds).toBe(FOUR_H);
+      expect(res.provenance.expectedCount).toBe(9121); // 1520d / 4h + 1 (inclusive end bound)
+      expect(res.provenance.coverage).toBeCloseTo(bars[symbol] / 9121, 9);
+      expect(res.provenance.inferredBarMinutes).toBe(240);
+      expect(res.provenance.firstBarTime).toBe('2019-01-01T00:00:00.000Z');
+      expect(res.provenance.lastBarTime).toBe('2023-02-28T20:00:00.000Z');
+      expect(res.provenance.fixturePath).toBe(path.join(TUNE_4H_2019, `${symbol}.json`));
+      expect(res.provenance.fixtureSha256).toMatch(/^[0-9a-f]{64}$/);
+    }
+  });
+
+  it('loads the deep-history 1d tune (2017-01-01 → 2025-02-28) as REAL fixture data with 100% coverage', async () => {
+    const loader = new HistoricalDataLoader({ fixtureDir: TUNE_1D_2017 }, makeLogger());
+    for (const symbol of PAIR) {
+      const res = await loader.loadCandles(symbol, new Date('2017-01-01T00:00:00Z'), new Date('2025-02-28T00:00:00Z'), 900);
+      expect(res.source).toBe('fixture');
+      expect(res.candles).toHaveLength(2981);
+      expect(res.provenance.granularitySeconds).toBe(DAY);
+      expect(res.provenance.expectedCount).toBe(2981);
+      expect(res.provenance.coverage).toBeCloseTo(1, 9);
+      expect(res.provenance.inferredBarMinutes).toBe(1440);
+      expect(res.provenance.firstBarTime).toBe('2017-01-01T00:00:00.000Z');
+      expect(res.provenance.lastBarTime).toBe('2025-02-28T00:00:00.000Z');
+      expect(res.provenance.fixturePath).toBe(path.join(TUNE_1D_2017, `${symbol}.json`));
+      expect(res.provenance.fixtureSha256).toMatch(/^[0-9a-f]{64}$/);
+    }
+    // --end-date 2025-03-01 (month boundary) counts one would-be bar at T00:00 that is deliberately absent.
+    const res = await loader.loadCandles('BTC-USD', new Date('2017-01-01T00:00:00Z'), new Date('2025-03-01T00:00:00Z'), 900);
+    expect(res.candles).toHaveLength(2981);
+    expect(res.provenance.expectedCount).toBe(2982);
+    expect(res.provenance.lastBarTime).toBe('2025-02-28T00:00:00.000Z');
+  });
+
+  it('deep-history tune dirs are DATA_UNAVAILABLE for SOL-USD and for windows they do not cover (incl. the sealed holdout)', async () => {
+    const loader4h = new HistoricalDataLoader({ fixtureDir: TUNE_4H_2019 }, makeLogger());
+    const loader1d = new HistoricalDataLoader({ fixtureDir: TUNE_1D_2017 }, makeLogger());
+    // No SOL-USD file in either directory.
+    await expect(
+      loader4h.loadCandles('SOL-USD', new Date('2019-01-01T00:00:00Z'), new Date('2023-03-01T00:00:00Z'), 900),
+    ).rejects.toMatchObject({ code: 'DATA_UNAVAILABLE' });
+    await expect(
+      loader1d.loadCandles('SOL-USD', new Date('2017-01-01T00:00:00Z'), new Date('2025-03-01T00:00:00Z'), 900),
+    ).rejects.toMatchObject({ code: 'DATA_UNAVAILABLE' });
+    // The 4h window after this set (the 2023-03 → 2025-03 tune) is not here.
+    await expect(
+      loader4h.loadCandles('BTC-USD', new Date('2023-03-01T00:00:00Z'), new Date('2025-03-01T00:00:00Z'), 900),
+    ).rejects.toMatchObject({ code: 'DATA_UNAVAILABLE' });
+    // The sealed HO-H1-DAILY window (2025-03-01 → 2026-08-31) must never be served from the tune set.
+    await expect(
+      loader1d.loadCandles('ETH-USD', new Date('2025-03-01T00:00:00Z'), new Date('2026-08-31T00:00:00Z'), 900),
+    ).rejects.toMatchObject({ code: 'DATA_UNAVAILABLE' });
+    // Pre-history: Coinbase has no 2016 bars in this window's file.
+    await expect(
+      loader1d.loadCandles('BTC-USD', new Date('2016-01-01T00:00:00Z'), new Date('2016-12-31T00:00:00Z'), 900),
     ).rejects.toMatchObject({ code: 'DATA_UNAVAILABLE' });
   });
 
