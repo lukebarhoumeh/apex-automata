@@ -31,7 +31,10 @@ export function StrategyCards({ strategies }: StrategyCardsProps) {
       {strategies.map((s) => {
         const status = STATUS_COPY[s.status];
         const label = s.status === "off" && s.disabledBy === "engine-offline" ? "Off · engine stopped" : status.label;
-        const up = s.pnlToday >= 0;
+        const up = s.pnlSession >= 0;
+        // Killed / stopped strategies own no session activity; a "0" would
+        // still read as a runnable strategy sitting idle, so render "—".
+        const inert = s.status === "killed" || !s.sessionScoped;
         return (
           <button
             key={s.id}
@@ -66,25 +69,43 @@ export function StrategyCards({ strategies }: StrategyCardsProps) {
             </div>
 
             <div className="flex items-end justify-between pt-1">
-              <div>
-                <div className="label">P&amp;L today</div>
-                <div className={cn("mono mt-0.5 text-[18px] font-medium leading-none", up ? "text-up" : "text-down")}>
-                  {up ? "+$" : "-$"}
-                  {Math.abs(s.pnlToday).toFixed(2)}
+              <div title="Realized P&L of this strategy's closed trades in the active session (TradeAnalytics)">
+                <div className="label">P&amp;L session</div>
+                <div
+                  className={cn(
+                    "mono mt-0.5 text-[18px] font-medium leading-none",
+                    inert ? "text-fg-3" : up ? "text-up" : "text-down",
+                  )}
+                  data-testid={`strategy-card-${s.id}-pnl`}
+                >
+                  {inert ? "—" : `${up ? "+$" : "-$"}${Math.abs(s.pnlSession).toFixed(2)}`}
                 </div>
               </div>
               <div className="flex gap-4 text-right">
-                <div>
+                <div title="Closed trades attributed to this strategy in the active session — not signals">
                   <div className="label">Trades</div>
-                  <div className="mono mt-0.5 text-[13px] font-medium text-fg-0">{s.trades}</div>
+                  <div className="mono mt-0.5 text-[13px] font-medium text-fg-0" data-testid={`strategy-card-${s.id}-trades`}>
+                    {inert ? "—" : s.trades}
+                  </div>
                 </div>
-                <div>
+                <div title="Win rate over this session's closed trades">
                   <div className="label">Win</div>
                   <div className="mono mt-0.5 text-[13px] font-medium text-fg-0">
-                    {(s.winRate * 100).toFixed(0)}%
+                    {inert || s.trades === 0 ? "—" : `${(s.winRate * 100).toFixed(0)}%`}
                   </div>
                 </div>
               </div>
+            </div>
+            <div
+              className="mono text-[10px] text-fg-3"
+              title="Signals the plugin emitted this run (StrategyRegistry counter). Most are filtered by risk / meta-filter before any order is routed."
+              data-testid={`strategy-card-${s.id}-signals`}
+            >
+              {s.status === "killed"
+                ? "never registered — emits no signals"
+                : !s.sessionScoped
+                  ? "no session ledger"
+                  : `${s.signals} ${s.signals === 1 ? "signal" : "signals"} emitted · ${s.trades} routed to ${s.trades === 1 ? "a trade" : "trades"}`}
             </div>
           </button>
         );

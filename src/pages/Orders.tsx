@@ -7,9 +7,12 @@ import { RecentFillsPanel } from "@/components/apex/orders/RecentFillsPanel";
 import { useOrders, useFills, useOrderStats } from "@/hooks/apex/useOrdersData";
 import { useOpenPositions } from "@/hooks/apex/useDashboardData";
 import { useLiveMarks } from "@/hooks/apex/useLiveMarks";
+import { useActiveSession } from "@/runtime/session";
 import type { OrderRecord } from "@/types/orders";
 
 export default function Orders() {
+  // Blotter, fills and KPIs are scoped to this session (see useOrdersData).
+  const session = useActiveSession();
   const orders = useOrders();
   const fills = useFills();
   const positions = useOpenPositions();
@@ -22,19 +25,20 @@ export default function Orders() {
 
   return (
     <div className="flex flex-col gap-4 p-6">
-      <OrdersKpiStrip stats={stats} />
+      <OrdersKpiStrip stats={stats} session={session} />
 
       <ActivePositionsStrip positions={positions.data} marks={marks} />
 
       <div className="grid gap-4" style={{ gridTemplateColumns: "minmax(0, 2fr) minmax(0, 1fr)" }}>
         <OrderBlotter
           orders={orders.data}
+          session={session}
           selectedId={selected?.id ?? null}
           onSelect={setSelected}
         />
         <div className="flex flex-col gap-4">
           <OrderDetailPanel order={selected} onClose={() => setSelected(null)} />
-          <RecentFillsPanel fills={fills.data} />
+          <RecentFillsPanel fills={fills.data} session={session} />
         </div>
       </div>
     </div>

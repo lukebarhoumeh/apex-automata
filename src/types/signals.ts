@@ -13,6 +13,12 @@ export interface SignalRecord {
   z: number | null;
   adx: number | null;
   note: string;
+  /**
+   * Strategy is in guardrails.yaml `disabled_strategies` (GET
+   * /api/strategies/policy). Such a signal can never reach order routing and
+   * must not be rendered as activity of a runnable strategy.
+   */
+  killed?: boolean;
 }
 
 export type FeedEventKind = "FILL" | "SIGNAL" | "REGIME" | "REJECT" | "RISK" | "SESSION";
@@ -25,4 +31,6 @@ export interface FeedEvent {
   tag: string;
   score?: number;
   risk?: "LOW" | "MED" | "HIGH";
+  /** See SignalRecord.killed. */
+  killed?: boolean;
 }

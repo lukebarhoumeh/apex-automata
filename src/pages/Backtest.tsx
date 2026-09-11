@@ -7,6 +7,7 @@ import { MonthlyReturnsPanel } from "@/components/apex/backtest/MonthlyReturnsPa
 import { RHistogram } from "@/components/apex/backtest/RHistogram";
 import { TradeLogTable } from "@/components/apex/backtest/TradeLogTable";
 import { Panel } from "@/components/apex/Panel";
+import { DemoBanner } from "@/components/apex/DemoBanner";
 import { useBacktestData } from "@/hooks/apex/useBacktestData";
 
 export default function Backtest() {
@@ -28,6 +29,18 @@ export default function Backtest() {
 
   return (
     <div className="flex flex-col gap-4 p-6">
+      <DemoBanner
+        detail={
+          <>
+            The <span className="text-fg-0">{B.preset}</span> run below (+{B.results.totalReturn.toFixed(1)}% on $
+            {B.config.initialCapital.toLocaleString()} initial capital, equity curve, monthly returns, trade log) is a
+            seeded fixture from <span className="mono">seed-data.ts</span>. <span className="text-fg-0">breakout</span> is
+            killed in <span className="mono">guardrails.yaml disabled_strategies</span>. Real backtests run via{" "}
+            <span className="mono">pnpm backtest</span> in <span className="mono">atlas/apps/core-node</span> and are not
+            wired to this page yet.
+          </>
+        }
+      />
       <BacktestHero config={B.config} results={B.results} />
       <ConfigPanel config={B.config} preset={B.preset} />
 

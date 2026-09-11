@@ -47,7 +47,8 @@ export function Footer() {
   const { data: status } = useRuntimeStatus();
   const connectivity = useConnectivity();
   const { data: metaFilter } = useMetaFilterStatus();
-  const now = useNow(5_000);
+  // 1s so the session uptime ticks like the sidebar/hero clocks it mirrors.
+  const now = useNow(1_000);
 
   const chips = deriveFooterChips({
     status,

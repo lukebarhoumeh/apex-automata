@@ -1,5 +1,6 @@
 import { NavLink } from "react-router-dom";
 import { Logo } from "@/components/apex/Logo";
+import { DemoPill } from "@/components/apex/DemoBanner";
 import { NAV } from "./nav-config";
 import { cn } from "@/lib/utils";
 import { useActiveSession } from "@/runtime/session";
@@ -116,7 +117,7 @@ export function AppSidebar() {
   );
 }
 
-function NavItem({ label, path, icon: Icon, kbd }: (typeof NAV)[number]) {
+function NavItem({ label, path, icon: Icon, kbd, demo }: (typeof NAV)[number]) {
   return (
     <NavLink
       to={path}
@@ -141,6 +142,7 @@ function NavItem({ label, path, icon: Icon, kbd }: (typeof NAV)[number]) {
           )}
           <Icon size={15} strokeWidth={1.5} />
           <span className="flex-1 text-[13px]">{label}</span>
+          {demo && <DemoPill />}
           <kbd className="kbd">{kbd}</kbd>
         </>
       )}

@@ -38,6 +38,8 @@ export function StrategyConfigCard({ strat }: Props) {
       : "text-warn bg-warn/10 ring-warn/20";
   const pill = STATE_PILL[strat.enabled ? "enabled" : strat.disabledBy ?? "runtime"];
   const killedBySot = strat.disabledBy === "guardrails";
+  // Killed or unregistered strategies have no session activity to report.
+  const inert = killedBySot || strat.disabledBy === "engine-offline";
 
   return (
     <Panel header={false} pad={0} className={cn(strat.enabled ? "" : "opacity-60")}>
@@ -92,33 +94,45 @@ export function StrategyConfigCard({ strat }: Props) {
         ))}
 
         <div className="border-t border-obsidian-line pt-3">
-          <div className="grid grid-cols-3 gap-4">
-            <div>
+          <div className="grid grid-cols-4 gap-4">
+            <div title="Win rate over this session's closed trades">
               <div className="mono text-[10px] uppercase text-fg-2">WIN RATE</div>
-              <div className="mono text-[17px] text-fg-0">{(strat.stats.winRate * 100).toFixed(1)}%</div>
+              <div className="mono text-[17px] text-fg-0">
+                {inert || strat.stats.trades === 0 ? "—" : `${(strat.stats.winRate * 100).toFixed(1)}%`}
+              </div>
             </div>
-            <div>
+            <div title="Average R per closed trade — not reported by the runtime yet">
               <div className="mono text-[10px] uppercase text-fg-2">AVG R</div>
-              <div className="mono text-[17px] text-up">{strat.stats.avgR.toFixed(2)}R</div>
+              <div className="mono text-[17px] text-fg-3">—</div>
             </div>
-            <div>
-              <div className="mono text-[10px] uppercase text-fg-2">TRADES</div>
-              <div className="mono text-[17px] text-fg-0">{strat.stats.trades}</div>
+            <div title="Closed trades attributed to this strategy in the ACTIVE session (TradeAnalytics)">
+              <div className="mono text-[10px] uppercase text-fg-2">TRADES · SESSION</div>
+              <div className="mono text-[17px] text-fg-0" data-testid={`strategy-config-${strat.id}-trades`}>
+                {inert ? "—" : strat.stats.trades}
+              </div>
             </div>
-          </div>
-          <div className="mt-3">
-            <div className="mono text-[10px] uppercase text-fg-2">LAST 12 R</div>
-            <div className="mt-1 flex gap-1">
-              {strat.stats.lastR.map((r, i) => (
-                <div
-                  key={i}
-                  className={cn("h-3 w-3 rounded-sm", r > 0 ? "bg-up" : "bg-down")}
-                  style={{ opacity: 0.4 + Math.min(Math.abs(r), 2.5) / 3 }}
-                  title={`${r.toFixed(2)}R`}
-                />
-              ))}
+            <div title="Signals the plugin emitted this run — most are filtered before any order is routed">
+              <div className="mono text-[10px] uppercase text-fg-2">SIGNALS</div>
+              <div className="mono text-[17px] text-fg-1" data-testid={`strategy-config-${strat.id}-signals`}>
+                {inert ? "—" : strat.stats.signals}
+              </div>
             </div>
           </div>
+          {strat.stats.lastR.length > 0 && (
+            <div className="mt-3">
+              <div className="mono text-[10px] uppercase text-fg-2">LAST 12 R</div>
+              <div className="mt-1 flex gap-1">
+                {strat.stats.lastR.map((r, i) => (
+                  <div
+                    key={i}
+                    className={cn("h-3 w-3 rounded-sm", r > 0 ? "bg-up" : "bg-down")}
+                    style={{ opacity: 0.4 + Math.min(Math.abs(r), 2.5) / 3 }}
+                    title={`${r.toFixed(2)}R`}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </Panel>

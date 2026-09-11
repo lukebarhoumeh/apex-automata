@@ -6,8 +6,16 @@ import type {
   MetaModelInfo,
 } from "@/types/strategy";
 import { supabase } from "@/integrations/supabase/client";
-import { fetchStrategyPolicy, type BackendStrategyPolicy } from "@/services/apexDashboardApi";
+import {
+  fetchSessionTrades,
+  fetchStrategyPolicy,
+  summarizeTradesByStrategy,
+  type BackendStrategyPolicy,
+  type BackendTradeRecord,
+} from "@/services/apexDashboardApi";
 import { mergeStrategyPolicy } from "@/lib/strategy-policy";
+import { hasActiveSession, sessionKey, sessionSinceIso, type SessionScope } from "@/lib/session-scope";
+import { useActiveSession } from "@/runtime/session";
 
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
 
@@ -60,40 +68,56 @@ interface SignalRow {
   reason: string | null;
 }
 
-function mapSignalRecord(row: SignalRow): SignalRecord {
+export function mapSignalRecord(row: SignalRow, killed: ReadonlySet<string> = new Set()): SignalRecord {
   const side: SignalSide = row.side?.toUpperCase() === "SELL" ? "SELL" : "BUY";
   const state: SignalState = row.allowed === false ? "REJECTED" : "ACCEPTED";
   const conf = num(row.meta_prob) || num(row.confidence) || num(row.score);
+  const strat = row.strategy ?? "—";
   return {
     id: row.id,
     ts: formatTime(row.decided_at),
     sym: row.symbol,
-    strat: row.strategy ?? "—",
+    strat,
     side,
     conf,
     state,
     z: null,
     adx: null,
     note: row.reason ?? "",
+    // Shelved in guardrails.yaml disabled_strategies → can never route.
+    killed: killed.has(strat),
   };
 }
 
+/**
+ * Signals decided since the ACTIVE session opened. `public.signals` has no
+ * session_id column (see lib/session-scope.ts) so the scope is the session's
+ * time window; with no session the stream is empty, never last run's rows.
+ */
+export async function fetchSessionSignalStream(scope: SessionScope, limit = 60): Promise<SignalRecord[]> {
+  const since = sessionSinceIso(scope);
+  if (!since) return [];
+  const [{ data, error }, policy] = await Promise.all([
+    supabase
+      .from("signals")
+      .select("id,symbol,strategy,decided_at,side,score,confidence,meta_prob,allowed,reason")
+      .gte("decided_at", since)
+      .order("decided_at", { ascending: false })
+      .limit(limit),
+    fetchStrategyPolicy(),
+  ]);
+  if (error) throw new Error(`signal-stream fetch: ${error.message}`);
+  const killed = new Set(policy?.disabledStrategies ?? []);
+  return (data as SignalRow[] | null)?.map((row) => mapSignalRecord(row, killed)) ?? [];
+}
+
 export function useSignalStream() {
+  const scope = useActiveSession();
   return useQuery<readonly SignalRecord[]>({
-    queryKey: ["apex", "signal-stream"],
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from("signals")
-        .select(
-          "id,symbol,strategy,decided_at,side,score,confidence,meta_prob,allowed,reason",
-        )
-        .order("decided_at", { ascending: false })
-        .limit(60);
-      if (error) throw new Error(`signal-stream fetch: ${error.message}`);
-      return (data as SignalRow[] | null)?.map(mapSignalRecord) ?? [];
-    },
+    queryKey: ["apex", "signal-stream", sessionKey(scope)],
+    queryFn: () => fetchSessionSignalStream(scope),
     staleTime: 2_000,
-    refetchInterval: 10_000,
+    refetchInterval: hasActiveSession(scope) ? 10_000 : false,
     placeholderData: keepPreviousData,
   });
 }
@@ -156,15 +180,24 @@ function kindFromCategory(category: string): StrategyConfig["kind"] {
     : "ml";
 }
 
+/**
+ * Strategy config cards. `stats.trades` is the ACTIVE session's closed-trade
+ * count from TradeAnalytics (`/api/analytics/trades`); `stats.signals` is the
+ * plugin's emitted-signal counter. They were conflated before, which showed
+ * emitted signals as trades.
+ */
 export function mapStrategyConfigs(
   registered: readonly BackendStrategy[],
   policy: BackendStrategyPolicy | null,
+  trades: readonly BackendTradeRecord[] | null = null,
 ): StrategyConfig[] {
+  const byStrategy = summarizeTradesByStrategy(trades);
   return mergeStrategyPolicy(registered, policy).map((m) => {
     const params = Object.entries(m.registered?.config ?? {})
       .map(([k, v]) => paramFromEntry(k, v))
       .filter((p): p is StrategyParam => p !== null)
       .slice(0, 5);
+    const summary = byStrategy[m.id];
     return {
       id: m.id,
       name: m.name,
@@ -174,9 +207,10 @@ export function mapStrategyConfigs(
       disabledBy: m.disabledBy,
       params,
       stats: {
-        winRate: 0,
+        winRate: summary?.winRate ?? 0,
         avgR: 0,
-        trades: m.registered?.stats?.signalsGenerated ?? 0,
+        trades: summary?.trades ?? 0,
+        signals: m.registered?.stats?.signalsGenerated ?? 0,
         lastR: [],
       },
     };
@@ -184,16 +218,19 @@ export function mapStrategyConfigs(
 }
 
 export function useStrategyConfigs() {
+  const scope = useActiveSession();
   return useQuery<readonly StrategyConfig[]>({
-    queryKey: ["apex", "strategy-configs"],
+    queryKey: ["apex", "strategy-configs", sessionKey(scope)],
     queryFn: async () => {
-      // Registered plugins (runtime) + guardrails policy (SoT) in parallel so
-      // a strategy killed in guardrails.yaml renders as killed, not missing.
-      const [res, policy] = await Promise.all([
+      // Registered plugins (runtime) + guardrails policy (SoT) + session trade
+      // ledger in parallel so a strategy killed in guardrails.yaml renders as
+      // killed, not missing, and trade counts are session-true.
+      const [res, policy, trades] = await Promise.all([
         fetchJsonOrNull<{ strategies: readonly BackendStrategy[] }>("/api/strategies"),
         fetchStrategyPolicy(),
+        fetchSessionTrades(),
       ]);
-      return mapStrategyConfigs(res?.strategies ?? [], policy);
+      return mapStrategyConfigs(res?.strategies ?? [], policy, trades);
     },
     staleTime: 10_000,
     refetchInterval: 30_000,

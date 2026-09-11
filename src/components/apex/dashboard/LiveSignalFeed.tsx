@@ -49,11 +49,17 @@ export function LiveSignalFeed({ initialEvents, className }: LiveSignalFeedProps
       className={className}
     >
       <div className="max-h-[520px] overflow-y-auto">
-        <ul className="divide-y divide-obsidian-line">
-          {initialEvents.map((ev, i) => (
-            <FeedRow key={ev.id} event={ev} isNew={i === 0} />
-          ))}
-        </ul>
+        {initialEvents.length === 0 ? (
+          <div className="px-4 py-10 text-center text-[12px] text-fg-2" data-testid="feed-empty">
+            No signals this session yet — only decisions made since the active session opened are shown.
+          </div>
+        ) : (
+          <ul className="divide-y divide-obsidian-line">
+            {initialEvents.map((ev, i) => (
+              <FeedRow key={ev.id} event={ev} isNew={i === 0} />
+            ))}
+          </ul>
+        )}
       </div>
     </Panel>
   );
@@ -83,7 +89,17 @@ function FeedRow({ event, isNew }: { event: FeedEvent; isNew: boolean }) {
       <div className="min-w-0">
         <div className="truncate text-[13px] font-medium text-fg-0">{event.msg}</div>
         <div className="mt-1 flex items-center gap-3 text-[10.5px] text-fg-2">
-          <span className="mono uppercase tracking-[0.09em] text-fg-1">{event.tag}</span>
+          <span className={cn("mono uppercase tracking-[0.09em]", event.killed ? "line-through text-fg-3" : "text-fg-1")}>
+            {event.tag}
+          </span>
+          {event.killed && (
+            <span
+              className="rounded-full border border-warn/30 bg-warn/10 px-1.5 py-px text-[9px] uppercase tracking-wider text-warn"
+              title="Strategy is in guardrails.yaml disabled_strategies — this signal can never reach order routing."
+            >
+              killed · guardrails
+            </span>
+          )}
           {typeof event.score === "number" && (
             <span className="mono">score: {event.score.toFixed(2)}</span>
           )}

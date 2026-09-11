@@ -9,9 +9,16 @@ import type {
   OrderStats,
 } from "@/types/orders";
 import { supabase } from "@/integrations/supabase/client";
+import { hasActiveSession, sessionKey, sessionSinceIso, type SessionScope } from "@/lib/session-scope";
+import { useActiveSession } from "@/runtime/session";
 
 // ============================================================
-// Orders — Supabase public.orders table
+// Orders — Supabase public.orders table, scoped to the ACTIVE session
+//
+// `orders` / `fills` carry no session_id column (API gap, see
+// lib/session-scope.ts), so the blotter reads only rows stamped at or after
+// /api/status → sessionStartedAt. Without an active session nothing is
+// queried: an empty blotter is the honest state, not last run's history.
 // ============================================================
 
 interface OrderRow {
@@ -102,20 +109,27 @@ function mapOrder(row: OrderRow): OrderRecord {
   };
 }
 
+/** Orders created since the active session opened; `[]` with no session. */
+export async function fetchSessionOrders(scope: SessionScope, limit = 100): Promise<OrderRecord[]> {
+  const since = sessionSinceIso(scope);
+  if (!since) return [];
+  const { data, error } = await supabase
+    .from("orders")
+    .select("id,external_order_id,symbol,side,type,status,price,quantity,strategy,created_at,updated_at")
+    .gte("created_at", since)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (error) throw new Error(`orders fetch: ${error.message}`);
+  return (data as OrderRow[] | null)?.map(mapOrder) ?? [];
+}
+
 export function useOrders() {
+  const scope = useActiveSession();
   return useQuery<readonly OrderRecord[]>({
-    queryKey: ["apex", "orders"],
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from("orders")
-        .select("id,external_order_id,symbol,side,type,status,price,quantity,strategy,created_at,updated_at")
-        .order("created_at", { ascending: false })
-        .limit(100);
-      if (error) throw new Error(`orders fetch: ${error.message}`);
-      return (data as OrderRow[] | null)?.map(mapOrder) ?? [];
-    },
+    queryKey: ["apex", "orders", sessionKey(scope)],
+    queryFn: () => fetchSessionOrders(scope),
     staleTime: 2_000,
-    refetchInterval: 15_000,
+    refetchInterval: hasActiveSession(scope) ? 15_000 : false,
     placeholderData: keepPreviousData,
   });
 }
@@ -148,28 +162,35 @@ function mapFill(row: FillRow): FillRecord {
   };
 }
 
+/** Fills stamped since the active session opened; `[]` with no session. */
+export async function fetchSessionFills(scope: SessionScope, limit = 50): Promise<FillRecord[]> {
+  const since = sessionSinceIso(scope);
+  if (!since) return [];
+  const { data, error } = await supabase
+    .from("fills")
+    .select("id,order_id,price,quantity,fee_amount,slippage_bps,filled_at,orders!inner(symbol,side)")
+    .gte("filled_at", since)
+    .order("filled_at", { ascending: false })
+    .limit(limit);
+  if (error) throw new Error(`fills fetch: ${error.message}`);
+  // Supabase joins return the embedded table as an object (for !inner with
+  // a single FK) or an array; normalize to object form for mapFill.
+  const rows = (data as unknown as (Omit<FillRow, "orders"> & { orders: FillRow["orders"] | FillRow["orders"][] })[] | null) ?? [];
+  return rows.map((r) =>
+    mapFill({
+      ...r,
+      orders: Array.isArray(r.orders) ? r.orders[0] ?? null : r.orders,
+    }),
+  );
+}
+
 export function useFills() {
+  const scope = useActiveSession();
   return useQuery<readonly FillRecord[]>({
-    queryKey: ["apex", "fills"],
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from("fills")
-        .select("id,order_id,price,quantity,fee_amount,slippage_bps,filled_at,orders!inner(symbol,side)")
-        .order("filled_at", { ascending: false })
-        .limit(50);
-      if (error) throw new Error(`fills fetch: ${error.message}`);
-      // Supabase joins return the embedded table as an object (for !inner with
-      // a single FK) or an array; normalize to object form for mapFill.
-      const rows = (data as unknown as (Omit<FillRow, "orders"> & { orders: FillRow["orders"] | FillRow["orders"][] })[] | null) ?? [];
-      return rows.map((r) =>
-        mapFill({
-          ...r,
-          orders: Array.isArray(r.orders) ? r.orders[0] ?? null : r.orders,
-        }),
-      );
-    },
+    queryKey: ["apex", "fills", sessionKey(scope)],
+    queryFn: () => fetchSessionFills(scope),
     staleTime: 2_000,
-    refetchInterval: 15_000,
+    refetchInterval: hasActiveSession(scope) ? 15_000 : false,
     placeholderData: keepPreviousData,
   });
 }

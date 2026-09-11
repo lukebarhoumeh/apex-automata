@@ -1,7 +1,8 @@
 import { useLocation } from "react-router-dom";
 import { ChevronRight, Command, Sliders } from "lucide-react";
 import { LiveClock } from "@/components/apex/LiveClock";
-import { TITLE_BY_PATH } from "./nav-config";
+import { DemoPill } from "@/components/apex/DemoBanner";
+import { DEMO_PATHS, TITLE_BY_PATH } from "./nav-config";
 import { EngineControls } from "./EngineControls";
 import { cn } from "@/lib/utils";
 
@@ -18,6 +19,7 @@ export function TopBar({
 }: TopBarProps) {
   const { pathname } = useLocation();
   const title = TITLE_BY_PATH[pathname] ?? "Dashboard";
+  const isDemo = DEMO_PATHS.has(pathname);
 
   return (
     <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-obsidian-line bg-obsidian-1/80 px-4 backdrop-blur-md">
@@ -28,6 +30,7 @@ export function TopBar({
         </span>
         <ChevronRight size={12} className="text-fg-3" strokeWidth={1.5} />
         <span className="text-[13px] font-medium text-fg-0">{title}</span>
+        {isDemo && <DemoPill className="ml-1" />}
       </div>
 
       {/* Command trigger */}

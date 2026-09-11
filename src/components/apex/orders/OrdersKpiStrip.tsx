@@ -1,6 +1,7 @@
 import { Check, CircleX, ListOrdered, TriangleAlert, Activity, type LucideIcon } from "lucide-react";
 import { Panel } from "@/components/apex/Panel";
 import { cn } from "@/lib/utils";
+import { hasActiveSession, type SessionScope } from "@/lib/session-scope";
 import type { OrderStats } from "@/types/orders";
 
 interface MetricTile {
@@ -29,16 +30,19 @@ const TONE_ICON: Record<MetricTile["tone"], string> = {
 
 interface OrdersKpiStripProps {
   stats: OrderStats;
+  /** Active runtime session the counts are scoped to (from /api/status). */
+  session: SessionScope;
 }
 
-export function OrdersKpiStrip({ stats }: OrdersKpiStripProps) {
+export function OrdersKpiStrip({ stats, session }: OrdersKpiStripProps) {
+  const active = hasActiveSession(session);
   const tiles: MetricTile[] = [
-    { label: "Orders today", value: stats.total, tone: "neutral", icon: ListOrdered },
+    { label: "Orders · session", value: stats.total, tone: "neutral", icon: ListOrdered },
     {
       label: "Filled",
       value: stats.filled,
       tone: "up",
-      sub: `${(stats.fillRate * 100).toFixed(0)}%`,
+      sub: active && stats.total > 0 ? `${(stats.fillRate * 100).toFixed(0)}%` : undefined,
       icon: Check,
     },
     { label: "Pending", value: stats.pending, tone: "accent", icon: Activity },
@@ -47,7 +51,7 @@ export function OrdersKpiStrip({ stats }: OrdersKpiStripProps) {
   ];
 
   return (
-    <div className="grid grid-cols-5 gap-4">
+    <div className="grid grid-cols-5 gap-4" data-testid="orders-kpi-strip">
       {tiles.map((t) => {
         const Icon = t.icon;
         return (
@@ -56,8 +60,11 @@ export function OrdersKpiStrip({ stats }: OrdersKpiStripProps) {
               <span className="label">{t.label}</span>
               <Icon size={14} strokeWidth={1.6} className={cn(TONE_ICON[t.tone], "opacity-70")} />
             </div>
-            <div className={cn("mono mt-1.5 text-[22px] font-medium leading-none", TONE_TEXT[t.tone])}>
-              {t.value}
+            <div
+              className={cn("mono mt-1.5 text-[22px] font-medium leading-none", active ? TONE_TEXT[t.tone] : "text-fg-3")}
+              title={active ? "Counted over this session's orders" : "No active session"}
+            >
+              {active ? t.value : "—"}
             </div>
             {t.sub && <div className="mt-0.5 text-[11px] text-fg-2">{t.sub}</div>}
           </Panel>

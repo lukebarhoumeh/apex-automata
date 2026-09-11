@@ -8,6 +8,8 @@ import type { EquityPoint, EquityRange } from "@/types/equity";
 import type { KpiTile } from "@/types/kpi";
 import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
 import { mergeStrategyPolicy } from "@/lib/strategy-policy";
+import { hasActiveSession, sessionKey, sessionSinceIso, type SessionScope } from "@/lib/session-scope";
+import { useActiveSession } from "@/runtime/session";
 import { supabase } from "@/integrations/supabase/client";
 import {
   countActiveMarkets,
@@ -16,13 +18,16 @@ import {
   fetchRegimeStatus,
   fetchRuntimeStatus,
   fetchSessionAnalytics,
+  fetchSessionTrades,
   fetchStrategies,
   fetchStrategyPolicy,
+  summarizeTradesByStrategy,
   type BackendRegimeEntry,
   type BackendRuntimeStatus,
   type BackendSessionStats,
   type BackendStrategy,
   type BackendStrategyPolicy,
+  type BackendTradeRecord,
 } from "@/services/apexDashboardApi";
 
 const PRIMARY_SYMBOL = "BTC-USD";
@@ -38,15 +43,9 @@ function formatTime(iso: string | null | undefined): string {
   return d.toISOString().slice(11, 19);
 }
 
-function formatUptime(startIso: string | undefined | null): string {
-  if (!startIso) return "—";
-  const start = new Date(startIso).getTime();
-  if (Number.isNaN(start)) return "—";
-  const ms = Date.now() - start;
-  if (ms < 0) return "0h 0m";
-  const h = Math.floor(ms / 3_600_000);
-  const m = Math.floor((ms % 3_600_000) / 60_000);
-  return `${String(h).padStart(2, "0")}h ${String(m).padStart(2, "0")}m`;
+function formatEpoch(ms: number | null | undefined): string {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) return "—";
+  return new Date(ms).toISOString().slice(11, 19);
 }
 
 // ============================================================
@@ -78,9 +77,20 @@ export function mapSessionStats(
       ? status.pnl.unrealizedPnlUsd
       : null;
 
+  // Session identity comes from /api/status only. TradeAnalytics has its own
+  // `sessionId`/`startTime` (paper-YYYYMMDD-…) which is NOT the runtime's
+  // `sess_…` id, so it must never be shown as the session clock.
+  const sessionId = status?.engineRunning && status.sessionId ? status.sessionId : null;
+  const sessionStartedAt =
+    sessionId && typeof status?.sessionStartedAt === "number" && status.sessionStartedAt > 0
+      ? status.sessionStartedAt
+      : null;
+
   if (!raw) {
     return {
-      openedAt: "—",
+      sessionId,
+      sessionStartedAt,
+      openedAt: formatEpoch(sessionStartedAt),
       pnl: 0,
       pnlR: 0,
       realized: 0,
@@ -92,20 +102,17 @@ export function mapSessionStats(
       heat: 0,
       heatCap: 3.0,
       maxDrawDown: 0,
-      signalsSeen: 0,
-      signalsTaken: 0,
-      acceptanceRate: 0,
-      uptime: "—",
       mode,
       engineVersion: "v2.4.1",
       markets,
-      metaThreshold: 0.65,
     };
   }
 
   const realized = raw.totalPnl ?? 0;
   return {
-    openedAt: formatTime(raw.startTime),
+    sessionId,
+    sessionStartedAt,
+    openedAt: sessionStartedAt ? formatEpoch(sessionStartedAt) : formatTime(raw.startTime),
     // Session P&L = closed-trade P&L (TradeAnalytics) + open P&L (PositionTracker).
     pnl: realized + (unrealized ?? 0),
     pnlR: raw.expectancy ?? 0,
@@ -118,14 +125,9 @@ export function mapSessionStats(
     heat: 0,
     heatCap: 3.0,
     maxDrawDown: raw.maxDrawdownPct ?? 0,
-    signalsSeen: 0,
-    signalsTaken: raw.totalTrades ?? 0,
-    acceptanceRate: 0,
-    uptime: formatUptime(raw.startTime),
     mode,
     engineVersion: "v2.4.1",
     markets,
-    metaThreshold: 0.65,
   };
 }
 
@@ -282,34 +284,56 @@ export function useMetaFilterStatus() {
 // Strategies: /api/strategies → StrategyCardData[]
 // ============================================================
 
+/**
+ * Strategy cards. Trade counts / P&L / win rate come from the ACTIVE session's
+ * TradeAnalytics ledger (`/api/analytics/trades`), bucketed by plugin id — the
+ * same ledger the hero's "Trades" QuickStat sums, so the numbers agree by
+ * construction. `stats.signalsGenerated` is surfaced separately as `signals`:
+ * it counts emitted signals (most are filtered before order routing) and was
+ * previously shown as "Trades", producing phantom trades on a zero-trade run.
+ *
+ * @param trades `null` when the engine is stopped (no session ledger).
+ */
 export function mapStrategyCards(
   registered: readonly BackendStrategy[],
   policy: BackendStrategyPolicy | null,
+  trades: readonly BackendTradeRecord[] | null = null,
 ): StrategyCardData[] {
+  const byStrategy = summarizeTradesByStrategy(trades);
   return mergeStrategyPolicy(registered, policy).map((m) => {
     const status: StrategyStatus =
       m.disabledBy === "guardrails" ? "killed" : m.enabled ? "on" : "off";
+    const summary = byStrategy[m.id];
     return {
       id: m.id,
       name: m.name,
       status,
       disabledBy: m.disabledBy,
-      pnlToday: 0,
-      trades: m.registered?.stats?.signalsGenerated ?? 0,
-      winRate: 0,
+      pnlSession: summary?.pnl ?? 0,
+      trades: summary?.trades ?? 0,
+      signals: m.registered?.stats?.signalsGenerated ?? 0,
+      winRate: summary?.winRate ?? 0,
+      sessionScoped: trades !== null,
       sparkline: [],
     };
   });
 }
 
 export function useStrategyStatus() {
+  const scope = useActiveSession();
   return useQuery<readonly StrategyCardData[]>({
-    queryKey: ["apex", "strategy-status"],
+    // Keyed by session so a new run never inherits last run's cards.
+    queryKey: ["apex", "strategy-status", sessionKey(scope)],
     queryFn: async () => {
-      // Registered plugins (runtime) + guardrails policy (SoT) in parallel so
-      // a strategy killed in guardrails.yaml renders as killed, not missing.
-      const [registered, policy] = await Promise.all([fetchStrategies(), fetchStrategyPolicy()]);
-      return mapStrategyCards(registered, policy);
+      // Registered plugins (runtime) + guardrails policy (SoT) + the session's
+      // closed-trade ledger in parallel so a strategy killed in guardrails.yaml
+      // renders as killed, not missing, and trade counts are session-true.
+      const [registered, policy, trades] = await Promise.all([
+        fetchStrategies(),
+        fetchStrategyPolicy(),
+        fetchSessionTrades(),
+      ]);
+      return mapStrategyCards(registered, policy, trades);
     },
     staleTime: 10_000,
     refetchInterval: 30_000,
@@ -334,25 +358,32 @@ interface SignalRow {
   reason: string | null;
 }
 
-function mapSignalRecord(row: SignalRow): SignalRecord {
+/** Killed-by-guardrails ids from the policy, or empty when the policy is unavailable. */
+export function killedStrategyIds(policy: BackendStrategyPolicy | null | undefined): ReadonlySet<string> {
+  return new Set(policy?.disabledStrategies ?? []);
+}
+
+export function mapSignalRecord(row: SignalRow, killed: ReadonlySet<string> = new Set()): SignalRecord {
   const side: SignalSide = row.side?.toUpperCase() === "SELL" ? "SELL" : "BUY";
   const state: SignalState = row.allowed === false ? "REJECTED" : "ACCEPTED";
   const conf = num(row.meta_prob) || num(row.confidence) || num(row.score);
+  const strat = row.strategy ?? "—";
   return {
     id: row.id,
     ts: formatTime(row.decided_at),
     sym: row.symbol,
-    strat: row.strategy ?? "—",
+    strat,
     side,
     conf,
     state,
     z: null,
     adx: null,
     note: row.reason ?? "",
+    killed: killed.has(strat),
   };
 }
 
-function recordToFeedEvent(r: SignalRecord): FeedEvent {
+export function recordToFeedEvent(r: SignalRecord): FeedEvent {
   return {
     id: `f-${r.id}`,
     ts: r.ts,
@@ -360,35 +391,51 @@ function recordToFeedEvent(r: SignalRecord): FeedEvent {
     msg: `${r.sym} ${r.side} p=${r.conf.toFixed(2)}${r.note ? ` · ${r.note}` : ""}`,
     tag: r.strat,
     score: r.conf,
+    killed: r.killed,
   };
 }
 
-async function fetchRecentSignals(limit: number): Promise<SignalRecord[]> {
-  const { data, error } = await supabase
-    .from("signals")
-    .select("id,symbol,strategy,decided_at,side,score,confidence,meta_prob,allowed,reason")
-    .order("decided_at", { ascending: false })
-    .limit(limit);
+/**
+ * Signals decided since the ACTIVE session opened. `public.signals` has no
+ * session_id column (see lib/session-scope.ts), so the scope is the session's
+ * time window; with no session the panel is empty rather than showing rows an
+ * earlier run wrote.
+ */
+async function fetchSessionSignals(limit: number, scope: SessionScope): Promise<SignalRecord[]> {
+  const since = sessionSinceIso(scope);
+  if (!since) return [];
+  const [{ data, error }, policy] = await Promise.all([
+    supabase
+      .from("signals")
+      .select("id,symbol,strategy,decided_at,side,score,confidence,meta_prob,allowed,reason")
+      .gte("decided_at", since)
+      .order("decided_at", { ascending: false })
+      .limit(limit),
+    fetchStrategyPolicy(),
+  ]);
   if (error) throw new Error(`signals fetch: ${error.message}`);
-  return (data as SignalRow[] | null)?.map(mapSignalRecord) ?? [];
+  const killed = killedStrategyIds(policy);
+  return (data as SignalRow[] | null)?.map((row) => mapSignalRecord(row, killed)) ?? [];
 }
 
 export function useSignalRecords() {
+  const scope = useActiveSession();
   return useQuery<readonly SignalRecord[]>({
-    queryKey: ["apex", "signal-records"],
-    queryFn: async () => fetchRecentSignals(20),
+    queryKey: ["apex", "signal-records", sessionKey(scope)],
+    queryFn: async () => fetchSessionSignals(20, scope),
     staleTime: 2_000,
-    refetchInterval: 15_000,
+    refetchInterval: hasActiveSession(scope) ? 15_000 : false,
     placeholderData: keepPreviousData,
   });
 }
 
 export function useSignalFeed() {
+  const scope = useActiveSession();
   return useQuery<readonly FeedEvent[]>({
-    queryKey: ["apex", "feed"],
-    queryFn: async () => (await fetchRecentSignals(25)).map(recordToFeedEvent),
+    queryKey: ["apex", "feed", sessionKey(scope)],
+    queryFn: async () => (await fetchSessionSignals(25, scope)).map(recordToFeedEvent),
     staleTime: 2_000,
-    refetchInterval: 15_000,
+    refetchInterval: hasActiveSession(scope) ? 15_000 : false,
     placeholderData: keepPreviousData,
   });
 }

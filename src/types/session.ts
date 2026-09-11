@@ -8,6 +8,13 @@
 export type BotMode = "paper" | "live" | "paused" | "halted" | "stopped";
 
 export interface SessionStats {
+  /** Active session id from /api/status; null when the engine is stopped. */
+  sessionId: string | null;
+  /**
+   * Epoch ms the active session opened (/api/status → sessionStartedAt).
+   * The ONE clock every uptime label derives from; null without a session.
+   */
+  sessionStartedAt: number | null;
   openedAt: string;
   pnl: number;
   pnlR: number;
@@ -21,12 +28,7 @@ export interface SessionStats {
   heat: number;
   heatCap: number;
   maxDrawDown: number;
-  signalsSeen: number;
-  signalsTaken: number;
-  acceptanceRate: number;
-  uptime: string;
   mode: BotMode;
   engineVersion: string;
   markets: number;
-  metaThreshold: number;
 }

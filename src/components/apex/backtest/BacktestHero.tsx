@@ -1,6 +1,7 @@
 import { FlaskConical } from "lucide-react";
 import { Panel } from "@/components/apex/Panel";
 import { Pill } from "@/components/apex/Pill";
+import { DemoPill } from "@/components/apex/DemoBanner";
 import { cn } from "@/lib/utils";
 import type { BacktestResults, BacktestConfig } from "@/types/backtest";
 
@@ -46,7 +47,7 @@ export function BacktestHero({ config, results }: Props) {
             <Pill tone="up">
               <FlaskConical size={10} strokeWidth={2} /> BACKTEST ENGINE
             </Pill>
-            <Pill tone="default">v2.4.1</Pill>
+            <DemoPill label="DEMO · SEEDED FIXTURE" />
           </div>
           <div
             className="serif-ital text-fg-0"
