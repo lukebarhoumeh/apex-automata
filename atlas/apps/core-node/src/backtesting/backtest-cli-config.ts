@@ -135,6 +135,15 @@ export interface BacktestConfigInput {
    * Default true — backtest/live parity. Set false only for legacy comparison.
    */
   applyAtrVolatilityFilter?: boolean;
+  /**
+   * Wire the live `PositionMonitor` exit rules from guardrails (G1/G3/G5
+   * exit-parity infra, 2026-09-10): ATR trailing stop
+   * (`strategy.stop_trail_atr` × entry ATR → `execution.trailAtrMultiplier`)
+   * and time stop (`strategy.time_stop_bars` → `execution.timeStopBars`).
+   * Default false: E1/E2 cards and the E4 harness run exactly as before;
+   * turning it on by default is an E5 decision, not infra.
+   */
+  applyExitParity?: boolean;
 }
 
 /**
@@ -251,6 +260,26 @@ export function buildBacktestConfig(input: BacktestConfigInput, guardrails: Guar
             atrVolatilityMax: guardrails.filters.atr_volatility_max,
           },
         }),
-    ...(input.minHoldBars ? { execution: { minHoldBars: input.minHoldBars } } : {}),
+    ...buildExecutionBlock(input, guardrails),
   };
+}
+
+/**
+ * `execution` block: min-hold (E4 cooldown) plus, when `applyExitParity` is
+ * on, the two guardrails exit knobs. Omitted entirely when nothing is set so
+ * existing callers see `config.execution === undefined` as before.
+ */
+function buildExecutionBlock(
+  input: BacktestConfigInput,
+  guardrails: GuardrailConfig,
+): Pick<BacktestConfig, 'execution'> {
+  const execution: NonNullable<BacktestConfig['execution']> = {};
+  if (input.minHoldBars) {
+    execution.minHoldBars = input.minHoldBars;
+  }
+  if (input.applyExitParity) {
+    execution.trailAtrMultiplier = guardrails.strategy.stop_trail_atr;
+    execution.timeStopBars = guardrails.strategy.time_stop_bars;
+  }
+  return Object.keys(execution).length > 0 ? { execution } : {};
 }

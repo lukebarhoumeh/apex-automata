@@ -1,5 +1,6 @@
 import { Logger } from '../core/logger';
-import { BacktestEngine, BacktestConfig, BacktestResult } from './backtest-engine';
+import { BacktestEngine, BacktestConfig, BacktestResult, ExitRuleState } from './backtest-engine';
+import { BACKTEST_EXIT_REASONS, type BacktestExitReason } from './exit-reasons';
 import { HistoricalDataLoader, LoadCandlesOptions, DataProvenance, DEFAULT_GRANULARITY_SECONDS } from './data-loader';
 import { withBarAggregation, describeBarTimeframe, type SeriesProvider } from './bar-aggregation';
 import fs from 'fs/promises';
@@ -231,6 +232,9 @@ export class BacktestRunner {
       .map(([r, n]) => `${r}=${n}`)
       .join(', ') || 'none';
 
+    const exitRulesLine = describeExitRules(metrics.exitRules);
+    const exitReasonsLine = describeExitReasons(metrics.exitReasons);
+
     const report = `${dataStampLine}
 BACKTEST REPORT
 ===============
@@ -284,6 +288,11 @@ Regime Gate:
 ------------
 Enabled: ${regime.enabled}  minCompatibilityScore=${regime.minCompatibilityScore}  minRegimeConfidence=${regime.minRegimeConfidence}  requireMTFAlignment=${regime.requireMTFAlignment}
 Entries by regime: ${regimeEntries}
+
+Exits:
+------
+Rules: ${exitRulesLine}
+By reason: ${exitReasonsLine}
 
 Performance Metrics:
 -------------------
@@ -431,6 +440,28 @@ ${trades.slice(-10).map(t =>
 
     return config;
   }
+}
+
+/**
+ * One-line description of the exit rules a run used, e.g.
+ * `hard stop + take profit (signal geometry); ATR trail 1 × entry ATR; time stop 96 bars; opposite-signal exits on`.
+ * Trail/time stop print as `off` when the run did not wire them.
+ */
+export function describeExitRules(rules: ExitRuleState | undefined): string {
+  const trail = rules?.trailAtrMultiplier
+    ? `ATR trail ${rules.trailAtrMultiplier} × entry ATR` +
+      (rules.trailUnavailableNoAtr > 0 ? ` (${rules.trailUnavailableNoAtr} entries without ATR → no trail)` : '')
+    : 'ATR trail off';
+  const timeStop = rules?.timeStopBars ? `time stop ${rules.timeStopBars} bars` : 'time stop off';
+  return `hard stop + take profit (signal geometry); ${trail}; ${timeStop}; opposite-signal exits on`;
+}
+
+/**
+ * Exit-reason breakdown in canonical label order, every label printed
+ * (zero-filled), e.g. `stop_loss=12, take_profit=4, trailing_stop=0, time_stop=0, signal=9, end_of_data=1`.
+ */
+export function describeExitReasons(exitReasons: Partial<Record<BacktestExitReason, number>> | undefined): string {
+  return BACKTEST_EXIT_REASONS.map((reason) => `${reason}=${exitReasons?.[reason] ?? 0}`).join(', ');
 }
 
 function describeProvenance(p: DataProvenance): string {
