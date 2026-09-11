@@ -1,5 +1,9 @@
 import { describe, test, expect } from 'vitest';
-import { computeRawEntryFillPrice } from '../trading/position-entry-vwap';
+import {
+  HYDRATED_ENTRY_PRICE_KEY,
+  computeRawEntryFillPrice,
+  resolvePersistedEntryPrice,
+} from '../trading/position-entry-vwap';
 
 describe('computeRawEntryFillPrice', () => {
   test('SHORT single-fill: returns the raw fill price (not the cost-basis averagePrice)', () => {
@@ -106,5 +110,42 @@ describe('computeRawEntryFillPrice', () => {
       // And the result must be ABOVE the cost-basis averagePrice for SHORTs
       expect(result, `${c.name} above cost-basis`).toBeGreaterThan(c.averagePrice);
     }
+  });
+});
+
+/**
+ * PR #64 — persisted entry price for the `positions` writer. A position hydrated
+ * from Supabase has no entry fill in `trades`, and PositionTracker zeroes
+ * `averagePrice` when it goes flat, so the close write used to resolve
+ * entry_price = 0 and skip — leaving the row `closed_at IS NULL` forever.
+ */
+describe('resolvePersistedEntryPrice', () => {
+  test('prefers the raw entry-fill VWAP when entry fills exist', () => {
+    const price = resolvePersistedEntryPrice({
+      side: 'long',
+      averagePrice: 0, // zeroed on close
+      trades: [
+        { side: 'buy', size: 1, price: 100 },
+        { side: 'sell', size: 1, price: 110 },
+      ],
+      metadata: { [HYDRATED_ENTRY_PRICE_KEY]: 95 },
+    });
+    expect(price).toBe(100);
+  });
+
+  test('hydrated position closed in a later session: falls back to metadata.hydratedEntryPrice', () => {
+    const price = resolvePersistedEntryPrice({
+      side: 'long',
+      averagePrice: 0, // zeroed on close
+      trades: [{ side: 'sell', size: 0.05, price: 2565.1 }], // only the exit fill is known
+      metadata: { hydratedFromSupabase: true, [HYDRATED_ENTRY_PRICE_KEY]: 2000.5 },
+    });
+    expect(price).toBe(2000.5);
+  });
+
+  test('falls back to averagePrice for a live position with no fills yet, and 0 when nothing is known', () => {
+    expect(resolvePersistedEntryPrice({ side: 'short', averagePrice: 3010, trades: [] })).toBe(3010);
+    expect(resolvePersistedEntryPrice({ side: 'long', averagePrice: 0, trades: [], metadata: {} })).toBe(0);
+    expect(resolvePersistedEntryPrice({ side: 'long', averagePrice: Number.NaN, metadata: { [HYDRATED_ENTRY_PRICE_KEY]: 'garbage' } })).toBe(0);
   });
 });

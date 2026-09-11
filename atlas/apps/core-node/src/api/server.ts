@@ -14,7 +14,7 @@ import {
 } from '../strategies/per-symbol-disable';
 import { buildRegimeGateConfig, evaluateRegimeGate } from '../strategies/regime-gate';
 import { buildStrategyPolicy } from '../strategies/strategy-policy';
-import { computeRawEntryFillPrice } from '../trading/position-entry-vwap';
+import { resolvePersistedEntryPrice } from '../trading/position-entry-vwap';
 import { buildFillRow, FILLS_UPSERT_ON_CONFLICT, FillRowFillRef, FillRowOrderRef } from '../persistence/fill-row';
 import { SessionColumnSupport, SessionStamp, writeWithSessionStamp } from '../persistence/session-stamp';
 import {
@@ -4794,15 +4794,22 @@ async function syncPositionToSupabase(position: any) {
     // it as `entry_price` makes dashboard R/R analytics look wildly broken
     // — for a SHORT it sits 25 bps below the actual fill, which puts a
     // correctly-placed take-profit on the WRONG side of `entry_price` in
-    // displayed numbers. See position-entry-vwap.ts for the full story.
-    const entryPriceRaw = computeRawEntryFillPrice(position);
-    const fallbackAvg = Number(position.averagePrice ?? position.avgPrice ?? position.entry_price ?? 0);
-    const entryPrice = Number.isFinite(entryPriceRaw) && entryPriceRaw > 0
-      ? entryPriceRaw
-      : (Number.isFinite(fallbackAvg) ? fallbackAvg : 0);
+    // displayed numbers. Falls back to the hydrated entry_price for positions
+    // restored from Supabase (their close would otherwise never persist).
+    // See position-entry-vwap.ts for the full story.
+    const resolvedEntry = resolvePersistedEntryPrice(position);
+    const legacyFallback = Number(position.avgPrice ?? position.entry_price ?? 0);
+    const entryPrice = resolvedEntry > 0 ? resolvedEntry : (Number.isFinite(legacyFallback) ? legacyFallback : 0);
 
     // Supabase schema expects position_side enum ('long'|'short'); skip invalid/flat snapshots
     if (!symbol || (side !== 'long' && side !== 'short') || entryPrice <= 0) {
+      logger.warn('Skipping position sync: no persistable side/entry price', {
+        positionId: position.id,
+        symbol,
+        side,
+        entryPrice,
+        closedAt: position.closedAt ?? null,
+      });
       return;
     }
 

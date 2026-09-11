@@ -97,6 +97,8 @@ describe('PositionTracker.hydrateOpenPositions', () => {
     expect(pos!.stopPrice).toBe(2900);
     expect(pos!.takeProfit).toBe(3150);
     expect(pos!.metadata?.hydratedFromSupabase).toBe(true);
+    // Recovered by the close write once the tracker zeroes averagePrice (PR #64).
+    expect(pos!.metadata?.hydratedEntryPrice).toBe(3000);
   });
 
   test('skips malformed rows (zero size, invalid price) without throwing', async () => {

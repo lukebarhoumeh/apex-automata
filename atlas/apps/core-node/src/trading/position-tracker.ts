@@ -221,7 +221,9 @@ export class PositionTracker extends EventEmitter {
           maxDrawdown: 0,
           stopPrice: Number.isFinite(stop) && stop > 0 ? stop : undefined,
           takeProfit: Number.isFinite(tp) && tp > 0 ? tp : undefined,
-          metadata: { hydratedFromSupabase: true, openedAtIso: openedAt.toISOString() },
+          // hydratedEntryPrice lets the close write recover entry_price once the
+          // tracker has zeroed averagePrice (no entry fill exists in `trades`).
+          metadata: { hydratedFromSupabase: true, openedAtIso: openedAt.toISOString(), hydratedEntryPrice: avgPrice },
         };
         this.positions.set(row.symbol, position);
         // Seed the FIFO ledger with a single synthetic lot reflecting the
