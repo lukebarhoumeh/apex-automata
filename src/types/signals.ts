@@ -1,5 +1,10 @@
 export type SignalSide = "BUY" | "SELL";
-export type SignalState = "ACCEPTED" | "REJECTED" | "CANCELLED";
+/**
+ * KILLED marks a row whose strategy is in guardrails.yaml `disabled_strategies`
+ * (single source of truth). Such rows are historical/audit only — a killed
+ * plugin is never registered, so nothing it "signalled" can reach routing.
+ */
+export type SignalState = "ACCEPTED" | "REJECTED" | "CANCELLED" | "KILLED";
 export type StrategyId = "meta" | "breakout" | "vwap_mr" | "trend_follow" | "momentum";
 
 export interface SignalRecord {
@@ -25,4 +30,12 @@ export interface FeedEvent {
   tag: string;
   score?: number;
   risk?: "LOW" | "MED" | "HIGH";
+}
+
+/** Scope applied to Supabase signal reads; session scope when a paper session is active. */
+export interface SignalScope {
+  /** ISO timestamp lower bound (the active session's start) or null for "recent". */
+  sinceIso: string | null;
+  /** Strategy ids killed by guardrails.yaml — excluded from live views, badged in audit views. */
+  killedStrategies: readonly string[];
 }

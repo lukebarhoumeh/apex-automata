@@ -7,6 +7,8 @@ import type { StrategyCardData, StrategyDisabledBy, StrategyStatus } from "@/typ
 
 interface StrategyCardsProps {
   strategies: readonly StrategyCardData[];
+  /** True while a paper session runs — trade/P&L stats below are that session's. */
+  sessionActive?: boolean;
 }
 
 const STATUS_COPY: Record<StrategyStatus, { label: string; className: string; dotColor: string }> = {
@@ -23,7 +25,7 @@ const DISABLED_BY_TITLE: Record<StrategyDisabledBy, string> = {
   "engine-offline": "Engine not running — registration state unknown.",
 };
 
-export function StrategyCards({ strategies }: StrategyCardsProps) {
+export function StrategyCards({ strategies, sessionActive = false }: StrategyCardsProps) {
   const navigate = useNavigate();
 
   return (
@@ -31,7 +33,8 @@ export function StrategyCards({ strategies }: StrategyCardsProps) {
       {strategies.map((s) => {
         const status = STATUS_COPY[s.status];
         const label = s.status === "off" && s.disabledBy === "engine-offline" ? "Off · engine stopped" : status.label;
-        const up = s.pnlToday >= 0;
+        const up = s.pnlSession >= 0;
+        const pnlText = sessionActive ? `${up ? "+$" : "-$"}${Math.abs(s.pnlSession).toFixed(2)}` : "—";
         return (
           <button
             key={s.id}
@@ -65,24 +68,35 @@ export function StrategyCards({ strategies }: StrategyCardsProps) {
               />
             </div>
 
+            {/* Session-scoped: trades/P&L come from the same TradeAnalytics object
+                as the hero counts, so both widgets agree (TASK_016 P5). Signals is
+                the plugin's emission count — deliberately NOT labelled "trades". */}
             <div className="flex items-end justify-between pt-1">
               <div>
-                <div className="label">P&amp;L today</div>
-                <div className={cn("mono mt-0.5 text-[18px] font-medium leading-none", up ? "text-up" : "text-down")}>
-                  {up ? "+$" : "-$"}
-                  {Math.abs(s.pnlToday).toFixed(2)}
+                <div className="label">Session P&amp;L</div>
+                <div
+                  className={cn(
+                    "mono mt-0.5 text-[18px] font-medium leading-none",
+                    !sessionActive ? "text-fg-3" : up ? "text-up" : "text-down",
+                  )}
+                >
+                  {pnlText}
                 </div>
               </div>
               <div className="flex gap-4 text-right">
                 <div>
                   <div className="label">Trades</div>
-                  <div className="mono mt-0.5 text-[13px] font-medium text-fg-0">{s.trades}</div>
+                  <div className="mono mt-0.5 text-[13px] font-medium text-fg-0">{sessionActive ? s.trades : "—"}</div>
                 </div>
                 <div>
                   <div className="label">Win</div>
                   <div className="mono mt-0.5 text-[13px] font-medium text-fg-0">
-                    {(s.winRate * 100).toFixed(0)}%
+                    {sessionActive && s.trades > 0 ? `${(s.winRate * 100).toFixed(0)}%` : "—"}
                   </div>
+                </div>
+                <div title="Signals emitted by the plugin in this process — not trades">
+                  <div className="label">Signals</div>
+                  <div className="mono mt-0.5 text-[13px] font-medium text-fg-1">{sessionActive ? s.signals : "—"}</div>
                 </div>
               </div>
             </div>

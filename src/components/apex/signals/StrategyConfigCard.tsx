@@ -5,6 +5,8 @@ import type { StrategyConfig, StrategyDisabledBy } from "@/types/strategy";
 
 interface Props {
   strat: StrategyConfig;
+  /** True while a paper session runs — the stats block below is that session's. */
+  sessionActive?: boolean;
 }
 
 const STATE_PILL: Record<StrategyDisabledBy | "enabled", { text: string; className: string; title: string }> = {
@@ -30,7 +32,7 @@ const STATE_PILL: Record<StrategyDisabledBy | "enabled", { text: string; classNa
   },
 };
 
-export function StrategyConfigCard({ strat }: Props) {
+export function StrategyConfigCard({ strat, sessionActive = false }: Props) {
   const Icon = strat.kind === "trend" ? TrendingUp : Activity;
   const accentClass =
     strat.kind === "trend"
@@ -38,6 +40,7 @@ export function StrategyConfigCard({ strat }: Props) {
       : "text-warn bg-warn/10 ring-warn/20";
   const pill = STATE_PILL[strat.enabled ? "enabled" : strat.disabledBy ?? "runtime"];
   const killedBySot = strat.disabledBy === "guardrails";
+  const hasTrades = strat.stats.trades > 0;
 
   return (
     <Panel header={false} pad={0} className={cn(strat.enabled ? "" : "opacity-60")}>
@@ -91,24 +94,41 @@ export function StrategyConfigCard({ strat }: Props) {
           </div>
         ))}
 
+        {/* Session-scoped stats from TradeAnalytics closed trades — the same
+            source the hero counts. "Signals" is the plugin's emission count and
+            is kept separate so it is never read as trades (TASK_016 P5). */}
         <div className="border-t border-obsidian-line pt-3">
-          <div className="grid grid-cols-3 gap-4">
+          <div className="mono mb-2 text-[9.5px] uppercase tracking-[0.12em] text-fg-3">
+            {sessionActive ? "this session" : "no active session"}
+          </div>
+          <div className="grid grid-cols-4 gap-4">
             <div>
               <div className="mono text-[10px] uppercase text-fg-2">WIN RATE</div>
-              <div className="mono text-[17px] text-fg-0">{(strat.stats.winRate * 100).toFixed(1)}%</div>
+              <div className="mono text-[17px] text-fg-0">
+                {sessionActive && hasTrades ? `${(strat.stats.winRate * 100).toFixed(1)}%` : "—"}
+              </div>
             </div>
             <div>
               <div className="mono text-[10px] uppercase text-fg-2">AVG R</div>
-              <div className="mono text-[17px] text-up">{strat.stats.avgR.toFixed(2)}R</div>
+              <div className={cn("mono text-[17px]", sessionActive && hasTrades ? (strat.stats.avgR >= 0 ? "text-up" : "text-down") : "text-fg-0")}>
+                {sessionActive && hasTrades && strat.stats.lastR.length > 0 ? `${strat.stats.avgR.toFixed(2)}R` : "—"}
+              </div>
             </div>
             <div>
               <div className="mono text-[10px] uppercase text-fg-2">TRADES</div>
-              <div className="mono text-[17px] text-fg-0">{strat.stats.trades}</div>
+              <div className="mono text-[17px] text-fg-0">{sessionActive ? strat.stats.trades : "—"}</div>
+            </div>
+            <div title="Signals emitted by the plugin in this process — not trades">
+              <div className="mono text-[10px] uppercase text-fg-2">SIGNALS</div>
+              <div className="mono text-[17px] text-fg-1">{sessionActive ? strat.stats.signals : "—"}</div>
             </div>
           </div>
           <div className="mt-3">
             <div className="mono text-[10px] uppercase text-fg-2">LAST 12 R</div>
             <div className="mt-1 flex gap-1">
+              {strat.stats.lastR.length === 0 && (
+                <span className="mono text-[10px] text-fg-3">{sessionActive ? "no closed trades yet" : "—"}</span>
+              )}
               {strat.stats.lastR.map((r, i) => (
                 <div
                   key={i}

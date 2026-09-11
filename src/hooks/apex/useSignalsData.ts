@@ -1,96 +1,32 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import type { SignalRecord, SignalSide, SignalState } from "@/types/signals";
-import type {
-  StrategyConfig,
-  StrategyParam,
-  MetaModelInfo,
-} from "@/types/strategy";
-import { supabase } from "@/integrations/supabase/client";
-import { fetchStrategyPolicy, type BackendStrategyPolicy } from "@/services/apexDashboardApi";
+import type { SignalRecord } from "@/types/signals";
+import type { StrategyConfig, StrategyParam, MetaFilterInfo } from "@/types/strategy";
+import {
+  fetchMetaFilterStats,
+  fetchStrategyPolicy,
+  type BackendStrategy,
+  type BackendStrategyPolicy,
+} from "@/services/apexDashboardApi";
 import { mergeStrategyPolicy } from "@/lib/strategy-policy";
-
-const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
-
-async function fetchJsonOrNull<T>(path: string): Promise<T | null> {
-  let res: Response;
-  try {
-    res = await fetch(`${API_URL}${path}`);
-  } catch {
-    throw new Error(`network error: ${path}`);
-  }
-  // 400 → engine not running (intentional empty). 429/5xx → transient, throw
-  // so React Query keeps the last-good data instead of wiping panels.
-  if (res.status === 400) return null;
-  if (res.status === 429) throw new Error(`rate-limited: ${path}`);
-  if (res.status >= 500) throw new Error(`server error ${res.status}: ${path}`);
-  if (!res.ok) return null;
-  return (await res.json()) as T;
-}
-
-function num(v: unknown): number {
-  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
-  if (typeof v === "string") {
-    const n = parseFloat(v);
-    return Number.isFinite(n) ? n : 0;
-  }
-  return 0;
-}
-
-function formatTime(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  return d.toISOString().slice(11, 19);
-}
+import { emptyStrategyStats, type StrategySessionStatsMap } from "@/lib/strategy-stats";
+import { fetchRecentSignals, fetchStrategyInputs, sessionSinceIso } from "@/hooks/apex/useDashboardData";
 
 // ============================================================
-// Signal stream — Supabase public.signals
+// Signal stream — Supabase public.signals (audit view)
 // ============================================================
 
-interface SignalRow {
-  id: string;
-  symbol: string;
-  strategy: string | null;
-  decided_at: string;
-  side: string | null;
-  score: number | string | null;
-  confidence: number | string | null;
-  meta_prob: number | string | null;
-  allowed: boolean | null;
-  reason: string | null;
-}
-
-function mapSignalRecord(row: SignalRow): SignalRecord {
-  const side: SignalSide = row.side?.toUpperCase() === "SELL" ? "SELL" : "BUY";
-  const state: SignalState = row.allowed === false ? "REJECTED" : "ACCEPTED";
-  const conf = num(row.meta_prob) || num(row.confidence) || num(row.score);
-  return {
-    id: row.id,
-    ts: formatTime(row.decided_at),
-    sym: row.symbol,
-    strat: row.strategy ?? "—",
-    side,
-    conf,
-    state,
-    z: null,
-    adx: null,
-    note: row.reason ?? "",
-  };
-}
-
-export function useSignalStream() {
+/**
+ * Session-scoped while a paper session runs. Rows from guardrails-killed
+ * strategies are kept for audit but badged KILLED so nothing shelved by the
+ * SoT (vwap_mr / breakout / momentum) can read as active.
+ */
+export function useSignalStream(sessionStartedAt: number | null) {
+  const sinceIso = sessionSinceIso(sessionStartedAt);
   return useQuery<readonly SignalRecord[]>({
-    queryKey: ["apex", "signal-stream"],
+    queryKey: ["apex", "signal-stream", sinceIso],
     queryFn: async () => {
-      const { data, error } = await supabase
-        .from("signals")
-        .select(
-          "id,symbol,strategy,decided_at,side,score,confidence,meta_prob,allowed,reason",
-        )
-        .order("decided_at", { ascending: false })
-        .limit(60);
-      if (error) throw new Error(`signal-stream fetch: ${error.message}`);
-      return (data as SignalRow[] | null)?.map(mapSignalRecord) ?? [];
+      const policy = await fetchStrategyPolicy();
+      return fetchRecentSignals(60, { sinceIso, killedStrategies: policy?.disabledStrategies ?? [] }, false);
     },
     staleTime: 2_000,
     refetchInterval: 10_000,
@@ -99,23 +35,8 @@ export function useSignalStream() {
 }
 
 // ============================================================
-// Strategies — /api/strategies mapped to StrategyConfig
+// Strategies — /api/strategies + policy + session trades → StrategyConfig
 // ============================================================
-
-interface BackendStrategy {
-  id: string;
-  name: string;
-  description: string;
-  category: string;
-  tags?: readonly string[];
-  enabled: boolean;
-  config?: Record<string, unknown>;
-  stats?: {
-    signalsGenerated?: number;
-    avgSignalStrength?: number;
-    signalsByDirection?: { buy?: number; sell?: number };
-  };
-}
 
 function keyToLabel(key: string): string {
   const spaced = key.replace(/([A-Z])/g, " $1").trim();
@@ -159,12 +80,14 @@ function kindFromCategory(category: string): StrategyConfig["kind"] {
 export function mapStrategyConfigs(
   registered: readonly BackendStrategy[],
   policy: BackendStrategyPolicy | null,
+  sessionStats: StrategySessionStatsMap = {},
 ): StrategyConfig[] {
   return mergeStrategyPolicy(registered, policy).map((m) => {
     const params = Object.entries(m.registered?.config ?? {})
       .map(([k, v]) => paramFromEntry(k, v))
       .filter((p): p is StrategyParam => p !== null)
       .slice(0, 5);
+    const s = sessionStats[m.id] ?? emptyStrategyStats();
     return {
       id: m.id,
       name: m.name,
@@ -174,10 +97,11 @@ export function mapStrategyConfigs(
       disabledBy: m.disabledBy,
       params,
       stats: {
-        winRate: 0,
-        avgR: 0,
-        trades: m.registered?.stats?.signalsGenerated ?? 0,
-        lastR: [],
+        winRate: s.winRate,
+        avgR: s.avgR,
+        trades: s.trades,
+        signals: m.registered?.stats?.signalsGenerated ?? 0,
+        lastR: s.lastR,
       },
     };
   });
@@ -187,13 +111,10 @@ export function useStrategyConfigs() {
   return useQuery<readonly StrategyConfig[]>({
     queryKey: ["apex", "strategy-configs"],
     queryFn: async () => {
-      // Registered plugins (runtime) + guardrails policy (SoT) in parallel so
-      // a strategy killed in guardrails.yaml renders as killed, not missing.
-      const [res, policy] = await Promise.all([
-        fetchJsonOrNull<{ strategies: readonly BackendStrategy[] }>("/api/strategies"),
-        fetchStrategyPolicy(),
-      ]);
-      return mapStrategyConfigs(res?.strategies ?? [], policy);
+      // Same inputs as the dashboard cards: registered plugins, guardrails
+      // policy and the session's closed trades (TradeAnalytics).
+      const { registered, policy, sessionStats } = await fetchStrategyInputs();
+      return mapStrategyConfigs(registered, policy, sessionStats);
     },
     staleTime: 10_000,
     refetchInterval: 30_000,
@@ -202,43 +123,29 @@ export function useStrategyConfigs() {
 }
 
 // ============================================================
-// Meta-filter stats — /api/metafilter/stats
+// Meta-filter — /api/metafilter/stats (rule-based; no ML model)
 // ============================================================
 
-interface BackendMetaFilterStats {
-  enabled: boolean;
-  config?: {
-    coldStreakEnabled?: boolean;
-    coldStreakThreshold?: number;
-    strengthFilterEnabled?: boolean;
-    volumeConfirmEnabled?: boolean;
-    timeFilterEnabled?: boolean;
-  };
-}
+type MetaRuleKey = "coldStreakEnabled" | "timeFilterEnabled" | "strengthFilterEnabled" | "volumeConfirmEnabled";
 
-export function useMetaModel() {
-  return useQuery<MetaModelInfo>({
-    queryKey: ["apex", "meta-model"],
+const RULE_LABELS: readonly { key: MetaRuleKey; label: string }[] = [
+  { key: "coldStreakEnabled", label: "Cold-streak cooldown" },
+  { key: "timeFilterEnabled", label: "Time-of-day filter" },
+  { key: "strengthFilterEnabled", label: "Signal-strength floor" },
+  { key: "volumeConfirmEnabled", label: "Volume confirmation" },
+];
+
+export function useMetaFilter() {
+  return useQuery<MetaFilterInfo>({
+    queryKey: ["apex", "meta-filter"],
     queryFn: async () => {
-      const res = await fetchJsonOrNull<BackendMetaFilterStats>("/api/metafilter/stats");
+      const res = await fetchMetaFilterStats();
       const cfg = res?.config ?? {};
-      const features = [
-        cfg.coldStreakEnabled,
-        cfg.strengthFilterEnabled,
-        cfg.volumeConfirmEnabled,
-        cfg.timeFilterEnabled,
-      ].filter(Boolean).length;
       return {
-        // Label explicitly clarifies this is the rule-based filter, not an
-        // ML model. MetaModelHero renders this as the header.
-        name: "Rule-based · cold-streak + time filter (ML not loaded)",
-        features,
-        rocAuc: 0,
-        precision: 0,
-        recall: 0,
-        f1: 0,
-        threshold: 0.5,
-        trainedOn: 0,
+        name: "Rule-based meta-filter · cold-streak + time-of-day (no ML model loaded)",
+        enabled: res ? Boolean(res.enabled) : null,
+        threshold: typeof cfg.minQualityScore === "number" ? cfg.minQualityScore : 0.5,
+        rules: RULE_LABELS.map((r) => ({ key: r.key, label: r.label, enabled: Boolean(cfg[r.key]) })),
       };
     },
     staleTime: 30_000,

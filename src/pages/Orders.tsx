@@ -7,11 +7,16 @@ import { RecentFillsPanel } from "@/components/apex/orders/RecentFillsPanel";
 import { useOrders, useFills, useOrderStats } from "@/hooks/apex/useOrdersData";
 import { useOpenPositions } from "@/hooks/apex/useDashboardData";
 import { useLiveMarks } from "@/hooks/apex/useLiveMarks";
+import { useActiveSession } from "@/runtime/session";
 import type { OrderRecord } from "@/types/orders";
 
 export default function Orders() {
-  const orders = useOrders();
-  const fills = useFills();
+  // Orders/fills are scoped to the active paper session; with no session the
+  // page shows recent rows and says so instead of calling them "today".
+  const { engineRunning, sessionStartedAt } = useActiveSession();
+  const since = engineRunning ? sessionStartedAt : null;
+  const orders = useOrders(since);
+  const fills = useFills(since);
   const positions = useOpenPositions();
   const marks = useLiveMarks();
   const stats = useOrderStats(orders.data);
@@ -22,9 +27,13 @@ export default function Orders() {
 
   return (
     <div className="flex flex-col gap-4 p-6">
-      <OrdersKpiStrip stats={stats} />
+      <OrdersKpiStrip stats={stats} scopeLabel={engineRunning ? "this session" : "recent · engine stopped"} />
 
-      <ActivePositionsStrip positions={positions.data} marks={marks} />
+      <ActivePositionsStrip
+        positions={positions.data.positions}
+        source={positions.data.source}
+        marks={marks}
+      />
 
       <div className="grid gap-4" style={{ gridTemplateColumns: "minmax(0, 2fr) minmax(0, 1fr)" }}>
         <OrderBlotter

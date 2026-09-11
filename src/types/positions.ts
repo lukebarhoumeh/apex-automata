@@ -1,5 +1,12 @@
 export type PositionSide = "LONG" | "SHORT";
 
+/**
+ * - engine: from GET /api/positions (PositionTracker of the running paper session)
+ * - book:   from the Supabase `positions` table while the engine is stopped
+ *           (rows the engine would hydrate on the next start; no live marks)
+ */
+export type PositionSource = "engine" | "book";
+
 export interface Position {
   id: string;
   sym: string;
@@ -11,9 +18,10 @@ export interface Position {
   opened: string;
   strat: string;
   conf: number;
-  /** Live mark price — ticks; may be undefined until feed arrives. */
+  source: PositionSource;
+  /** Engine mark at the last poll; overlaid by fresher WS ticks at render time. Undefined until known. */
   mark?: number;
-  /** Derived unrealized P&L in quote currency. */
+  /** Engine-reported unrealized P&L (USD) at the last poll. */
   pnl?: number;
   /** Derived P&L %. */
   pnlPct?: number;

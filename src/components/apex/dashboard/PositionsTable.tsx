@@ -6,37 +6,47 @@ import { fmt, fmtSign } from "@/components/apex/format";
 import { computePositionPnl } from "@/lib/position-pnl";
 import { cn } from "@/lib/utils";
 import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
-import type { Position } from "@/types/positions";
+import type { Position, PositionSource } from "@/types/positions";
 
 interface PositionsTableProps {
   positions: readonly Position[];
+  /** engine → GET /api/positions (running session); book → Supabase rows while stopped. */
+  source?: PositionSource;
   /** Real marks from the runtime (WS ticker / engine). Absent symbol → "—". */
   marks?: LiveMarks;
 }
 
 const NO_MARKS: LiveMarks = {};
 
-function markStatusLabel(rows: readonly Position[], marks: LiveMarks): string {
-  if (rows.length === 0) return "";
-  const marked = rows.filter((p) => marks[p.sym] !== undefined).length;
-  if (marked === 0) return "no live marks";
-  if (marked === rows.length) return "live marks";
-  return `marks ${marked}/${rows.length}`;
+/** Freshest real mark: WS tick first, then the engine's last polled mark. */
+function markFor(position: Position, marks: LiveMarks): number | undefined {
+  return marks[position.sym]?.price ?? position.mark;
+}
+
+function markStatusLabel(rows: readonly Position[], marks: LiveMarks, source: PositionSource): string {
+  if (rows.length === 0) return source === "book" ? "engine stopped" : "";
+  const marked = rows.filter((p) => markFor(p, marks) !== undefined).length;
+  const prefix = source === "book" ? "book · engine stopped · " : "";
+  if (marked === 0) return `${prefix}no live marks`;
+  if (marked === rows.length) return `${prefix}live marks`;
+  return `${prefix}marks ${marked}/${rows.length}`;
 }
 
 /**
  * Open positions valued at the runtime's real marks. Rows are derived from
  * props on every render — no local ticking state, no synthetic jitter.
  */
-export function PositionsTable({ positions, marks = NO_MARKS }: PositionsTableProps) {
+export function PositionsTable({ positions, source = "engine", marks = NO_MARKS }: PositionsTableProps) {
   return (
     <Panel
       header
       pad={0}
       title="Open positions"
-      subtitle={`${positions.length} active`}
+      subtitle={`${positions.length} ${source === "book" ? "on book" : "active"}`}
       right={
-        <span className="mono text-[10.5px] text-fg-2">{markStatusLabel(positions, marks)}</span>
+        <span className={cn("mono text-[10.5px]", source === "book" ? "text-warn/90" : "text-fg-2")}>
+          {markStatusLabel(positions, marks, source)}
+        </span>
       }
     >
       <div className="overflow-x-auto">
@@ -59,7 +69,7 @@ export function PositionsTable({ positions, marks = NO_MARKS }: PositionsTablePr
           </thead>
           <tbody>
             {positions.map((p) => (
-              <PositionRow key={p.id} position={p} mark={marks[p.sym]?.price} />
+              <PositionRow key={p.id} position={p} mark={markFor(p, marks)} />
             ))}
           </tbody>
         </table>

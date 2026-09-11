@@ -6,6 +6,8 @@ import type { FeedEvent, FeedEventKind } from "@/types/signals";
 
 interface LiveSignalFeedProps {
   initialEvents: readonly FeedEvent[];
+  /** True while a paper session is running — the feed is session-scoped and truly live. */
+  live?: boolean;
   className?: string;
 }
 
@@ -21,21 +23,29 @@ const KIND_META: Record<
   SESSION: { icon: Info,        label: "SESSION", tone: "default" },
 };
 
-export function LiveSignalFeed({ initialEvents, className }: LiveSignalFeedProps) {
+export function LiveSignalFeed({ initialEvents, live = false, className }: LiveSignalFeedProps) {
   // Render the real feed straight from the upstream prop — useSignalFeed() polls
-  // /signals on a 15s cadence via React Query. The previous implementation injected
+  // /signals on a 15s cadence via React Query, scoped to the active session and
+  // with guardrails-killed strategies excluded. The previous implementation injected
   // synthetic pulses every 6s with KILLED strategy tags ("breakout", "vwap_mr") which
   // showed as live signals to operators; that lied about engine state during paper runs.
   return (
     <Panel
       header
       pad={0}
-      title="Live signal feed"
+      title={live ? "Live signal feed" : "Signal feed"}
+      subtitle={live ? "this session" : "recent · engine stopped"}
       right={
         <>
-          <span className="flex items-center gap-1.5">
-            <span className="dot-live" />
-            <span className="mono text-[11px] text-fg-1">LIVE</span>
+          <span className="flex items-center gap-1.5" data-testid="signal-feed-state">
+            {live ? (
+              <span className="dot-live" />
+            ) : (
+              <span className="inline-block h-1.5 w-1.5 rounded-full bg-fg-3" />
+            )}
+            <span className={cn("mono text-[11px]", live ? "text-fg-1" : "text-fg-3")}>
+              {live ? "LIVE" : "IDLE"}
+            </span>
           </span>
           <button
             type="button"
@@ -49,9 +59,14 @@ export function LiveSignalFeed({ initialEvents, className }: LiveSignalFeedProps
       className={className}
     >
       <div className="max-h-[520px] overflow-y-auto">
+        {initialEvents.length === 0 && (
+          <div className="mono px-4 py-6 text-[11px] text-fg-3">
+            {live ? "No signals yet this session." : "No signals to show."}
+          </div>
+        )}
         <ul className="divide-y divide-obsidian-line">
           {initialEvents.map((ev, i) => (
-            <FeedRow key={ev.id} event={ev} isNew={i === 0} />
+            <FeedRow key={ev.id} event={ev} isNew={live && i === 0} />
           ))}
         </ul>
       </div>

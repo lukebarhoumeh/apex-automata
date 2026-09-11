@@ -17,11 +17,14 @@ interface PillProps {
   children: ReactNode;
   className?: string;
   dot?: boolean;
+  /** Native tooltip explaining where the value comes from. */
+  title?: string;
 }
 
-export function Pill({ tone = "default", dot, children, className }: PillProps) {
+export function Pill({ tone = "default", dot, children, className, title }: PillProps) {
   return (
     <span
+      title={title}
       className={cn(
         "inline-flex items-center gap-1.5 rounded-full border px-2 py-[3px]",
         "font-mono text-[10.5px] font-medium uppercase tracking-wider",

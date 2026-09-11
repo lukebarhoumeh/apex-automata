@@ -2,7 +2,7 @@ import { mulberry32, makeSeries } from "./rng";
 import type { EquityPoint } from "@/types/equity";
 import type { Position } from "@/types/positions";
 import type { SignalRecord, FeedEvent } from "@/types/signals";
-import type { StrategyCardData, StrategyConfig, MetaModelInfo } from "@/types/strategy";
+import type { StrategyCardData, StrategyConfig, MetaFilterInfo } from "@/types/strategy";
 import type { MarketRegime } from "@/types/regime";
 import type { SessionStats } from "@/types/session";
 import type { OrderRecord, FillRecord } from "@/types/orders";
@@ -19,6 +19,8 @@ export const SESSION_SEED: SessionStats = {
   pnlR: 1.82,
   realized: 982.10,
   unrealized: 309.87,
+  equity: 101_291.97,
+  startEquity: 100_000,
   trades: 6,
   wins: 4,
   losses: 2,
@@ -26,21 +28,20 @@ export const SESSION_SEED: SessionStats = {
   heat: 1.4,
   heatCap: 3.0,
   maxDrawDown: -0.6,
-  signalsSeen: 17,
-  signalsTaken: 6,
-  acceptanceRate: 0.353,
+  openPositions: 3,
   uptime: "03h 12m",
   mode: "paper",
-  engineVersion: "v2.4.1",
+  engineState: "running",
   markets: 6,
-  metaThreshold: 0.65,
+  metaFilterEnabled: true,
 };
 
 export const POSITIONS_SEED: readonly Position[] = [
   {
     id: "p1",
     sym: "BTC-USD",
-    side: "LONG",
+    side: "LONG" as const,
+    source: "engine" as const,
     qty: 0.4182,
     entry: 66_840.0,
     stop: 65_920,
@@ -54,7 +55,8 @@ export const POSITIONS_SEED: readonly Position[] = [
   {
     id: "p2",
     sym: "ETH-USD",
-    side: "LONG",
+    side: "LONG" as const,
+    source: "engine" as const,
     qty: 3.21,
     entry: 3_261.0,
     stop: 3_218,
@@ -68,7 +70,8 @@ export const POSITIONS_SEED: readonly Position[] = [
   {
     id: "p3",
     sym: "SOL-USD",
-    side: "SHORT",
+    side: "SHORT" as const,
+    source: "engine" as const,
     qty: 42,
     entry: 184.9,
     stop: 188.4,
@@ -123,27 +126,30 @@ export const STRATEGY_CARDS_SEED: readonly StrategyCardData[] = [
     id: "trend_follow",
     name: "Trend Follow · ETH",
     status: "on",
-    pnlToday: 682.4,
+    pnlSession: 682.4,
     trades: 3,
     winRate: 0.667,
+    signals: 5,
     sparkline: makeSeries(201, 40, 100, 2.5, 0.3),
   },
   {
     id: "momentum",
     name: "Momentum · ETH",
     status: "on",
-    pnlToday: 441.2,
+    pnlSession: 441.2,
     trades: 2,
     winRate: 0.5,
+    signals: 4,
     sparkline: makeSeries(202, 40, 100, 3.0, 0.2),
   },
   {
     id: "breakout",
     name: "Breakout + Volume",
     status: "cooldown",
-    pnlToday: 168.4,
+    pnlSession: 168.4,
     trades: 1,
     winRate: 0.5,
+    signals: 2,
     sparkline: makeSeries(203, 40, 100, 2.0, -0.1),
   },
 ];
@@ -204,15 +210,16 @@ export const FILLS_SEED: readonly FillRecord[] = [
   { id: "fill-6", ts: "09:02:11.500", sym: "BTC-USD", side: "SELL", qty: 0.18, px: 67_512.00, fee: 4.86, slip:  0.20 },
 ];
 
-export const META_MODEL_SEED: MetaModelInfo = {
-  name: "xgb_v2.4 · 128 features",
-  features: 128,
-  rocAuc: 0.784,
-  precision: 0.642,
-  recall: 0.718,
-  f1: 0.678,
-  threshold: 0.65,
-  trainedOn: 47_331,
+export const META_MODEL_SEED: MetaFilterInfo = {
+  name: "Rule-based meta-filter · cold-streak + time-of-day (no ML model loaded)",
+  enabled: true,
+  threshold: 0.5,
+  rules: [
+    { key: "coldStreakEnabled", label: "Cold-streak cooldown", enabled: true },
+    { key: "timeFilterEnabled", label: "Time-of-day filter", enabled: true },
+    { key: "strengthFilterEnabled", label: "Signal-strength floor", enabled: false },
+    { key: "volumeConfirmEnabled", label: "Volume confirmation", enabled: false },
+  ],
 };
 
 export const STRATEGY_CONFIG_SEED: readonly StrategyConfig[] = [
@@ -227,7 +234,7 @@ export const STRATEGY_CONFIG_SEED: readonly StrategyConfig[] = [
       { key: "donchianN", label: "Donchian period", val: 20, min: 10, max: 40, step: 1, format: (v) => `${v}` },
       { key: "atrPctile", label: "ATR pctile min",  val: 60, min: 30, max: 90, step: 5, format: (v) => `${v}` },
     ],
-    stats: { winRate: 0.564, avgR: 1.42, trades: 48, lastR: [0.8, -1, 1.4, 2.1, -1, 0.9, 1.6, -1, 0.7, 2.2, 1.1, -1] },
+    stats: { winRate: 0.564, avgR: 1.42, trades: 48, signals: 61, lastR: [0.8, -1, 1.4, 2.1, -1, 0.9, 1.6, -1, 0.7, 2.2, 1.1, -1] },
   },
   {
     id: "vwap_mr",
@@ -239,7 +246,7 @@ export const STRATEGY_CONFIG_SEED: readonly StrategyConfig[] = [
       { key: "zAbsMin", label: "|Z| minimum", val: 2.0, min: 1.5, max: 3.0, step: 0.1, format: (v) => `${v.toFixed(1)}σ` },
       { key: "adxMax",  label: "ADX maximum", val: 25,  min: 15,  max: 35,  step: 1,   format: (v) => `${v}` },
     ],
-    stats: { winRate: 0.612, avgR: 0.82, trades: 63, lastR: [1.1, 0.8, -1, 1.3, 0.9, -1, 1.2, 0.7, -1, 1.1, 1.4, 0.6] },
+    stats: { winRate: 0.612, avgR: 0.82, trades: 63, signals: 80, lastR: [1.1, 0.8, -1, 1.3, 0.9, -1, 1.2, 0.7, -1, 1.1, 1.4, 0.6] },
   },
 ];
 
