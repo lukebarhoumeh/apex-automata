@@ -5,6 +5,7 @@ import {
   type JournalFilter,
 } from "@/components/apex/journal/JournalFilterBar";
 import { JournalCard } from "@/components/apex/journal/JournalCard";
+import { DemoBanner } from "@/components/apex/DemoBanner";
 import { useJournalEntries } from "@/hooks/apex/useJournalData";
 
 export default function Journal() {
@@ -28,6 +29,16 @@ export default function Journal() {
 
   return (
     <div className="flex flex-col gap-4 p-6">
+      <DemoBanner
+        detail={
+          <>
+            Every journal entry, thesis, tag and P&amp;L below is a seeded fixture from{" "}
+            <span className="mono">seed-data.ts</span> — none of these trades happened in the active paper session.
+            Session trades live in the runtime ledger (<span className="mono">/api/analytics/trades</span>) and
+            Supabase <span className="mono">trade_log</span>; this page is not wired to them yet.
+          </>
+        }
+      />
       <JournalHero entries={entries.data} />
       <JournalFilterBar filter={filter} onFilter={setFilter} counts={counts} />
 

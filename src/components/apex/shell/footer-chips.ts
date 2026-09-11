@@ -9,6 +9,7 @@
 
 import type { RuntimeConnectivity } from "@/runtime/connectivity/types";
 import type { RuntimeStatus } from "@/services/runtimeClient";
+import { deriveSessionUptime, shortSessionId } from "@/lib/session-scope";
 
 export type ChipStatus = "ok" | "warn" | "down" | "idle";
 
@@ -131,7 +132,11 @@ export function deriveFooterChips(inputs: FooterChipInputs): FooterChip[] {
   return [marketDataChip(inputs), brokerChip(inputs), metaFilterChip(inputs)];
 }
 
-/** Right-hand footer text: session identity + status freshness. */
+/**
+ * Right-hand footer text: session identity + the ONE session clock + status
+ * freshness. Uptime derives from `/api/status → sessionStartedAt`, the same
+ * source as the sidebar card and dashboard hero, so the three never disagree.
+ */
 export function deriveFooterSessionText(
   status: RuntimeStatus | null | undefined,
   connectivity: RuntimeConnectivity,
@@ -142,7 +147,10 @@ export function deriveFooterSessionText(
   const parts: string[] = [];
   if (status.engineRunning) {
     parts.push((status.mode ?? "unknown mode").toUpperCase());
-    parts.push(status.sessionId ? `session …${status.sessionId.slice(-6)}` : "session id pending");
+    parts.push(status.sessionId ? `session ${shortSessionId(status.sessionId)}` : "session id pending");
+    if (status.sessionId && status.sessionStartedAt) {
+      parts.push(`up ${deriveSessionUptime(status.sessionStartedAt, now)}`);
+    }
   } else {
     parts.push("no active session");
   }

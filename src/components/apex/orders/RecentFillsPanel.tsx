@@ -1,24 +1,33 @@
 import { Panel } from "@/components/apex/Panel";
 import { Pill } from "@/components/apex/Pill";
 import { fmt, fmtSign } from "@/components/apex/format";
+import { hasActiveSession, type SessionScope } from "@/lib/session-scope";
 import type { FillRecord } from "@/types/orders";
 
 interface RecentFillsPanelProps {
   fills: readonly FillRecord[];
+  /** Active runtime session the fills are scoped to (from /api/status). */
+  session: SessionScope;
 }
 
-export function RecentFillsPanel({ fills }: RecentFillsPanelProps) {
+export function RecentFillsPanel({ fills, session }: RecentFillsPanelProps) {
+  const active = hasActiveSession(session);
   return (
     <Panel
       header
       pad={0}
       title="Recent fills"
-      right={<Pill tone="default">{fills.length}</Pill>}
+      subtitle="this session"
+      right={<Pill tone="default">{active ? fills.length : "—"}</Pill>}
     >
       <div className="max-h-[240px] overflow-y-auto">
-        {fills.map((f) => (
-          <FillRow key={f.id} fill={f} />
-        ))}
+        {fills.length === 0 ? (
+          <div className="px-4 py-8 text-center text-[12px] text-fg-2" data-testid="fills-empty">
+            {active ? "No fills this session yet." : "No active session — fills appear here once the engine is running."}
+          </div>
+        ) : (
+          fills.map((f) => <FillRow key={f.id} fill={f} />)
+        )}
       </div>
     </Panel>
   );

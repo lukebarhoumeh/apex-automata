@@ -252,7 +252,8 @@ describe("U5 — footer chips reflect runtime health, never hard-coded green", (
   });
 
   it("describes the session honestly on the right", () => {
-    expect(deriveFooterSessionText(restStatus(), CONNECTED, 7_000)).toBe("PAPER · session …23_abc · status 2s ago");
+    // sessionStartedAt=1_000, now=7_000 → the one session clock reads 00:00:06.
+    expect(deriveFooterSessionText(restStatus(), CONNECTED, 7_000)).toBe("PAPER · session …23_abc · up 00:00:06 · status 2s ago");
     expect(deriveFooterSessionText(restStatus({ engineRunning: false, sessionId: null }), CONNECTED, 7_000)).toBe("no active session · status 2s ago");
     expect(deriveFooterSessionText(undefined, { state: "BACKEND_DOWN", since: 0 }, 0)).toBe("runtime unreachable");
   });
@@ -341,12 +342,13 @@ describe("P4 — guardrails disabled_strategies overlay", () => {
     expect(merged[0]).toMatchObject({ enabled: false, disabledBy: "runtime" });
   });
 
-  it("maps to dashboard cards with a killed status", () => {
+  it("maps to dashboard cards with a killed status — emitted signals are never counted as trades", () => {
     const cards = mapStrategyCards(
       [{ id: "trend_follow", name: "Trend Follow", description: "d", category: "trend", enabled: true, stats: { signalsGenerated: 3 } }],
       policy,
+      [],
     );
-    expect(cards.find((c) => c.id === "trend_follow")).toMatchObject({ status: "on", trades: 3 });
-    expect(cards.find((c) => c.id === "momentum")).toMatchObject({ status: "killed", disabledBy: "guardrails" });
+    expect(cards.find((c) => c.id === "trend_follow")).toMatchObject({ status: "on", trades: 0, signals: 3, sessionScoped: true });
+    expect(cards.find((c) => c.id === "momentum")).toMatchObject({ status: "killed", disabledBy: "guardrails", trades: 0 });
   });
 });

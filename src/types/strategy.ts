@@ -16,9 +16,15 @@ export interface StrategyCardData {
   name: string;
   status: StrategyStatus;
   disabledBy?: StrategyDisabledBy;
-  pnlToday: number;
+  /** Realized P&L (USD) of this strategy's closed trades in the ACTIVE session. */
+  pnlSession: number;
+  /** Closed trades attributed to this strategy in the ACTIVE session (TradeAnalytics). */
   trades: number;
+  /** Signals the plugin emitted this run — NOT trades; most are filtered before routing. */
+  signals: number;
   winRate: number;
+  /** False when the engine is stopped and no session ledger exists. */
+  sessionScoped: boolean;
   sparkline: readonly number[];
 }
 
@@ -43,7 +49,10 @@ export interface StrategyConfig {
   stats: {
     winRate: number;
     avgR: number;
+    /** Closed trades in the ACTIVE session (TradeAnalytics), not signals. */
     trades: number;
+    /** Signals emitted by the plugin this run (StrategyRegistry counter). */
+    signals: number;
     lastR: readonly number[];
   };
 }

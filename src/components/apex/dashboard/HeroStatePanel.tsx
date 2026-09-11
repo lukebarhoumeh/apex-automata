@@ -4,6 +4,8 @@ import { Sparkline } from "@/components/apex/Sparkline";
 import { HeatBar } from "@/components/apex/HeatBar";
 import { fmt } from "@/components/apex/format";
 import { cn } from "@/lib/utils";
+import { shortSessionId } from "@/lib/session-scope";
+import { useSessionUptime } from "@/components/apex/shell/useSessionUptime";
 import type { SessionStats } from "@/types/session";
 import type { MarketRegime } from "@/types/regime";
 import type { EquityPoint } from "@/types/equity";
@@ -41,6 +43,9 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
   const sparkData = intradayEquity.slice(-60).map((p) => p.v);
   const pnlUp = pnl >= 0;
   const heatPctLabel = `${session.heat.toFixed(1)}% / ${session.heatCap.toFixed(1)}%`;
+  // Uptime ticks from /api/status → sessionStartedAt via the same hook as the
+  // sidebar session card — never from TradeAnalytics' start time or page mount.
+  const uptime = useSessionUptime(session.sessionStartedAt);
 
   return (
     <div
@@ -90,7 +95,16 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
           </div>
 
           <div>
-            <div className="label mb-1.5">Current session</div>
+            <div className="label mb-1.5 flex items-center gap-2">
+              <span>Current session</span>
+              <span
+                className="mono normal-case tracking-normal text-fg-3"
+                title={session.sessionId ? `Session ${session.sessionId} (from /api/status)` : "No active session"}
+                data-testid="hero-session-id"
+              >
+                {session.sessionId ? shortSessionId(session.sessionId) : "none"}
+              </span>
+            </div>
             <div
               className="serif-ital text-fg-0"
               style={{ fontSize: 44, lineHeight: 1, fontWeight: 500, letterSpacing: "-0.02em" }}
@@ -109,13 +123,12 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
           </div>
 
           <p className="max-w-[380px] text-[12.5px] leading-[1.55] text-fg-1">
-            {mode.subtitle}. Meta model gating at{" "}
-            <span className="mono text-fg-0">p ≥ {session.metaThreshold.toFixed(2)}</span>.
-            Ran <span className="mono text-fg-0">{session.signalsSeen}</span> candidates · took{" "}
+            {mode.subtitle}. Signals are gated by the rule-based meta-filter (no ML model).
+            Closed{" "}
             <span className="mono" style={{ color: "hsl(var(--accent-2))" }}>
-              {session.signalsTaken}
+              {session.trades}
             </span>{" "}
-            this session.
+            {session.trades === 1 ? "trade" : "trades"} this session.
           </p>
 
           <div className="mt-1 flex items-center gap-2">
@@ -211,7 +224,7 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
             <QuickStat label="W/L" value={`${session.wins}/${session.losses}`} />
             <QuickStat label="Regime" value={regime.label} small />
             <QuickStat label="TF" value={regime.timeframe} />
-            <QuickStat label="Uptime" value={session.uptime} />
+            <QuickStat label="Uptime" value={uptime} />
           </div>
         </div>
       </div>

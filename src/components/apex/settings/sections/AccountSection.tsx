@@ -54,14 +54,15 @@ export function AccountSection({ account }: Props) {
       </FormRow>
       <FormRow
         label="API key · personal"
-        hint="Automation against your workspace. Treat like a password."
+        hint="Demo placeholder — no personal API key exists for this workspace yet."
       >
         <div className="flex items-center gap-2">
           <div
-            className="mono rounded-md border border-obsidian-line bg-obsidian-2 px-3 py-2 text-[11.5px] text-fg-0"
+            className="mono rounded-md border border-obsidian-line bg-obsidian-2 px-3 py-2 text-[11.5px] text-fg-3"
             style={{ width: 320 }}
+            data-testid="account-api-key"
           >
-            apex_live_sk_4aF3x•••••••••••••9zQp
+            no key issued (demo)
           </div>
           <button className="inline-flex items-center gap-1.5 rounded-md border border-obsidian-line bg-obsidian-2 px-2.5 py-1 text-[11px] text-fg-1 hover:bg-obsidian-3">
             <Copy size={12} /> Copy

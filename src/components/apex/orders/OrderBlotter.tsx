@@ -15,12 +15,28 @@ import { Pill } from "@/components/apex/Pill";
 import { Segmented } from "@/components/apex/Segmented";
 import { fmt } from "@/components/apex/format";
 import { cn } from "@/lib/utils";
+import {
+  hasActiveSession,
+  sessionOpenedLabel,
+  shortSessionId,
+  type SessionScope,
+} from "@/lib/session-scope";
 import type { OrderRecord, OrderStatus, OrderSide } from "@/types/orders";
 
 interface OrderBlotterProps {
   orders: readonly OrderRecord[];
+  /** Active runtime session the rows are scoped to (from /api/status). */
+  session: SessionScope;
   selectedId?: string | null;
   onSelect: (order: OrderRecord) => void;
+}
+
+/** Honest empty-state copy: no session ≠ no orders ≠ filtered out. */
+export function blotterEmptyMessage(session: SessionScope, total: number, filtered: number): string {
+  if (!hasActiveSession(session)) return "No active session — orders appear here once the engine is running.";
+  if (total === 0) return "No orders this session yet.";
+  if (filtered === 0) return "No orders match the current filters.";
+  return "";
 }
 
 type SideFilter = "ALL" | "BUY" | "SELL";
@@ -44,7 +60,7 @@ const STATUS_META: Record<
   REJECTED:  { tone: "down",    icon: TriangleAlert },
 };
 
-export function OrderBlotter({ orders, selectedId, onSelect }: OrderBlotterProps) {
+export function OrderBlotter({ orders, session, selectedId, onSelect }: OrderBlotterProps) {
   const [sideFilter, setSideFilter] = useState<SideFilter>("ALL");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("ALL");
   const [symbolFilter, setSymbolFilter] = useState<string>("ALL");
@@ -62,14 +78,29 @@ export function OrderBlotter({ orders, selectedId, onSelect }: OrderBlotterProps
     [orders, sideFilter, statusFilter, symbolFilter],
   );
 
+  const active = hasActiveSession(session);
+  const emptyMessage = blotterEmptyMessage(session, orders.length, filtered.length);
+
   return (
     <Panel header={false} pad={0}>
       <div className="flex items-center justify-between gap-3 border-b border-obsidian-line px-4 py-3">
         <div className="flex items-center gap-3">
           <span className="label">Order blotter</span>
-          <div className="flex items-center gap-1.5">
-            <span className="dot-live" />
-            <span className="mono text-[10.5px] uppercase tracking-[0.12em] text-fg-2">streaming</span>
+          <div
+            className="flex items-center gap-1.5"
+            data-testid="blotter-session-scope"
+            title={
+              active
+                ? `Rows created since this session opened (${sessionOpenedLabel(session.sessionStartedAt)}). Session ${session.sessionId}.`
+                : "No active runtime session — nothing to attribute orders to."
+            }
+          >
+            {active ? <span className="dot-live" /> : <span className="inline-block h-1.5 w-1.5 rounded-full bg-fg-3" />}
+            <span className="mono text-[10.5px] uppercase tracking-[0.12em] text-fg-2">
+              {active
+                ? `session ${shortSessionId(session.sessionId)} · since ${sessionOpenedLabel(session.sessionStartedAt)}`
+                : "no active session"}
+            </span>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -132,8 +163,8 @@ export function OrderBlotter({ orders, selectedId, onSelect }: OrderBlotterProps
           <tbody>
             {filtered.length === 0 ? (
               <tr>
-                <td colSpan={11} className="py-10 text-center text-[12px] text-fg-2">
-                  No orders match the current filters.
+                <td colSpan={11} className="py-10 text-center text-[12px] text-fg-2" data-testid="blotter-empty">
+                  {emptyMessage}
                 </td>
               </tr>
             ) : (

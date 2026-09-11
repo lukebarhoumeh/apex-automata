@@ -57,7 +57,7 @@ export function CommandPalette({
               >
                 <Icon size={14} strokeWidth={1.6} className="mr-2" />
                 <span className="flex-1">Go to {item.label}</span>
-                <Pill tone="default">nav</Pill>
+                <Pill tone={item.demo ? "warn" : "default"}>{item.demo ? "demo" : "nav"}</Pill>
               </CommandItem>
             );
           })}

@@ -33,7 +33,7 @@ export function SignalStreamPanel({ signals, threshold }: Props) {
         <div className="flex items-center gap-3">
           <span className="inline-block h-1.5 w-1.5 rounded-full bg-accent shadow-[0_0_0_2px_hsl(var(--accent)/0.25)]" />
           <span className="mono text-[10px] font-medium uppercase tracking-[0.12em] text-fg-2">
-            SIGNAL STREAM · LIVE
+            SIGNAL STREAM · THIS SESSION
           </span>
         </div>
         <Segmented<Filter> value={filter} onChange={setFilter} options={FILTER_OPTIONS} />
@@ -53,11 +53,33 @@ export function SignalStreamPanel({ signals, threshold }: Props) {
             </tr>
           </thead>
           <tbody>
+            {filtered.length === 0 && (
+              <tr>
+                <td colSpan={9} className="py-10 text-center text-[12px] text-fg-2" data-testid="signal-stream-empty">
+                  {signals.length === 0
+                    ? "No signals this session — the stream shows only decisions made since the active session opened."
+                    : "No signals match the current filter."}
+                </td>
+              </tr>
+            )}
             {filtered.map((s) => (
-              <tr key={s.id} className="border-b border-obsidian-line/60 hover:bg-obsidian-2/60">
+              <tr key={s.id} className={cn("border-b border-obsidian-line/60 hover:bg-obsidian-2/60", s.killed && "opacity-60")}>
                 <td className="mono px-3 py-2 text-[11px] text-fg-2">{s.ts}</td>
                 <td className="px-3 py-2 text-[12.5px] font-medium text-fg-0">{s.sym}</td>
-                <td className="mono px-3 py-2 text-[11px] text-fg-1">{s.strat}</td>
+                <td className="mono px-3 py-2 text-[11px] text-fg-1">
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className={cn(s.killed && "line-through text-fg-3")}>{s.strat}</span>
+                    {s.killed && (
+                      <span
+                        className="rounded-full border border-warn/30 bg-warn/10 px-1.5 py-px text-[9px] uppercase tracking-wider text-warn"
+                        title="Strategy is in guardrails.yaml disabled_strategies (GET /api/strategies/policy). Signals from it never reach order routing."
+                        data-testid={`signal-killed-${s.id}`}
+                      >
+                        killed
+                      </span>
+                    )}
+                  </span>
+                </td>
                 <td className="px-3 py-2">
                   <Pill tone={s.side === "BUY" ? "up" : "down"}>{s.side}</Pill>
                 </td>
