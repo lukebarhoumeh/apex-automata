@@ -916,6 +916,61 @@ app.get('/api/pnl', (req, res) => {
   res.json(snapshot);
 });
 
+/**
+ * Open positions from the engine's PositionTracker (TASK_016 step 5).
+ * This is the paper session's source of truth: the mark and unrealized P&L
+ * are the exact numbers the engine risks against, and perps marked via the
+ * spot proxy are included. 400 while the engine is stopped so the UI can
+ * distinguish "no session" from "no positions". Read-only.
+ */
+app.get('/api/positions', (req, res) => {
+  if (!tradingEngine?.engineRunning) {
+    return res.status(400).json({ error: 'Trading engine not running' });
+  }
+
+  const toIso = (value: unknown): string | null => {
+    if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString();
+    if (typeof value === 'number' || typeof value === 'string') {
+      const d = new Date(value);
+      return Number.isNaN(d.getTime()) ? null : d.toISOString();
+    }
+    return null;
+  };
+  const finiteOrNull = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isFinite(value) ? value : null;
+
+  const positions = tradingEngine.getOpenPositions().map((p) => {
+    // Same raw entry-fill VWAP the Supabase mirror stores (position-entry-vwap.ts):
+    // averagePrice rolls entry fees into cost basis and misplaces stops/TPs on screen.
+    const entryRaw = computeRawEntryFillPrice(p);
+    const entryPrice = Number.isFinite(entryRaw) && entryRaw > 0 ? entryRaw : p.averagePrice;
+    const mark = finiteOrNull(p.marketPrice);
+    return {
+      id: p.id,
+      symbol: p.symbol,
+      side: p.side,
+      qty: p.size,
+      entryPrice,
+      averagePrice: p.averagePrice,
+      markPrice: mark !== null && mark > 0 ? mark : null,
+      unrealizedPnlUsd: finiteOrNull(p.unrealizedPnL) ?? 0,
+      realizedPnlUsd: finiteOrNull(p.realizedPnL) ?? 0,
+      stopPrice: finiteOrNull(p.stopPrice),
+      takeProfit: finiteOrNull(p.takeProfit),
+      strategy: p.strategy ?? null,
+      openedAt: toIso(p.openTime),
+      lastUpdateAt: toIso(p.lastUpdateTime),
+    };
+  });
+
+  res.json({
+    sessionId: runtimeState.sessionId,
+    mode: tradingEngine.getConfig().mode,
+    ts: Date.now(),
+    positions,
+  });
+});
+
 // Get trading engine status (UI contract) with 24/7 resilience fields
 app.get('/api/status', (req, res) => {
   const isEngineRunning = tradingEngine !== null && tradingEngine.engineRunning;
