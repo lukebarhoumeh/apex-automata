@@ -20,6 +20,14 @@ not read by the gate:
   hard-preflight**.
 - `1d/` — 24-month native daily bars.
 
+Long 15m windows for E2-MOM-ISO (BTC, ETH, SOL; native `FIFTEEN_MINUTE`, no
+rollup) live in `15m/` and are documented in [`15m/README.md`](./15m/README.md);
+they are **not** read by the gate either — the 7d files above stay CI-only:
+
+- `15m/holdout-2025-03_2026-03/` — 12-month 15m **holdout**; hard-preflight /
+  counted path for E2-MOM-ISO.
+- `15m/tune-2023-03_2025-03/` — 24-month 15m **tune** window (in-sample only).
+
 Format: `BarFixtureFile` (`src/backtesting/data-loader.ts`) — `candles[].time`
 is epoch **seconds**, matching the `public.bars` convention. Each file records
 `fetchedAt`, `endpoint` and `source` for provenance; the loader logs the file

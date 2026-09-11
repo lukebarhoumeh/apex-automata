@@ -7,7 +7,10 @@ run — each `--fixture-dir` is one timeframe **and one window**.
 
 The 15m fixtures in the parent directory (`fixtures/bars/BTC-USD.json`,
 `ETH-USD.json`) belong to the `backtest-gate` CI workflow and are **not** part
-of this set — see `README.md` there.
+of this set — see `README.md` there. The long native-15m holdout / tune
+windows for E2-MOM-ISO (`15m/holdout-2025-03_2026-03/`,
+`15m/tune-2023-03_2025-03/`) are documented in `15m/README.md`; they cover the
+same two windows as the 4h sets below and were cross-checked against them.
 
 ## What is committed
 
