@@ -5,7 +5,13 @@ dotenv.config({ path: path.resolve(process.cwd(), '../../../.env') });
 import yargs from 'yargs/yargs';
 import { hideBin } from 'yargs/helpers';
 import { createLogger } from '../core/logger';
-import { BacktestRunner, BacktestRunnerConfig, FeeTierLabel } from '../backtesting/backtest-runner';
+import {
+  BacktestRunner,
+  BacktestRunnerConfig,
+  FeeTierLabel,
+  describeExitReasons,
+  describeExitRules,
+} from '../backtesting/backtest-runner';
 import { BacktestResult, EvGateMode } from '../backtesting/backtest-engine';
 import { isDataUnavailableError } from '../backtesting/data-loader';
 import { SUPPORTED_BAR_MINUTES, describeBarTimeframe, isBarAggregationError } from '../backtesting/bar-aggregation';
@@ -47,6 +53,8 @@ function printSummary(result: BacktestResult, feeTier: FeeTierLabel): void {
   // RegimeFilter line above. Ships disabled; `--regime-conditional-gates` flips it for a run.
   const a6 = result.config.regimeConditionalGates;
   console.log(`Regime-conditional gates (A6): enabled=${a6?.enabled ?? false} rules=${a6?.rules.length ?? 0}`);
+  console.log(`Exit rules: ${describeExitRules(m.exitRules)}`);
+  console.log(`Exits by reason: ${describeExitReasons(m.exitReasons)}`);
   console.log(`Total Return: ${m.returnPercent.toFixed(2)}%`);
   console.log(`Sharpe Ratio: ${m.sharpeRatio.toFixed(2)}`);
   console.log(`Win Rate: ${(m.winRate * 100).toFixed(2)}%`);
@@ -189,6 +197,16 @@ async function main() {
         'impact without changing live/paper config.',
       default: false,
     })
+    .option('exit-parity', {
+      type: 'string',
+      choices: ['on', 'off'],
+      default: 'off',
+      describe:
+        'Live PositionMonitor exit rules from guardrails.yaml: ATR trailing stop ' +
+        '(strategy.stop_trail_atr × entry ATR, label trailing_stop) + time stop ' +
+        '(strategy.time_stop_bars completed bars, label time_stop). Default off so E1/E2 ' +
+        'cards are unchanged; G1/G3/G5 infra only — flipping the default is an E5 decision.',
+    })
     .option('optimize', {
       type: 'boolean',
       describe: 'Run parameter optimization',
@@ -230,6 +248,7 @@ async function main() {
   // for this run only so projected impact can be measured without touching
   // live/paper config. Wired through buildBacktestConfig() (below).
   const forceRegimeConditionalGates = Boolean(argv.regimeConditionalGates);
+  const exitParity = String(argv.exitParity) === 'on';
 
   logger.info('Starting backtest', {
     startDate: argv.startDate,
@@ -243,6 +262,7 @@ async function main() {
     evGateMode,
     regimeGates: argv.regimeGates,
     regimeConditionalGates: forceRegimeConditionalGates ? 'forced-on' : 'guardrails',
+    exitParity,
     barMinutes,
     allowSynthetic,
     fixtureDir,
@@ -286,6 +306,7 @@ async function main() {
       regimeGates: String(argv.regimeGates) !== 'off',
       forceRegimeConditionalGates,
       slippageRate: argv.slippage !== undefined ? Number(argv.slippage) : undefined,
+      applyExitParity: exitParity,
     },
     guardrails,
   );

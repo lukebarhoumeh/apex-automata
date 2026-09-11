@@ -26,6 +26,7 @@ import {
 } from '../trading/execution/venue-capabilities';
 import { FeeModel, Exchange } from '../core/fee-model';
 import { describeSeries, inferBarMinutes, type DataProvenance } from './data-loader';
+import { BACKTEST_EXIT_REASONS, isMarketExit, type BacktestExitReason } from './exit-reasons';
 
 type OrderSide = 'BUY' | 'SELL';
 
@@ -264,9 +265,28 @@ export interface BacktestConfig {
    *    analog: `strategy.trade_cooldown_min` (15 min = 1 × 15m bar), routing
    *    reason `exit_position_too_young`. Stops/TPs bypass it exactly as live.
    *    E4 4H card: 1 bar (= 240 min). Default 0 (pre-E4 behaviour).
+   *  - `trailAtrMultiplier`: ATR trailing stop (live `PositionMonitor`
+   *    `trailing_stop`, guardrails `strategy.stop_trail_atr`). Distance =
+   *    multiplier × the ATR the entry signal carried
+   *    (`signal.metadata.indicators.atr`, or trend_follow's `metadata.atr` —
+   *    the same ATR that sized its stop and TP; see `resolveEntryAtr`). The
+   *    high-water mark starts at the fill price; the trail arms on
+   *    the first bar that improves it and only ever tightens. Unset/0 = off
+   *    (pre-G1 behaviour). A signal without a usable ATR never arms a trail
+   *    (counted in `metrics.exitRules.trailUnavailableNoAtr`).
+   *  - `timeStopBars`: time stop (live `time_stop`, guardrails
+   *    `strategy.time_stop_bars`). Counts COMPLETED bars of the position's own
+   *    symbol, entry bar included, exactly as live `incrementBarCount`
+   *    counts the entry bar's completion; on the N-th completion the
+   *    position exits at that bar's close as a market order. Unset/0 = off.
+   *
+   * `pnpm backtest --exit-parity on` wires the last two from guardrails;
+   * default off so E1/E2 cards are unaffected until E5 flips it.
    */
   execution?: {
     minHoldBars?: number;
+    trailAtrMultiplier?: number;
+    timeStopBars?: number;
   };
 }
 
@@ -283,7 +303,12 @@ export interface BacktestTrade {
   exitTimestamp?: Date;
   pnl?: number;
   pnlPercent?: number;
-  exitReason?: 'signal' | 'stop_loss' | 'take_profit' | 'end_of_data';
+  /**
+   * Why the trade closed. Monitor-driven labels (`stop_loss`, `take_profit`,
+   * `trailing_stop`, `time_stop`) are the live `PositionMonitor` vocabulary;
+   * `signal` / `end_of_data` are backtest-only. See `exit-reasons.ts`.
+   */
+  exitReason?: BacktestExitReason;
   signal: Signal;
   /** Strategy that produced the entry — surfaced in the by-strategy summary. */
   strategy: string;
@@ -314,6 +339,20 @@ export interface BacktestPosition {
   entryTimestamp: Date;
   /** Timeline step the entry filled on (drives `execution.minHoldBars`). */
   entryBarIndex: number;
+  /**
+   * Completed bars of THIS symbol since entry, entry bar included (live
+   * `MonitoredPosition.barsInTrade`). Drives `execution.timeStopBars`.
+   */
+  barsInTrade: number;
+  /**
+   * Best price seen since entry — highest high for a long, lowest low for a
+   * short. Starts at the fill price (live `MonitoredPosition.highWaterMark`).
+   */
+  highWaterMark: number;
+  /** Armed ATR trailing-stop level, or null until the HWM first improves. */
+  trailingStop: number | null;
+  /** ATR the entry signal carried (`metadata.indicators.atr` or `metadata.atr`), or null. */
+  entryAtr: number | null;
   unrealizedPnl: number;
   trades: BacktestTrade[];
 }
@@ -368,6 +407,20 @@ export interface BacktestMetrics {
   atrFilterRejects: number;
   /** Opposite-signal exits ignored because the position was younger than `execution.minHoldBars`. */
   exitsIgnoredMinHold: number;
+  /** Closed trades per exit label (every label present, zero-filled). */
+  exitReasons: Record<BacktestExitReason, number>;
+  /** Exit rules the run used, echoed for the report. */
+  exitRules: ExitRuleState;
+}
+
+/** Exit rules in force for a run (`execution.trailAtrMultiplier` / `timeStopBars`). */
+export interface ExitRuleState {
+  /** ATR trail multiplier, or null when the trail is off. */
+  trailAtrMultiplier: number | null;
+  /** Time stop in completed bars, or null when off. */
+  timeStopBars: number | null;
+  /** Entries whose signal carried no usable ATR, so no trail could arm (trail on only). */
+  trailUnavailableNoAtr: number;
 }
 
 /** Regime-gate (RegimeFilter) state snapshot for the report. */
@@ -484,6 +537,11 @@ export class BacktestEngine extends EventEmitter {
   private atrFilterRejects: number = 0;
   private exitsIgnoredMinHold: number = 0;
   private readonly minHoldBars: number;
+  /** `execution.trailAtrMultiplier`, sanitised; 0 = trail off. */
+  private readonly trailAtrMultiplier: number;
+  /** `execution.timeStopBars`, sanitised; 0 = time stop off. */
+  private readonly timeStopBars: number;
+  private trailUnavailableNoAtr: number = 0;
 
   constructor(config: BacktestConfig, logger: Logger) {
     super();
@@ -508,6 +566,10 @@ export class BacktestEngine extends EventEmitter {
     this.evGatePrior = config.evGate?.prior ?? DEFAULT_WIN_RATE_PRIOR;
     const minHold = config.execution?.minHoldBars ?? 0;
     this.minHoldBars = Number.isInteger(minHold) && minHold > 0 ? minHold : 0;
+    const trailMult = config.execution?.trailAtrMultiplier ?? 0;
+    this.trailAtrMultiplier = Number.isFinite(trailMult) && trailMult > 0 ? trailMult : 0;
+    const timeStop = config.execution?.timeStopBars ?? 0;
+    this.timeStopBars = Number.isInteger(timeStop) && timeStop > 0 ? timeStop : 0;
     this.evGateStats = {
       mode: this.evGateMode,
       evaluated: 0,
@@ -645,6 +707,7 @@ export class BacktestEngine extends EventEmitter {
       products: this.config.products,
       disabledStrategies: Array.from(this.disabledStrategies),
       realism: this.realism,
+      exitRules: this.describeExitRules(),
     });
 
     this.initializeSignalProcessor();
@@ -688,6 +751,8 @@ export class BacktestEngine extends EventEmitter {
       returnPercent: metrics.returnPercent,
       activeStrategies: metrics.activeStrategies,
       byStrategy: metrics.byStrategy,
+      exitReasons: metrics.exitReasons,
+      exitRules: metrics.exitRules,
     });
     if (anySynthetic) {
       this.logger.warn('DATA: SYNTHETIC — run is SMOKE/VOID; do not cite these results', {
@@ -901,7 +966,9 @@ export class BacktestEngine extends EventEmitter {
    *
    *   1. Fill any pending entry from the previous bar at this bar's open.
    *   2. Mark-to-market open positions on this bar's close.
-   *   3. Run stop/TP exits against this bar's high/low (with overshoot).
+   *   3. Run protective-stop (hard or ATR trail) / TP / time-stop exits
+   *      against this bar (see `checkExitConditions`), then ratchet the
+   *      trail for the next bar.
    *   4. Feed this bar's close to the signal processor; signals it emits
    *      enter pendingFills for the next bar.
    *   5. Record equity at this bar's close.
@@ -1270,6 +1337,15 @@ export class BacktestEngine extends EventEmitter {
 
     this.capital -= trade.entryFee;
 
+    const entryAtr = this.resolveEntryAtr(signal);
+    if (this.trailAtrMultiplier > 0 && entryAtr === null) {
+      this.trailUnavailableNoAtr += 1;
+      this.logger.debug('Backtest: signal carries no usable ATR — trailing stop will not arm', {
+        symbol: signal.symbol,
+        strategy: signal.strategy,
+      });
+    }
+
     const position: BacktestPosition = {
       product: signal.symbol,
       side: signal.direction === 'buy' ? 'long' : 'short',
@@ -1277,6 +1353,10 @@ export class BacktestEngine extends EventEmitter {
       entryPrice: trade.entryPrice,
       entryTimestamp: fillTimestamp,
       entryBarIndex: this.barIndex,
+      barsInTrade: 0,
+      highWaterMark: trade.entryPrice,
+      trailingStop: null,
+      entryAtr,
       unrealizedPnl: 0,
       trades: [trade],
     };
@@ -1291,7 +1371,28 @@ export class BacktestEngine extends EventEmitter {
       entryPrice: position.entryPrice,
       stopLoss: trade.stopLoss,
       takeProfit: trade.takeProfit,
+      entryAtr,
     });
+  }
+
+  /**
+   * ATR the entry signal carried — the same value the strategy used for its
+   * stop/TP geometry. Builtin plugins disagree on where they stamp it:
+   * momentum/breakout/vwap_mr pass `indicators: { atr }` (→
+   * `metadata.indicators.atr`, what the live `atr_vol` filter reads), while
+   * trend_follow passes `metadata: { atr }` (→ `metadata.atr`, invisible to
+   * that filter — pre-existing, flagged, not changed here). Read both so the
+   * trail arms on every builtin strategy. Null when absent or not a positive
+   * finite number.
+   */
+  private resolveEntryAtr(signal: Signal): number | null {
+    const indicators = signal.metadata?.indicators as Record<string, unknown> | undefined;
+    for (const candidate of [indicators?.atr, signal.metadata?.atr]) {
+      if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0) {
+        return candidate;
+      }
+    }
+    return null;
   }
 
   private resolveStopLoss(signal: Signal, override: number | undefined, fillPrice: number): number {
@@ -1470,16 +1571,17 @@ export class BacktestEngine extends EventEmitter {
     product: string,
     rawExitPrice: number,
     timestamp: Date,
-    reason: 'signal' | 'stop_loss' | 'take_profit' | 'end_of_data',
+    reason: BacktestExitReason,
   ): void {
     const position = this.positions.get(product);
     if (!position) return;
 
-    // Slippage on signal/end-of-data exits is symmetric with entries.
-    // Stop-loss / take-profit fills already include the overshoot model
-    // baked in by `checkExitConditions`.
+    // Market exits (signal / time_stop / end_of_data) pay slippage symmetric
+    // with entries. Stop-type fills (stop_loss / trailing_stop) already
+    // include the overshoot model baked in by `checkExitConditions`; TP
+    // fills at the level.
     let exitPrice = rawExitPrice;
-    if (reason === 'signal' || reason === 'end_of_data') {
+    if (isMarketExit(reason)) {
       const slipFactor = this.realism.entrySlippageBps / 10_000;
       exitPrice = position.side === 'long'
         ? rawExitPrice * (1 - slipFactor)
@@ -1619,15 +1721,35 @@ export class BacktestEngine extends EventEmitter {
   }
 
   /**
-   * Defect #4 fix: stop fills include an OVERSHOOT factor. Real stops fill
-   * worse than the trigger when price wicks/gaps through, so the model
+   * Per-bar exit checks, in the order the live `PositionMonitor` evaluates
+   * them (protective stop → take profit → time stop), adapted to OHLC bars:
+   *
+   *   1. Protective stop — the hard stop or the armed ATR trail, whichever is
+   *      closer to price (for a long: the higher of the two; the closer level
+   *      is crossed first on the way down). Labelled `trailing_stop` when the
+   *      trail is binding, else `stop_loss`.
+   *   2. Take profit at the level.
+   *   3. Time stop — this bar completes with the position still open; on the
+   *      `timeStopBars`-th completion exit at the close (market order).
+   *   4. Ratchet the high-water mark / trail using this bar's extreme, for
+   *      the NEXT bar. Checking the trail as of the bar's start and ratcheting
+   *      afterwards assumes the adverse move came before the favourable one
+   *      (pessimistic, the house convention); the alternative would credit
+   *      every wick's ratchet before the same bar's low.
+   *
+   * Defect #4: stop fills include an OVERSHOOT factor. Real stops fill worse
+   * than the trigger when price wicks/gaps through, so the model
    * pessimistically assumes:
    *
    *   overshootPx = max(stopOvershootBarRangePct * (high − low),
    *                     stopLevel * minBps/10000)
    *
-   * For a long stop, fill = stopLoss − overshootPx. For a short stop, fill
-   * = stopLoss + overshootPx. Take-profit fills stay at the level (filling
+   * For a long stop, fill = level − overshootPx; for a short stop, level +
+   * overshootPx. Because the trail ratchets at every bar close, a bar can
+   * open already through a stale trail level, so the trail trigger is capped
+   * at the open (gap-through) before overshoot. Hard-stop fills keep the
+   * pre-existing `stopLoss ∓ overshoot` model (no open cap) so runs without
+   * exit parity are unchanged. Take-profit fills stay at the level (filling
    * BETTER than the level on a wick is unrealistic too, but TP filling at
    * the level is the conventional pessimistic assumption).
    */
@@ -1638,23 +1760,79 @@ export class BacktestEngine extends EventEmitter {
     const trade = position.trades[0];
     const stopLoss = trade?.stopLoss ?? this.fallbackStopLoss(position);
     const takeProfit = trade?.takeProfit ?? this.fallbackTakeProfit(position);
+    const isLong = position.side === 'long';
 
-    const longStopHit = position.side === 'long' && candle.low <= stopLoss;
-    const shortStopHit = position.side === 'short' && candle.high >= stopLoss;
-    if (longStopHit || shortStopHit) {
-      const overshoot = this.computeStopOvershoot(candle, stopLoss);
-      const exitPrice = position.side === 'long'
-        ? Math.max(0, stopLoss - overshoot)
-        : stopLoss + overshoot;
-      this.closePosition(product, exitPrice, timestamp, 'stop_loss');
+    // 1. Protective stop: hard stop, or the armed trail when it is the
+    //    binding (closer) level.
+    const trail = position.trailingStop;
+    const trailBinding = trail !== null && (isLong ? trail >= stopLoss : trail <= stopLoss);
+    const protectiveLevel = trailBinding ? trail : stopLoss;
+    const protectiveHit = isLong ? candle.low <= protectiveLevel : candle.high >= protectiveLevel;
+    if (protectiveHit) {
+      if (trailBinding) {
+        const trigger = isLong ? Math.min(trail, candle.open) : Math.max(trail, candle.open);
+        const overshoot = this.computeStopOvershoot(candle, trigger);
+        const exitPrice = isLong ? Math.max(0, trigger - overshoot) : trigger + overshoot;
+        this.closePosition(product, exitPrice, timestamp, 'trailing_stop');
+      } else {
+        const overshoot = this.computeStopOvershoot(candle, stopLoss);
+        const exitPrice = isLong ? Math.max(0, stopLoss - overshoot) : stopLoss + overshoot;
+        this.closePosition(product, exitPrice, timestamp, 'stop_loss');
+      }
       return;
     }
 
-    const longTpHit = position.side === 'long' && candle.high >= takeProfit;
-    const shortTpHit = position.side === 'short' && candle.low <= takeProfit;
-    if (longTpHit || shortTpHit) {
+    // 2. Take profit.
+    const tpHit = isLong ? candle.high >= takeProfit : candle.low <= takeProfit;
+    if (tpHit) {
       this.closePosition(product, takeProfit, timestamp, 'take_profit');
+      return;
     }
+
+    // 3. Time stop: this bar completes with the position still open (live
+    //    `incrementBarCount` on candle close, entry bar included).
+    position.barsInTrade += 1;
+    if (this.timeStopBars > 0 && position.barsInTrade >= this.timeStopBars) {
+      this.closePosition(product, candle.close, timestamp, 'time_stop');
+      return;
+    }
+
+    // 4. Ratchet HWM / trail for the next bar.
+    this.ratchetTrailingStop(position, candle);
+  }
+
+  /**
+   * Live `PositionMonitor.updatePrice` + `updateTrailingStop` on bar data:
+   * the high-water mark follows this bar's extreme (highest high for a long,
+   * lowest low for a short) and, when it improves, the trail is re-placed
+   * `trailAtrMultiplier × entryAtr` behind it — never loosened. Trail
+   * distance is ATR-based, NOT the live file's `highWaterMark × 0.01`
+   * approximation (the documented semantics are `stop_trail_atr × ATR`).
+   */
+  private ratchetTrailingStop(position: BacktestPosition, candle: OHLCV): void {
+    const isLong = position.side === 'long';
+    const extreme = isLong ? candle.high : candle.low;
+    const improved = isLong ? extreme > position.highWaterMark : extreme < position.highWaterMark;
+    if (!improved) return;
+    position.highWaterMark = extreme;
+
+    if (this.trailAtrMultiplier <= 0 || position.entryAtr === null) return;
+    const distance = this.trailAtrMultiplier * position.entryAtr;
+    const candidate = isLong ? extreme - distance : extreme + distance;
+    const tightens = position.trailingStop === null
+      || (isLong ? candidate > position.trailingStop : candidate < position.trailingStop);
+    if (tightens) {
+      position.trailingStop = candidate;
+    }
+  }
+
+  /** Exit rules in force for this run, for logs and the report. */
+  private describeExitRules(): ExitRuleState {
+    return {
+      trailAtrMultiplier: this.trailAtrMultiplier > 0 ? this.trailAtrMultiplier : null,
+      timeStopBars: this.timeStopBars > 0 ? this.timeStopBars : null,
+      trailUnavailableNoAtr: this.trailUnavailableNoAtr,
+    };
   }
 
   private fallbackStopLoss(position: BacktestPosition): number {
@@ -1695,7 +1873,7 @@ export class BacktestEngine extends EventEmitter {
     this.equityCurve.push({ timestamp, equity, drawdown });
   }
 
-  private closeAllPositions(reason: 'signal' | 'stop_loss' | 'take_profit' | 'end_of_data'): void {
+  private closeAllPositions(reason: BacktestExitReason): void {
     for (const [product] of this.positions.entries()) {
       const data = this.historicalData.get(product);
       if (data && data.length > 0) {
@@ -1783,6 +1961,17 @@ export class BacktestEngine extends EventEmitter {
       bucket.averageRMultiple = bucket.trades > 0 ? bucket.averageRMultiple / bucket.trades : 0;
     }
 
+    // Exit-reason breakdown — zero-filled so reports always print every
+    // label (a silent `trailing_stop=0` is itself information).
+    const exitReasons = Object.fromEntries(
+      BACKTEST_EXIT_REASONS.map((reason) => [reason, 0]),
+    ) as Record<BacktestExitReason, number>;
+    for (const trade of trades) {
+      if (trade.exitReason) {
+        exitReasons[trade.exitReason] += 1;
+      }
+    }
+
     return {
       totalTrades: trades.length,
       winningTrades: winningTrades.length,
@@ -1817,6 +2006,8 @@ export class BacktestEngine extends EventEmitter {
       entriesByRegime: { ...this.entriesByRegime },
       atrFilterRejects: this.atrFilterRejects,
       exitsIgnoredMinHold: this.exitsIgnoredMinHold,
+      exitReasons,
+      exitRules: this.describeExitRules(),
     };
   }
 
