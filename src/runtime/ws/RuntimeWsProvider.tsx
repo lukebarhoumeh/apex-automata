@@ -168,8 +168,9 @@ export function RuntimeWsProvider({
         break;
         
       case 'status':
-        queryClient.invalidateQueries({ queryKey: ['runtime-status'] });
-        queryClient.invalidateQueries({ queryKey: ['runtime-health'] });
+        // Intentionally no REST invalidation. The event bus merges the WS
+        // status into ['runtime-status'] (applyEventToCache); refetching
+        // /api/status on every 1.5s StatusUpdate was the U7 refetch storm.
         break;
         
       case 'pnl:snapshot':
@@ -179,10 +180,12 @@ export function RuntimeWsProvider({
         queryClient.invalidateQueries({ queryKey: ['equity-curve'] });
         break;
         
-      case 'risk:metrics':
       case 'risk:event':
         queryClient.invalidateQueries({ queryKey: ['risk-events'] });
-        queryClient.invalidateQueries({ queryKey: ['runtime-status'] });
+        break;
+
+      case 'risk:metrics':
+        // Periodic (5s) metrics tick; the `risk` block rides on StatusUpdate.
         break;
         
       case 'regime:update':

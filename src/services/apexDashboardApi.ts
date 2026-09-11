@@ -149,12 +149,68 @@ export interface BackendRuntimeStatus {
   engineRunning: boolean;
   mode: "paper" | "live" | null;
   sessionId: string | null;
+  paused?: boolean;
+  killSwitch?: { active: boolean; reasons?: readonly string[] };
+  engineState?: string;
   activeSymbols?: readonly string[];
   candlesBuffered?: Record<string, number>;
+  /** PositionTracker/RiskEngine snapshot; null while the engine is stopped. */
+  pnl?: {
+    realizedPnlUsd: number;
+    unrealizedPnlUsd: number;
+    totalEquityUsd: number;
+    dailyPnlUsd: number;
+    dailyPnlR: number;
+    openPositionsCount: number;
+    exposureUsd: number;
+  } | null;
 }
 
 export async function fetchRuntimeStatus(): Promise<BackendRuntimeStatus | null> {
   const res = await fetchJson<BackendRuntimeStatus>("/api/status");
+  return res.ok ? res.data : null;
+}
+
+// ============================================================
+// Meta-filter (rule-based; there is no ML model in this codebase)
+// ============================================================
+
+export interface BackendMetaFilterStats {
+  enabled: boolean;
+}
+
+/** `null` when the engine is stopped (signal processor not running). */
+export async function fetchMetaFilterStats(): Promise<BackendMetaFilterStats | null> {
+  const res = await fetchJson<BackendMetaFilterStats>("/api/metafilter/stats");
+  return res.ok ? res.data : null;
+}
+
+// ============================================================
+// Strategy policy — guardrails.yaml single source of truth
+// ============================================================
+
+export interface BackendStrategyPolicyEntry {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  disabledByGuardrails: boolean;
+}
+
+export interface BackendStrategyPolicy {
+  source: string;
+  disabledStrategies: readonly string[];
+  perSymbolDisabledStrategies: Record<string, readonly string[]>;
+  strategies: readonly BackendStrategyPolicyEntry[];
+}
+
+/**
+ * Served from the loaded guardrails regardless of engine state, so the UI can
+ * show a strategy as killed-by-SoT even when the signal processor is not
+ * running (killed plugins are never registered, so /api/strategies omits them).
+ */
+export async function fetchStrategyPolicy(): Promise<BackendStrategyPolicy | null> {
+  const res = await fetchJson<BackendStrategyPolicy>("/api/strategies/policy");
   return res.ok ? res.data : null;
 }
 

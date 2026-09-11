@@ -1,48 +1,42 @@
-import { useEffect, useState } from "react";
 import { MoreHorizontal, X } from "lucide-react";
 import { Panel } from "@/components/apex/Panel";
 import { Pill } from "@/components/apex/Pill";
 import { Sparkline } from "@/components/apex/Sparkline";
 import { fmt, fmtSign } from "@/components/apex/format";
+import { computePositionPnl } from "@/lib/position-pnl";
 import { cn } from "@/lib/utils";
+import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
 import type { Position } from "@/types/positions";
 
 interface PositionsTableProps {
   positions: readonly Position[];
+  /** Real marks from the runtime (WS ticker / engine). Absent symbol → "—". */
+  marks?: LiveMarks;
 }
 
-/** Tiny jitter on live mark so the flashes have something to react to. */
-function useTickingMarks(initial: readonly Position[]): Position[] {
-  const [rows, setRows] = useState<Position[]>(() => initial.map((p) => ({ ...p })));
-  useEffect(() => {
-    const id = window.setInterval(() => {
-      setRows((prev) =>
-        prev.map((p) => {
-          const base = p.mark ?? p.entry;
-          const jitter = (Math.random() - 0.5) * base * 0.0006;
-          const mark = base + jitter;
-          const pnl = p.side === "LONG" ? (mark - p.entry) * p.qty : (p.entry - mark) * p.qty;
-          const pnlPct = p.side === "LONG" ? ((mark - p.entry) / p.entry) * 100 : ((p.entry - mark) / p.entry) * 100;
-          return { ...p, mark, pnl, pnlPct };
-        }),
-      );
-    }, 1400);
-    return () => window.clearInterval(id);
-  }, []);
-  return rows;
+const NO_MARKS: LiveMarks = {};
+
+function markStatusLabel(rows: readonly Position[], marks: LiveMarks): string {
+  if (rows.length === 0) return "";
+  const marked = rows.filter((p) => marks[p.sym] !== undefined).length;
+  if (marked === 0) return "no live marks";
+  if (marked === rows.length) return "live marks";
+  return `marks ${marked}/${rows.length}`;
 }
 
-export function PositionsTable({ positions }: PositionsTableProps) {
-  const rows = useTickingMarks(positions);
-
+/**
+ * Open positions valued at the runtime's real marks. Rows are derived from
+ * props on every render — no local ticking state, no synthetic jitter.
+ */
+export function PositionsTable({ positions, marks = NO_MARKS }: PositionsTableProps) {
   return (
     <Panel
       header
       pad={0}
       title="Open positions"
-      subtitle={`${rows.length} active`}
+      subtitle={`${positions.length} active`}
       right={
-        <span className="mono text-[10.5px] text-fg-2">real-time</span>
+        <span className="mono text-[10.5px] text-fg-2">{markStatusLabel(positions, marks)}</span>
       }
     >
       <div className="overflow-x-auto">
@@ -64,8 +58,8 @@ export function PositionsTable({ positions }: PositionsTableProps) {
             </tr>
           </thead>
           <tbody>
-            {rows.map((p) => (
-              <PositionRow key={p.id} position={p} />
+            {positions.map((p) => (
+              <PositionRow key={p.id} position={p} mark={marks[p.sym]?.price} />
             ))}
           </tbody>
         </table>
@@ -93,9 +87,10 @@ function Th({
   );
 }
 
-function PositionRow({ position }: { position: Position }) {
-  const pnlUp = (position.pnl ?? 0) >= 0;
-  const mark = position.mark ?? position.entry;
+function PositionRow({ position, mark }: { position: Position; mark: number | undefined }) {
+  const live = computePositionPnl(position.side, position.entry, position.qty, mark);
+  const pnlUp = live ? live.pnl >= 0 : null;
+  const pnlTone = pnlUp === null ? "text-fg-3" : pnlUp ? "text-up" : "text-down";
 
   return (
     <tr className="group h-9 border-b border-obsidian-line transition-colors hover:bg-obsidian-2">
@@ -107,12 +102,17 @@ function PositionRow({ position }: { position: Position }) {
       </td>
       <td className="mono px-3 text-right text-[12.5px] text-fg-0">{fmt(position.qty, 4)}</td>
       <td className="mono px-3 text-right text-[12.5px] text-fg-1">{fmt(position.entry, 2)}</td>
-      <td className="mono px-3 text-right text-[12.5px] text-fg-0">{fmt(mark, 2)}</td>
-      <td className={cn("mono px-3 text-right text-[12.5px] font-medium", pnlUp ? "text-up" : "text-down")}>
-        {pnlUp ? "+" : "-"}${fmt(Math.abs(position.pnl ?? 0), 2)}
+      <td
+        className={cn("mono px-3 text-right text-[12.5px]", live ? "text-fg-0" : "text-fg-3")}
+        title={live ? undefined : "No live mark from runtime yet"}
+      >
+        {live ? fmt(live.mark, 2) : "—"}
       </td>
-      <td className={cn("mono px-3 text-right text-[12.5px]", pnlUp ? "text-up" : "text-down")}>
-        {fmtSign(position.pnlPct ?? 0, 2)}%
+      <td className={cn("mono px-3 text-right text-[12.5px] font-medium", pnlTone)}>
+        {live ? `${pnlUp ? "+" : "-"}$${fmt(Math.abs(live.pnl), 2)}` : "—"}
+      </td>
+      <td className={cn("mono px-3 text-right text-[12.5px]", pnlTone)}>
+        {live ? `${fmtSign(live.pnlPct, 2)}%` : "—"}
       </td>
       <td className="mono px-3 text-right text-[12.5px] text-fg-1">{fmt(position.stop, 2)}</td>
       <td className="mono px-3 text-right text-[12.5px] text-fg-1">{fmt(position.target, 2)}</td>
@@ -120,7 +120,7 @@ function PositionRow({ position }: { position: Position }) {
         <span className="mono text-[10.5px] uppercase tracking-[0.09em] text-fg-2">{position.strat}</span>
       </td>
       <td className="px-3">
-        {position.sparkline && (
+        {position.sparkline && position.sparkline.length >= 2 && (
           <Sparkline
             data={position.sparkline}
             width={80}

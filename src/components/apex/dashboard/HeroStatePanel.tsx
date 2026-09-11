@@ -14,10 +14,21 @@ interface HeroStatePanelProps {
   intradayEquity: readonly EquityPoint[];
 }
 
-const MODE_COPY: Record<SessionStats["mode"], { label: string; tone: "accent" | "up" | "warn"; subtitle: string; dotColor: string }> = {
-  paper:  { label: "PAPER",  tone: "accent", subtitle: "Simulated capital — no real orders",   dotColor: "hsl(var(--accent))" },
-  live:   { label: "LIVE",   tone: "up",     subtitle: "Executing real orders on Coinbase",    dotColor: "#39d98a" },
-  paused: { label: "PAUSED", tone: "warn",   subtitle: "New entries halted — positions held",  dotColor: "#ffb020" },
+interface ModeCopy {
+  label: string;
+  subtitle: string;
+  dotColor: string;
+  /** Hero headline: "The engine is {verb} …" */
+  verb: string;
+  scanning: boolean;
+}
+
+const MODE_COPY: Record<SessionStats["mode"], ModeCopy> = {
+  paper:   { label: "PAPER",   subtitle: "Simulated capital — no real orders",                                   dotColor: "hsl(var(--accent))", verb: "scanning", scanning: true },
+  live:    { label: "LIVE",    subtitle: "Executing real orders on Coinbase",                                    dotColor: "#ff5a6a",            verb: "scanning", scanning: true },
+  paused:  { label: "PAUSED",  subtitle: "New entries halted — positions held",                                  dotColor: "#ffb020",            verb: "paused on", scanning: true },
+  halted:  { label: "HALTED",  subtitle: "Kill switch active — trading blocked, positions NOT auto-closed",      dotColor: "#ff5a6a",            verb: "halted", scanning: false },
+  stopped: { label: "STOPPED", subtitle: "No active session — engine idle",                                      dotColor: "#6a7588",            verb: "stopped", scanning: false },
 };
 
 export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePanelProps) {
@@ -85,9 +96,15 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
               style={{ fontSize: 44, lineHeight: 1, fontWeight: 500, letterSpacing: "-0.02em" }}
             >
               The engine is{" "}
-              <span style={{ color: "hsl(var(--accent-2))" }}>scanning</span>
+              <span style={{ color: mode.scanning ? "hsl(var(--accent-2))" : mode.dotColor }}>{mode.verb}</span>
               <br />
-              <span className="text-fg-1">{session.markets} markets</span> for edge.
+              {mode.scanning ? (
+                <>
+                  <span className="text-fg-1">{session.markets} markets</span> for edge.
+                </>
+              ) : (
+                <span className="text-fg-1">— no markets streaming.</span>
+              )}
             </div>
           </div>
 
@@ -142,8 +159,9 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
             <MiniStat label="Realized" value={`$${fmt(session.realized, 2)}`} />
             <MiniStat
               label="Unrealized"
-              value={`${unreal >= 0 ? "+" : "-"}$${fmt(Math.abs(unreal), 2)}`}
-              tone={unreal >= 0 ? "up" : "down"}
+              value={unreal === null ? "—" : `${unreal >= 0 ? "+" : "-"}$${fmt(Math.abs(unreal), 2)}`}
+              tone={unreal === null ? "muted" : unreal >= 0 ? "up" : "down"}
+              title={unreal === null ? "No PositionTracker snapshot — engine stopped" : "Open-position P&L from the runtime PositionTracker"}
             />
             <MiniStat
               label="In R"
@@ -205,19 +223,22 @@ function MiniStat({
   label,
   value,
   tone = "neutral",
+  title,
 }: {
   label: string;
   value: string;
-  tone?: "up" | "down" | "accent" | "neutral";
+  tone?: "up" | "down" | "accent" | "neutral" | "muted";
+  title?: string;
 }) {
   const COLOR: Record<typeof tone, string> = {
     up: "text-up",
     down: "text-down",
     accent: "text-accent",
     neutral: "text-fg-0",
+    muted: "text-fg-3",
   } as const;
   return (
-    <div className="flex flex-col gap-0.5">
+    <div className="flex flex-col gap-0.5" title={title}>
       <span className="mono text-[9px] font-medium uppercase tracking-[0.12em] text-fg-2">
         {label}
       </span>

@@ -1,11 +1,21 @@
 import { type StrategyId } from "./signals";
 
-export type StrategyStatus = "on" | "off" | "cooldown";
+/**
+ * - on:       registered and enabled in the runtime StrategyRegistry
+ * - off:      registered but disabled at runtime (or engine offline → unknown)
+ * - cooldown: registered, temporarily paused
+ * - killed:   listed in guardrails.yaml `disabled_strategies` (SoT) — never registered
+ */
+export type StrategyStatus = "on" | "off" | "cooldown" | "killed";
+
+/** Why a strategy is not enabled. Absent when it is enabled. */
+export type StrategyDisabledBy = "guardrails" | "runtime" | "engine-offline";
 
 export interface StrategyCardData {
   id: StrategyId | string;
   name: string;
   status: StrategyStatus;
+  disabledBy?: StrategyDisabledBy;
   pnlToday: number;
   trades: number;
   winRate: number;
@@ -28,6 +38,7 @@ export interface StrategyConfig {
   desc: string;
   kind: "trend" | "revert" | "ml";
   enabled: boolean;
+  disabledBy?: StrategyDisabledBy;
   params: readonly StrategyParam[];
   stats: {
     winRate: number;

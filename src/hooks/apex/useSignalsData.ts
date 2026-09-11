@@ -6,6 +6,8 @@ import type {
   MetaModelInfo,
 } from "@/types/strategy";
 import { supabase } from "@/integrations/supabase/client";
+import { fetchStrategyPolicy, type BackendStrategyPolicy } from "@/services/apexDashboardApi";
+import { mergeStrategyPolicy } from "@/lib/strategy-policy";
 
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
 
@@ -146,41 +148,52 @@ function paramFromEntry(key: string, raw: unknown): StrategyParam | null {
   return { key, label: keyToLabel(key), val: raw, min, max, step, format };
 }
 
-function mapStrategyConfig(s: BackendStrategy): StrategyConfig {
-  const kind: StrategyConfig["kind"] =
-    s.category === "mean-reversion" || s.category === "revert"
-      ? "revert"
-      : s.category === "momentum" || s.category === "trend"
-      ? "trend"
-      : "ml";
-  const params = Object.entries(s.config ?? {})
-    .map(([k, v]) => paramFromEntry(k, v))
-    .filter((p): p is StrategyParam => p !== null)
-    .slice(0, 5);
-  return {
-    id: s.id,
-    name: s.name,
-    desc: s.description,
-    kind,
-    enabled: s.enabled,
-    params,
-    stats: {
-      winRate: 0,
-      avgR: 0,
-      trades: s.stats?.signalsGenerated ?? 0,
-      lastR: [],
-    },
-  };
+function kindFromCategory(category: string): StrategyConfig["kind"] {
+  return category === "mean-reversion" || category === "revert"
+    ? "revert"
+    : category === "momentum" || category === "trend"
+    ? "trend"
+    : "ml";
+}
+
+export function mapStrategyConfigs(
+  registered: readonly BackendStrategy[],
+  policy: BackendStrategyPolicy | null,
+): StrategyConfig[] {
+  return mergeStrategyPolicy(registered, policy).map((m) => {
+    const params = Object.entries(m.registered?.config ?? {})
+      .map(([k, v]) => paramFromEntry(k, v))
+      .filter((p): p is StrategyParam => p !== null)
+      .slice(0, 5);
+    return {
+      id: m.id,
+      name: m.name,
+      desc: m.description,
+      kind: kindFromCategory(m.category),
+      enabled: m.enabled,
+      disabledBy: m.disabledBy,
+      params,
+      stats: {
+        winRate: 0,
+        avgR: 0,
+        trades: m.registered?.stats?.signalsGenerated ?? 0,
+        lastR: [],
+      },
+    };
+  });
 }
 
 export function useStrategyConfigs() {
   return useQuery<readonly StrategyConfig[]>({
     queryKey: ["apex", "strategy-configs"],
     queryFn: async () => {
-      const res = await fetchJsonOrNull<{ strategies: readonly BackendStrategy[] }>(
-        "/api/strategies",
-      );
-      return (res?.strategies ?? []).map(mapStrategyConfig);
+      // Registered plugins (runtime) + guardrails policy (SoT) in parallel so
+      // a strategy killed in guardrails.yaml renders as killed, not missing.
+      const [res, policy] = await Promise.all([
+        fetchJsonOrNull<{ strategies: readonly BackendStrategy[] }>("/api/strategies"),
+        fetchStrategyPolicy(),
+      ]);
+      return mapStrategyConfigs(res?.strategies ?? [], policy);
     },
     staleTime: 10_000,
     refetchInterval: 30_000,

@@ -151,6 +151,27 @@ function normalizeKeys<T>(obj: unknown): T {
 }
 
 /**
+ * Status fields forwarded verbatim when the backend includes them. Kept as a
+ * list so the cache merge in applyEventToCache can trust that an absent key
+ * means "not carried by this envelope", never "reset to default".
+ */
+const STATUS_PASSTHROUGH_KEYS = [
+  'sessionId',
+  'sessionStartedAt',
+  'engineState',
+  'activeSymbols',
+  'warmupComplete',
+  'candlesBuffered',
+  'pnl',
+  'lastMarketDataAt',
+  'lastEngineHeartbeatAt',
+  'timestamp',
+  'ws',
+  'rest',
+  'exchangeHealth',
+] as const;
+
+/**
  * Normalize status payload
  */
 function normalizeStatusPayload(raw: Record<string, unknown>): StatusPayload {
@@ -160,7 +181,7 @@ function normalizeStatusPayload(raw: Record<string, unknown>): StatusPayload {
   const kill_switch = normalized.kill_switch as Record<string, unknown> | undefined;
   const riskData = normalized.risk as Record<string, unknown> | undefined;
   
-  return {
+  const status: StatusPayload = {
     engineRunning: Boolean(normalized.engineRunning ?? normalized.engine_running ?? false),
     mode: (normalized.mode as 'paper' | 'live' | null) ?? null,
     paused: Boolean(normalized.paused ?? false),
@@ -181,6 +202,15 @@ function normalizeStatusPayload(raw: Record<string, unknown>): StatusPayload {
       openPositionsCount: riskData.openPositionsCount as number | undefined ?? riskData.open_positions_count as number | undefined,
     } : undefined,
   };
+
+  const passthrough = status as unknown as Record<string, unknown>;
+  for (const key of STATUS_PASSTHROUGH_KEYS) {
+    if (normalized[key] !== undefined) {
+      passthrough[key] = normalized[key];
+    }
+  }
+
+  return status;
 }
 
 /**
@@ -284,26 +314,41 @@ function normalizeFillPayload(raw: Record<string, unknown>): FillPayload {
 /**
  * Normalize position payload
  */
+function finiteOrUndefined(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Normalize position payload.
+ *
+ * Accepts both the Supabase row shape (`qty_open`, `entry_price`, …) and the
+ * backend PositionTracker shape broadcast on `PositionUpdate` (`size`,
+ * `averagePrice`, `marketPrice`, `unrealizedPnL`, `openTime`). The tracker
+ * shape is what carries the engine's real mark, so it must not be dropped.
+ */
 function normalizePositionPayload(raw: Record<string, unknown>): PositionPayload {
   const normalized = normalizeKeys<Record<string, unknown>>(raw);
+  const openTime = normalized.openTime;
   
   return {
     id: normalized.id as string | undefined,
     positionId: (normalized.positionId ?? normalized.id) as string | undefined,
     symbol: (normalized.symbol as string) ?? '',
     side: (normalized.side as 'long' | 'short') ?? 'long',
-    qty: (normalized.qty ?? normalized.qtyOpen ?? normalized.quantity) as number ?? 0,
+    qty: (normalized.qty ?? normalized.qtyOpen ?? normalized.quantity ?? normalized.size) as number ?? 0,
     qtyOpen: normalized.qtyOpen as number | undefined,
-    entryPrice: (normalized.entryPrice ?? normalized.entry_price) as number ?? 0,
+    entryPrice: (normalized.entryPrice ?? normalized.entry_price ?? normalized.averagePrice) as number ?? 0,
     exitPrice: (normalized.exitPrice ?? normalized.exit_price) as number | undefined,
-    stopPriceAtEntry: normalized.stopPriceAtEntry as number | undefined,
-    takeProfitPrice: normalized.takeProfitPrice as number | undefined,
+    stopPriceAtEntry: (normalized.stopPriceAtEntry ?? normalized.stopPrice) as number | undefined,
+    takeProfitPrice: (normalized.takeProfitPrice ?? normalized.takeProfit) as number | undefined,
     strategy: normalized.strategy as string | undefined,
     pnlUsd: (normalized.pnlUsd ?? normalized.realizedPnlUsd) as number | undefined,
     pnlR: (normalized.pnlR ?? normalized.realizedR) as number | undefined,
-    realizedPnlUsd: normalized.realizedPnlUsd as number | undefined,
+    realizedPnlUsd: (normalized.realizedPnlUsd ?? normalized.realizedPnL) as number | undefined,
     realizedR: normalized.realizedR as number | undefined,
-    openedAt: normalized.openedAt as string | undefined,
+    marketPrice: finiteOrUndefined(normalized.marketPrice),
+    unrealizedPnlUsd: finiteOrUndefined(normalized.unrealizedPnlUsd ?? normalized.unrealizedPnL),
+    openedAt: (normalized.openedAt ?? (typeof openTime === 'string' ? openTime : undefined)) as string | undefined,
     closedAt: normalized.closedAt as string | undefined,
     exitReason: normalized.exitReason as string | undefined,
     phase: normalized.phase as 'opened' | 'updated' | 'closed' | undefined,

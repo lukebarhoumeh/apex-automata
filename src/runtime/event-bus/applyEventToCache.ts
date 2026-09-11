@@ -157,7 +157,9 @@ export function applyEventToCache(
       return false;
       
     case 'risk:metrics':
-      queryClient.invalidateQueries({ queryKey: ['runtime-status'] });
+      // The 1.5s StatusUpdate already carries the `risk` block derived from
+      // these metrics; refetching /api/status here (every 5s) only added to
+      // the U7 refetch storm. Nothing to patch.
       return false;
       
     // ============ PnL Snapshot (CANONICAL - Sprint 1.4) ============
@@ -174,7 +176,11 @@ export function applyEventToCache(
     // ============ Status/Health ============
     case 'status':
     case 'runtime:heartbeat':
-      queryClient.setQueryData(['runtime-status'], payload);
+      // MERGE, never replace (TASK_016 U7). The WS StatusUpdate is a partial
+      // view of GET /api/status; replacing the cache wholesale dropped
+      // `sessionId` every 1.5s, which ActiveSessionProvider read as a session
+      // change and answered by invalidating every ["apex"] query.
+      mergeQueryData(queryClient, ['runtime-status'], payload);
       return true;
       
     case 'supervisor:health':
@@ -218,6 +224,28 @@ export function applyEventToCache(
       // Unknown event type - just invalidate common queries
       return false;
   }
+}
+
+/**
+ * Shallow-merge a partial payload over the cached object for `queryKey`.
+ * Keys whose value is `undefined` are skipped, so an envelope that does not
+ * carry a field can never reset it. Exported for tests.
+ */
+export function mergeQueryData(
+  queryClient: QueryClient,
+  queryKey: unknown[],
+  patch: unknown
+): void {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return;
+  const defined: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(patch as Record<string, unknown>)) {
+    if (value !== undefined) defined[key] = value;
+  }
+  queryClient.setQueryData<Record<string, unknown>>(queryKey, (prev) =>
+    prev && typeof prev === 'object' && !Array.isArray(prev)
+      ? { ...prev, ...defined }
+      : defined
+  );
 }
 
 /**

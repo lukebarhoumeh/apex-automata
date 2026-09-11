@@ -1,11 +1,34 @@
 import { TrendingUp, Activity } from "lucide-react";
 import { Panel } from "@/components/apex/Panel";
 import { cn } from "@/lib/utils";
-import type { StrategyConfig } from "@/types/strategy";
+import type { StrategyConfig, StrategyDisabledBy } from "@/types/strategy";
 
 interface Props {
   strat: StrategyConfig;
 }
+
+const STATE_PILL: Record<StrategyDisabledBy | "enabled", { text: string; className: string; title: string }> = {
+  enabled: {
+    text: "ENABLED",
+    className: "bg-up/10 text-up border-up/20",
+    title: "Registered and enabled in the runtime StrategyRegistry",
+  },
+  runtime: {
+    text: "DISABLED",
+    className: "bg-obsidian-3 text-fg-2 border-obsidian-line-2",
+    title: "Disabled in the runtime StrategyRegistry (POST /api/strategies/:id/disable)",
+  },
+  guardrails: {
+    text: "DISABLED · GUARDRAILS",
+    className: "bg-warn/10 text-warn border-warn/20",
+    title: "Listed in atlas/config/guardrails.yaml → disabled_strategies (single source of truth). Never registered at runtime.",
+  },
+  "engine-offline": {
+    text: "ENGINE STOPPED",
+    className: "bg-obsidian-3 text-fg-3 border-obsidian-line-2",
+    title: "Engine not running — registration state unknown",
+  },
+};
 
 export function StrategyConfigCard({ strat }: Props) {
   const Icon = strat.kind === "trend" ? TrendingUp : Activity;
@@ -13,6 +36,8 @@ export function StrategyConfigCard({ strat }: Props) {
     strat.kind === "trend"
       ? "text-up bg-up/10 ring-up/20"
       : "text-warn bg-warn/10 ring-warn/20";
+  const pill = STATE_PILL[strat.enabled ? "enabled" : strat.disabledBy ?? "runtime"];
+  const killedBySot = strat.disabledBy === "guardrails";
 
   return (
     <Panel header={false} pad={0} className={cn(strat.enabled ? "" : "opacity-60")}>
@@ -24,21 +49,29 @@ export function StrategyConfigCard({ strat }: Props) {
           <div className="flex flex-col">
             <span className="text-[13.5px] font-semibold text-fg-0">{strat.name}</span>
             <span className="text-[11px] text-fg-2">{strat.desc}</span>
+            {killedBySot && (
+              <span className="mono mt-0.5 text-[10px] text-warn/90">
+                killed in guardrails.yaml disabled_strategies — no signal reaches order routing
+              </span>
+            )}
           </div>
         </div>
         <span
-          className={cn(
-            "mono text-[10px] px-2 py-0.5 rounded-full border uppercase",
-            strat.enabled
-              ? "bg-up/10 text-up border-up/20"
-              : "bg-obsidian-3 text-fg-2 border-obsidian-line-2",
-          )}
+          className={cn("mono text-[10px] px-2 py-0.5 rounded-full border uppercase whitespace-nowrap", pill.className)}
+          title={pill.title}
         >
-          {strat.enabled ? "ENABLED" : "DISABLED"}
+          {pill.text}
         </span>
       </div>
 
       <div className="flex flex-col gap-4 p-4">
+        {strat.params.length === 0 && (
+          <div className="mono text-[10.5px] text-fg-3">
+            {killedBySot
+              ? "Parameters not loaded — plugin is not instantiated while killed."
+              : "No runtime parameters reported."}
+          </div>
+        )}
         {strat.params.map((p) => (
           <div key={p.key}>
             <div className="mb-1.5 flex items-center justify-between text-[12px]">

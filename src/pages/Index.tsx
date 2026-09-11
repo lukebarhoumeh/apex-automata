@@ -15,6 +15,7 @@ import {
   useSignalFeed,
   useStrategyStatus,
 } from "@/hooks/apex/useDashboardData";
+import { useLiveMarks } from "@/hooks/apex/useLiveMarks";
 import type { EquityRange } from "@/types/equity";
 
 export default function Dashboard() {
@@ -26,7 +27,8 @@ export default function Dashboard() {
   const strategies = useStrategyStatus();
   const feed = useSignalFeed();
   const regime = useMarketRegime();
-  const { data: kpis } = useDashboardKpis();
+  const marks = useLiveMarks();
+  const { data: kpis } = useDashboardKpis(marks);
 
   if (!session.data || !equity.data || !positions.data || !strategies.data || !feed.data || !regime.data) {
     return null;
@@ -56,7 +58,7 @@ export default function Dashboard() {
       </div>
 
       <div className="grid gap-4" style={{ gridTemplateColumns: "minmax(0, 1fr) 300px" }}>
-        <PositionsTable positions={positions.data} />
+        <PositionsTable positions={positions.data} marks={marks} />
         <RegimeCard regime={regime.data} />
       </div>
     </div>
