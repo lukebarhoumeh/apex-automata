@@ -26,10 +26,6 @@ not read by the gate:
 - `1d/tune-2017-01_2025-03/` — 98-month deep-history native daily **tune**
   window (BTC-USD + ETH-USD only; in-sample only), ending the day before
   the sealed holdout window.
-- `1d/btc-eth-2017_plus/` — **full** native daily series 2017-01-01 →
-  present (last complete UTC day; BTC-USD + ETH-USD only). Research /
-  continuity — it contains the holdout months, so it is not counted
-  evidence; the sealed `1d/` files remain the HO-H1-DAILY source.
 
 Long 15m windows for E2-MOM-ISO (BTC, ETH, SOL; native `FIFTEEN_MINUTE`, no
 rollup) live in `15m/` and are documented in [`15m/README.md`](./15m/README.md);

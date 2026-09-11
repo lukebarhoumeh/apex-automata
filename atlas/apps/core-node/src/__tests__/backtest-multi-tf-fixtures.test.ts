@@ -23,7 +23,6 @@
  * 1d windows:
  *   1d/                      2024-09-01 → 2026-08-31 — sealed HO-H1-DAILY source (BTC, ETH, SOL)
  *   1d/tune-2017-01_2025-03/ 2017-01-01 → 2025-02-28 — deep-history tuning window (BTC, ETH)
- *   1d/btc-eth-2017_plus/    2017-01-01 → present (last complete UTC day) — full daily series (BTC, ETH)
  */
 import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
@@ -58,10 +57,6 @@ const PAIR = ['BTC-USD', 'ETH-USD'];
 const TUNE_4H_2019 = path.join(FIXTURES, '4h', 'tune-2019-01_2023-03');
 const TUNE_1D_2017 = path.join(FIXTURES, '1d', 'tune-2017-01_2025-03');
 const SEALED_1D = path.join(FIXTURES, '1d');
-/** Full daily series 2017-01-01 → present; extend by regenerating and bumping these two constants. */
-const FULL_1D = path.join(FIXTURES, '1d', 'btc-eth-2017_plus');
-const FULL_1D_LAST_DAY = Date.UTC(2026, 8, 10) / 1000; // last complete UTC day at generation (2026-09-10)
-const FULL_1D_BARS = 3540;
 
 /**
  * 4h bucket starts that Coinbase's own public candle series cannot fill
@@ -551,57 +546,6 @@ describe('deep-history tune fixtures (TM P0 backfill): 4h/tune-2019-01_2023-03 a
     // 731 days; 2023-03-04 is 4/6 buckets after the upstream gap and is dropped, not compared.
     for (const symbol of PAIR) expectFourHourReproducesDaily(TUNE_4H, TUNE_1D_2017, symbol, 730, 1);
   });
-
-  describe('1d/btc-eth-2017_plus/: full daily series 2017-01-01 → present (BTC, ETH)', () => {
-    it(`holds ${FULL_1D_BARS} native ONE_DAY bars 2017-01-01 → last complete UTC day, no gaps, no forming candle`, () => {
-      for (const symbol of PAIR) {
-        const file = readFixture(FULL_1D, symbol);
-        assertRealProvenance(file, symbol);
-        expect(file.granularity).toBe('ONE_DAY');
-        expect(file.granularitySeconds).toBe(DAY);
-        expect(file.rollup).toBeUndefined();
-        expect(file.candles).toHaveLength(FULL_1D_BARS);
-        expect(file.candles[0].time).toBe(Date.UTC(2017, 0, 1) / 1000);
-        expect(file.candles[FULL_1D_BARS - 1].time).toBe(FULL_1D_LAST_DAY);
-        // The day the file was fetched is still forming and must never be in the file.
-        expect(FULL_1D_LAST_DAY).toBeLessThan(Math.floor(new Date(file.fetchedAt).getTime() / 1000 / DAY) * DAY);
-        assertContiguous(file, DAY);
-      }
-    });
-
-    it('reproduces the sealed 1d/ files byte-for-byte on all 730 days they cover (2024-09-01 → 2026-08-31)', () => {
-      // The sealed HO-H1-DAILY source is a strict sub-window of this series; it is read, never written, here.
-      for (const symbol of PAIR) {
-        const full = new Map(readFixture(FULL_1D, symbol).candles.map((c) => [c.time, c]));
-        const sealed = readFixture(SEALED_1D, symbol);
-        let compared = 0;
-        for (const s of sealed.candles) {
-          expect(full.get(s.time)).toEqual(s);
-          compared++;
-        }
-        expect(compared).toBe(730);
-      }
-    });
-
-    it('has 1d/tune-2017-01_2025-03 as an exact prefix (2981 identical bars, then continues into the holdout months)', () => {
-      for (const symbol of PAIR) {
-        const full = readFixture(FULL_1D, symbol).candles;
-        const tune = readFixture(TUNE_1D_2017, symbol).candles;
-        expect(full.slice(0, tune.length)).toEqual(tune);
-        expect(full[tune.length].time).toBe(HO_H1_DAILY_START);
-      }
-    });
-
-    it('every committed 4h set rolled to 1d reproduces its OHLC exactly (holdout 364, smoke 31, tune 730, deep tune 1514/1516 days)', () => {
-      for (const symbol of PAIR) {
-        expectFourHourReproducesDaily(HOLDOUT_4H, FULL_1D, symbol, 364, 1);
-        expectFourHourReproducesDaily(SMOKE_4H, FULL_1D, symbol, 31, 0);
-        expectFourHourReproducesDaily(TUNE_4H, FULL_1D, symbol, 730, 1);
-      }
-      expectFourHourReproducesDaily(TUNE_4H_2019, FULL_1D, 'BTC-USD', 1514, 6, TUNE_2019_VOLUME_OUTLIER_DAYS);
-      expectFourHourReproducesDaily(TUNE_4H_2019, FULL_1D, 'ETH-USD', 1516, 4, TUNE_2019_VOLUME_OUTLIER_DAYS);
-    });
-  });
 });
 
 describe('fail-closed loader honours the fixture-declared bar width', () => {
@@ -728,36 +672,6 @@ describe('fail-closed loader honours the fixture-declared bar width', () => {
     expect(res.candles).toHaveLength(2981);
     expect(res.provenance.expectedCount).toBe(2982);
     expect(res.provenance.lastBarTime).toBe('2025-02-28T00:00:00.000Z');
-  });
-
-  it('loads the full daily series (2017-01-01 → present) as REAL fixture data; SOL-USD and future windows are DATA_UNAVAILABLE', async () => {
-    const loader = new HistoricalDataLoader({ fixtureDir: FULL_1D }, makeLogger());
-    const lastDay = new Date(FULL_1D_LAST_DAY * 1000);
-    for (const symbol of PAIR) {
-      const res = await loader.loadCandles(symbol, new Date('2017-01-01T00:00:00Z'), lastDay, 900);
-      expect(res.source).toBe('fixture');
-      expect(res.candles).toHaveLength(FULL_1D_BARS);
-      expect(res.provenance.granularitySeconds).toBe(DAY);
-      expect(res.provenance.expectedCount).toBe(FULL_1D_BARS);
-      expect(res.provenance.coverage).toBeCloseTo(1, 9);
-      expect(res.provenance.inferredBarMinutes).toBe(1440);
-      expect(res.provenance.firstBarTime).toBe('2017-01-01T00:00:00.000Z');
-      expect(res.provenance.lastBarTime).toBe(lastDay.toISOString());
-      expect(res.provenance.fixturePath).toBe(path.join(FULL_1D, `${symbol}.json`));
-      expect(res.provenance.fixtureSha256).toMatch(/^[0-9a-f]{64}$/);
-    }
-    // The sealed HO-H1-DAILY window is servable from this series and must match the sealed set bar-for-bar.
-    const sealedLoader = new HistoricalDataLoader({ fixtureDir: SEALED_1D }, makeLogger());
-    const fromFull = await loader.loadCandles('BTC-USD', new Date('2025-03-01T00:00:00Z'), new Date('2026-08-31T00:00:00Z'), 900);
-    const fromSealed = await sealedLoader.loadCandles('BTC-USD', new Date('2025-03-01T00:00:00Z'), new Date('2026-08-31T00:00:00Z'), 900);
-    expect(fromFull.candles).toHaveLength(549);
-    expect(fromFull.candles).toEqual(fromSealed.candles);
-    await expect(
-      loader.loadCandles('SOL-USD', new Date('2017-01-01T00:00:00Z'), lastDay, 900),
-    ).rejects.toMatchObject({ code: 'DATA_UNAVAILABLE' });
-    await expect(
-      loader.loadCandles('ETH-USD', new Date('2026-10-01T00:00:00Z'), new Date('2026-12-31T00:00:00Z'), 900),
-    ).rejects.toMatchObject({ code: 'DATA_UNAVAILABLE' });
   });
 
   it('deep-history tune dirs are DATA_UNAVAILABLE for SOL-USD and for windows they do not cover (incl. the sealed holdout)', async () => {

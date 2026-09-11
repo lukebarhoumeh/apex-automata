@@ -22,7 +22,6 @@ same two windows as the 4h sets below and were cross-checked against them.
 | `4h/smoke-aug2026/` | **SMOKE ONLY — not hard-preflight** | BTC-USD, ETH-USD, SOL-USD | 186 | 2026-08-01T00:00 → 2026-08-31T20:00 (August 2026 month-block) | 4h | 744 native `ONE_HOUR` candles rolled up; 186 / 186 complete |
 | `1d/` | 1D experiments (E4 second pass); **sealed HO-H1-DAILY source** (fixed 2025-03-01 → 2026-08-31 sub-window, 549 bars) | BTC-USD, ETH-USD, SOL-USD | 730 | 2024-09-01 → 2026-08-31 (24 months) | 1d (`ONE_DAY`, 86400 s) | native `ONE_DAY` candles, no rollup |
 | `1d/tune-2017-01_2025-03/` | **TUNE (deep history)** — parameter fitting only; never out-of-sample evidence | BTC-USD, ETH-USD | **2981** | 2017-01-01 → 2025-02-28 (98 months) | 1d | native `ONE_DAY` candles, no rollup; 2981 / 2981 slots, **no upstream gaps** |
-| `1d/btc-eth-2017_plus/` | **FULL DAILY SERIES 2017 → present** — research / continuity; contains the sealed holdout months, so a run on it is **not** counted evidence unless windowed **and** cross-checked against the sealed `1d/` files | BTC-USD, ETH-USD | **3540** (at generation) | 2017-01-01 → 2026-09-10 (last complete UTC day at generation; extend by regenerating) | 1d | native `ONE_DAY` candles, no rollup; 3540 / 3540 slots, **no upstream gaps** |
 
 - Tune and holdout are **adjacent and disjoint**: the last tune bar is
   2025-02-28T20:00, the first holdout bar is 2025-03-01T00:00 (asserted by the
@@ -40,19 +39,6 @@ same two windows as the 4h sets below and were cross-checked against them.
   The deep-history set did not modify them; it lives in a subdirectory and
   reproduces their candles byte-for-byte on the 181 overlapping days
   (2024-09-01 → 2025-02-28, asserted by the unit test).
-- **`1d/btc-eth-2017_plus/` is the full 2017 → present daily series** (Data
-  Steward refine, 2026-09-11). It is the seal-safe answer to "extend `1d/`
-  to 2017 → present": the sealed loose files are untouched and the full
-  series is a sibling directory that reproduces them **byte-for-byte on all
-  730 days** they cover (2024-09-01 → 2026-08-31) and has
-  `1d/tune-2017-01_2025-03/` as an exact 2981-bar prefix (both asserted).
-  Because it contains the holdout months, the counted HO-H1-DAILY path still
-  reads the sealed `1d/` files; use this series for continuity / research
-  (e.g. long look-backs, regime labelling) or window it explicitly. Its end
-  is the **last complete UTC day** at generation (2026-09-10) — the forming
-  day is never written (asserted against `fetchedAt`). Regenerating to a
-  newer "present" changes the bar count and `end`; update the table, the
-  sha256s and `FULL_1D_LAST_DAY` / `FULL_1D_BARS` in the unit test together.
 - Upstream depth for reference: Coinbase's public `ONE_DAY` series begins
   2015-07-20 for BTC-USD and 2016-05-18 for ETH-USD, so 2017-01-01 is a
   full-coverage start, not a truncation. `ONE_HOUR` exists for 2018 too —
@@ -116,9 +102,8 @@ Consequences: at each hole the engine steps 8 hours in one bar; the CLI
 coverage line reads `9114/9121` (BTC) and `9116/9121` (ETH). Rolling this
 set 4h → 1d drops those 6 / 4 days as incomplete, so the daily cross-check
 below compares 1514 / 1516 of the 1520 days. Nothing after 2020-10-20 is
-missing in this window. `1d/tune-2017-01_2025-03/` and `1d/btc-eth-2017_plus/`
-have **no** gaps at all — Coinbase's daily series is complete 2017-01-01 →
-2026-09-10 on both symbols (3540 / 3540 slots).
+missing in this window. `1d/tune-2017-01_2025-03/` has **no** gaps at all —
+Coinbase's daily series is complete 2017-01-01 → 2025-02-28 on both symbols.
 
 ## How Strategies should invoke (from `atlas/apps/core-node`)
 
@@ -156,12 +141,6 @@ pnpm exec tsx src/cli/backtest.ts --fixture-dir fixtures/bars/4h/tune-2019-01_20
 pnpm exec tsx src/cli/backtest.ts --fixture-dir fixtures/bars/1d/tune-2017-01_2025-03 \
   --products BTC-USD ETH-USD \
   --start-date 2017-01-01 --end-date 2025-03-01
-
-# 1D FULL SERIES 2017 → present — research / continuity, NOT counted evidence
-# (--end-date = the day after the last complete bar in the file)
-pnpm exec tsx src/cli/backtest.ts --fixture-dir fixtures/bars/1d/btc-eth-2017_plus \
-  --products BTC-USD ETH-USD \
-  --start-date 2017-01-01 --end-date 2026-09-11
 ```
 
 Add the usual experiment flags (`--fee-tier`, `--commission`, `--slippage`,
@@ -187,24 +166,10 @@ Data source ETH-USD: fixture bars=2981/2982 coverage=100.0% spacing=1440m
 Bar timeframe: 1440 min (native stored bars; no aggregation)
 ```
 
-and the full daily series (`--end-date 2026-09-11` at generation):
-
-```
-DATA: REAL
-Backtest Results:
-=================
-Data source BTC-USD: fixture bars=3540/3541 coverage=100.0% spacing=1440m
-Data source ETH-USD: fixture bars=3540/3541 coverage=100.0% spacing=1440m
-Bar timeframe: 1440 min (native stored bars; no aggregation)
-```
-
-(`9121` / `2982` / `3541`: the `+1` is the inclusive end bound at
-`--end-date T00:00`; `--end-date 2025-03-01` on the daily tune counts a
-would-be 2025-03-01 bar that is deliberately absent — that bar belongs to
-the sealed holdout — and `--end-date 2026-09-11` on the full series counts
-the forming day, which is never written. Passing `SOL-USD` to any of the
-three deep-history directories is `DATA_UNAVAILABLE`, exit 2, as is a window
-after the last complete day.)
+(`9121` / `2982`: the `+1` is the inclusive end bound at `--end-date T00:00`;
+`--end-date 2025-03-01` on the daily tune counts a would-be 2025-03-01 bar
+that is deliberately absent — that bar belongs to the sealed holdout. Passing
+`SOL-USD` to either deep-history directory is `DATA_UNAVAILABLE`, exit 2.)
 
 Expected stdout / report header for the holdout run:
 
@@ -266,8 +231,6 @@ can be tied to the committed data — they are **not** a holdout):
 | `4h/tune-2019-01_2023-03/ETH-USD.json` | `1e25eba7a18cfa56eed527be525eb2bccfe79bc904652ae7c1c9fb32d6535dc2` |
 | `1d/tune-2017-01_2025-03/BTC-USD.json` | `0308ba0d72da994db3cc50215268f40d9fc76fc58446cbc96885093498c4a039` |
 | `1d/tune-2017-01_2025-03/ETH-USD.json` | `eaa217768fc4f7387850ffacaacb805ca8753631a202a1e16fde3ec15326d9e3` |
-| `1d/btc-eth-2017_plus/BTC-USD.json` (→ 2026-09-10) | `b1745ba4ff089f432e5a18b66d11ad7bb828c0a87836f47d716f998d7eb735c2` |
-| `1d/btc-eth-2017_plus/ETH-USD.json` (→ 2026-09-10) | `45ca2899e64105cd0cf3198c9fad46fb5d151a170d6f0c91b7f9a866cf582991` |
 
 **Never** pass `--allow-synthetic` for an E4 / preflight run — any
 `DATA: SYNTHETIC` output is SMOKE/VOID and is not evidence of anything. Never
@@ -384,24 +347,6 @@ Deep-history tune windows (2026-09-11; `4h/tune-2019-01_2023-03/`,
 - Fetch volume: 4h pair ≈ 62 s (122 pages / symbol at `ONE_HOUR`), daily
   pair ≈ 6 s (10 pages / symbol).
 
-Full daily series `1d/btc-eth-2017_plus/` (2026-09-11, `--until 2026-09-10`):
-
-- Structure: 3540 / 3540 slots per symbol, no gaps, no OHLC violations, no
-  zero-volume bars; last bar 2026-09-10 < the fetch day's UTC midnight
-  (forming candle excluded, asserted).
-- Byte-for-byte equal to the sealed `1d/BTC-USD.json` / `1d/ETH-USD.json`
-  on all **730** days they cover, and to `1d/tune-2017-01_2025-03/` on all
-  **2981** days (exact prefix; bar 2982 is 2025-03-01, the sealed holdout
-  start). Loading 2025-03-01 → 2026-08-31 from it returns the same 549
-  candles the sealed set returns (unit test).
-- Every committed 4h set rolled 4h → 1d reproduces its **OHLC exactly**:
-  holdout 364 / 364 complete days, smoke 31 / 31, tune-2023 730 / 730,
-  tune-2019 1514 (BTC) / 1516 (ETH), with 2021-11-24 the only volume
-  outlier as above. Unit tests.
-- CLI: `DATA: REAL`, exit 0, header shown above; `SOL-USD` and a window
-  after 2026-09-10 are `DATA_UNAVAILABLE` (exit 2). Fetch ≈ 7 s for the pair
-  (12 pages / symbol).
-
 Cross-granularity caveat (upstream, not a rollup defect): Coinbase's own
 series disagree across granularities on volume for a small share of hours —
 e.g. BTC-USD 2026-08-28T23:00Z native `ONE_HOUR` volume 149.85 vs the sum of
@@ -451,15 +396,6 @@ pnpm backtest:backfill --products BTC-USD,ETH-USD \
 pnpm backtest:backfill --products BTC-USD,ETH-USD \
   --since 2017-01-01 --until 2025-02-28 \
   --granularity ONE_DAY --out-dir fixtures/bars/1d/tune-2017-01_2025-03
-
-# 1d FULL SERIES 2017 → present (BTC + ETH; ≈ 3 s / symbol)
-# --until MUST be the last COMPLETE UTC day (yesterday, UTC), never today:
-# Coinbase returns the forming candle for the current day and the tool
-# would write it. Then update the row above, the sha256 table and
-# FULL_1D_LAST_DAY / FULL_1D_BARS in src/__tests__/backtest-multi-tf-fixtures.test.ts.
-pnpm backtest:backfill --products BTC-USD,ETH-USD \
-  --since 2017-01-01 --until "$(date -u -d yesterday +%F)" \
-  --granularity ONE_DAY --out-dir fixtures/bars/1d/btc-eth-2017_plus
 ```
 
 Notes:
@@ -489,14 +425,9 @@ Notes:
 - Hard preflight / counted E[n] reads `4h/holdout-2025-03_2026-03/` only.
   `4h/smoke-aug2026/` is SMOKE ONLY; `4h/tune-2023-03_2025-03/`,
   `4h/tune-2019-01_2023-03/` and `1d/tune-2017-01_2025-03/` are in-sample.
-  `1d/btc-eth-2017_plus/` spans train, holdout and post-holdout months in
-  one file — research / continuity only; the counted HO-H1-DAILY path reads
-  the sealed `1d/` files.
 - The loose `1d/*.json` files are the sealed HO-H1-DAILY source. Never
   regenerate them in place; deeper or different daily windows go in a
   sibling subdirectory (`1d/<role>-<from>_<to>/`), as the 2017 tune does.
-- Never write a forming candle: a "→ present" window ends on the last
-  complete UTC day (`--until` yesterday, UTC).
 - One timeframe and one window per directory; do not put 4h and 1d files, or
   two windows, in the same `--fixture-dir`.
 - Leave the 15m gate fixtures (`fixtures/bars/*.json`) and
