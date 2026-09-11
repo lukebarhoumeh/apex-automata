@@ -15,8 +15,8 @@ import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
 import type { Position } from "@/types/positions";
 
 const POSITIONS: readonly Position[] = [
-  { id: "p1", sym: "BTC-USD", side: "LONG", qty: 0.5, entry: 60_000, stop: 59_000, target: 63_000, opened: "09:00:00", strat: "trend_follow", conf: 0 },
-  { id: "p2", sym: "ETH-PERP-INTX", side: "SHORT", qty: 2, entry: 3_000, stop: 3_100, target: 2_800, opened: "09:05:00", strat: "trend_follow", conf: 0 },
+  { id: "p1", sym: "BTC-USD", side: "LONG", source: "engine", qty: 0.5, entry: 60_000, stop: 59_000, target: 63_000, opened: "09:00:00", strat: "trend_follow", conf: 0 },
+  { id: "p2", sym: "ETH-PERP-INTX", side: "SHORT", source: "engine", qty: 2, entry: 3_000, stop: 3_100, target: 2_800, opened: "09:05:00", strat: "trend_follow", conf: 0 },
 ];
 
 const MARKS: LiveMarks = {
@@ -77,6 +77,27 @@ describe("PositionsTable", () => {
     expect(queryByText("+$0.00")).toBeNull();
     expect(getAllByText("—")).toHaveLength(6);
     expect(getByText("no live marks")).toBeInTheDocument();
+  });
+});
+
+describe("PositionsTable — source labelling", () => {
+  it("labels Supabase book rows as engine-stopped and uses the engine mark when no tick has arrived", () => {
+    const book: Position[] = POSITIONS.map((p) => ({ ...p, source: "book" }));
+    const { getByText } = render(<PositionsTable positions={book} source="book" />);
+    expect(getByText("book · engine stopped · no live marks")).toBeInTheDocument();
+    expect(getByText("2 on book")).toBeInTheDocument();
+
+    const engine: Position[] = [{ ...POSITIONS[0], source: "engine", mark: 60_500, pnl: 250 }];
+    const r = render(<PositionsTable positions={engine} source="engine" />);
+    expect(r.getByText("60,500.00")).toBeInTheDocument();
+    expect(r.getByText("+$250.00")).toBeInTheDocument();
+    expect(r.getByText("live marks")).toBeInTheDocument();
+  });
+
+  it("a fresher WS tick overrides the engine's polled mark", () => {
+    const engine: Position[] = [{ ...POSITIONS[0], source: "engine", mark: 60_500 }];
+    const { getByText } = render(<PositionsTable positions={engine} source="engine" marks={MARKS} />);
+    expect(getByText("61,000.00")).toBeInTheDocument();
   });
 });
 
