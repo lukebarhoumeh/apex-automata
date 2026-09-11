@@ -188,6 +188,16 @@ export interface TradeAnalyticsConfig {
   initialEquity: number;
   mode: 'paper' | 'live';
   equitySampleIntervalMs: number; // How often to sample equity curve
+  /**
+   * Externally owned session identity (the API server's `trading_sessions.session_id`).
+   * When set, `getSessionStats().sessionId` / `trade_log.session_id` carry this id so
+   * analytics, the PnL snapshot and `/api/status` agree on ONE session, and the
+   * `trading_sessions` row is left to its owner (no summary upsert on stop).
+   * When absent, a self-generated `<mode>-<date>-<time>-<rand>` id is used (legacy).
+   */
+  sessionId?: string;
+  /** Epoch ms the externally owned session opened; defaults to construction time. */
+  sessionStartedAt?: number;
 }
 
 // ============================================================================
@@ -202,6 +212,8 @@ export class TradeAnalytics extends EventEmitter {
   // Session state
   private sessionId: string;
   private sessionStartTime: Date;
+  /** True when the API server owns the `trading_sessions` row for this session. */
+  private readonly externalSession: boolean;
   private trades: Map<string, TradeRecord> = new Map();
   private closedTrades: TradeRecord[] = [];
   private equityCurve: EquityPoint[] = [];
@@ -236,8 +248,12 @@ export class TradeAnalytics extends EventEmitter {
     this.logger = logger;
     this.supabase = createClient(config.supabaseUrl, config.supabaseKey);
     
-    this.sessionId = this.generateSessionId();
-    this.sessionStartTime = new Date();
+    this.externalSession = typeof config.sessionId === 'string' && config.sessionId.length > 0;
+    this.sessionId = this.externalSession ? config.sessionId! : this.generateSessionId();
+    this.sessionStartTime =
+      typeof config.sessionStartedAt === 'number' && Number.isFinite(config.sessionStartedAt)
+        ? new Date(config.sessionStartedAt)
+        : new Date();
     this.currentEquity = config.initialEquity;
     this.highWaterMark = config.initialEquity;
     
@@ -600,6 +616,19 @@ export class TradeAnalytics extends EventEmitter {
   public getRecentTrades(limit: number = 50): TradeRecord[] {
     return this.closedTrades.slice(-limit);
   }
+
+  /**
+   * Every closed trade of the session, oldest first (input for the per-strategy
+   * session stats served at `GET /api/analytics/strategies`).
+   */
+  public getClosedTrades(): TradeRecord[] {
+    return [...this.closedTrades];
+  }
+
+  /** Session identity this instance stamps on `trade_log` rows and reports in `getSessionStats()`. */
+  public getSessionId(): string {
+    return this.sessionId;
+  }
   
   /**
    * Get open trades.
@@ -804,11 +833,17 @@ export class TradeAnalytics extends EventEmitter {
       this.equitySampleInterval = null;
     }
     
-    // Persist final session summary
-    await this.persistSessionSummary();
+    // Persist final session summary — only for self-owned sessions. When the API
+    // server minted the id it also owns the `trading_sessions` row (open on start,
+    // close on stop) and a summary upsert here would stamp `ended_at` on a session
+    // that is merely restarting under the supervisor.
+    if (!this.externalSession) {
+      await this.persistSessionSummary();
+    }
     
     this.logger.info('TradeAnalytics stopped', {
       sessionId: this.sessionId,
+      externalSession: this.externalSession,
       totalTrades: this.closedTrades.length,
       totalPnl: this.sumPnl,
     });

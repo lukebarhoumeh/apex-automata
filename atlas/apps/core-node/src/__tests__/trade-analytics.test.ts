@@ -310,5 +310,85 @@ describe('TradeAnalytics', () => {
     expect(stats.winningTrades).toBe(0);
     expect(stats.losingTrades).toBe(0);
   });
+
+  test('getClosedTrades returns every closed trade oldest-first and does not expose internal state', () => {
+    for (let i = 1; i <= 3; i++) {
+      analytics.recordEntry({ tradeId: `trade-${i}`, symbol: 'ETH-USD', side: 'long', entryPrice: 2000, size: 1, strategy: 'momentum' });
+      analytics.recordExit({ tradeId: `trade-${i}`, exitPrice: 2010, realizedPnl: 10, fees: 0 });
+    }
+
+    const closed = analytics.getClosedTrades();
+    expect(closed.map((t) => t.id)).toEqual(['trade-1', 'trade-2', 'trade-3']);
+    expect(closed.every((t) => t.strategy === 'momentum')).toBe(true);
+
+    closed.pop();
+    expect(analytics.getClosedTrades()).toHaveLength(3);
+  });
+});
+
+/**
+ * FE contract #2 — analytics bound to the API server's session. When the engine
+ * passes the minted `trading_sessions.session_id` + open time, TradeAnalytics
+ * reports THAT id (so `/api/analytics/session.sessionId === /api/status.sessionId`)
+ * and leaves the `trading_sessions` row to the server (no summary upsert on stop).
+ */
+describe('TradeAnalytics — externally owned session', () => {
+  const baseConfig: TradeAnalyticsConfig = {
+    supabaseUrl: 'http://localhost:54321',
+    supabaseKey: 'test-key',
+    userId: 'test-user',
+    initialEquity: 10000,
+    mode: 'paper',
+    equitySampleIntervalMs: 60000,
+  };
+  const SESSION_ID = 'sess_1757606400000_ab12cd';
+  const STARTED_AT = Date.parse('2026-09-11T16:00:00.000Z');
+
+  test('uses the supplied session id and start time in getSessionStats()', async () => {
+    const analytics = new TradeAnalytics({ ...baseConfig, sessionId: SESSION_ID, sessionStartedAt: STARTED_AT }, mockLogger as any);
+    try {
+      const stats = analytics.getSessionStats();
+      expect(stats.sessionId).toBe(SESSION_ID);
+      expect(analytics.getSessionId()).toBe(SESSION_ID);
+      expect(stats.startTime.getTime()).toBe(STARTED_AT);
+      expect(stats.sessionId).not.toMatch(/^paper-\d{8}-\d{6}-/);
+    } finally {
+      await analytics.stop();
+    }
+  });
+
+  test('falls back to a self-generated id and construction time without a supplied session', async () => {
+    const before = Date.now();
+    const analytics = new TradeAnalytics(baseConfig, mockLogger as any);
+    try {
+      const stats = analytics.getSessionStats();
+      expect(stats.sessionId).toMatch(/^paper-\d{8}-\d{6}-[a-z0-9]{4}$/);
+      expect(stats.startTime.getTime()).toBeGreaterThanOrEqual(before);
+    } finally {
+      await analytics.stop();
+    }
+  });
+
+  test('stop() skips the trading_sessions summary upsert for an externally owned session', async () => {
+    const analytics = new TradeAnalytics({ ...baseConfig, sessionId: SESSION_ID, sessionStartedAt: STARTED_AT }, mockLogger as any);
+    const persistSpy = vi.spyOn(analytics, 'persistSessionSummary');
+
+    await analytics.stop();
+
+    expect(persistSpy).not.toHaveBeenCalled();
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      'TradeAnalytics stopped',
+      expect.objectContaining({ sessionId: SESSION_ID, externalSession: true }),
+    );
+  });
+
+  test('stop() still persists the summary for a self-owned session', async () => {
+    const analytics = new TradeAnalytics(baseConfig, mockLogger as any);
+    const persistSpy = vi.spyOn(analytics, 'persistSessionSummary');
+
+    await analytics.stop();
+
+    expect(persistSpy).toHaveBeenCalledTimes(1);
+  });
 });
 
