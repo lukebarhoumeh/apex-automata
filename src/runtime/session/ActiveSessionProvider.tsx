@@ -25,6 +25,7 @@ export function ActiveSessionProvider({ children }: { children: React.ReactNode 
   const { data } = useRuntimeStatus();
   const queryClient = useQueryClient();
   const lastSessionId = useRef<string | null | undefined>(undefined);
+  const engineRunningRef = useRef(false);
 
   const value = useMemo<ActiveSession>(
     () => ({
@@ -35,6 +36,7 @@ export function ActiveSessionProvider({ children }: { children: React.ReactNode 
     }),
     [data?.sessionId, data?.sessionStartedAt, data?.engineRunning, data?.mode],
   );
+  engineRunningRef.current = value.engineRunning;
 
   useEffect(() => {
     const current = value.sessionId;
@@ -47,6 +49,12 @@ export function ActiveSessionProvider({ children }: { children: React.ReactNode 
     }
 
     if (current === previous) return;
+
+    // A running engine always owns a session id (openTradingSession sets it
+    // synchronously). `null` while running is a payload gap — e.g. a status
+    // envelope from a backend that predates sessionId on StatusUpdate — not a
+    // session change. Wiping caches on it caused the U7 refetch storm.
+    if (current === null && engineRunningRef.current) return;
 
     // Wipe every apex:* cache so stale session data doesn't leak across runs.
     queryClient.invalidateQueries({ queryKey: ["apex"] });

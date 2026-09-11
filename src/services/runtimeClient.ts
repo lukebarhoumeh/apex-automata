@@ -34,6 +34,55 @@ export interface RuntimeStatus {
   candlesBuffered?: Record<string, number>;
   requiredWarmup?: number;
   symbols?: string[];
+  /** 'stopped' | 'starting' | 'running' | 'halted' | ... from TradingEngine.getEngineState(). */
+  engineState?: string;
+  lastMarketDataAt?: number;
+  lastEngineHeartbeatAt?: number;
+  /** Server clock when the snapshot was built (ms). */
+  timestamp?: number;
+  /** PnL snapshot from PositionTracker/RiskEngine; null when the engine is stopped. */
+  pnl?: RuntimePnlSnapshot | null;
+  /** Exchange WebSocket health; null when no exchange adapter is attached. */
+  ws?: {
+    connected: boolean;
+    reconnecting?: boolean;
+    reconnectAttempts?: number;
+    lastMessageAt?: number | null;
+    messageAgeMs?: number | null;
+    isStalled?: boolean;
+    subscriptionCount?: number;
+  } | null;
+  /** Exchange REST health; null when no exchange adapter is attached. */
+  rest?: {
+    circuitOpen?: boolean;
+    rateLimited?: boolean;
+    consecutiveFailures?: number;
+    degraded?: boolean;
+    degradedReasons?: string[];
+  } | null;
+  exchangeHealth?: {
+    degraded?: boolean;
+    degradedReasons?: string[];
+    allowsEntries?: boolean;
+    allowsExits?: boolean;
+  } | null;
+}
+
+export interface RuntimePnlSnapshot {
+  ts: number;
+  sessionId?: string;
+  executionMode?: 'paper' | 'live';
+  sessionStartEquityUsd?: number;
+  dayStartEquityUsd?: number;
+  realizedPnlUsd: number;
+  unrealizedPnlUsd: number;
+  totalEquityUsd: number;
+  dailyPnlUsd: number;
+  dailyPnlR: number;
+  riskUnitUsd?: number;
+  openPositionsCount: number;
+  exposureUsd: number;
+  maxDrawdownPct?: number;
 }
 
 export interface RiskStatus {

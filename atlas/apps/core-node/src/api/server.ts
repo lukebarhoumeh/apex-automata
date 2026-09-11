@@ -13,6 +13,7 @@ import {
   isSymbolStrategyDisabled,
 } from '../strategies/per-symbol-disable';
 import { buildRegimeGateConfig, evaluateRegimeGate } from '../strategies/regime-gate';
+import { buildStrategyPolicy } from '../strategies/strategy-policy';
 import { computeRawEntryFillPrice } from '../trading/position-entry-vwap';
 import { buildFillRow, FILLS_UPSERT_ON_CONFLICT, FillRowFillRef, FillRowOrderRef } from '../persistence/fill-row';
 import { createClient } from '@supabase/supabase-js';
@@ -726,6 +727,11 @@ statusBroadcastInterval = setInterval(() => {
     payload: {
       engineRunning: isEngineRunning,
       mode: isEngineRunning ? tradingEngine!.getConfig().mode : null,
+      // TASK_016 U7: the UI merges this envelope over GET /api/status; the
+      // session identity must ride along or the merge cannot track a
+      // start/stop that happens between REST refreshes.
+      sessionId: runtimeState.sessionId,
+      sessionStartedAt: runtimeState.sessionStartedAt,
       paused: runtimeState.paused,
       dailyStopHit: runtimeState.dailyStopHit,
       killSwitch: runtimeState.killSwitch,
@@ -783,6 +789,8 @@ wss.on('connection', (ws) => {
     payload: {
       engineRunning: isEngineRunningOnConnect,
       mode: isEngineRunningOnConnect ? tradingEngine!.getConfig().mode : null,
+      sessionId: runtimeState.sessionId,
+      sessionStartedAt: runtimeState.sessionStartedAt,
       paused: runtimeState.paused,
       dailyStopHit: runtimeState.dailyStopHit,
       killSwitch: runtimeState.killSwitch,
@@ -3508,6 +3516,15 @@ app.get('/api/strategies/stats', (req, res) => {
   }
 
   res.json(signalProcessor.getStrategyRegistryStats());
+});
+
+// Strategy policy from guardrails.yaml (single source of truth).
+// Read-only and engine-independent: killed plugins are never registered, so
+// `/api/strategies` cannot show them, and the UI needs this even while the
+// signal processor is down to render "DISABLED · guardrails" honestly
+// (TASK_016 P4). Must stay registered before `/api/strategies/:strategyId`.
+app.get('/api/strategies/policy', (req, res) => {
+  res.json(buildStrategyPolicy(guardrails));
 });
 
 // Get a specific strategy
