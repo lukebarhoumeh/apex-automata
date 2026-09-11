@@ -11,7 +11,16 @@ import type { PositionPayload, StatusPayload } from "@/runtime/ws/types";
 import { deriveEnginePill } from "@/runtime/state/deriveEnginePill";
 import { deriveFooterChips, deriveFooterSessionText } from "@/components/apex/shell/footer-chips";
 import { mergeStrategyPolicy } from "@/lib/strategy-policy";
-import { deriveBotMode, mapSessionStats, mapStrategyCards } from "@/hooks/apex/useDashboardData";
+import { aggregateStrategyStats } from "@/lib/strategy-stats";
+import {
+  deriveBotMode,
+  mapBookPosition,
+  mapEnginePosition,
+  mapSessionStats,
+  mapSignalRecord,
+  mapStrategyCards,
+  sessionSinceIso,
+} from "@/hooks/apex/useDashboardData";
 import type { RuntimeConnectivity } from "@/runtime/connectivity/types";
 import type { RuntimeStatus } from "@/services/runtimeClient";
 import type { BackendRuntimeStatus, BackendStrategyPolicy } from "@/services/apexDashboardApi";
@@ -297,6 +306,37 @@ describe("Hero — mode and unrealized come from /api/status", () => {
     expect(stats.unrealized).toBe(-4.25);
     expect(stats.pnl).toBe(15.75);
   });
+
+  it("equity, heat (exposure/equity) and R come from the PnL snapshot; meta-filter gate is passed through", () => {
+    const stats = mapSessionStats(
+      { totalPnl: 20, startTime: new Date().toISOString(), mode: "paper", totalTrades: 2, winningTrades: 1, losingTrades: 1, winRate: 0.5 } as never,
+      backendStatus({
+        engineState: "running",
+        pnl: {
+          realizedPnlUsd: 20, unrealizedPnlUsd: -4.25, totalEquityUsd: 10_015.75, sessionStartEquityUsd: 10_000,
+          dailyPnlUsd: 15.75, dailyPnlR: 0.3, riskUnitUsd: 50, openPositionsCount: 1, exposureUsd: 500,
+        },
+      }),
+      true,
+    );
+    expect(stats.equity).toBe(10_015.75);
+    expect(stats.startEquity).toBe(10_000);
+    expect(stats.heat).toBeCloseTo((500 / 10_015.75) * 100, 10);
+    expect(stats.pnlR).toBeCloseTo(15.75 / 50, 10);
+    expect(stats.openPositions).toBe(1);
+    expect(stats.engineState).toBe("running");
+    expect(stats.metaFilterEnabled).toBe(true);
+  });
+
+  it("ignores a stale PnL snapshot when the engine reports stopped", () => {
+    const stats = mapSessionStats(null, backendStatus({ engineRunning: false }), true);
+    expect(stats.unrealized).toBeNull();
+    expect(stats.equity).toBeNull();
+    expect(stats.heat).toBeNull();
+    expect(stats.pnlR).toBeNull();
+    expect(stats.metaFilterEnabled).toBeNull();
+    expect(stats.engineState).toBe("stopped");
+  });
 });
 
 describe("P4 — guardrails disabled_strategies overlay", () => {
@@ -341,12 +381,107 @@ describe("P4 — guardrails disabled_strategies overlay", () => {
     expect(merged[0]).toMatchObject({ enabled: false, disabledBy: "runtime" });
   });
 
-  it("maps to dashboard cards with a killed status", () => {
+  it("maps to dashboard cards with a killed status — signalsGenerated is NOT reported as trades", () => {
     const cards = mapStrategyCards(
       [{ id: "trend_follow", name: "Trend Follow", description: "d", category: "trend", enabled: true, stats: { signalsGenerated: 3 } }],
       policy,
     );
-    expect(cards.find((c) => c.id === "trend_follow")).toMatchObject({ status: "on", trades: 3 });
+    // The "3 trades vs 0 session trades" screenshot bug: the plugin had emitted
+    // 3 signals, none of which became a closed trade.
+    expect(cards.find((c) => c.id === "trend_follow")).toMatchObject({ status: "on", trades: 0, signals: 3, pnlSession: 0 });
     expect(cards.find((c) => c.id === "momentum")).toMatchObject({ status: "killed", disabledBy: "guardrails" });
+  });
+
+  it("card trades / P&L come from the session's closed trades (same SoT as the hero)", () => {
+    const stats = aggregateStrategyStats(
+      [
+        { id: "t1", symbol: "ETH-USD", side: "long", entryTime: "2026-09-11T10:00:00Z", exitTime: "2026-09-11T11:00:00Z", entryPrice: 3000, exitPrice: 3030, size: 1, realizedPnl: 30, fees: 1, outcome: "win", strategy: "trend_follow" },
+        { id: "t2", symbol: "ETH-USD", side: "long", entryTime: "2026-09-11T12:00:00Z", exitTime: "2026-09-11T13:00:00Z", entryPrice: 3000, exitPrice: 2990, size: 1, realizedPnl: -10, fees: 1, outcome: "loss", strategy: "trend_follow" },
+        { id: "t3", symbol: "BTC-USD", side: "long", entryTime: "2026-09-11T12:30:00Z", entryPrice: 60000, size: 0.1, unrealizedPnl: 5, fees: 1, strategy: "trend_follow" } as never, // still open → ignored
+      ],
+      50, // 1R = $50
+    );
+    expect(stats.trend_follow).toMatchObject({ trades: 2, wins: 1, losses: 1, winRate: 0.5, pnl: 20 });
+    expect(stats.trend_follow.avgR).toBeCloseTo(0.2, 10);
+    expect(stats.trend_follow.lastR.map((r) => Number(r.toFixed(6)))).toEqual([0.6, -0.2]);
+
+    const cards = mapStrategyCards(
+      [{ id: "trend_follow", name: "Trend Follow", description: "d", category: "trend", enabled: true, stats: { signalsGenerated: 7 } }],
+      policy,
+      stats,
+    );
+    expect(cards.find((c) => c.id === "trend_follow")).toMatchObject({ trades: 2, signals: 7, pnlSession: 20, winRate: 0.5 });
+  });
+
+  it("aggregateStrategyStats: engine stopped → empty; unknown risk unit → no R multiples", () => {
+    expect(aggregateStrategyStats(null, 50)).toEqual({});
+    const s = aggregateStrategyStats(
+      [{ id: "t", symbol: "ETH-USD", side: "short", entryTime: "2026-09-11T10:00:00Z", exitTime: "2026-09-11T11:00:00Z", entryPrice: 1, size: 1, realizedPnl: 12, fees: 0, strategy: "trend_follow" }],
+      null,
+    );
+    expect(s.trend_follow).toMatchObject({ trades: 1, wins: 1, pnl: 12, avgR: 0, lastR: [] });
+  });
+});
+
+describe("P5 — positions from the paper API session", () => {
+  it("maps GET /api/positions entries with the engine mark and unrealized P&L", () => {
+    const p = mapEnginePosition({
+      id: "pos-1",
+      symbol: "ETH-PERP-INTX",
+      side: "short",
+      qty: 2,
+      entryPrice: 3000,
+      averagePrice: 3001.5,
+      markPrice: 2950,
+      unrealizedPnlUsd: 100,
+      realizedPnlUsd: 0,
+      stopPrice: 3100,
+      takeProfit: 2800,
+      strategy: "trend_follow",
+      openedAt: "2026-09-11T14:00:00.000Z",
+      lastUpdateAt: "2026-09-11T14:05:00.000Z",
+    });
+    expect(p).toMatchObject({ source: "engine", side: "SHORT", qty: 2, entry: 3000, stop: 3100, target: 2800, mark: 2950, pnl: 100, strat: "trend_follow", opened: "14:00:00" });
+    expect(p.pnlPct).toBeCloseTo((50 / 3000) * 100, 10);
+  });
+
+  it("leaves mark/P&L undefined when the engine has no mark yet", () => {
+    const p = mapEnginePosition({
+      id: "pos-2", symbol: "BTC-USD", side: "long", qty: 1, entryPrice: 60000, averagePrice: 60000, markPrice: null,
+      unrealizedPnlUsd: 0, realizedPnlUsd: 0, stopPrice: null, takeProfit: null, strategy: null, openedAt: null, lastUpdateAt: null,
+    });
+    expect(p.mark).toBeUndefined();
+    expect(p.pnl).toBeUndefined();
+    expect(p.strat).toBe("—");
+  });
+
+  it("book positions (Supabase, engine stopped) never carry a fabricated mark", () => {
+    const p = mapBookPosition({
+      id: "row-1", symbol: "SOL-USD", strategy: "trend_follow", side: "long", qty_open: "3", entry_price: "100.5",
+      stop_price_at_entry: 98, take_profit_price: 105, opened_at: "2026-09-11T09:00:00Z", closed_at: null,
+    });
+    expect(p).toMatchObject({ source: "book", side: "LONG", qty: 3, entry: 100.5 });
+    expect(p.mark).toBeUndefined();
+  });
+
+  it("session scoping: ISO lower bound only when a session is active", () => {
+    expect(sessionSinceIso(null)).toBeNull();
+    expect(sessionSinceIso(undefined)).toBeNull();
+    expect(sessionSinceIso(Date.UTC(2026, 8, 11, 15, 55, 30))).toBe("2026-09-11T15:55:30.000Z");
+  });
+});
+
+describe("P5 — signals respect the guardrails kill list", () => {
+  const row = (strategy: string, allowed: boolean) => ({
+    id: `s-${strategy}`, symbol: "BTC-USD", strategy, decided_at: "2026-09-11T00:00:00Z", side: "buy",
+    score: 0.7, confidence: 0.7, meta_prob: null, allowed, reason: "",
+  });
+
+  it("badges rows from killed strategies as KILLED, never ACCEPTED/REJECTED", () => {
+    const killed = new Set(["breakout", "vwap_mr", "momentum"]);
+    expect(mapSignalRecord(row("breakout", false), killed).state).toBe("KILLED");
+    expect(mapSignalRecord(row("breakout", true), killed).state).toBe("KILLED");
+    expect(mapSignalRecord(row("trend_follow", true), killed).state).toBe("ACCEPTED");
+    expect(mapSignalRecord(row("trend_follow", false), killed).state).toBe("REJECTED");
   });
 });
