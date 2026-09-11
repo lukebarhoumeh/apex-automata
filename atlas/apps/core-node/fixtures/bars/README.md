@@ -16,9 +16,16 @@ not read by the gate:
 - `4h/holdout-2025-03_2026-03/` — 12-month 4h **holdout**; the hard-preflight
   source of truth for counted E[n].
 - `4h/tune-2023-03_2025-03/` — 24-month 4h **tune** window (in-sample only).
+- `4h/tune-2019-01_2023-03/` — 50-month deep-history 4h **tune** window
+  (BTC-USD + ETH-USD only; in-sample only), adjacent to the 2023 tune.
 - `4h/smoke-aug2026/` — August 2026 4h month-block, **SMOKE ONLY — not
   hard-preflight**.
-- `1d/` — 24-month native daily bars.
+- `1d/` — 24-month native daily bars; the loose files are the **sealed
+  HO-H1-DAILY** source (do not regenerate in place — see
+  [`1d/README.md`](./1d/README.md)).
+- `1d/tune-2017-01_2025-03/` — 98-month deep-history native daily **tune**
+  window (BTC-USD + ETH-USD only; in-sample only), ending the day before
+  the sealed holdout window.
 
 Long 15m windows for E2-MOM-ISO (BTC, ETH, SOL; native `FIFTEEN_MINUTE`, no
 rollup) live in `15m/` and are documented in [`15m/README.md`](./15m/README.md);
