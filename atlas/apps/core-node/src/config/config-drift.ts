@@ -84,9 +84,12 @@ export const SCALAR_PINS: readonly ScalarPin[] = [
   { key: 'perps_symbols.BTC-PERP-INTX.strategy_overrides.momentum.takeProfitAtr', expected: 6.0 },
 ];
 
-/** Lists that must contain every listed entry (extra entries are allowed). */
+/**
+ * Lists that must contain every listed entry (extra entries are allowed).
+ * `momentum` joined the global shelf on 2026-09-11 (E2-MOM-ISO KILL).
+ */
 export const LIST_PINS: ReadonlyArray<{ key: string; mustInclude: readonly string[] }> = [
-  { key: 'disabled_strategies', mustInclude: ['vwap_mr', 'breakout'] },
+  { key: 'disabled_strategies', mustInclude: ['vwap_mr', 'breakout', 'momentum'] },
   { key: 'perps_symbols.ETH-PERP-INTX.disabled_strategies', mustInclude: ['momentum'] },
   { key: 'perps_symbols.BTC-PERP-INTX.disabled_strategies', mustInclude: ['momentum'] },
 ];
