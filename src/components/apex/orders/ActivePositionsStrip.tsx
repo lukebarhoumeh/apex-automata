@@ -1,45 +1,42 @@
-import { useEffect, useState } from "react";
 import { ArrowRight, ArrowUp, ArrowDown } from "lucide-react";
 import { Panel } from "@/components/apex/Panel";
 import { Pill } from "@/components/apex/Pill";
 import { fmt } from "@/components/apex/format";
+import { computePositionPnl, computeStopTargetProgress } from "@/lib/position-pnl";
 import { cn } from "@/lib/utils";
+import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
 import type { Position } from "@/types/positions";
 
 interface ActivePositionsStripProps {
   positions: readonly Position[];
+  /** Real marks from the runtime (WS ticker / engine). Absent symbol → "—". */
+  marks?: LiveMarks;
   onViewAll?: () => void;
 }
 
-/** Tiny live-mark jitter so the progress bar moves. */
-function useLiveMarks(initial: readonly Position[]): Position[] {
-  const [rows, setRows] = useState<Position[]>(() => initial.map((p) => ({ ...p })));
-  useEffect(() => {
-    const id = window.setInterval(() => {
-      setRows((prev) =>
-        prev.map((p) => {
-          const base = p.mark ?? p.entry;
-          const mark = base + (Math.random() - 0.5) * base * 0.0006;
-          return { ...p, mark };
-        }),
-      );
-    }, 1400);
-    return () => window.clearInterval(id);
-  }, []);
-  return rows;
-}
+const NO_MARKS: LiveMarks = {};
 
-export function ActivePositionsStrip({ positions, onViewAll }: ActivePositionsStripProps) {
-  const rows = useLiveMarks(positions);
+/**
+ * Active positions valued at the runtime's real marks. Cards are derived from
+ * props on every render — no local ticking state, no synthetic jitter.
+ */
+export function ActivePositionsStrip({ positions, marks = NO_MARKS, onViewAll }: ActivePositionsStripProps) {
+  const markedCount = positions.filter((p) => marks[p.sym] !== undefined).length;
+  const feedLive = positions.length > 0 && markedCount === positions.length;
 
   return (
     <Panel header={false} pad={0}>
       {/* Custom header — needs inline dot + label + pill + right-aligned action */}
       <div className="flex items-center justify-between border-b border-obsidian-line px-4 py-3">
         <div className="flex items-center gap-3">
-          <span className="dot-live" />
+          <span className={feedLive ? "dot-live" : "inline-block h-1.5 w-1.5 rounded-full bg-fg-3"} />
           <span className="label">Active positions</span>
-          <Pill tone="accent">{rows.length} OPEN</Pill>
+          <Pill tone="accent">{positions.length} OPEN</Pill>
+          {positions.length > 0 && !feedLive && (
+            <span className="mono text-[10px] uppercase tracking-[0.09em] text-fg-3">
+              marks {markedCount}/{positions.length}
+            </span>
+          )}
         </div>
         <button
           type="button"
@@ -52,28 +49,25 @@ export function ActivePositionsStrip({ positions, onViewAll }: ActivePositionsSt
       </div>
 
       <div className="grid grid-cols-3 divide-x divide-obsidian-line">
-        {rows.map((p) => (
-          <PositionCard key={p.id} position={p} />
+        {positions.map((p) => (
+          <PositionCard key={p.id} position={p} mark={marks[p.sym]?.price} />
         ))}
       </div>
     </Panel>
   );
 }
 
-function PositionCard({ position }: { position: Position }) {
-  const last = position.mark ?? position.entry;
-  const pnl =
-    position.side === "LONG"
-      ? (last - position.entry) * position.qty
-      : (position.entry - last) * position.qty;
-  const pnlPct = (pnl / (position.entry * position.qty)) * 100;
-  const up = pnl >= 0;
-
-  // Progress along SL—ENTRY—TP; -100..+100
-  const tp = Math.abs(position.target - position.entry);
-  const sl = Math.abs(position.entry - position.stop);
-  const moved = position.side === "LONG" ? last - position.entry : position.entry - last;
-  const progress = Math.max(-100, Math.min(100, (moved / (moved >= 0 ? tp : sl)) * 100));
+function PositionCard({ position, mark }: { position: Position; mark: number | undefined }) {
+  const live = computePositionPnl(position.side, position.entry, position.qty, mark);
+  const up = live ? live.pnl >= 0 : null;
+  const pnlTone = up === null ? "text-fg-3" : up ? "text-up" : "text-down";
+  const progress = computeStopTargetProgress(
+    position.side,
+    position.entry,
+    position.stop,
+    position.target,
+    mark,
+  );
 
   return (
     <div className="flex flex-col gap-3 p-4">
@@ -97,18 +91,18 @@ function PositionCard({ position }: { position: Position }) {
           <span className="mono text-[9px] font-medium uppercase tracking-[0.12em] text-fg-2">
             UNREAL P&amp;L
           </span>
-          <span className={cn("mono text-[18px] font-medium leading-none", up ? "text-up" : "text-down")}>
-            {up ? "+$" : "-$"}
-            {fmt(Math.abs(pnl), 2)}
+          <span className={cn("mono text-[18px] font-medium leading-none", pnlTone)}>
+            {live ? `${up ? "+$" : "-$"}${fmt(Math.abs(live.pnl), 2)}` : "—"}
           </span>
-          <span className={cn("mono text-[11px]", up ? "text-up" : "text-down")}>
-            {up ? "+" : ""}
-            {pnlPct.toFixed(2)}%
+          <span className={cn("mono text-[11px]", pnlTone)}>
+            {live ? `${up ? "+" : ""}${live.pnlPct.toFixed(2)}%` : "no live mark"}
           </span>
         </div>
         <div className="flex flex-col items-end gap-0.5">
           <span className="mono text-[9px] font-medium uppercase tracking-[0.12em] text-fg-2">LAST</span>
-          <span className="mono text-[14px] text-fg-0">${fmt(last, 2)}</span>
+          <span className={cn("mono text-[14px]", live ? "text-fg-0" : "text-fg-3")}>
+            {live ? `$${fmt(live.mark, 2)}` : "—"}
+          </span>
           <span className="mono text-[11px] text-fg-2">qty {fmt(position.qty, 4)}</span>
         </div>
       </div>

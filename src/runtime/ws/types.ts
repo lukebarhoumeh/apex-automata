@@ -67,6 +67,23 @@ export interface StatusPayload {
     exposureUsd?: number;
     openPositionsCount?: number;
   };
+  // Fields below are only present when the backend includes them in the
+  // StatusUpdate envelope. They are passed through untouched (never defaulted)
+  // so a partial WS payload can be merged over the REST /api/status snapshot
+  // without clobbering fields it did not carry (TASK_016 U7).
+  sessionId?: string | null;
+  sessionStartedAt?: number | null;
+  engineState?: string;
+  activeSymbols?: string[];
+  warmupComplete?: boolean;
+  candlesBuffered?: Record<string, number>;
+  pnl?: Record<string, unknown> | null;
+  lastMarketDataAt?: number;
+  lastEngineHeartbeatAt?: number;
+  timestamp?: number;
+  ws?: Record<string, unknown> | null;
+  rest?: Record<string, unknown> | null;
+  exchangeHealth?: Record<string, unknown> | null;
 }
 
 /** PnL Snapshot - canonical P&L payload from backend PnLService */
@@ -200,6 +217,9 @@ export interface PositionPayload {
   pnlR?: number;
   realizedPnlUsd?: number;
   realizedR?: number;
+  /** Engine mark the PositionTracker last valued this position at (paper: spot proxy for perps). */
+  marketPrice?: number;
+  unrealizedPnlUsd?: number;
   openedAt?: string;
   closedAt?: string;
   exitReason?: string;
