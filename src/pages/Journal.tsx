@@ -6,6 +6,7 @@ import {
 } from "@/components/apex/journal/JournalFilterBar";
 import { JournalCard } from "@/components/apex/journal/JournalCard";
 import { useJournalEntries } from "@/hooks/apex/useJournalData";
+import { DemoDataBanner } from "@/components/apex/DemoDataBanner";
 
 export default function Journal() {
   const entries = useJournalEntries();
@@ -28,6 +29,7 @@ export default function Journal() {
 
   return (
     <div className="flex flex-col gap-4 p-6">
+      <DemoDataBanner subject="journal entries" />
       <JournalHero entries={entries.data} />
       <JournalFilterBar filter={filter} onFilter={setFilter} counts={counts} />
 

@@ -8,6 +8,7 @@ import { RHistogram } from "@/components/apex/backtest/RHistogram";
 import { TradeLogTable } from "@/components/apex/backtest/TradeLogTable";
 import { Panel } from "@/components/apex/Panel";
 import { useBacktestData } from "@/hooks/apex/useBacktestData";
+import { DemoDataBanner } from "@/components/apex/DemoDataBanner";
 
 export default function Backtest() {
   const bt = useBacktestData();
@@ -28,6 +29,7 @@ export default function Backtest() {
 
   return (
     <div className="flex flex-col gap-4 p-6">
+      <DemoDataBanner subject="backtest results, equity curve and trade log" />
       <BacktestHero config={B.config} results={B.results} />
       <ConfigPanel config={B.config} preset={B.preset} />
 
