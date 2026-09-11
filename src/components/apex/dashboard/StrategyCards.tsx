@@ -3,7 +3,7 @@ import { Panel } from "@/components/apex/Panel";
 import { Sparkline } from "@/components/apex/Sparkline";
 import { fmtSign } from "@/components/apex/format";
 import { cn } from "@/lib/utils";
-import type { StrategyCardData, StrategyStatus } from "@/types/strategy";
+import type { StrategyCardData, StrategyDisabledBy, StrategyStatus } from "@/types/strategy";
 
 interface StrategyCardsProps {
   strategies: readonly StrategyCardData[];
@@ -13,6 +13,14 @@ const STATUS_COPY: Record<StrategyStatus, { label: string; className: string; do
   on: { label: "Active", className: "text-up", dotColor: "#39d98a" },
   off: { label: "Off",    className: "text-fg-2", dotColor: "#6a7588" },
   cooldown: { label: "Cooldown", className: "text-warn", dotColor: "#ffb020" },
+  // Killed in guardrails.yaml `disabled_strategies` — the SoT, not a runtime toggle.
+  killed: { label: "Disabled · guardrails", className: "text-warn", dotColor: "#ffb020" },
+};
+
+const DISABLED_BY_TITLE: Record<StrategyDisabledBy, string> = {
+  guardrails: "Listed in atlas/config/guardrails.yaml → disabled_strategies. Never registered at runtime; no signal reaches order routing.",
+  runtime: "Disabled in the runtime StrategyRegistry (POST /api/strategies/:id/disable).",
+  "engine-offline": "Engine not running — registration state unknown.",
 };
 
 export function StrategyCards({ strategies }: StrategyCardsProps) {
@@ -22,13 +30,19 @@ export function StrategyCards({ strategies }: StrategyCardsProps) {
     <div className="grid grid-cols-3 gap-4">
       {strategies.map((s) => {
         const status = STATUS_COPY[s.status];
+        const label = s.status === "off" && s.disabledBy === "engine-offline" ? "Off · engine stopped" : status.label;
         const up = s.pnlToday >= 0;
         return (
           <button
             key={s.id}
             type="button"
             onClick={() => navigate(`/signals?strategy=${s.id}`)}
-            className="group relative flex flex-col gap-3 rounded-[10px] border border-obsidian-line bg-obsidian-1 p-4 text-left transition-colors hover:border-obsidian-line-2 hover:bg-obsidian-2"
+            title={s.disabledBy ? DISABLED_BY_TITLE[s.disabledBy] : undefined}
+            data-testid={`strategy-card-${s.id}`}
+            className={cn(
+              "group relative flex flex-col gap-3 rounded-[10px] border border-obsidian-line bg-obsidian-1 p-4 text-left transition-colors hover:border-obsidian-line-2 hover:bg-obsidian-2",
+              s.status === "killed" && "opacity-70",
+            )}
           >
             <div className="flex items-start justify-between gap-3">
               <div>
@@ -38,7 +52,7 @@ export function StrategyCards({ strategies }: StrategyCardsProps) {
                     className="inline-block h-1.5 w-1.5 rounded-full"
                     style={{ background: status.dotColor, boxShadow: `0 0 6px ${status.dotColor}` }}
                   />
-                  {status.label}
+                  {label}
                 </div>
               </div>
               <Sparkline

@@ -1,22 +1,28 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import type { SessionStats } from "@/types/session";
+import type { BotMode, SessionStats } from "@/types/session";
 import type { Position } from "@/types/positions";
 import type { SignalRecord, FeedEvent, SignalState, SignalSide } from "@/types/signals";
 import type { StrategyCardData, StrategyStatus } from "@/types/strategy";
 import type { MarketRegime, RegimeMeter, RegimeMeterTone } from "@/types/regime";
 import type { EquityPoint, EquityRange } from "@/types/equity";
 import type { KpiTile } from "@/types/kpi";
+import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
+import { mergeStrategyPolicy } from "@/lib/strategy-policy";
 import { supabase } from "@/integrations/supabase/client";
 import {
   countActiveMarkets,
   fetchEquityCurve,
+  fetchMetaFilterStats,
   fetchRegimeStatus,
   fetchRuntimeStatus,
   fetchSessionAnalytics,
   fetchStrategies,
+  fetchStrategyPolicy,
   type BackendRegimeEntry,
+  type BackendRuntimeStatus,
   type BackendSessionStats,
   type BackendStrategy,
+  type BackendStrategyPolicy,
 } from "@/services/apexDashboardApi";
 
 const PRIMARY_SYMBOL = "BTC-USD";
@@ -47,17 +53,38 @@ function formatUptime(startIso: string | undefined | null): string {
 // Session stats: map /api/analytics/session → SessionStats
 // ============================================================
 
-function mapSessionStats(
+/**
+ * Engine mode for the hero pill, from the runtime status — never a "paper"
+ * default. Kill switch outranks paused outranks running.
+ */
+export function deriveBotMode(status: BackendRuntimeStatus | null): BotMode {
+  if (!status || !status.engineRunning) return "stopped";
+  if (status.killSwitch?.active || status.engineState === "halted") return "halted";
+  if (status.paused) return "paused";
+  return status.mode === "live" ? "live" : "paper";
+}
+
+export function mapSessionStats(
   raw: BackendSessionStats | null,
-  markets: number,
+  status: BackendRuntimeStatus | null,
 ): SessionStats {
+  const markets = countActiveMarkets(status);
+  const mode = deriveBotMode(status);
+  // Unrealized comes from the PositionTracker snapshot on /api/status — the
+  // same number the engine's own P&L uses. `null` (rendered "—") when the
+  // engine is stopped or the snapshot is missing; never a hard-coded 0.
+  const unrealized =
+    status?.pnl && Number.isFinite(status.pnl.unrealizedPnlUsd)
+      ? status.pnl.unrealizedPnlUsd
+      : null;
+
   if (!raw) {
     return {
       openedAt: "—",
       pnl: 0,
       pnlR: 0,
       realized: 0,
-      unrealized: 0,
+      unrealized,
       trades: 0,
       wins: 0,
       losses: 0,
@@ -69,19 +96,21 @@ function mapSessionStats(
       signalsTaken: 0,
       acceptanceRate: 0,
       uptime: "—",
-      mode: "paper",
+      mode,
       engineVersion: "v2.4.1",
       markets,
       metaThreshold: 0.65,
     };
   }
 
+  const realized = raw.totalPnl ?? 0;
   return {
     openedAt: formatTime(raw.startTime),
-    pnl: raw.totalPnl ?? 0,
+    // Session P&L = closed-trade P&L (TradeAnalytics) + open P&L (PositionTracker).
+    pnl: realized + (unrealized ?? 0),
     pnlR: raw.expectancy ?? 0,
-    realized: raw.netProfit ?? 0,
-    unrealized: 0,
+    realized,
+    unrealized,
     trades: raw.totalTrades ?? 0,
     wins: raw.winningTrades ?? 0,
     losses: raw.losingTrades ?? 0,
@@ -93,7 +122,7 @@ function mapSessionStats(
     signalsTaken: raw.totalTrades ?? 0,
     acceptanceRate: 0,
     uptime: formatUptime(raw.startTime),
-    mode: raw.mode,
+    mode,
     engineVersion: "v2.4.1",
     markets,
     metaThreshold: 0.65,
@@ -111,7 +140,7 @@ export function useSessionStats() {
         fetchSessionAnalytics(),
         fetchRuntimeStatus(),
       ]);
-      return mapSessionStats(raw, countActiveMarkets(status));
+      return mapSessionStats(raw, status);
     },
     staleTime: 5_000,
     refetchInterval: 15_000,
@@ -184,29 +213,23 @@ function num(v: unknown): number {
 
 function mapPosition(row: PositionRow): Position {
   const side = row.side?.toUpperCase() === "SHORT" ? "SHORT" : "LONG";
-  const qty = num(row.qty_open);
-  const entry = num(row.entry_price);
-  const stop = num(row.stop_price_at_entry);
-  const target = num(row.take_profit_price);
-  const mark = entry; // Live mark can be layered in later via useLiveTicker
-  const pnl = side === "LONG" ? (mark - entry) * qty : (entry - mark) * qty;
-  const pnlPct = entry > 0 ? ((side === "LONG" ? mark - entry : entry - mark) / entry) * 100 : 0;
 
+  // The positions table stores no mark price. Marks come from the runtime
+  // (useLiveMarks: WS ticker + engine PositionUpdate) and are layered in at
+  // render time; until one arrives the UI shows "—", never entry-as-mark or a
+  // fabricated $0.00 P&L.
   return {
     id: row.id,
     sym: row.symbol,
     side,
-    qty,
-    entry,
-    stop,
-    target,
+    qty: num(row.qty_open),
+    entry: num(row.entry_price),
+    stop: num(row.stop_price_at_entry),
+    target: num(row.take_profit_price),
     opened: formatTime(row.opened_at),
     strat: row.strategy ?? "—",
     conf: 0,
-    mark,
     sparkline: [],
-    pnl,
-    pnlPct,
   };
 }
 
@@ -234,26 +257,60 @@ export function useOpenPositions() {
 }
 
 // ============================================================
+// Meta-filter status (rule-based gate; no ML model exists)
+// ============================================================
+
+export interface MetaFilterStatus {
+  /** null → engine stopped / signal processor not running. */
+  enabled: boolean | null;
+}
+
+export function useMetaFilterStatus() {
+  return useQuery<MetaFilterStatus>({
+    queryKey: ["apex", "meta-filter-status"],
+    queryFn: async () => {
+      const res = await fetchMetaFilterStats();
+      return { enabled: res ? Boolean(res.enabled) : null };
+    },
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+    placeholderData: keepPreviousData,
+  });
+}
+
+// ============================================================
 // Strategies: /api/strategies → StrategyCardData[]
 // ============================================================
 
-function mapStrategy(s: BackendStrategy): StrategyCardData {
-  const status: StrategyStatus = s.enabled ? "on" : "off";
-  return {
-    id: s.id,
-    name: s.name,
-    status,
-    pnlToday: 0,
-    trades: s.stats?.signalsGenerated ?? 0,
-    winRate: 0,
-    sparkline: [],
-  };
+export function mapStrategyCards(
+  registered: readonly BackendStrategy[],
+  policy: BackendStrategyPolicy | null,
+): StrategyCardData[] {
+  return mergeStrategyPolicy(registered, policy).map((m) => {
+    const status: StrategyStatus =
+      m.disabledBy === "guardrails" ? "killed" : m.enabled ? "on" : "off";
+    return {
+      id: m.id,
+      name: m.name,
+      status,
+      disabledBy: m.disabledBy,
+      pnlToday: 0,
+      trades: m.registered?.stats?.signalsGenerated ?? 0,
+      winRate: 0,
+      sparkline: [],
+    };
+  });
 }
 
 export function useStrategyStatus() {
   return useQuery<readonly StrategyCardData[]>({
     queryKey: ["apex", "strategy-status"],
-    queryFn: async () => (await fetchStrategies()).map(mapStrategy),
+    queryFn: async () => {
+      // Registered plugins (runtime) + guardrails policy (SoT) in parallel so
+      // a strategy killed in guardrails.yaml renders as killed, not missing.
+      const [registered, policy] = await Promise.all([fetchStrategies(), fetchStrategyPolicy()]);
+      return mapStrategyCards(registered, policy);
+    },
     staleTime: 10_000,
     refetchInterval: 30_000,
     placeholderData: keepPreviousData,
@@ -420,7 +477,7 @@ export function useMarketRegime() {
 // KPIs: derived from session + positions + equity
 // ============================================================
 
-export function useDashboardKpis(): { data: KpiTile[] } {
+export function useDashboardKpis(marks: LiveMarks = {}): { data: KpiTile[] } {
   const session = useSessionStats();
   const positions = useOpenPositions();
   const equity = useEquityCurve("ALL");
@@ -428,9 +485,11 @@ export function useDashboardKpis(): { data: KpiTile[] } {
   const sparkSource =
     equity.data && equity.data.length >= 2 ? equity.data.map((p) => p.v).slice(-24) : [0, 0];
 
+  // Notional at the runtime mark when one exists, else at entry (labelled).
   const exposureUsd = positions.data
-    ? positions.data.reduce((acc, p) => acc + (p.mark ?? p.entry) * p.qty, 0)
+    ? positions.data.reduce((acc, p) => acc + (marks[p.sym]?.price ?? p.entry) * p.qty, 0)
     : 0;
+  const unmarked = positions.data ? positions.data.filter((p) => marks[p.sym] === undefined).length : 0;
 
   const tiles: KpiTile[] = [
     {
@@ -466,7 +525,7 @@ export function useDashboardKpis(): { data: KpiTile[] } {
       label: "Open exposure",
       value: `$${Math.round(exposureUsd).toLocaleString()}`,
       delta: positions.data
-        ? `${positions.data.length} positions`
+        ? `${positions.data.length} positions${unmarked > 0 ? ` · ${unmarked} at entry (no mark)` : ""}`
         : "0 positions",
       tone: "neutral",
       sparkline: sparkSource,
