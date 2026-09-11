@@ -1,23 +1,27 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import type { BotMode, SessionStats } from "@/types/session";
-import type { Position } from "@/types/positions";
-import type { SignalRecord, FeedEvent, SignalState, SignalSide } from "@/types/signals";
+import type { Position, PositionSide } from "@/types/positions";
+import type { SignalRecord, FeedEvent, SignalScope, SignalState, SignalSide } from "@/types/signals";
 import type { StrategyCardData, StrategyStatus } from "@/types/strategy";
 import type { MarketRegime, RegimeMeter, RegimeMeterTone } from "@/types/regime";
 import type { EquityPoint, EquityRange } from "@/types/equity";
 import type { KpiTile } from "@/types/kpi";
 import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
 import { mergeStrategyPolicy } from "@/lib/strategy-policy";
+import { aggregateStrategyStats, emptyStrategyStats, type StrategySessionStatsMap } from "@/lib/strategy-stats";
 import { supabase } from "@/integrations/supabase/client";
 import {
   countActiveMarkets,
+  fetchEnginePositions,
   fetchEquityCurve,
   fetchMetaFilterStats,
   fetchRegimeStatus,
   fetchRuntimeStatus,
   fetchSessionAnalytics,
+  fetchSessionTrades,
   fetchStrategies,
   fetchStrategyPolicy,
+  type BackendEnginePosition,
   type BackendRegimeEntry,
   type BackendRuntimeStatus,
   type BackendSessionStats,
@@ -26,6 +30,9 @@ import {
 } from "@/services/apexDashboardApi";
 
 const PRIMARY_SYMBOL = "BTC-USD";
+
+/** Open exposure / equity cap — mirrors the Risk page's HEAT_CAP_PCT. */
+const HEAT_CAP_PCT = 3.0;
 
 // ============================================================
 // Helpers
@@ -49,8 +56,28 @@ function formatUptime(startIso: string | undefined | null): string {
   return `${String(h).padStart(2, "0")}h ${String(m).padStart(2, "0")}m`;
 }
 
+function num(v: unknown): number {
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  if (typeof v === "string") {
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
+function finiteOrNull(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/** ISO lower bound for session-scoped Supabase reads; null when no session is active. */
+export function sessionSinceIso(sessionStartedAt: number | null | undefined): string | null {
+  if (!sessionStartedAt || !Number.isFinite(sessionStartedAt)) return null;
+  const d = new Date(sessionStartedAt);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
 // ============================================================
-// Session stats: map /api/analytics/session → SessionStats
+// Session stats: /api/analytics/session + /api/status → SessionStats
 // ============================================================
 
 /**
@@ -67,65 +94,49 @@ export function deriveBotMode(status: BackendRuntimeStatus | null): BotMode {
 export function mapSessionStats(
   raw: BackendSessionStats | null,
   status: BackendRuntimeStatus | null,
+  metaFilterEnabled: boolean | null = null,
 ): SessionStats {
   const markets = countActiveMarkets(status);
   const mode = deriveBotMode(status);
-  // Unrealized comes from the PositionTracker snapshot on /api/status — the
-  // same number the engine's own P&L uses. `null` (rendered "—") when the
-  // engine is stopped or the snapshot is missing; never a hard-coded 0.
-  const unrealized =
-    status?.pnl && Number.isFinite(status.pnl.unrealizedPnlUsd)
-      ? status.pnl.unrealizedPnlUsd
-      : null;
+  const snapshot = status?.engineRunning ? status.pnl ?? null : null;
 
-  if (!raw) {
-    return {
-      openedAt: "—",
-      pnl: 0,
-      pnlR: 0,
-      realized: 0,
-      unrealized,
-      trades: 0,
-      wins: 0,
-      losses: 0,
-      winRate: 0,
-      heat: 0,
-      heatCap: 3.0,
-      maxDrawDown: 0,
-      signalsSeen: 0,
-      signalsTaken: 0,
-      acceptanceRate: 0,
-      uptime: "—",
-      mode,
-      engineVersion: "v2.4.1",
-      markets,
-      metaThreshold: 0.65,
-    };
-  }
+  // Everything below the fold comes from the PositionTracker/RiskEngine
+  // snapshot on /api/status — the numbers the engine itself risks against.
+  // null (rendered "—") when the engine is stopped; never a hard-coded 0.
+  const unrealized = finiteOrNull(snapshot?.unrealizedPnlUsd);
+  const equity = finiteOrNull(snapshot?.totalEquityUsd);
+  const startEquity = finiteOrNull(snapshot?.sessionStartEquityUsd);
+  const exposure = finiteOrNull(snapshot?.exposureUsd);
+  const riskUnit = finiteOrNull(snapshot?.riskUnitUsd);
+  const heat = equity !== null && equity > 0 && exposure !== null ? (exposure / equity) * 100 : null;
+  const openPositions = snapshot?.openPositionsCount ?? 0;
+  const engineState = status?.engineState ?? (status?.engineRunning ? "running" : "stopped");
 
-  const realized = raw.totalPnl ?? 0;
+  const realized = raw?.totalPnl ?? 0;
+  // Session P&L = closed-trade P&L (TradeAnalytics) + open P&L (PositionTracker).
+  const pnl = realized + (unrealized ?? 0);
+
   return {
-    openedAt: formatTime(raw.startTime),
-    // Session P&L = closed-trade P&L (TradeAnalytics) + open P&L (PositionTracker).
-    pnl: realized + (unrealized ?? 0),
-    pnlR: raw.expectancy ?? 0,
+    openedAt: raw ? formatTime(raw.startTime) : "—",
+    pnl,
+    pnlR: riskUnit !== null && riskUnit > 0 ? pnl / riskUnit : null,
     realized,
     unrealized,
-    trades: raw.totalTrades ?? 0,
-    wins: raw.winningTrades ?? 0,
-    losses: raw.losingTrades ?? 0,
-    winRate: raw.winRate ?? 0,
-    heat: 0,
-    heatCap: 3.0,
-    maxDrawDown: raw.maxDrawdownPct ?? 0,
-    signalsSeen: 0,
-    signalsTaken: raw.totalTrades ?? 0,
-    acceptanceRate: 0,
-    uptime: formatUptime(raw.startTime),
+    equity,
+    startEquity,
+    trades: raw?.totalTrades ?? 0,
+    wins: raw?.winningTrades ?? 0,
+    losses: raw?.losingTrades ?? 0,
+    winRate: raw?.winRate ?? 0,
+    heat,
+    heatCap: HEAT_CAP_PCT,
+    maxDrawDown: raw?.maxDrawdownPct ?? 0,
+    openPositions,
+    uptime: raw ? formatUptime(raw.startTime) : "—",
     mode,
-    engineVersion: "v2.4.1",
+    engineState,
     markets,
-    metaThreshold: 0.65,
+    metaFilterEnabled: status?.engineRunning ? metaFilterEnabled : null,
   };
 }
 
@@ -133,14 +144,14 @@ export function useSessionStats() {
   return useQuery<SessionStats>({
     queryKey: ["apex", "session-stats"],
     queryFn: async () => {
-      // Session analytics + runtime status fetched in parallel so the
-      // "scanning N markets" hero number reflects real active symbols
-      // (spot + perps) instead of a hardcoded constant.
-      const [raw, status] = await Promise.all([
+      // Session analytics + runtime status + meta-filter gate fetched in
+      // parallel; all three describe the same paper session.
+      const [raw, status, meta] = await Promise.all([
         fetchSessionAnalytics(),
         fetchRuntimeStatus(),
+        fetchMetaFilterStats(),
       ]);
-      return mapSessionStats(raw, status);
+      return mapSessionStats(raw, status, meta ? Boolean(meta.enabled) : null);
     },
     staleTime: 5_000,
     refetchInterval: 15_000,
@@ -186,7 +197,7 @@ export function useEquityCurve(range: EquityRange) {
 }
 
 // ============================================================
-// Open positions: Supabase positions table
+// Open positions: engine PositionTracker (running) → Supabase book (stopped)
 // ============================================================
 
 interface PositionRow {
@@ -202,26 +213,16 @@ interface PositionRow {
   closed_at: string | null;
 }
 
-function num(v: unknown): number {
-  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
-  if (typeof v === "string") {
-    const n = parseFloat(v);
-    return Number.isFinite(n) ? n : 0;
-  }
-  return 0;
+function toSide(raw: string | null | undefined): PositionSide {
+  return raw?.toUpperCase() === "SHORT" ? "SHORT" : "LONG";
 }
 
-function mapPosition(row: PositionRow): Position {
-  const side = row.side?.toUpperCase() === "SHORT" ? "SHORT" : "LONG";
-
-  // The positions table stores no mark price. Marks come from the runtime
-  // (useLiveMarks: WS ticker + engine PositionUpdate) and are layered in at
-  // render time; until one arrives the UI shows "—", never entry-as-mark or a
-  // fabricated $0.00 P&L.
+/** Supabase row → book position. No mark: the table stores none. */
+export function mapBookPosition(row: PositionRow): Position {
   return {
     id: row.id,
     sym: row.symbol,
-    side,
+    side: toSide(row.side),
     qty: num(row.qty_open),
     entry: num(row.entry_price),
     stop: num(row.stop_price_at_entry),
@@ -229,29 +230,71 @@ function mapPosition(row: PositionRow): Position {
     opened: formatTime(row.opened_at),
     strat: row.strategy ?? "—",
     conf: 0,
+    source: "book",
     sparkline: [],
   };
 }
 
+/** GET /api/positions entry → engine position with the engine's own mark and unrealized P&L. */
+export function mapEnginePosition(p: BackendEnginePosition): Position {
+  const side = toSide(p.side);
+  const mark = p.markPrice !== null && Number.isFinite(p.markPrice) && p.markPrice > 0 ? p.markPrice : undefined;
+  const entry = num(p.entryPrice);
+  const pnl = mark !== undefined ? p.unrealizedPnlUsd : undefined;
+  const pnlPct =
+    mark !== undefined && entry > 0 ? ((side === "LONG" ? mark - entry : entry - mark) / entry) * 100 : undefined;
+  return {
+    id: p.id,
+    sym: p.symbol,
+    side,
+    qty: num(p.qty),
+    entry,
+    stop: num(p.stopPrice),
+    target: num(p.takeProfit),
+    opened: formatTime(p.openedAt),
+    strat: p.strategy ?? "—",
+    conf: 0,
+    source: "engine",
+    mark,
+    pnl,
+    pnlPct,
+    sparkline: [],
+  };
+}
+
+export interface OpenPositions {
+  source: "engine" | "book";
+  positions: readonly Position[];
+}
+
+async function fetchBookPositions(): Promise<readonly Position[]> {
+  const { data, error } = await supabase
+    .from("positions")
+    .select("id,symbol,strategy,side,qty_open,entry_price,stop_price_at_entry,take_profit_price,opened_at,closed_at")
+    .is("closed_at", null)
+    .order("opened_at", { ascending: false })
+    .limit(50);
+  // Throw on transient errors so React Query keeps the last-good list
+  // instead of clearing the positions table while a refetch stumbles.
+  if (error) throw new Error(`positions fetch: ${error.message}`);
+  return (data as PositionRow[] | null)?.map(mapBookPosition) ?? [];
+}
+
+/**
+ * Engine positions are the paper session's truth (marks, unrealized, stops
+ * from the PositionTracker). Only while the engine is stopped do we fall back
+ * to the Supabase book — the rows a restart would hydrate — and label it so.
+ */
 export function useOpenPositions() {
-  return useQuery<readonly Position[]>({
+  return useQuery<OpenPositions>({
     queryKey: ["apex", "positions"],
     queryFn: async () => {
-      const { data, error } = await supabase
-        .from("positions")
-        .select(
-          "id,symbol,strategy,side,qty_open,entry_price,stop_price_at_entry,take_profit_price,opened_at,closed_at",
-        )
-        .is("closed_at", null)
-        .order("opened_at", { ascending: false })
-        .limit(50);
-      // Throw on transient errors so React Query keeps the last-good list
-      // instead of clearing the positions table while a refetch stumbles.
-      if (error) throw new Error(`positions fetch: ${error.message}`);
-      return (data as PositionRow[] | null)?.map(mapPosition) ?? [];
+      const engine = await fetchEnginePositions();
+      if (engine) return { source: "engine", positions: engine.positions.map(mapEnginePosition) };
+      return { source: "book", positions: await fetchBookPositions() };
     },
     staleTime: 2_000,
-    refetchInterval: 20_000,
+    refetchInterval: 5_000,
     placeholderData: keepPreviousData,
   });
 }
@@ -279,37 +322,52 @@ export function useMetaFilterStatus() {
 }
 
 // ============================================================
-// Strategies: /api/strategies → StrategyCardData[]
+// Strategies: /api/strategies + policy + session trades → StrategyCardData[]
 // ============================================================
 
 export function mapStrategyCards(
   registered: readonly BackendStrategy[],
   policy: BackendStrategyPolicy | null,
+  sessionStats: StrategySessionStatsMap = {},
 ): StrategyCardData[] {
   return mergeStrategyPolicy(registered, policy).map((m) => {
     const status: StrategyStatus =
       m.disabledBy === "guardrails" ? "killed" : m.enabled ? "on" : "off";
+    const s = sessionStats[m.id] ?? emptyStrategyStats();
     return {
       id: m.id,
       name: m.name,
       status,
       disabledBy: m.disabledBy,
-      pnlToday: 0,
-      trades: m.registered?.stats?.signalsGenerated ?? 0,
-      winRate: 0,
+      pnlSession: s.pnl,
+      trades: s.trades,
+      winRate: s.winRate,
+      signals: m.registered?.stats?.signalsGenerated ?? 0,
       sparkline: [],
     };
   });
+}
+
+/** Registered plugins + guardrails policy + the session's closed trades, fetched together. */
+export async function fetchStrategyInputs() {
+  const [registered, policy, trades, status] = await Promise.all([
+    fetchStrategies(),
+    fetchStrategyPolicy(),
+    fetchSessionTrades(),
+    fetchRuntimeStatus(),
+  ]);
+  const riskUnit = status?.engineRunning ? status.pnl?.riskUnitUsd ?? null : null;
+  return { registered, policy, sessionStats: aggregateStrategyStats(trades, riskUnit) };
 }
 
 export function useStrategyStatus() {
   return useQuery<readonly StrategyCardData[]>({
     queryKey: ["apex", "strategy-status"],
     queryFn: async () => {
-      // Registered plugins (runtime) + guardrails policy (SoT) in parallel so
-      // a strategy killed in guardrails.yaml renders as killed, not missing.
-      const [registered, policy] = await Promise.all([fetchStrategies(), fetchStrategyPolicy()]);
-      return mapStrategyCards(registered, policy);
+      // Trades come from the same TradeAnalytics object that /analytics/session
+      // counts, so card trade counts reconcile with the hero (TASK_016 P5).
+      const { registered, policy, sessionStats } = await fetchStrategyInputs();
+      return mapStrategyCards(registered, policy, sessionStats);
     },
     staleTime: 10_000,
     refetchInterval: 30_000,
@@ -334,15 +392,16 @@ interface SignalRow {
   reason: string | null;
 }
 
-function mapSignalRecord(row: SignalRow): SignalRecord {
+export function mapSignalRecord(row: SignalRow, killed: ReadonlySet<string> = new Set()): SignalRecord {
   const side: SignalSide = row.side?.toUpperCase() === "SELL" ? "SELL" : "BUY";
-  const state: SignalState = row.allowed === false ? "REJECTED" : "ACCEPTED";
+  const strat = row.strategy ?? "—";
+  const state: SignalState = killed.has(strat) ? "KILLED" : row.allowed === false ? "REJECTED" : "ACCEPTED";
   const conf = num(row.meta_prob) || num(row.confidence) || num(row.score);
   return {
     id: row.id,
     ts: formatTime(row.decided_at),
     sym: row.symbol,
-    strat: row.strategy ?? "—",
+    strat,
     side,
     conf,
     state,
@@ -363,30 +422,58 @@ function recordToFeedEvent(r: SignalRecord): FeedEvent {
   };
 }
 
-async function fetchRecentSignals(limit: number): Promise<SignalRecord[]> {
-  const { data, error } = await supabase
+/**
+ * Recent signals, scoped to the active session when one exists, with the
+ * guardrails kill list applied: killed strategies never run, so their rows
+ * are historical — `excludeKilled` drops them (live feed) or they are badged
+ * KILLED (audit stream).
+ */
+export async function fetchRecentSignals(
+  limit: number,
+  scope: SignalScope,
+  excludeKilled: boolean,
+): Promise<SignalRecord[]> {
+  let query = supabase
     .from("signals")
     .select("id,symbol,strategy,decided_at,side,score,confidence,meta_prob,allowed,reason")
     .order("decided_at", { ascending: false })
     .limit(limit);
+  if (scope.sinceIso) query = query.gte("decided_at", scope.sinceIso);
+  const { data, error } = await query;
   if (error) throw new Error(`signals fetch: ${error.message}`);
-  return (data as SignalRow[] | null)?.map(mapSignalRecord) ?? [];
+  const killed = new Set(scope.killedStrategies);
+  const rows = (data as SignalRow[] | null) ?? [];
+  return rows
+    .filter((r) => !excludeKilled || !killed.has(r.strategy ?? "—"))
+    .map((r) => mapSignalRecord(r, killed));
 }
 
-export function useSignalRecords() {
+/** Guardrails kill list for signal scoping; empty when the policy endpoint is unavailable. */
+async function fetchKilledStrategies(): Promise<readonly string[]> {
+  const policy = await fetchStrategyPolicy();
+  return policy?.disabledStrategies ?? [];
+}
+
+export function useSignalRecords(sessionStartedAt: number | null) {
+  const sinceIso = sessionSinceIso(sessionStartedAt);
   return useQuery<readonly SignalRecord[]>({
-    queryKey: ["apex", "signal-records"],
-    queryFn: async () => fetchRecentSignals(20),
+    queryKey: ["apex", "signal-records", sinceIso],
+    queryFn: async () =>
+      fetchRecentSignals(20, { sinceIso, killedStrategies: await fetchKilledStrategies() }, false),
     staleTime: 2_000,
     refetchInterval: 15_000,
     placeholderData: keepPreviousData,
   });
 }
 
-export function useSignalFeed() {
+export function useSignalFeed(sessionStartedAt: number | null) {
+  const sinceIso = sessionSinceIso(sessionStartedAt);
   return useQuery<readonly FeedEvent[]>({
-    queryKey: ["apex", "feed"],
-    queryFn: async () => (await fetchRecentSignals(25)).map(recordToFeedEvent),
+    queryKey: ["apex", "feed", sinceIso],
+    queryFn: async () =>
+      (await fetchRecentSignals(25, { sinceIso, killedStrategies: await fetchKilledStrategies() }, true)).map(
+        recordToFeedEvent,
+      ),
     staleTime: 2_000,
     refetchInterval: 15_000,
     placeholderData: keepPreviousData,
@@ -479,17 +566,18 @@ export function useMarketRegime() {
 
 export function useDashboardKpis(marks: LiveMarks = {}): { data: KpiTile[] } {
   const session = useSessionStats();
-  const positions = useOpenPositions();
+  const open = useOpenPositions();
   const equity = useEquityCurve("ALL");
 
+  const positions = open.data?.positions;
   const sparkSource =
     equity.data && equity.data.length >= 2 ? equity.data.map((p) => p.v).slice(-24) : [0, 0];
 
-  // Notional at the runtime mark when one exists, else at entry (labelled).
-  const exposureUsd = positions.data
-    ? positions.data.reduce((acc, p) => acc + (marks[p.sym]?.price ?? p.entry) * p.qty, 0)
-    : 0;
-  const unmarked = positions.data ? positions.data.filter((p) => marks[p.sym] === undefined).length : 0;
+  // Notional at the freshest mark (WS tick → engine poll), else at entry (labelled).
+  const markOf = (p: Position): number | undefined => marks[p.sym]?.price ?? p.mark;
+  const exposureUsd = positions ? positions.reduce((acc, p) => acc + (markOf(p) ?? p.entry) * p.qty, 0) : 0;
+  const unmarked = positions ? positions.filter((p) => markOf(p) === undefined).length : 0;
+  const bookLabel = open.data?.source === "book" && (positions?.length ?? 0) > 0 ? " · book (engine stopped)" : "";
 
   const tiles: KpiTile[] = [
     {
@@ -524,8 +612,8 @@ export function useDashboardKpis(marks: LiveMarks = {}): { data: KpiTile[] } {
       key: "exposure",
       label: "Open exposure",
       value: `$${Math.round(exposureUsd).toLocaleString()}`,
-      delta: positions.data
-        ? `${positions.data.length} positions${unmarked > 0 ? ` · ${unmarked} at entry (no mark)` : ""}`
+      delta: positions
+        ? `${positions.length} positions${unmarked > 0 ? ` · ${unmarked} at entry (no mark)` : ""}${bookLabel}`
         : "0 positions",
       tone: "neutral",
       sparkline: sparkSource,

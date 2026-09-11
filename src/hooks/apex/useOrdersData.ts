@@ -102,15 +102,30 @@ function mapOrder(row: OrderRow): OrderRecord {
   };
 }
 
-export function useOrders() {
+/** ISO lower bound for session-scoped reads; null when no session is active. */
+function sinceIso(sessionStartedAt: number | null | undefined): string | null {
+  if (!sessionStartedAt || !Number.isFinite(sessionStartedAt)) return null;
+  const d = new Date(sessionStartedAt);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/**
+ * Orders written by the paper session. Scoped to `created_at >= sessionStartedAt`
+ * while a session is active so the blotter and KPI strip describe THIS run;
+ * with no session they show the most recent rows, labelled as such by the page.
+ */
+export function useOrders(sessionStartedAt: number | null = null) {
+  const since = sinceIso(sessionStartedAt);
   return useQuery<readonly OrderRecord[]>({
-    queryKey: ["apex", "orders"],
+    queryKey: ["apex", "orders", since],
     queryFn: async () => {
-      const { data, error } = await supabase
+      let query = supabase
         .from("orders")
         .select("id,external_order_id,symbol,side,type,status,price,quantity,strategy,created_at,updated_at")
         .order("created_at", { ascending: false })
         .limit(100);
+      if (since) query = query.gte("created_at", since);
+      const { data, error } = await query;
       if (error) throw new Error(`orders fetch: ${error.message}`);
       return (data as OrderRow[] | null)?.map(mapOrder) ?? [];
     },
@@ -148,15 +163,18 @@ function mapFill(row: FillRow): FillRecord {
   };
 }
 
-export function useFills() {
+export function useFills(sessionStartedAt: number | null = null) {
+  const since = sinceIso(sessionStartedAt);
   return useQuery<readonly FillRecord[]>({
-    queryKey: ["apex", "fills"],
+    queryKey: ["apex", "fills", since],
     queryFn: async () => {
-      const { data, error } = await supabase
+      let query = supabase
         .from("fills")
         .select("id,order_id,price,quantity,fee_amount,slippage_bps,filled_at,orders!inner(symbol,side)")
         .order("filled_at", { ascending: false })
         .limit(50);
+      if (since) query = query.gte("filled_at", since);
+      const { data, error } = await query;
       if (error) throw new Error(`fills fetch: ${error.message}`);
       // Supabase joins return the embedded table as an object (for !inner with
       // a single FK) or an array; normalize to object form for mapFill.

@@ -16,9 +16,13 @@ export interface StrategyCardData {
   name: string;
   status: StrategyStatus;
   disabledBy?: StrategyDisabledBy;
-  pnlToday: number;
+  /** Realized P&L of this strategy's closed trades in the current session (USD). */
+  pnlSession: number;
+  /** Closed trades in the current session — same TradeAnalytics source as the hero. */
   trades: number;
   winRate: number;
+  /** Signals the plugin emitted in the current process (NOT trades). */
+  signals: number;
   sparkline: readonly number[];
 }
 
@@ -40,21 +44,24 @@ export interface StrategyConfig {
   enabled: boolean;
   disabledBy?: StrategyDisabledBy;
   params: readonly StrategyParam[];
+  /** Session-scoped, from TradeAnalytics closed trades (same SoT as the hero). */
   stats: {
     winRate: number;
     avgR: number;
     trades: number;
+    signals: number;
     lastR: readonly number[];
   };
 }
 
-export interface MetaModelInfo {
+/**
+ * Rule-based meta-filter state (there is no ML model in this codebase).
+ * `enabled === null` → engine stopped / filter state unknown.
+ */
+export interface MetaFilterInfo {
   name: string;
-  features: number;
-  rocAuc: number;
-  precision: number;
-  recall: number;
-  f1: number;
+  enabled: boolean | null;
+  /** Quality-score threshold a signal must reach to pass (0–1). */
   threshold: number;
-  trainedOn: number;
+  rules: readonly { key: string; label: string; enabled: boolean }[];
 }

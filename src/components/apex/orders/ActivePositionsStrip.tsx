@@ -5,10 +5,12 @@ import { fmt } from "@/components/apex/format";
 import { computePositionPnl, computeStopTargetProgress } from "@/lib/position-pnl";
 import { cn } from "@/lib/utils";
 import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
-import type { Position } from "@/types/positions";
+import type { Position, PositionSource } from "@/types/positions";
 
 interface ActivePositionsStripProps {
   positions: readonly Position[];
+  /** engine → GET /api/positions (running session); book → Supabase rows while stopped. */
+  source?: PositionSource;
   /** Real marks from the runtime (WS ticker / engine). Absent symbol → "—". */
   marks?: LiveMarks;
   onViewAll?: () => void;
@@ -16,13 +18,17 @@ interface ActivePositionsStripProps {
 
 const NO_MARKS: LiveMarks = {};
 
+function markFor(position: Position, marks: LiveMarks): number | undefined {
+  return marks[position.sym]?.price ?? position.mark;
+}
+
 /**
  * Active positions valued at the runtime's real marks. Cards are derived from
  * props on every render — no local ticking state, no synthetic jitter.
  */
-export function ActivePositionsStrip({ positions, marks = NO_MARKS, onViewAll }: ActivePositionsStripProps) {
-  const markedCount = positions.filter((p) => marks[p.sym] !== undefined).length;
-  const feedLive = positions.length > 0 && markedCount === positions.length;
+export function ActivePositionsStrip({ positions, source = "engine", marks = NO_MARKS, onViewAll }: ActivePositionsStripProps) {
+  const markedCount = positions.filter((p) => markFor(p, marks) !== undefined).length;
+  const feedLive = source === "engine" && positions.length > 0 && markedCount === positions.length;
 
   return (
     <Panel header={false} pad={0}>
@@ -31,8 +37,15 @@ export function ActivePositionsStrip({ positions, marks = NO_MARKS, onViewAll }:
         <div className="flex items-center gap-3">
           <span className={feedLive ? "dot-live" : "inline-block h-1.5 w-1.5 rounded-full bg-fg-3"} />
           <span className="label">Active positions</span>
-          <Pill tone="accent">{positions.length} OPEN</Pill>
-          {positions.length > 0 && !feedLive && (
+          <Pill tone={source === "book" ? "warn" : "accent"}>
+            {positions.length} {source === "book" ? "ON BOOK" : "OPEN"}
+          </Pill>
+          {source === "book" && (
+            <span className="mono text-[10px] uppercase tracking-[0.09em] text-warn/90">
+              engine stopped · no live marks
+            </span>
+          )}
+          {source === "engine" && positions.length > 0 && !feedLive && (
             <span className="mono text-[10px] uppercase tracking-[0.09em] text-fg-3">
               marks {markedCount}/{positions.length}
             </span>
@@ -50,7 +63,7 @@ export function ActivePositionsStrip({ positions, marks = NO_MARKS, onViewAll }:
 
       <div className="grid grid-cols-3 divide-x divide-obsidian-line">
         {positions.map((p) => (
-          <PositionCard key={p.id} position={p} mark={marks[p.sym]?.price} />
+          <PositionCard key={p.id} position={p} mark={markFor(p, marks)} />
         ))}
       </div>
     </Panel>

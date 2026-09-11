@@ -29,11 +29,13 @@ const TONE_ICON: Record<MetricTile["tone"], string> = {
 
 interface OrdersKpiStripProps {
   stats: OrderStats;
+  /** What window the counts describe, e.g. "this session" or "recent · engine stopped". */
+  scopeLabel?: string;
 }
 
-export function OrdersKpiStrip({ stats }: OrdersKpiStripProps) {
+export function OrdersKpiStrip({ stats, scopeLabel = "this session" }: OrdersKpiStripProps) {
   const tiles: MetricTile[] = [
-    { label: "Orders today", value: stats.total, tone: "neutral", icon: ListOrdered },
+    { label: `Orders · ${scopeLabel}`, value: stats.total, tone: "neutral", icon: ListOrdered },
     {
       label: "Filled",
       value: stats.filled,

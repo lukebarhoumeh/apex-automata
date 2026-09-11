@@ -40,7 +40,11 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
   const mode = MODE_COPY[session.mode];
   const sparkData = intradayEquity.slice(-60).map((p) => p.v);
   const pnlUp = pnl >= 0;
-  const heatPctLabel = `${session.heat.toFixed(1)}% / ${session.heatCap.toFixed(1)}%`;
+  const heatKnown = session.heat !== null;
+  const heatPctLabel = heatKnown ? `${session.heat!.toFixed(2)}% / ${session.heatCap.toFixed(1)}%` : "—";
+  const sessionActive = mode.scanning || session.mode === "halted";
+  const equityDelta =
+    session.equity !== null && session.startEquity !== null ? session.equity - session.startEquity : null;
 
   return (
     <div
@@ -83,9 +87,9 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
                 {mode.label} MODE
               </span>
             </span>
-            <Pill tone="accent">
+            <Pill tone={sessionActive ? "accent" : "default"} title="TradingEngine state reported by /api/status">
               <Zap size={10} strokeWidth={2} className="-ml-0.5 mr-0.5" />
-              ENGINE {session.engineVersion}
+              ENGINE {session.engineState.toUpperCase()}
             </Pill>
           </div>
 
@@ -108,14 +112,26 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
             </div>
           </div>
 
+          {/* Every number here is the paper session's own (TradeAnalytics /
+              PositionTracker via /api/status). The meta-filter is rule-based —
+              there is no ML model, so no "p ≥ x" claim. */}
           <p className="max-w-[380px] text-[12.5px] leading-[1.55] text-fg-1">
-            {mode.subtitle}. Meta model gating at{" "}
-            <span className="mono text-fg-0">p ≥ {session.metaThreshold.toFixed(2)}</span>.
-            Ran <span className="mono text-fg-0">{session.signalsSeen}</span> candidates · took{" "}
-            <span className="mono" style={{ color: "hsl(var(--accent-2))" }}>
-              {session.signalsTaken}
-            </span>{" "}
-            this session.
+            {mode.subtitle}.{" "}
+            {sessionActive ? (
+              <>
+                Rule-based meta-filter{" "}
+                <span className={cn("mono", session.metaFilterEnabled === false ? "text-warn" : "text-fg-0")}>
+                  {session.metaFilterEnabled === null ? "state unknown" : session.metaFilterEnabled ? "gating" : "BYPASSED"}
+                </span>
+                . <span className="mono text-fg-0">{session.trades}</span> closed trades ·{" "}
+                <span className="mono" style={{ color: "hsl(var(--accent-2))" }}>
+                  {session.openPositions}
+                </span>{" "}
+                open this session.
+              </>
+            ) : (
+              <>Session stats appear when a paper session is running.</>
+            )}
           </p>
 
           <div className="mt-1 flex items-center gap-2">
@@ -156,7 +172,7 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
           </div>
 
           <div className="mt-2.5 flex items-start gap-5 text-[12px]">
-            <MiniStat label="Realized" value={`$${fmt(session.realized, 2)}`} />
+            <MiniStat label="Realized" value={`$${fmt(session.realized, 2)}`} title="Closed-trade P&L (TradeAnalytics)" />
             <MiniStat
               label="Unrealized"
               value={unreal === null ? "—" : `${unreal >= 0 ? "+" : "-"}$${fmt(Math.abs(unreal), 2)}`}
@@ -165,8 +181,19 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
             />
             <MiniStat
               label="In R"
-              value={`+${session.pnlR.toFixed(2)}R`}
-              tone="accent"
+              value={session.pnlR === null ? "—" : `${session.pnlR >= 0 ? "+" : "-"}${Math.abs(session.pnlR).toFixed(2)}R`}
+              tone={session.pnlR === null ? "muted" : "accent"}
+              title={session.pnlR === null ? "Risk unit unknown — engine stopped" : "Session P&L ÷ 1R (riskUnitUsd from the PnL snapshot)"}
+            />
+            <MiniStat
+              label="Equity"
+              value={session.equity === null ? "—" : `$${fmt(session.equity, 2)}`}
+              tone={session.equity === null ? "muted" : equityDelta === null || equityDelta >= 0 ? "neutral" : "down"}
+              title={
+                session.equity === null
+                  ? "No PnL snapshot — engine stopped"
+                  : `Sizing equity from the PnL snapshot${session.startEquity !== null ? ` · session start $${fmt(session.startEquity, 2)}` : ""}`
+              }
             />
           </div>
 
@@ -187,28 +214,36 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
           </div>
         </div>
 
-        {/* Col 3 — Heat + quick stats */}
+        {/* Col 3 — Exposure heat + quick stats */}
         <div className="flex flex-col gap-2.5 border-l border-obsidian-line pl-7">
           <div className="flex items-center justify-between">
-            <div className="label">Portfolio heat</div>
-            <span className="mono text-[11px] text-fg-1">{heatPctLabel}</span>
+            <div className="label" title="Open exposure as % of equity — same definition as the Risk page">
+              Portfolio heat
+            </div>
+            <span className={cn("mono text-[11px]", heatKnown ? "text-fg-1" : "text-fg-3")}>{heatPctLabel}</span>
           </div>
           <div className="relative">
-            <HeatBar value={session.heat} cap={session.heatCap} warn={0.66} />
+            <HeatBar value={session.heat ?? 0} cap={session.heatCap} warn={0.66} />
             <span
               aria-hidden
               className="absolute top-[-2px] h-2 w-px bg-warn"
               style={{ left: "66%" }}
             />
           </div>
-          <div className="mono text-[10.5px] text-fg-3">0% — 2% — CAP 3%</div>
+          <div className="mono text-[10.5px] text-fg-3">
+            {heatKnown ? `exposure / equity — cap ${session.heatCap.toFixed(0)}%` : "no PnL snapshot — engine stopped"}
+          </div>
 
           <div className="my-1.5 h-px bg-obsidian-line" />
 
           <div className="flex flex-wrap gap-x-5 gap-y-3">
-            <QuickStat label="Win rate" value={`${(session.winRate * 100).toFixed(1)}%`} tone="up" />
-            <QuickStat label="Trades" value={String(session.trades)} />
-            <QuickStat label="W/L" value={`${session.wins}/${session.losses}`} />
+            <QuickStat
+              label="Win rate"
+              value={session.trades > 0 ? `${(session.winRate * 100).toFixed(1)}%` : "—"}
+              tone={session.trades > 0 ? "up" : undefined}
+            />
+            <QuickStat label="Trades" value={sessionActive ? String(session.trades) : "—"} />
+            <QuickStat label="W/L" value={sessionActive ? `${session.wins}/${session.losses}` : "—"} />
             <QuickStat label="Regime" value={regime.label} small />
             <QuickStat label="TF" value={regime.timeframe} />
             <QuickStat label="Uptime" value={session.uptime} />
