@@ -123,7 +123,7 @@ describe('loadGuardrails() single source', () => {
   test('loads with no argument', () => {
     const g = loadGuardrails();
     expect(g.account.equity_usd).toBeGreaterThan(0);
-    expect(g.disabled_strategies).toEqual(expect.arrayContaining(['vwap_mr', 'breakout']));
+    expect(g.disabled_strategies).toEqual(expect.arrayContaining(['vwap_mr', 'breakout', 'momentum']));
   });
 
   test('accepts an atlasRoot that resolves to the canonical file', () => {
@@ -177,7 +177,7 @@ describe('checkConfigDrift() on the real repository', () => {
   test('strategies.json mirrors disabled_strategies and carries no parameters', () => {
     const { strategies } = JSON.parse(realStrategiesJson);
     expect(strategies).toEqual({
-      momentum: { enabled: true },
+      momentum: { enabled: false },
       trend_follow: { enabled: true },
       vwap_mr: { enabled: false },
       breakout: { enabled: false },
@@ -267,9 +267,10 @@ describe('checkConfigDrift() fixtures', () => {
 
     test('claiming enabled=false for an active strategy is also a conflict', () => {
       const { violations } = checkConfigDrift(
-        makeRepo({ strategiesJson: withStrategies((s) => { s.momentum.enabled = false; }) })
+        makeRepo({ strategiesJson: withStrategies((s) => { s.trend_follow.enabled = false; }) })
       );
       expect(codes(violations)).toEqual(['strategies_json_enabled_conflict']);
+      expect(violations[0].key).toBe('strategies.trend_follow.enabled');
       expect(violations[0].message).toMatch(/does not disable it/);
     });
 
@@ -296,14 +297,14 @@ describe('checkConfigDrift() fixtures', () => {
     });
 
     test('tracks disabled_strategies from the canonical file, not a hardcoded list', () => {
-      // Disable momentum in guardrails; the mirror must follow.
+      // Disable trend_follow (the last active strategy) in guardrails; the mirror must follow.
       const { violations } = checkConfigDrift(
         makeRepo({
-          mutateCanonical: (doc) => { doc.disabled_strategies.push('momentum'); },
+          mutateCanonical: (doc) => { doc.disabled_strategies.push('trend_follow'); },
         })
       );
       expect(codes(violations)).toEqual(['strategies_json_enabled_conflict']);
-      expect(violations[0].key).toBe('strategies.momentum.enabled');
+      expect(violations[0].key).toBe('strategies.trend_follow.enabled');
     });
 
     test('invalid JSON is reported once', () => {
@@ -410,9 +411,16 @@ describe('checkConfigDrift() fixtures', () => {
     );
 
     pinCase(
-      'global disabled_strategies must keep vwap_mr and breakout (extras allowed); the strategies.json mirror follows',
+      'global disabled_strategies must keep vwap_mr, breakout and momentum (extras allowed); the strategies.json mirror follows',
       (doc) => { doc.disabled_strategies = ['vwap_mr', 'something_else']; },
-      ['strategies.breakout.enabled', 'disabled_strategies'],
+      ['strategies.momentum.enabled', 'strategies.breakout.enabled', 'disabled_strategies', 'disabled_strategies'],
+      ['strategies_json_enabled_conflict', 'strategies_json_enabled_conflict', 'pin_list_missing_entry', 'pin_list_missing_entry']
+    );
+
+    pinCase(
+      'dropping only momentum from the global shelf (E2-MOM-ISO KILL) is caught',
+      (doc) => { doc.disabled_strategies = ['vwap_mr', 'breakout']; },
+      ['strategies.momentum.enabled', 'disabled_strategies'],
       ['strategies_json_enabled_conflict', 'pin_list_missing_entry']
     );
 

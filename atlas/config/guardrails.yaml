@@ -36,9 +36,17 @@ fees:
 # VWAP MR: Zero/1 trade across 12 months — ADX ranging regime too short
 # Breakout: Negative-EV even at zero fees — signal has no edge
 # See PHASE3_BACKTEST_VERDICT.md for full analysis
+#
+# Momentum: E2-MOM-ISO KILL (2026-09-11, TM+Algo+Risk SoT). Perps momentum was
+# already off per-symbol (F4 follow-up §8, see perps_symbols below); this shelves
+# spot momentum (BTC-USD / ETH-USD / SOL-USD) too, so no momentum signal reaches
+# order routing in paper or live. The `momentum:` parameter block and per-symbol
+# strategy_overrides stay in place (desk pins, one-line undo).
+# Enforced by `pnpm check:config` (config-drift.ts LIST_PINS).
 disabled_strategies:
   - vwap_mr
   - breakout
+  - momentum
 
 # Backtest realism model. Read by atlas/apps/core-node/src/backtesting/backtest-engine.ts
 # to make backtest P&L comparable to paper/live behaviour. These knobs are

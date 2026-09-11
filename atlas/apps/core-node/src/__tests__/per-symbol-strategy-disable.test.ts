@@ -12,7 +12,9 @@
  *
  *   2. YAML state — `guardrails.yaml` carries `disabled_strategies:
  *      [momentum]` on BOTH `perps_symbols.{ETH,BTC}-PERP-INTX` AND nothing
- *      on the spot `per_symbol.*` blocks (so spot momentum keeps firing).
+ *      on the spot `per_symbol.*` blocks. Since E2-MOM-ISO (2026-09-11)
+ *      spot momentum is shelved via the GLOBAL `disabled_strategies` list
+ *      instead, so the per-symbol blocks stay untouched (one-line undo).
  *
  *   3. SignalProcessor.processSignal end-to-end gate — a `momentum` signal
  *      on `ETH-PERP-INTX` is rejected with the structured-log
@@ -175,7 +177,7 @@ describe('guardrails.yaml — disabled_strategies state (F4 follow-up §8)', () 
     expect(guardrails.perps_symbols?.['BTC-PERP-INTX']?.disabled_strategies).toEqual(['momentum']);
   });
 
-  it('spot ETH-USD has no per-symbol disable list (momentum still fires on spot)', () => {
+  it('spot ETH-USD has no per-symbol disable list (spot momentum is shelved globally, not per-symbol)', () => {
     const eth = guardrails.per_symbol?.['ETH-USD'];
     expect(eth, 'ETH-USD per_symbol block missing').toBeDefined();
     expect(eth?.disabled_strategies).toBeUndefined();
@@ -189,8 +191,8 @@ describe('guardrails.yaml — disabled_strategies state (F4 follow-up §8)', () 
     expect(guardrails.per_symbol?.['SOL-USD']?.disabled_strategies).toBeUndefined();
   });
 
-  it('global disabled_strategies still only contains the Phase-3 kills', () => {
-    expect(new Set(guardrails.disabled_strategies)).toEqual(new Set(['vwap_mr', 'breakout']));
+  it('global disabled_strategies contains the Phase-3 kills plus momentum (E2-MOM-ISO KILL)', () => {
+    expect(new Set(guardrails.disabled_strategies)).toEqual(new Set(['vwap_mr', 'breakout', 'momentum']));
   });
 
   it('buildPerSymbolDisabledStrategies(guardrails) flattens to exactly the two perp symbols', () => {

@@ -5,7 +5,7 @@
 
   "strategies": {
     "momentum": {
-      "enabled": true
+      "enabled": false
     },
     "trend_follow": {
       "enabled": true
