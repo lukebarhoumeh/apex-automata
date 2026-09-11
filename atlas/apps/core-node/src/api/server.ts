@@ -12,6 +12,7 @@ import {
   buildPerSymbolDisabledStrategies,
   isSymbolStrategyDisabled,
 } from '../strategies/per-symbol-disable';
+import { buildRegimeGateConfig, evaluateRegimeGate } from '../strategies/regime-gate';
 import { computeRawEntryFillPrice } from '../trading/position-entry-vwap';
 import { buildFillRow, FILLS_UPSERT_ON_CONFLICT, FillRowFillRef, FillRowOrderRef } from '../persistence/fill-row';
 import { createClient } from '@supabase/supabase-js';
@@ -1537,6 +1538,10 @@ app.post('/api/engine/start', async (req, res) => {
     // single map. Passed to SignalProcessor for the live gate, and used by
     // the signal:generated defence-in-depth handler below.
     const perSymbolDisabledStrategies = buildPerSymbolDisabledStrategies(guardrails);
+    // A6 (2026-05-29): regime-conditional gates (disabled by default). Passed
+    // to SignalProcessor for the live gate; re-checked in the signal:generated
+    // defence-in-depth handler below.
+    const regimeConditionalGates = buildRegimeGateConfig(guardrails);
     // Momentum runtime constants live in guardrails.yaml's `momentum:` block
     // (or per-symbol overrides). Plugin configSchema in
     // strategies/plugins/builtin/momentum-strategy.ts is the source of
@@ -1590,6 +1595,7 @@ app.post('/api/engine/start', async (req, res) => {
       supabaseKey: env.SUPABASE_SERVICE_KEY || '',
       disabledStrategies,
       perSymbolDisabledStrategies,
+      regimeConditionalGates,
       strategies: {
         breakout: {
           enabled: !disabledStrategies.includes('breakout'),
@@ -1856,6 +1862,41 @@ app.post('/api/engine/start', async (req, res) => {
             },
           });
           return;
+        }
+
+        // Defense-in-depth (A6 regime gate): SignalProcessor's regime_gate
+        // stage should have caught this already (disabled by default). Re-check
+        // at the final chokepoint, mirroring the per_symbol_disable defense
+        // above. Added 2026-05-29.
+        {
+          const gatedRegime =
+            typeof signal.metadata?.regime === 'string' ? signal.metadata.regime : undefined;
+          const regimeDecision = evaluateRegimeGate(regimeConditionalGates, {
+            strategy: signal.strategy,
+            symbol: signal.symbol,
+            regime: gatedRegime,
+          });
+          if (regimeDecision.blocked) {
+            logger.warn(
+              `SECURITY: regime-gated (${signal.symbol}/${signal.strategy}/${gatedRegime}) reached signal:generated handler — rejected`,
+              { signalId: signal.id, symbol: signal.symbol, strategy: signal.strategy, regime: gatedRegime },
+            );
+            recordSignalFiltered(logger, {
+              stage: 'regime_gate',
+              reason: 'router_defense_in_depth',
+              symbol: signal.symbol,
+              strategy: signal.strategy,
+              signalId: signal.id,
+              direction: signal.direction,
+              strength: signal.strength,
+              context: {
+                source: 'api_server',
+                regime: gatedRegime,
+                blockRegimes: regimeDecision.rule?.blockRegimes,
+              },
+            });
+            return;
+          }
         }
 
         // Defense-in-depth (global): even if signal-processor.ts's disabled-

@@ -43,6 +43,10 @@ function printSummary(result: BacktestResult, feeTier: FeeTierLabel): void {
   console.log(`Long/Short entries: ${m.longEntries}/${m.shortEntries} (sell-exits=${m.sellSignalExits}, short-blocked=${m.shortBlocked})`);
   console.log(`EV gate: mode=${m.evGate.mode} evaluated=${m.evGate.evaluated} rejected=${m.evGate.rejected} shadow-would-reject=${m.evGate.shadowWouldReject}`);
   console.log(`Regime gate: enabled=${result.regimeGate.enabled} minCompat=${result.regimeGate.minCompatibilityScore} minConf=${result.regimeGate.minRegimeConfidence}`);
+  // A6 regime-conditional gates (guardrails.regime_gates) — distinct from the
+  // RegimeFilter line above. Ships disabled; `--regime-conditional-gates` flips it for a run.
+  const a6 = result.config.regimeConditionalGates;
+  console.log(`Regime-conditional gates (A6): enabled=${a6?.enabled ?? false} rules=${a6?.rules.length ?? 0}`);
   console.log(`Total Return: ${m.returnPercent.toFixed(2)}%`);
   console.log(`Sharpe Ratio: ${m.sharpeRatio.toFixed(2)}`);
   console.log(`Win Rate: ${(m.winRate * 100).toFixed(2)}%`);
@@ -172,7 +176,18 @@ async function main() {
       type: 'string',
       choices: ['on', 'off'],
       default: 'on',
-      describe: 'Regime/strategy compatibility filter (RegimeFilter). Default on.',
+      describe:
+        'Regime/strategy compatibility filter (RegimeFilter). Default on. ' +
+        'NOT the A6 guardrails.regime_gates policy — see --regime-conditional-gates.',
+    })
+    .option('regime-conditional-gates', {
+      type: 'boolean',
+      describe:
+        'A6: enable regime-conditional gates for THIS run (overrides ' +
+        'guardrails.regime_gates.enabled=false). The rules themselves come ' +
+        'from guardrails.yaml regime_gates.rules. Use to measure projected ' +
+        'impact without changing live/paper config.',
+      default: false,
     })
     .option('optimize', {
       type: 'boolean',
@@ -210,6 +225,11 @@ async function main() {
   const venueOverride = argv.venue ? (String(argv.venue) as MarketVenue) : undefined;
   const allowSynthetic = Boolean(argv.allowSynthetic);
   const barMinutes = Number(argv.barMinutes);
+  // A6 (2026-05-29): regime-conditional gates default to guardrails.regime_gates
+  // (disabled unless the YAML flips `enabled: true`). The flag force-enables
+  // for this run only so projected impact can be measured without touching
+  // live/paper config. Wired through buildBacktestConfig() (below).
+  const forceRegimeConditionalGates = Boolean(argv.regimeConditionalGates);
 
   logger.info('Starting backtest', {
     startDate: argv.startDate,
@@ -222,6 +242,7 @@ async function main() {
     venueOverride: venueOverride ?? 'per-symbol',
     evGateMode,
     regimeGates: argv.regimeGates,
+    regimeConditionalGates: forceRegimeConditionalGates ? 'forced-on' : 'guardrails',
     barMinutes,
     allowSynthetic,
     fixtureDir,
@@ -263,6 +284,7 @@ async function main() {
       venueOverride,
       evGateMode,
       regimeGates: String(argv.regimeGates) !== 'off',
+      forceRegimeConditionalGates,
       slippageRate: argv.slippage !== undefined ? Number(argv.slippage) : undefined,
     },
     guardrails,

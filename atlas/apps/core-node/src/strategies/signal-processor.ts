@@ -25,6 +25,7 @@ import {
   PerSymbolDisabledStrategies,
   isSymbolStrategyDisabled,
 } from './per-symbol-disable';
+import { RegimeGateConfig, evaluateRegimeGate } from './regime-gate';
 
 export interface SignalProcessorConfig {
   supabaseUrl: string;
@@ -46,6 +47,12 @@ export interface SignalProcessorConfig {
   // perps_symbols + hyperliquid_symbols `.disabled_strategies` fields via
   // `buildPerSymbolDisabledStrategies()`. See ./per-symbol-disable.ts.
   perSymbolDisabledStrategies?: PerSymbolDisabledStrategies;
+  // A6 (2026-05-29) — regime-conditional gate config (disabled by default).
+  // Built once from guardrails.regime_gates via buildRegimeGateConfig().
+  // Not to be confused with the RegimeFilter (`regimeFilter` below / the
+  // backtest `regimeGates` on|off toggle) — this is the strategy × regime
+  // block-rule policy layered on top of it.
+  regimeConditionalGates?: RegimeGateConfig;
   // Regime detection configuration
   regimeDetector?: Partial<RegimeDetectorConfig>;
   regimeFilter?: Partial<RegimeFilterConfig>;
@@ -1152,6 +1159,48 @@ export class SignalProcessor extends EventEmitter {
       positionMultiplier: filterResult.positionMultiplier,
       regimeCompatibility: filterResult.compatibilityScore,
     };
+
+    // A6 (2026-05-29) — regime-conditional gate. DISABLED BY DEFAULT via
+    // guardrails.regime_gates.enabled. Runs AFTER the RegimeFilter so it reads
+    // the confidently-stamped regime (adjustedSignal.metadata.regime), and
+    // BEFORE the meta-filter so a gated signal never consumes the cold-streak /
+    // quality budget. Composes additively on top of the plugin-level
+    // regimeCompatibility gate (which already refuses trend_follow in
+    // ranging/choppy) — this layer encodes the empirical edge the static matrix
+    // misses (e.g. trend_follow's weak_trend bleed). Audited via the signal
+    // funnel exactly like the per_symbol_disable gate above.
+    // See docs/research/2026-05-29_a6-regime-conditional-gates.md.
+    const stampedRegime =
+      typeof adjustedSignal.metadata?.regime === 'string'
+        ? adjustedSignal.metadata.regime
+        : undefined;
+    const regimeGateDecision = evaluateRegimeGate(this.config.regimeConditionalGates, {
+      strategy: adjustedSignal.strategy,
+      symbol: adjustedSignal.symbol,
+      regime: stampedRegime,
+    });
+    if (regimeGateDecision.blocked) {
+      this.emit(
+        'signal:filtered',
+        adjustedSignal,
+        `Regime gate: ${adjustedSignal.strategy} blocked in ${stampedRegime ?? 'unknown'} regime`,
+      );
+      recordSignalFiltered(this.logger, {
+        stage: 'regime_gate',
+        reason: 'regime_blocked',
+        symbol: adjustedSignal.symbol,
+        strategy: adjustedSignal.strategy,
+        signalId: adjustedSignal.id,
+        direction: adjustedSignal.direction,
+        strength: adjustedSignal.strength,
+        context: {
+          source: 'signal_processor',
+          regime: stampedRegime,
+          blockRegimes: regimeGateDecision.rule?.blockRegimes,
+        },
+      });
+      return;
+    }
 
     // Apply rule-based meta filter (trade quality filter)
     const indicators = this.indicators.get(signal.symbol) || {};

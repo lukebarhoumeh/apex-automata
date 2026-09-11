@@ -371,6 +371,38 @@ live:
   min_quote_usd: 20
   ev_gate_mode: enforce
 
+# A6 (2026-05-29) — Regime-conditional gates. DISABLED BY DEFAULT.
+# ---------------------------------------------------------------------------
+# Live/paper behaviour is UNCHANGED while `enabled: false` (the gate is a
+# no-op). Flip `enabled: true` ONLY after a human reviews the trade-count vs
+# edge trade-off in docs/research/2026-05-29_a6-regime-conditional-gates.md.
+# To MEASURE projected impact in a backtest WITHOUT changing this default:
+#   pnpm backtest --regime-conditional-gates --start-date <s> --end-date <e> --products <...>
+# (NB: the backtest CLI's `--regime-gates on|off` is the unrelated RegimeFilter
+# compatibility toggle from TASK_017 — it does NOT read this block.)
+#
+# Mechanism: each rule blocks `strategy` signals when the CONFIDENTLY-classified
+# regime (signal.metadata.regime, stamped by RegimeFilter / the strategy plugin)
+# is in `block_regimes`. Optional `venues` ([spot]|[PERP]) and `symbols` narrow
+# a rule. Low-confidence signals (no stamped regime) are never gated. Composes
+# ON TOP OF the plugin-level regimeCompatibility gate (which already refuses
+# trend_follow in ranging/choppy) and the RegimeFilter — it is strictly
+# additive, never a relaxation.
+#
+# Empirical basis (8fea8b1 backtests, HL 4.5bps): trend_follow bleeds in
+# weak_trend — PF 0.78 (90d, n=143) and PF 0.80 (12m, n=405) — and only shows
+# positive edge in strong_trend (PF 1.41, 12m, n=16). Blocking weak_trend keeps
+# only the strong_trend edge. CAVEAT: strong_trend is rare, so this nearly
+# silences trend_follow — read the doc's §"projected impact" before enabling.
+# Momentum is intentionally NOT gated here: its regime edge is NOT stationary
+# (strong_trend PF 3.73 over 90d vs 0.46 over 12m), so a momentum regime gate
+# would overfit to one window.
+regime_gates:
+  enabled: false
+  rules:
+    - strategy: trend_follow
+      block_regimes: [weak_trend]
+
 compliance:
   tax_method: FIFO
   export_frequency_days: 7
