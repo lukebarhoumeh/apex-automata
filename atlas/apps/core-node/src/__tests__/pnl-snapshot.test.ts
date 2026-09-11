@@ -3,9 +3,10 @@
  *
  * Pins:
  *   - `sessionId` is the runtime trading_sessions id (not `paper-<date>`);
- *   - every numeric field is a finite number; `totalEquityUsd` comes from the
- *     risk engine and, if that is ever non-finite, is derived from the session
- *     anchor + P&L — never from a 50_000 / 100_000 constant;
+ *   - every numeric field is a finite number; paper `totalEquityUsd` is
+ *     mark-to-market from the session anchor (start + realized + unrealized),
+ *     live `totalEquityUsd` is the exchange snapshot — never a 50_000 / 100_000
+ *     constant; the risk engine's clamped sizing figure rides along separately;
  *   - no equity anchor at all is an error, not a demo number.
  */
 
@@ -42,8 +43,10 @@ describe('buildPnlSnapshotPayload', () => {
     expect(snap.riskDay).toBe('2026-09-11');
     expect(snap.sessionStartEquityUsd).toBe(10_000);
     expect(snap.dayStartEquityUsd).toBe(10_000);
+    // paper SoT: start + realized + unrealized (10_000 + 30 + 12.5), independent of the sizing tick
     expect(snap.totalEquityUsd).toBe(10_042.5);
-    expect(snap.equitySource).toBe('risk_engine');
+    expect(snap.equitySource).toBe('mark_to_market');
+    expect(snap.sizingEquityUsd).toBe(10_042.5);
     expect(snap.realizedPnlUsd).toBe(30);
     expect(snap.unrealizedPnlUsd).toBe(12.5);
     expect(snap.dailyPnlUsd).toBe(42.5);
@@ -63,12 +66,27 @@ describe('buildPnlSnapshotPayload', () => {
     expect(EQUITY_SOT_FIELDS.pnl).toBe('/api/pnl.totalEquityUsd');
   });
 
-  it('derives equity from the session anchor + P&L when the engine value is non-finite (never a constant)', () => {
-    const snap = buildPnlSnapshotPayload(inputs({ equityForSizingUsd: Number.NaN }));
+  it('paper: totalEquityUsd does not lag or clamp with the sizing figure (stale/clamped sizing equity is reported separately)', () => {
+    // Risk metrics tick has not run yet: sizing equity still at the anchor while a position carries +28.43 unrealized.
+    const stale = buildPnlSnapshotPayload(
+      inputs({ equityForSizingUsd: 10_000, portfolio: { totalRealizedPnL: 0, totalUnrealizedPnL: 28.43, positionCount: 1 } }),
+    );
+    expect(stale.totalEquityUsd).toBe(10_028.43);
+    expect(stale.sizingEquityUsd).toBe(10_000);
 
-    expect(snap.totalEquityUsd).toBe(10_000 + 30 + 12.5);
-    expect(snap.equitySource).toBe('derived');
-    expect(snap.totalEquityUsd).not.toBe(50_000);
+    // Sizing floor (50% of paper capital) must not masquerade as account equity.
+    const deep = buildPnlSnapshotPayload(
+      inputs({ equityForSizingUsd: 5_000, portfolio: { totalRealizedPnL: -6_000, totalUnrealizedPnL: 0, positionCount: 0 } }),
+    );
+    expect(deep.totalEquityUsd).toBe(4_000);
+    expect(deep.sizingEquityUsd).toBe(5_000);
+
+    // Non-finite engine value: still mark-to-market, never a constant.
+    const nan = buildPnlSnapshotPayload(inputs({ equityForSizingUsd: Number.NaN }));
+    expect(nan.totalEquityUsd).toBe(10_000 + 30 + 12.5);
+    expect(nan.sizingEquityUsd).toBeNull();
+    expect(nan.equitySource).toBe('mark_to_market');
+    expect(nan.totalEquityUsd).not.toBe(50_000);
   });
 
   it('falls through to the risk-engine account equity for the anchor only while no session row is open', () => {
@@ -104,13 +122,16 @@ describe('buildPnlSnapshotPayload', () => {
     expect(snap.dayStartEquityUsd).toBe(10_000);
   });
 
-  it('passes the live account block through in live mode only', () => {
+  it('live: totalEquityUsd is the exchange snapshot and the live account block passes through', () => {
     const liveAccount = { equityUsd: 2_500, quoteAvailableUsd: 2_000, feeTier: { name: 'Intro' }, fetchedAt: NOW, stale: false };
     const live = buildPnlSnapshotPayload(inputs({ mode: 'live', accountEquityUsd: 2_500, equityForSizingUsd: 2_512, session: { ...SESSION, sessionInitialEquityUsd: 2_500 }, liveAccount }));
     expect(live.liveAccount).toBe(liveAccount);
     expect(live.sessionStartEquityUsd).toBe(2_500);
+    expect(live.totalEquityUsd).toBe(2_512);
+    expect(live.equitySource).toBe('exchange_snapshot');
 
     const paper = buildPnlSnapshotPayload(inputs({ liveAccount }));
     expect(paper.liveAccount).toBeNull();
+    expect(paper.equitySource).toBe('mark_to_market');
   });
 });
