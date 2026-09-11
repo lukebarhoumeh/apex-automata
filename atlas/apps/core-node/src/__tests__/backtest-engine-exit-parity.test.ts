@@ -221,6 +221,23 @@ describe('G3 — ATR trailing stop (multiplier × entry ATR, not HWM × 0.01)', 
     expect(trade.exitPrice).toBeCloseTo(1012 - 0.2 * 7, 9);
   });
 
+  it('reads trend_follow\'s ATR placement (metadata.atr) as well as metadata.indicators.atr', () => {
+    // trend_follow stamps ATR via createSignal({ metadata: { atr } }) → metadata.atr, not
+    // metadata.indicators.atr (momentum/breakout/vwap_mr). Both must arm the trail.
+    const tf = { ...LONG(), metadata: { indicators: {}, reason: 'test', atr: 10 } } as Signal;
+    const { eng, position } = openLong(cfg({ execution: { trailAtrMultiplier: 1.0 } }), tf);
+    expect(position.entryAtr).toBe(10);
+    expect(eng.trailUnavailableNoAtr).toBe(0);
+    eng.checkExitConditions('BTC-USD', bar(t(11), 1000, 1030, 995, 1025), new Date(t(11)));
+    expect(position.trailingStop).toBe(1020);
+
+    // indicators.atr wins when both are present; non-positive / non-finite values are ignored.
+    const both = { ...LONG(), metadata: { indicators: { atr: 8 }, reason: 'test', atr: 10 } } as Signal;
+    expect(openLong(cfg({ execution: { trailAtrMultiplier: 1.0 } }), both).position.entryAtr).toBe(8);
+    const junk = { ...LONG(), metadata: { indicators: { atr: 0 }, reason: 'test', atr: Number.NaN } } as Signal;
+    expect(openLong(cfg({ execution: { trailAtrMultiplier: 1.0 } }), junk).position.entryAtr).toBeNull();
+  });
+
   it('never arms when the entry signal carries no usable ATR, and counts it', () => {
     const { engine, eng, position } = openLong(cfg({ execution: { trailAtrMultiplier: 1.0 } }), signal('buy', 1000, 975, 1060));
     expect(position.entryAtr).toBeNull();

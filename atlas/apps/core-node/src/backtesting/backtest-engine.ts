@@ -268,8 +268,9 @@ export interface BacktestConfig {
    *  - `trailAtrMultiplier`: ATR trailing stop (live `PositionMonitor`
    *    `trailing_stop`, guardrails `strategy.stop_trail_atr`). Distance =
    *    multiplier × the ATR the entry signal carried
-   *    (`signal.metadata.indicators.atr`, the same ATR that sized its stop and
-   *    TP). The high-water mark starts at the fill price; the trail arms on
+   *    (`signal.metadata.indicators.atr`, or trend_follow's `metadata.atr` —
+   *    the same ATR that sized its stop and TP; see `resolveEntryAtr`). The
+   *    high-water mark starts at the fill price; the trail arms on
    *    the first bar that improves it and only ever tightens. Unset/0 = off
    *    (pre-G1 behaviour). A signal without a usable ATR never arms a trail
    *    (counted in `metrics.exitRules.trailUnavailableNoAtr`).
@@ -350,7 +351,7 @@ export interface BacktestPosition {
   highWaterMark: number;
   /** Armed ATR trailing-stop level, or null until the HWM first improves. */
   trailingStop: number | null;
-  /** ATR the entry signal carried (`metadata.indicators.atr`), or null. */
+  /** ATR the entry signal carried (`metadata.indicators.atr` or `metadata.atr`), or null. */
   entryAtr: number | null;
   unrealizedPnl: number;
   trades: BacktestTrade[];
@@ -1375,14 +1376,23 @@ export class BacktestEngine extends EventEmitter {
   }
 
   /**
-   * ATR the entry signal carried (`signal.metadata.indicators.atr`) — the same
-   * value the strategy used for its stop/TP geometry and the live `atr_vol`
-   * filter reads. Null when absent or not a positive finite number.
+   * ATR the entry signal carried — the same value the strategy used for its
+   * stop/TP geometry. Builtin plugins disagree on where they stamp it:
+   * momentum/breakout/vwap_mr pass `indicators: { atr }` (→
+   * `metadata.indicators.atr`, what the live `atr_vol` filter reads), while
+   * trend_follow passes `metadata: { atr }` (→ `metadata.atr`, invisible to
+   * that filter — pre-existing, flagged, not changed here). Read both so the
+   * trail arms on every builtin strategy. Null when absent or not a positive
+   * finite number.
    */
   private resolveEntryAtr(signal: Signal): number | null {
     const indicators = signal.metadata?.indicators as Record<string, unknown> | undefined;
-    const atr = indicators?.atr;
-    return typeof atr === 'number' && Number.isFinite(atr) && atr > 0 ? atr : null;
+    for (const candidate of [indicators?.atr, signal.metadata?.atr]) {
+      if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0) {
+        return candidate;
+      }
+    }
+    return null;
   }
 
   private resolveStopLoss(signal: Signal, override: number | undefined, fillPrice: number): number {
