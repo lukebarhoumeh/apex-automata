@@ -244,3 +244,32 @@ describe('order:filled → fills row (live-style exchange through the real Order
     orderManager.destroy();
   });
 });
+
+/**
+ * TASK_014 P5 — optional session stamp on the fills row. The P2 invariant is
+ * untouched: stamping only ADDS `session_id` / `execution_mode`.
+ */
+describe('buildFillRow — P5: optional session stamp', () => {
+  const order = { id: randomUUID(), exchangeOrderId: 'cb-exchange-order-9' };
+  const session = { sessionId: 'sess_1757606400000_ab12cd', executionMode: 'paper' as const };
+
+  it('adds session_id + execution_mode when a session is supplied', () => {
+    const row = buildFillRow({ userId: USER_ID, order, fill: legacyFill({ order_id: 'cb-exchange-order-9' }), session });
+
+    expect(row.session_id).toBe(session.sessionId);
+    expect(row.execution_mode).toBe('paper');
+    expect(row.order_id).toBe(order.id);
+    expect(row.external_order_id).toBe('cb-exchange-order-9');
+  });
+
+  it('builds the legacy shape (no stamp columns) when the session is omitted or null', () => {
+    const plain = buildFillRow({ userId: USER_ID, order, fill: legacyFill({}) });
+    const nulled = buildFillRow({ userId: USER_ID, order, fill: legacyFill({}), session: null });
+
+    for (const row of [plain, nulled]) {
+      expect(row).not.toHaveProperty('session_id');
+      expect(row).not.toHaveProperty('execution_mode');
+      expect(row.order_id).toBe(order.id);
+    }
+  });
+});

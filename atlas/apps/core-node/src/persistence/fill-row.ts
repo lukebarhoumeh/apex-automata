@@ -21,11 +21,15 @@
  * Handoff — broader TASK_014 (P1, P3–P8) is owned separately. Extend here rather
  * than re-inlining the row in server.ts:
  *   - P3  trade_id policy: exchange trade_id (live) / `paper-${sessionId}-${seq}` (paper)
- *   - P5  stamping: add `execution_mode` / `session_id` inputs and columns
+ *   - P5  stamping: DONE — optional `session` input adds `session_id` / `execution_mode`
+ *         (columns from migration 20260911170000; schema-tolerant fallback lives in
+ *         persistence/session-stamp.ts)
  *   - P6  durable writes: `server.ts` can hand the built row to `SupabaseWriter`
  * The P2 invariant (`order_id` = client UUID, exchange id only in `external_order_id`)
  * is pinned by `__tests__/fill-row.test.ts` and must survive those extensions.
  */
+
+import { SessionStamp, SessionStampColumns, stampSessionColumns } from './session-stamp';
 
 /** The engine-side order the fill belongs to (`ManagedOrder` shape, structurally typed). */
 export interface FillRowOrderRef {
@@ -67,6 +71,9 @@ export interface FillRow {
   filled_at: string | null | undefined;
 }
 
+/** `FillRow` plus the TASK_014 P5 session stamp (`session_id`, `execution_mode`). */
+export type StampedFillRow = FillRow & SessionStampColumns;
+
 /** Upsert conflict target used for `fills` writes (unchanged from the inline writer). */
 export const FILLS_UPSERT_ON_CONFLICT = 'user_id,trade_id';
 
@@ -106,11 +113,30 @@ export function resolveFillExternalOrderId(
  * @param input.userId Owning `user_id`.
  * @param input.order Engine-side order the fill belongs to.
  * @param input.fill Fill payload.
+ * @param input.session Optional active-session stamp (TASK_014 P5). When given, the row
+ *   also carries `session_id` / `execution_mode`; omit it to build the legacy shape.
  * @throws {Error} `FILL_ORDER_ID_MISSING` when `order.id` is absent — the fill must not be
  *   written with the exchange id in `order_id` (that is the P2 defect), so fail loudly instead.
  */
-export function buildFillRow(input: { userId: string; order: FillRowOrderRef; fill: FillRowFillRef }): FillRow {
-  const { userId, order, fill } = input;
+export function buildFillRow(input: {
+  userId: string;
+  order: FillRowOrderRef;
+  fill: FillRowFillRef;
+  session: SessionStamp;
+}): StampedFillRow;
+export function buildFillRow(input: {
+  userId: string;
+  order: FillRowOrderRef;
+  fill: FillRowFillRef;
+  session?: SessionStamp | null;
+}): FillRow;
+export function buildFillRow(input: {
+  userId: string;
+  order: FillRowOrderRef;
+  fill: FillRowFillRef;
+  session?: SessionStamp | null;
+}): FillRow | StampedFillRow {
+  const { userId, order, fill, session } = input;
 
   if (!nonEmptyString(order?.id)) {
     throw new Error(
@@ -119,7 +145,7 @@ export function buildFillRow(input: { userId: string; order: FillRowOrderRef; fi
     );
   }
 
-  return {
+  const row: FillRow = {
     user_id: userId,
     order_id: order.id,
     external_order_id: resolveFillExternalOrderId(order, fill),
@@ -131,4 +157,6 @@ export function buildFillRow(input: { userId: string; order: FillRowOrderRef; fi
     maker: fill.liquidity === 'M',
     filled_at: fill.created_at,
   };
+
+  return stampSessionColumns(row as unknown as Record<string, unknown>, session) as unknown as FillRow | StampedFillRow;
 }

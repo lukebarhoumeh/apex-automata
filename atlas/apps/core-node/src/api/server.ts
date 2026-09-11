@@ -14,8 +14,23 @@ import {
 } from '../strategies/per-symbol-disable';
 import { buildRegimeGateConfig, evaluateRegimeGate } from '../strategies/regime-gate';
 import { buildStrategyPolicy } from '../strategies/strategy-policy';
-import { computeRawEntryFillPrice } from '../trading/position-entry-vwap';
+import { resolvePersistedEntryPrice } from '../trading/position-entry-vwap';
 import { buildFillRow, FILLS_UPSERT_ON_CONFLICT, FillRowFillRef, FillRowOrderRef } from '../persistence/fill-row';
+import { SessionColumnSupport, SessionStamp, writeWithSessionStamp } from '../persistence/session-stamp';
+import {
+  activeSessionWindow,
+  buildSessionScopeMeta,
+  parseSessionScopeQuery,
+  readWithSessionScope,
+  sessionWindowFromRow,
+  SESSION_SCOPE_TIME_COLUMN,
+  SessionScopedTable,
+  SessionScopeQuery,
+  SessionWindow,
+} from './session-scope';
+import { buildStrategySessionStats, StrategySessionStats } from './strategy-session-stats';
+import { buildPnlSnapshotPayload, PnlSnapshot } from './pnl-snapshot';
+import { buildStatusPayload, StatusPayload } from './status-payload';
 import { createClient } from '@supabase/supabase-js';
 import path from 'path';
 import { loadAndValidateEnv } from '../core/env';
@@ -26,6 +41,7 @@ import { FeeModel } from '../core/fee-model';
 import { isMissingColumnError } from '../core/postgrest-errors';
 import { validateSchemaOrFail } from '../config/validateSchema';
 import { OrderRequest } from '../exchanges/coinbase';
+import type { Position } from '../trading/position-tracker';
 import { MetricsTracker } from '../trading/metrics-tracker';
 import { SecretManager } from '../config/secrets';
 import { AdvancedTradeRestClient, loadAdvancedTradeAuth } from '../exchanges/coinbase/advanced-trade-client';
@@ -295,8 +311,22 @@ const metricsTracker = new MetricsTracker({
 
 // Fixed USER_ID for single-user mode
 const USER_ID = 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f';
-const INITIAL_BALANCE = 50000; // Starting balance for paper trading
+// Paper capital comes from guardrails.yaml (single source of truth) — the old
+// hard-coded 50_000 seed leaked a demo equity into account_metrics.
+const INITIAL_BALANCE = guardrails.account.equity_usd;
 logger.info('Using fixed USER_ID for single-user mode:', USER_ID);
+
+// Shared per-table memory of whether `session_id` / `execution_mode` exist on
+// orders / fills / signals / positions (migration 20260911170000). Writers and
+// the blotter read endpoints consult the same instance so one failed probe
+// switches every path to the legacy shape at once.
+const sessionColumnSupport = new SessionColumnSupport();
+
+// Session stamp for persisted rows. Set the moment the engine starts building
+// (so anything written during start-up already carries the id) and cleared when
+// the session closes. `runtimeState.session*` (what /api/status reports) is only
+// populated once the engine is actually running — see openTradingSession.
+let activeSessionStamp: SessionStamp | null = null;
 
 const DEFAULT_LIVE_CONFIRM_PHRASE = 'ENABLE LIVE';
 
@@ -307,21 +337,36 @@ const supabase = createClient(
 );
 
 /**
+ * Mint the identity of a trading session: the `trading_sessions.session_id`
+ * and the epoch-ms the start request began. Minted BEFORE the engine is built
+ * so TradeAnalytics, the outcome collector and the row stamps all carry the
+ * same id, and so `sessionStartedAt` is a lower bound for every row the
+ * session writes (the interim `created_at >= sessionStartedAt` filter relies
+ * on that).
+ */
+function mintTradingSession(): { sessionId: string; startedAt: number } {
+  const startedAt = Date.now();
+  return { sessionId: `sess_${startedAt}_${Math.random().toString(36).slice(2, 8)}`, startedAt };
+}
+
+/**
  * Opens a new trading_sessions row when the engine starts and populates
  * runtimeState.session* fields. The session_id also gets broadcast over
  * WS so the frontend can reset per-session caches on a clean start.
  */
 async function openTradingSession(params: {
+  sessionId: string;
+  startedAt: number;
   mode: 'paper' | 'live';
   initialEquity: number;
 }): Promise<string> {
-  const sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const startedAt = Date.now();
+  const { sessionId, startedAt } = params;
 
   runtimeState.sessionId = sessionId;
   runtimeState.sessionStartedAt = startedAt;
   runtimeState.sessionMode = params.mode;
   runtimeState.sessionInitialEquity = params.initialEquity;
+  activeSessionStamp = { sessionId, executionMode: params.mode };
 
   // Drop any dedup state carried over from a prior session; new positions,
   // new clock for the 60s windows.
@@ -403,13 +448,21 @@ async function openTradingSession(params: {
   }
 
   try {
-    const { error } = await supabase.from('trading_sessions').insert({
+    const sessionRow = {
       session_id: sessionId,
       user_id: USER_ID,
       mode: params.mode,
       started_at: new Date(startedAt).toISOString(),
       initial_equity: params.initialEquity,
-    });
+    };
+    // `execution_mode` mirrors `mode` (migrations 20260203000002 / 20260910180200);
+    // fall back to the legacy shape if a snapshot predates that column.
+    let { error } = await supabase
+      .from('trading_sessions')
+      .insert({ ...sessionRow, execution_mode: params.mode });
+    if (error && isMissingColumnError(error, 'execution_mode')) {
+      ({ error } = await supabase.from('trading_sessions').insert(sessionRow));
+    }
     if (error) {
       logger.error('Failed to persist trading_sessions row', { error: error.message, sessionId });
     } else {
@@ -438,12 +491,20 @@ async function openTradingSession(params: {
  */
 async function closeTradingSession(params: {
   finalEquity?: number | null;
+  /** Closed-trade count from the session's analytics, captured before the engine stopped. */
+  totalTrades?: number | null;
 }): Promise<void> {
   const { sessionId, sessionStartedAt, sessionInitialEquity } = runtimeState;
+  // Stamp clears even when no runtimeState session was opened (start failed early).
+  activeSessionStamp = null;
   if (!sessionId) return;
 
   const endedAt = Date.now();
-  const finalEquity = params.finalEquity ?? sessionInitialEquity ?? null;
+  // No equity snapshot (e.g. start-up failure) => final_equity stays NULL rather
+  // than pretending the session ended flat at its opening equity.
+  const finalEquity = typeof params.finalEquity === 'number' && Number.isFinite(params.finalEquity)
+    ? params.finalEquity
+    : null;
   const totalPnl =
     finalEquity !== null && sessionInitialEquity !== null
       ? finalEquity - sessionInitialEquity
@@ -456,6 +517,7 @@ async function closeTradingSession(params: {
         ended_at: new Date(endedAt).toISOString(),
         final_equity: finalEquity,
         total_pnl: totalPnl,
+        ...(typeof params.totalTrades === 'number' ? { total_trades: params.totalTrades } : {}),
       })
       .eq('session_id', sessionId);
     if (error) {
@@ -712,50 +774,17 @@ statusBroadcastInterval = setInterval(() => {
     runtimeState.killSwitch = supervisorState.killSwitch;
   }
   
-  const isEngineRunning = tradingEngine !== null && tradingEngine.engineRunning;
-  
-  // Build PnL snapshot for broadcast
-  const pnlSnapshot = buildPnLSnapshot();
-  
+  // TASK_016 U7 / FE contract #4: one payload builder for REST and every WS
+  // StatusUpdate, so the session window (sessionId + sessionStartedAt) and the
+  // equity SoT (pnl.totalEquityUsd) never flap between emitters.
+  const status = buildStatusCore(supervisorState);
+
   // Broadcast PnL snapshot as separate event so the frontend pnl:snapshot handler picks it up
-  if (pnlSnapshot) {
-    broadcast({ type: 'PnLSnapshot', payload: pnlSnapshot });
+  if (status.pnl) {
+    broadcast({ type: 'PnLSnapshot', payload: status.pnl });
   }
-  
-  broadcast({
-    type: 'StatusUpdate',
-    payload: {
-      engineRunning: isEngineRunning,
-      mode: isEngineRunning ? tradingEngine!.getConfig().mode : null,
-      // TASK_016 U7: the UI merges this envelope over GET /api/status; the
-      // session identity must ride along or the merge cannot track a
-      // start/stop that happens between REST refreshes.
-      sessionId: runtimeState.sessionId,
-      sessionStartedAt: runtimeState.sessionStartedAt,
-      paused: runtimeState.paused,
-      dailyStopHit: runtimeState.dailyStopHit,
-      killSwitch: runtimeState.killSwitch,
-      wsLatencyMs: runtimeState.wsLatencyMs,
-      restLatencyMs: runtimeState.restLatencyMs,
-      spreadPctile: runtimeState.spreadPctile,
-      regime: runtimeState.regime,
-      risk: runtimeState.risk,
-      pnl: pnlSnapshot,
-      activeSymbols: tradingEngine?.getActiveSymbols() || [],
-      warmupComplete: runtimeState.warmupComplete,
-      candlesBuffered: runtimeState.candlesBuffered,
-      // 24/7 Resilience fields
-      runtimeAlive: runtimeState.runtimeAlive,
-      engineState: runtimeState.engineState,
-      engineDesiredState: supervisorState.engineDesiredState,
-      lastMarketDataAt: runtimeState.lastMarketDataAt,
-      lastEngineHeartbeatAt: runtimeState.lastEngineHeartbeatAt,
-      restartCount: runtimeState.restartCount,
-      lastRestartReason: runtimeState.lastRestartReason,
-      lastRestartAt: runtimeState.lastRestartAt,
-      timestamp: Date.now(),
-    }
-  });
+
+  broadcast({ type: 'StatusUpdate', payload: status });
 }, 1500);
 
 // WebSocket connection handler
@@ -778,41 +807,11 @@ wss.on('connection', (ws) => {
     logger.error('WebSocket error:', error);
   });
 
-  // Send initial StatusUpdate (must match periodic broadcast payload)
-  const isEngineRunningOnConnect = tradingEngine !== null && tradingEngine.engineRunning;
-  const supervisorStateOnConnect = supervisor.getState();
-  const pnlSnapshotOnConnect = buildPnLSnapshot();
-  
+  // Send initial StatusUpdate — same builder as the periodic broadcast and GET /api/status.
   ws.send(JSON.stringify({
     type: 'StatusUpdate',
     timestamp: Date.now(),
-    payload: {
-      engineRunning: isEngineRunningOnConnect,
-      mode: isEngineRunningOnConnect ? tradingEngine!.getConfig().mode : null,
-      sessionId: runtimeState.sessionId,
-      sessionStartedAt: runtimeState.sessionStartedAt,
-      paused: runtimeState.paused,
-      dailyStopHit: runtimeState.dailyStopHit,
-      killSwitch: runtimeState.killSwitch,
-      wsLatencyMs: runtimeState.wsLatencyMs,
-      restLatencyMs: runtimeState.restLatencyMs,
-      spreadPctile: runtimeState.spreadPctile,
-      regime: runtimeState.regime,
-      risk: runtimeState.risk,
-      pnl: pnlSnapshotOnConnect,
-      activeSymbols: tradingEngine?.getActiveSymbols() || [],
-      warmupComplete: runtimeState.warmupComplete,
-      candlesBuffered: runtimeState.candlesBuffered,
-      runtimeAlive: runtimeState.runtimeAlive,
-      engineState: runtimeState.engineState,
-      engineDesiredState: supervisorStateOnConnect.engineDesiredState,
-      lastMarketDataAt: runtimeState.lastMarketDataAt,
-      lastEngineHeartbeatAt: runtimeState.lastEngineHeartbeatAt,
-      restartCount: runtimeState.restartCount,
-      lastRestartReason: runtimeState.lastRestartReason,
-      lastRestartAt: runtimeState.lastRestartAt,
-      timestamp: Date.now(),
-    }
+    payload: buildStatusCore(),
   }));
 });
 
@@ -862,52 +861,74 @@ function buildLiveAccountBlock(): Record<string, unknown> | null {
   };
 }
 
-// Build PnL snapshot from trading engine state for frontend consumption
-function buildPnLSnapshot(): Record<string, unknown> | null {
+/**
+ * Canonical PnL / equity snapshot (FE contract #5). `null` while the engine is
+ * not running — never a partial object. Equity SoT is the risk engine's sizing
+ * equity; the session anchor is the value persisted to `trading_sessions`.
+ * Shape + invariants live in `api/pnl-snapshot.ts`.
+ */
+function buildPnLSnapshot(): PnlSnapshot | null {
   if (!tradingEngine?.engineRunning) return null;
-  
+
   const riskEngine = tradingEngine.getRiskEngineInstance();
   const positionTracker = tradingEngine.getPositionTrackerInstance();
   if (!riskEngine || !positionTracker) return null;
-  
-  const riskMetrics = riskEngine.getMetrics();
-  const riskStatus = riskEngine.getRiskStatus();
-  const portfolio = positionTracker.getPortfolioSummary();
+
   const config = tradingEngine.getConfig();
   const isLive = config.mode === 'live';
-  // Session equity anchor: Coinbase snapshot at start in live (no yaml fallback), yaml in paper.
-  const accountEquity = isLive
-    ? riskEngine.getAccountEquity()
-    : (config.guardrails?.account?.equity_usd ?? 50_000);
-  
-  const totalEquity = riskEngine.getCurrentEquityForSizing();
-  const dailyPnlUsd = riskMetrics.dailyPnL;
-  const riskUnitUsd = riskStatus.riskUnitUsd ?? (accountEquity * 0.01);
-  const dailyPnlR = riskUnitUsd > 0 ? dailyPnlUsd / riskUnitUsd : 0;
-  
-  return {
-    ts: Date.now(),
-    userId: config.supabase?.userId ?? '',
-    sessionId: `paper-${new Date().toISOString().split('T')[0]}`,
-    executionMode: config.mode ?? 'paper',
-    riskDay: new Date().toISOString().split('T')[0],
-    sessionStartEquityUsd: accountEquity,
-    dayStartEquityUsd: riskStatus.dayStartEquityUsd ?? accountEquity,
-    realizedPnlUsd: portfolio.totalRealizedPnL,
-    unrealizedPnlUsd: portfolio.totalUnrealizedPnL,
-    totalEquityUsd: totalEquity,
-    dailyPnlUsd,
-    dailyPnlR,
-    riskUnitUsd,
-    openPositionsCount: portfolio.positionCount,
-    exposureUsd: riskMetrics.currentExposure,
-    maxDrawdownPct: riskMetrics.maxDrawdown,
-    // Live only (TASK_011): {equityUsd, quoteAvailableUsd, feeTier, fetchedAt, stale}.
-    liveAccount: isLive ? buildLiveAccountBlock() : null,
-  };
+
+  try {
+    return buildPnlSnapshotPayload({
+      mode: config.mode,
+      userId: config.supabase?.userId ?? USER_ID,
+      session: {
+        sessionId: runtimeState.sessionId,
+        sessionStartedAt: runtimeState.sessionStartedAt,
+        sessionInitialEquityUsd: runtimeState.sessionInitialEquity,
+      },
+      // Live: Coinbase snapshot at start (no yaml fallback). Paper: guardrails paper
+      // capital — schema-required, so there is no constant behind it.
+      accountEquityUsd: isLive ? riskEngine.getAccountEquity() : config.guardrails.account.equity_usd,
+      equityForSizingUsd: riskEngine.getCurrentEquityForSizing(),
+      riskMetrics: riskEngine.getMetrics(),
+      riskStatus: riskEngine.getRiskStatus(),
+      portfolio: positionTracker.getPortfolioSummary(),
+      liveAccount: isLive ? buildLiveAccountBlock() : null,
+    });
+  } catch (error) {
+    logger.error('Failed to build PnL snapshot', { error: error instanceof Error ? error.message : String(error) });
+    return null;
+  }
 }
 
-// Dedicated PnL snapshot endpoint
+/**
+ * Status payload shared by GET /api/status and every WS StatusUpdate emitter
+ * (periodic, on-connect, pause/resume). See `api/status-payload.ts` for the
+ * guarantees (sessionId + sessionStartedAt + pnl always present).
+ */
+function buildStatusCore(supervisorState = supervisor.getState()): StatusPayload {
+  const isEngineRunning = tradingEngine !== null && tradingEngine.engineRunning;
+  const mode = isEngineRunning ? tradingEngine!.getConfig().mode : null;
+  return buildStatusPayload({
+    runtime: runtimeState,
+    supervisor: supervisorState,
+    engine: {
+      running: isEngineRunning,
+      mode,
+      engineState: tradingEngine?.getEngineState() || 'stopped',
+      activeSymbols: tradingEngine?.getActiveSymbols() || [],
+    },
+    pnl: buildPnLSnapshot(),
+    liveAccount: isEngineRunning && mode === 'live' ? buildLiveAccountBlock() : null,
+  });
+}
+
+/** Session identity for stamping persisted rows (null outside a session). */
+function currentSessionStamp(): SessionStamp | null {
+  return activeSessionStamp;
+}
+
+// Dedicated PnL snapshot endpoint — equity SoT: `totalEquityUsd` (same object as /api/status.pnl)
 app.get('/api/pnl', (req, res) => {
   const snapshot = buildPnLSnapshot();
   if (!snapshot) {
@@ -918,48 +939,20 @@ app.get('/api/pnl', (req, res) => {
 
 // Get trading engine status (UI contract) with 24/7 resilience fields
 app.get('/api/status', (req, res) => {
-  const isEngineRunning = tradingEngine !== null && tradingEngine.engineRunning;
-  const supervisorState = supervisor.getState();
-  
   // Get comprehensive exchange health if available
   const exchange = tradingEngine?.getExchange();
   const wsHealth = exchange ? (exchange as any).getWsHealth?.() : null;
   const exchangeHealth = exchange ? (exchange as any).getExchangeHealth?.() : null;
   const restHealth = exchange ? (exchange as any).getRestHealth?.() : null;
   const reconcilerState = exchange ? (exchange as any).getReconcilerState?.() : null;
-  
-  // Include PnL snapshot for frontend consumption
-  const pnlSnapshot = buildPnLSnapshot();
-  
+
   res.json({
-    engineRunning: isEngineRunning,
-    mode: isEngineRunning ? tradingEngine!.getConfig().mode : null,
-    sessionId: runtimeState.sessionId,
-    sessionStartedAt: runtimeState.sessionStartedAt,
-    paused: runtimeState.paused,
-    dailyStopHit: runtimeState.dailyStopHit,
-    killSwitch: supervisorState.killSwitch.active ? supervisorState.killSwitch : runtimeState.killSwitch,
-    wsLatencyMs: runtimeState.wsLatencyMs,
-    restLatencyMs: runtimeState.restLatencyMs,
-    spreadPctile: runtimeState.spreadPctile,
-    regime: runtimeState.regime,
-    risk: runtimeState.risk,
-    pnl: pnlSnapshot,
-    // Live only (TASK_011): the Coinbase account snapshot the session sizes from; null in paper.
-    liveAccount: isEngineRunning && tradingEngine!.getConfig().mode === 'live' ? buildLiveAccountBlock() : null,
-    activeSymbols: tradingEngine?.getActiveSymbols() || [],
-    warmupComplete: runtimeState.warmupComplete ?? false,
-    candlesBuffered: runtimeState.candlesBuffered ?? {},
-    // 24/7 Resilience fields - ALWAYS present for UI staleness detection
+    // Core contract (sessionId, sessionStartedAt, pnl, engineState, ... ) — identical
+    // to the WS StatusUpdate payload so the UI's merge is a no-op on shape.
+    ...buildStatusCore(),
+    // Process is alive if this handler is executing — the supervisor's flag is
+    // for the WS heartbeat; REST keeps the explicit `true` for probe semantics.
     runtimeAlive: true,
-    engineState: tradingEngine?.getEngineState() || 'stopped',
-    engineDesiredState: supervisorState.engineDesiredState,
-    lastMarketDataAt: supervisorState.lastMarketDataAt,
-    lastEngineHeartbeatAt: supervisorState.lastEngineHeartbeatAt,
-    restartCount: supervisorState.restartCount,
-    lastRestartReason: supervisorState.lastRestartReason,
-    lastRestartAt: supervisorState.lastRestartAt,
-    timestamp: Date.now(), // Explicit timestamp for UI staleness detection
     // WebSocket health - single source of truth
     ws: wsHealth ? {
       connected: wsHealth.connected,
@@ -1216,6 +1209,11 @@ app.post('/api/engine/start', async (req, res) => {
     // Step 4: Unified environment config
     // Paper mode now uses production market data by default
     const resolvedMarketDataEnv = requestedMarketEnv === 'sandbox' ? 'sandbox' : 'production';
+
+    // Session identity for this run — minted before the engine exists so analytics,
+    // the outcome collector and every persisted row share it (FE contracts #1-#4).
+    const mintedSession = mintTradingSession();
+    activeSessionStamp = { sessionId: mintedSession.sessionId, executionMode: mode as 'paper' | 'live' };
     
     const engineConfig: TradingEngineConfig = {
       mode: mode as 'paper' | 'live',
@@ -1243,11 +1241,13 @@ app.post('/api/engine/start', async (req, res) => {
       },
       // Live-only: the engine refuses to start without it (ACCOUNT_TRUTH_UNAVAILABLE).
       liveAccountTruth,
+      session: mintedSession,
     };
 
     logger.info(`Starting trading engine in ${mode} mode`, {
       marketDataEnv: resolvedMarketDataEnv,
       executionMode: mode,
+      sessionId: mintedSession.sessionId,
     });
 
     // Create trading engine
@@ -1742,7 +1742,8 @@ app.post('/api/engine/start', async (req, res) => {
     tradeOutcomeCollector = new TradeOutcomeCollector({
       supabaseUrl: env.SUPABASE_URL || '',
       supabaseKey: env.SUPABASE_SERVICE_KEY || '',
-      sessionId: `session_${Date.now()}`,
+      // trade_outcomes.session_id joins to trading_sessions like everything else now.
+      sessionId: mintedSession.sessionId,
       enabled: true,
       profitThreshold: 0,
     }, logger);
@@ -2416,6 +2417,8 @@ app.post('/api/engine/start', async (req, res) => {
     // Persist a trading_sessions row so the UI can scope this run's state.
     // Live: the session's initial equity is the Coinbase snapshot, never the yaml value.
     const sessionId = await openTradingSession({
+      sessionId: mintedSession.sessionId,
+      startedAt: mintedSession.startedAt,
       mode: mode as 'paper' | 'live',
       initialEquity: liveAccountSummary ? liveAccountSummary.equityUsd : engineGuardrails.account.equity_usd,
     });
@@ -2751,10 +2754,13 @@ app.post('/api/engine/stop', async (req, res) => {
     // Update supervisor state first
     supervisor.setDesiredState('stopped');
 
-    // Snapshot final equity BEFORE tearing the engine down so we can stamp
-    // it on the trading_sessions row.
+    // Snapshot final equity + closed-trade count BEFORE tearing the engine down
+    // so we can stamp them on the trading_sessions row. `totalEquityUsd` is the
+    // equity SoT (the old code read a non-existent `.equity` and always wrote
+    // final_equity = initial_equity).
     const snapshot = buildPnLSnapshot();
-    const finalEquity: number | null = typeof snapshot?.equity === 'number' ? snapshot.equity : null;
+    const finalEquity: number | null = snapshot?.totalEquityUsd ?? null;
+    const finalStats = tradingEngine.getSessionStats();
 
     await tradingEngine.stop('api_request');
     if (perpsRiskMonitor) {
@@ -2783,7 +2789,7 @@ app.post('/api/engine/stop', async (req, res) => {
     engineRunningGauge.set(0);
 
     // Close the trading_sessions row (best-effort, does not block response)
-    await closeTradingSession({ finalEquity });
+    await closeTradingSession({ finalEquity, totalTrades: finalStats?.totalTrades ?? null });
 
     res.json({ success: true, message: 'Trading engine stopped' });
 
@@ -2872,16 +2878,16 @@ app.post('/api/engine/kill', async (req, res) => {
 // Control: pause
 app.post('/api/control/pause', (req, res) => {
   runtimeState.paused = true;
-  const isRunning = tradingEngine !== null && tradingEngine.engineRunning;
-  broadcast({ type: 'StatusUpdate', payload: { ...runtimeState, engineRunning: isRunning, mode: isRunning ? tradingEngine!.getConfig().mode : null } });
+  // Full status payload (not a raw runtimeState dump) so the UI merge sees the
+  // same shape — including sessionId/sessionStartedAt/pnl — as every other emitter.
+  broadcast({ type: 'StatusUpdate', payload: buildStatusCore() });
   res.json({ ok: true });
 });
 
 // Control: resume
 app.post('/api/control/resume', (req, res) => {
   runtimeState.paused = false;
-  const isRunning = tradingEngine !== null && tradingEngine.engineRunning;
-  broadcast({ type: 'StatusUpdate', payload: { ...runtimeState, engineRunning: isRunning, mode: isRunning ? tradingEngine!.getConfig().mode : null } });
+  broadcast({ type: 'StatusUpdate', payload: buildStatusCore() });
   res.json({ ok: true });
 });
 
@@ -3014,7 +3020,21 @@ app.post('/api/config/signals', (req, res) => {
 // Analytics Endpoints - Real-time Performance Tracking & Telemetry
 // ============================================================================
 
-// Get session statistics
+/**
+ * Active-session identity block returned with every analytics payload (FE
+ * contract #2). `sessionId` here is the same `trading_sessions.session_id` as
+ * `/api/status.sessionId`; TradeAnalytics is constructed with it on every engine
+ * start, so its trade list / equity curve can only ever contain this session.
+ */
+function activeSessionBlock() {
+  return {
+    sessionId: runtimeState.sessionId,
+    sessionStartedAt: runtimeState.sessionStartedAt,
+    executionMode: runtimeState.sessionMode,
+  };
+}
+
+// Get session statistics — always the ACTIVE session (TradeAnalytics is rebuilt per engine start).
 app.get('/api/analytics/session', (req, res) => {
   if (!tradingEngine || !tradingEngine.engineRunning) {
     return res.status(400).json({ error: 'Trading engine not running' });
@@ -3027,41 +3047,102 @@ app.get('/api/analytics/session', (req, res) => {
   
   // Return stats without equity curve (large payload)
   const { equityCurve, ...statsWithoutCurve } = stats;
-  res.json(statsWithoutCurve);
+  const session = activeSessionBlock();
+  res.json({
+    ...statsWithoutCurve,
+    // Runtime session identity wins over the analytics' own label so the UI
+    // can key caches on one id; they are equal whenever the engine was
+    // started through this API.
+    sessionId: session.sessionId ?? stats.sessionId,
+    sessionStartedAt: session.sessionStartedAt ?? stats.startTime.getTime(),
+    executionMode: session.executionMode ?? stats.mode,
+  });
 });
 
-// Get equity curve data
+// Get equity curve data — active session only; equity SoT is the PnL snapshot.
 app.get('/api/analytics/equity-curve', (req, res) => {
-  if (!tradingEngine) {
+  if (!tradingEngine || !tradingEngine.engineRunning) {
     return res.status(400).json({ error: 'Trading engine not running' });
   }
   
   const curve = tradingEngine.getEquityCurve();
   const stats = tradingEngine.getSessionStats();
-  // Live: exchange truth (latest snapshot); paper: yaml start equity + session PnL.
-  const liveSnapshot = tradingEngine.getLiveAccountTruth()?.getSnapshot() ?? null;
-  const baseEquity = tradingEngine.getConfig().mode === 'live'
-    ? (tradingEngine.getRiskEngineInstance()?.getAccountEquity() ?? liveSnapshot?.equityUsd ?? 0)
-    : guardrails.account.equity_usd;
+  const snapshot = buildPnLSnapshot();
+  const session = activeSessionBlock();
   
   res.json({
+    ...session,
     equityCurve: curve,
-    highWaterMark: stats?.highWaterMark ?? 0,
-    currentEquity: liveSnapshot ? liveSnapshot.equityUsd : (stats?.totalPnl ? baseEquity + stats.totalPnl : baseEquity),
+    highWaterMark: stats?.highWaterMark ?? snapshot?.sessionStartEquityUsd ?? null,
+    // Same number as /api/status.pnl.totalEquityUsd — never a yaml/constant fallback.
+    currentEquity: snapshot?.totalEquityUsd ?? null,
+    sessionStartEquity: snapshot?.sessionStartEquityUsd ?? runtimeState.sessionInitialEquity,
     maxDrawdown: stats?.maxDrawdown ?? 0,
+    equitySource: snapshot?.equitySource ?? null,
   });
 });
 
-// Get recent trades
+// Get recent trades — active session only (closed trades recorded by TradeAnalytics).
 app.get('/api/analytics/trades', (req, res) => {
-  if (!tradingEngine) {
+  if (!tradingEngine || !tradingEngine.engineRunning) {
     return res.status(400).json({ error: 'Trading engine not running' });
   }
   
   const limit = Math.min(parseInt(req.query.limit as string, 10) || 50, 500);
   const trades = tradingEngine.getRecentTrades(limit);
   
-  res.json({ trades });
+  res.json({ ...activeSessionBlock(), trades });
+});
+
+/**
+ * Session-scoped per-strategy trade stats (FE contract #3).
+ *
+ * GET /api/analytics/strategies[?session_id=<active id>]
+ *   → { sessionId, sessionStartedAt, executionMode, engineRunning, riskDay,
+ *       strategies: [{ strategyId, name, enabled, closedTrades, openTrades, wins, losses,
+ *                      breakeven, winRate|null, realizedPnlUsd, pnlToday, closedTradesToday,
+ *                      avgTradeUsd|null, feesUsd, lastTradeAt|null, signalsGenerated|null }],
+ *       totals, notes }
+ *
+ * Always 200 while the request is well-formed: with no engine session the list
+ * is empty and `sessionId` is null (render "—"). A `session_id` that is not
+ * the active session is refused with 404 — closed trades live in memory for the
+ * active session only; history is in `trade_log` (`/api/analytics/trade-history`).
+ */
+app.get('/api/analytics/strategies', (req, res) => {
+  const parsed = parseSessionScopeQuery(req.query as Record<string, unknown>);
+  if (!parsed.ok) {
+    return res.status(parsed.status).json({ error: parsed.error });
+  }
+  const requestedSessionId = parsed.query.sessionId;
+  if (requestedSessionId && requestedSessionId !== runtimeState.sessionId) {
+    return res.status(404).json({
+      error: 'session_id is not the active session',
+      activeSessionId: runtimeState.sessionId,
+      hint: 'Per-strategy stats are served for the active session only; use /api/analytics/trade-history for closed sessions.',
+    });
+  }
+  if (parsed.query.executionMode && runtimeState.sessionMode && parsed.query.executionMode !== runtimeState.sessionMode) {
+    return res.status(400).json({
+      error: `execution_mode '${parsed.query.executionMode}' does not match the active session mode '${runtimeState.sessionMode}'`,
+    });
+  }
+
+  const engineRunning = tradingEngine !== null && tradingEngine.engineRunning;
+  res.json(buildStrategySessionStats({
+    closedTrades: engineRunning ? tradingEngine!.getClosedTrades() : [],
+    openTrades: engineRunning ? tradingEngine!.getOpenTrades() : [],
+    strategies: signalProcessor
+      ? signalProcessor.getRegisteredStrategies().map((s) => ({
+          id: s.id,
+          name: s.name,
+          enabled: s.enabled,
+          signalsGenerated: s.getStats?.()?.signalsGenerated ?? null,
+        }))
+      : [],
+    session: activeSessionBlock(),
+    engineRunning,
+  }));
 });
 
 // Get historical trade log from database
@@ -3133,7 +3214,8 @@ app.get('/api/analytics/sessions', async (req, res) => {
       .from('trading_sessions')
       .select('*')
       .eq('user_id', USER_ID)
-      .order('start_time', { ascending: false })
+      // Live schema column is started_at (start_time was renamed in 20260202190000).
+      .order('started_at', { ascending: false })
       .limit(limit);
     
     if (error) {
@@ -3192,6 +3274,173 @@ app.get('/api/analytics/system-metrics', (req, res) => {
     },
   });
 });
+
+// ============================================================================
+// Session-scoped blotter reads (FE contract #1)
+//
+//   GET /api/orders    ?session_id=&execution_mode=&limit=
+//   GET /api/fills     ?session_id=&execution_mode=&limit=
+//   GET /api/signals   ?session_id=&execution_mode=&limit=
+//   GET /api/positions ?session_id=&execution_mode=&status=open|closed|all&limit=
+//
+// Response: { <table>: Row[], count, scope: { sessionId, executionMode,
+// sessionStartedAt, sessionEndedAt, isActive, filter: 'session_id' |
+// 'time_window' | 'none', timeColumn, limit, note } }. `/api/positions` for the
+// active session also carries `engineOpenPositions` (the in-memory truth the
+// PnL snapshot is computed from).
+//
+// No `session_id` => the active session. No active session => 200 with empty
+// rows and `scope.filter = 'none'` (the UI renders "—", never stale rows).
+// A past `session_id` is scoped through its `trading_sessions` window.
+// Filter shape follows the deployed schema (see api/session-scope.ts).
+// ============================================================================
+
+const BLOTTER_SELECT: Record<SessionScopedTable, string> = {
+  orders: '*',
+  // Left-embed the parent order so the fills table can show symbol/side without a
+  // second round-trip; a fill whose order row is missing still comes back.
+  fills: '*, orders(symbol, side, strategy)',
+  signals: '*',
+  positions: '*',
+};
+
+type SessionWindowResolution =
+  | { ok: true; window: SessionWindow | null }
+  | { ok: false; status: 400 | 404 | 500; error: string; activeSessionId: string | null };
+
+/**
+ * Resolve the query's session to a window. `null` window == no active session.
+ * Past sessions are looked up in `trading_sessions`; an `execution_mode` that
+ * contradicts the session's mode is a client error, not an empty result.
+ */
+async function resolveSessionWindow(query: SessionScopeQuery): Promise<SessionWindowResolution> {
+  const active = activeSessionWindow(runtimeState);
+  let window: SessionWindow | null;
+
+  if (query.sessionId === null || query.sessionId === active?.sessionId) {
+    window = active;
+  } else {
+    const { data, error } = await supabase
+      .from('trading_sessions')
+      .select('session_id, started_at, ended_at, mode')
+      .eq('user_id', USER_ID)
+      .eq('session_id', query.sessionId)
+      .maybeSingle();
+    if (error) {
+      logger.error('Failed to look up trading_sessions row for blotter scope', { sessionId: query.sessionId, error: error.message });
+      return { ok: false, status: 500, error: 'Failed to resolve session_id', activeSessionId: active?.sessionId ?? null };
+    }
+    if (!data) {
+      return { ok: false, status: 404, error: `Unknown session_id '${query.sessionId}'`, activeSessionId: active?.sessionId ?? null };
+    }
+    window = sessionWindowFromRow(data);
+    if (!window) {
+      return { ok: false, status: 404, error: `Session '${query.sessionId}' has no started_at; nothing can be scoped to it`, activeSessionId: active?.sessionId ?? null };
+    }
+  }
+
+  if (window && query.executionMode && window.executionMode && query.executionMode !== window.executionMode) {
+    return {
+      ok: false,
+      status: 400,
+      error: `execution_mode '${query.executionMode}' does not match session '${window.sessionId}' mode '${window.executionMode}'`,
+      activeSessionId: active?.sessionId ?? null,
+    };
+  }
+
+  return { ok: true, window };
+}
+
+/** Compact, JSON-safe view of an in-memory engine position (the PnL snapshot's truth). */
+function mapEnginePosition(p: Position) {
+  return {
+    id: p.id,
+    symbol: p.symbol,
+    strategy: p.strategy ?? null,
+    side: p.side,
+    size: p.size,
+    averagePrice: p.averagePrice,
+    marketPrice: p.marketPrice,
+    unrealizedPnL: p.unrealizedPnL,
+    realizedPnL: p.realizedPnL,
+    stopPrice: p.stopPrice ?? null,
+    takeProfit: p.takeProfit ?? null,
+    openTime: p.openTime instanceof Date ? p.openTime.getTime() : p.openTime,
+    /** Opened in a prior session and hydrated at start — not one of this session's trades. */
+    hydratedFromPriorSession: Boolean(p.metadata?.hydratedFromSupabase),
+  };
+}
+
+function registerBlotterEndpoint(table: SessionScopedTable, route: string): void {
+  app.get(route, async (req, res) => {
+    const parsed = parseSessionScopeQuery(req.query as Record<string, unknown>, { allowStatus: table === 'positions' });
+    if (!parsed.ok) {
+      return res.status(parsed.status).json({ error: parsed.error });
+    }
+
+    const resolved = await resolveSessionWindow(parsed.query);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json({ error: resolved.error, activeSessionId: resolved.activeSessionId });
+    }
+
+    const { window } = resolved;
+    if (!window) {
+      return res.json({
+        [table]: [],
+        count: 0,
+        scope: buildSessionScopeMeta(null, 'none', table, parsed.query),
+        ...(table === 'positions' ? { engineOpenPositions: [] } : {}),
+      });
+    }
+
+    try {
+      const result = await readWithSessionScope<Record<string, unknown>, any>({
+        table,
+        userId: USER_ID,
+        window,
+        limit: parsed.query.limit,
+        status: parsed.query.status,
+        support: sessionColumnSupport,
+        createQuery: () => supabase.from(table).select(BLOTTER_SELECT[table]),
+        execute: async (builder) => {
+          const { data, error } = await builder;
+          return { data: (data ?? null) as Record<string, unknown>[] | null, error };
+        },
+        logger,
+      });
+
+      const scope = buildSessionScopeMeta(window, result.filter, table, parsed.query);
+      if (result.error) {
+        logger.error(`Failed to read session-scoped ${table}`, {
+          code: result.error.code,
+          message: result.error.message,
+          filter: result.filter,
+          sessionId: window.sessionId,
+        });
+        return res.status(500).json({ error: `Failed to read ${table}`, details: result.error.message, scope });
+      }
+
+      res.json({
+        [table]: result.rows,
+        count: result.rows.length,
+        scope,
+        ...(table === 'positions' && window.isActive
+          ? { engineOpenPositions: (tradingEngine?.getOpenPositions() ?? []).map(mapEnginePosition) }
+          : {}),
+      });
+    } catch (error) {
+      logger.error(`Unexpected error reading session-scoped ${table}`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      res.status(500).json({ error: `Failed to read ${table}` });
+    }
+  });
+}
+
+registerBlotterEndpoint('orders', '/api/orders');
+registerBlotterEndpoint('fills', '/api/fills');
+registerBlotterEndpoint('signals', '/api/signals');
+registerBlotterEndpoint('positions', '/api/positions');
 
 // ============ Regime Detection Endpoints ============
 
@@ -3486,12 +3735,35 @@ app.post('/api/metafilter/outcome', (req, res) => {
 // ============ Strategy Plugin Management Endpoints ============
 
 // Get all registered strategies
+//
+// `stats` is the plugin's own counter block and `stats.signalsGenerated` counts
+// SIGNALS the strategy emitted — it is NOT a trade count (the dashboard cards
+// were rendering it as "trades"). It is kept unchanged for compatibility; the
+// honest, session-scoped trade numbers are `sessionStats` on each entry (same
+// shape as /api/analytics/strategies).
 app.get('/api/strategies', (req, res) => {
   if (!signalProcessor) {
     return res.status(400).json({ error: 'Signal processor not running' });
   }
 
   const strategies = signalProcessor.getRegisteredStrategies();
+  const engineRunning = tradingEngine !== null && tradingEngine.engineRunning;
+  const sessionReport = buildStrategySessionStats({
+    closedTrades: engineRunning ? tradingEngine!.getClosedTrades() : [],
+    openTrades: engineRunning ? tradingEngine!.getOpenTrades() : [],
+    strategies: strategies.map((s) => ({
+      id: s.id,
+      name: s.name,
+      enabled: s.enabled,
+      signalsGenerated: s.getStats?.()?.signalsGenerated ?? null,
+    })),
+    session: activeSessionBlock(),
+    engineRunning,
+  });
+  const sessionStatsById = new Map<string, StrategySessionStats>(
+    sessionReport.strategies.map((s) => [s.strategyId, s]),
+  );
+
   res.json({
     strategies: strategies.map(s => ({
       id: s.id,
@@ -3503,9 +3775,19 @@ app.get('/api/strategies', (req, res) => {
       enabled: s.enabled,
       config: s.config,
       stats: s.getStats?.(),
+      sessionStats: sessionStatsById.get(s.id) ?? null,
     })),
     total: strategies.length,
     enabled: signalProcessor.getEnabledStrategies().length,
+    session: {
+      sessionId: sessionReport.sessionId,
+      sessionStartedAt: sessionReport.sessionStartedAt,
+      executionMode: sessionReport.executionMode,
+      engineRunning: sessionReport.engineRunning,
+      riskDay: sessionReport.riskDay,
+    },
+    statsNote:
+      'stats.signalsGenerated counts strategy SIGNALS, not trades. Use sessionStats.closedTrades / pnlToday / winRate (session-scoped) for trade figures.',
   });
 });
 
@@ -4421,24 +4703,37 @@ async function syncOrderToSupabase(order: any) {
   const signalId = order.metadata?.signalId ?? order.signalId ?? null;
 
   try {
-    const { error } = await supabase
-      .from('orders')
-      .upsert({
-        id: order.id,
-        user_id: USER_ID,
-        external_order_id: order.exchangeOrderId,
-        signal_id: signalId,
-        symbol: order.productId || order.product || order.symbol,
-        side: ((order.side || 'buy').toLowerCase() === 'sell' ? 'sell' : 'buy') as 'buy' | 'sell',
-        type: mapOrderType(order.type) as any,
-        status: mapOrderStatus(order.status) as any,
-        price: order.price ? parseFloat(order.price) : null,
-        quantity: normalizedQuantity,
-        strategy: normalizeStrategy(order.strategy) as any,
-        meta_prob: order.metaProb || null,
-        created_at: order.createdAt ? order.createdAt.toISOString() : new Date().toISOString(),
-        updated_at: order.updatedAt ? order.updatedAt.toISOString() : new Date().toISOString()
-      });
+    const row = {
+      id: order.id,
+      user_id: USER_ID,
+      external_order_id: order.exchangeOrderId,
+      signal_id: signalId,
+      symbol: order.productId || order.product || order.symbol,
+      side: ((order.side || 'buy').toLowerCase() === 'sell' ? 'sell' : 'buy') as 'buy' | 'sell',
+      type: mapOrderType(order.type) as any,
+      status: mapOrderStatus(order.status) as any,
+      price: order.price ? parseFloat(order.price) : null,
+      quantity: normalizedQuantity,
+      strategy: normalizeStrategy(order.strategy) as any,
+      meta_prob: order.metaProb || null,
+      created_at: order.createdAt ? order.createdAt.toISOString() : new Date().toISOString(),
+      updated_at: order.updatedAt ? order.updatedAt.toISOString() : new Date().toISOString()
+    };
+
+    // TASK_014 P5: stamp session_id / execution_mode; orders hydrated from a prior
+    // session keep that session's stamp (the upsert omits the columns for them).
+    const stamp = order.metadata?.hydratedFromSupabase ? null : currentSessionStamp();
+    const { error } = await writeWithSessionStamp({
+      table: 'orders',
+      row,
+      stamp,
+      support: sessionColumnSupport,
+      write: async (payload) => {
+        const { error } = await supabase.from('orders').upsert(payload);
+        return { error };
+      },
+      logger,
+    });
 
     if (error) {
       logger.error('Failed to sync order to Supabase:', error);
@@ -4456,9 +4751,18 @@ async function syncOrderToSupabase(order: any) {
 async function syncFillToSupabase(order: FillRowOrderRef, fill: FillRowFillRef) {
   try {
     const row = buildFillRow({ userId: USER_ID, order, fill });
-    const { error } = await supabase
-      .from('fills')
-      .upsert(row, { onConflict: FILLS_UPSERT_ON_CONFLICT });
+    // TASK_014 P5: session stamp with schema-tolerant fallback (session-stamp.ts).
+    const { error } = await writeWithSessionStamp({
+      table: 'fills',
+      row: row as unknown as Record<string, unknown>,
+      stamp: currentSessionStamp(),
+      support: sessionColumnSupport,
+      write: async (payload) => {
+        const { error } = await supabase.from('fills').upsert(payload, { onConflict: FILLS_UPSERT_ON_CONFLICT });
+        return { error };
+      },
+      logger,
+    });
 
     if (error) {
       logger.error('Failed to sync fill to Supabase:', error);
@@ -4490,15 +4794,22 @@ async function syncPositionToSupabase(position: any) {
     // it as `entry_price` makes dashboard R/R analytics look wildly broken
     // — for a SHORT it sits 25 bps below the actual fill, which puts a
     // correctly-placed take-profit on the WRONG side of `entry_price` in
-    // displayed numbers. See position-entry-vwap.ts for the full story.
-    const entryPriceRaw = computeRawEntryFillPrice(position);
-    const fallbackAvg = Number(position.averagePrice ?? position.avgPrice ?? position.entry_price ?? 0);
-    const entryPrice = Number.isFinite(entryPriceRaw) && entryPriceRaw > 0
-      ? entryPriceRaw
-      : (Number.isFinite(fallbackAvg) ? fallbackAvg : 0);
+    // displayed numbers. Falls back to the hydrated entry_price for positions
+    // restored from Supabase (their close would otherwise never persist).
+    // See position-entry-vwap.ts for the full story.
+    const resolvedEntry = resolvePersistedEntryPrice(position);
+    const legacyFallback = Number(position.avgPrice ?? position.entry_price ?? 0);
+    const entryPrice = resolvedEntry > 0 ? resolvedEntry : (Number.isFinite(legacyFallback) ? legacyFallback : 0);
 
     // Supabase schema expects position_side enum ('long'|'short'); skip invalid/flat snapshots
     if (!symbol || (side !== 'long' && side !== 'short') || entryPrice <= 0) {
+      logger.warn('Skipping position sync: no persistable side/entry price', {
+        positionId: position.id,
+        symbol,
+        side,
+        entryPrice,
+        closedAt: position.closedAt ?? null,
+      });
       return;
     }
 
@@ -4551,9 +4862,21 @@ async function syncPositionToSupabase(position: any) {
     const preserveHistory = (process.env.POSITIONS_HISTORY_PRESERVE ?? 'false').toLowerCase() === 'true';
     const onConflictTarget = preserveHistory ? 'id' : 'user_id,symbol';
 
-    const { error } = await supabase
-      .from('positions')
-      .upsert(mappedPosition, { onConflict: onConflictTarget });
+    // TASK_014 P5: `session_id` on a position is the session that OPENED it. A
+    // position hydrated from a prior session is re-written without the stamp so
+    // the opening session's value survives its close in this session.
+    const stamp = position.metadata?.hydratedFromSupabase ? null : currentSessionStamp();
+    const { error } = await writeWithSessionStamp({
+      table: 'positions',
+      row: mappedPosition,
+      stamp,
+      support: sessionColumnSupport,
+      write: async (payload) => {
+        const { error } = await supabase.from('positions').upsert(payload, { onConflict: onConflictTarget });
+        return { error };
+      },
+      logger,
+    });
 
     if (error) {
       logger.error('Failed to sync position to Supabase:', {
@@ -4586,23 +4909,34 @@ async function syncSignalToSupabase(signal: any) {
         ? 'short'
         : (signal.side === 'long' || signal.side === 'short' ? signal.side : null);
 
-    const { error } = await supabase
-      .from('signals')
-      .insert({
-        ...(maybeId ? { id: maybeId } : {}),
-        user_id: USER_ID,
-        symbol: signal.symbol,
-        strategy: signal.strategy, // strategy_name enum
-        decided_at: decidedAt,
-        side, // position_side enum
-        score: signal.strength || signal.score || 0,
-        confidence: signal.confidence || signal.strength || 0,
-        meta_prob: signal.metaLabel || signal.metaProb || null,
-        features: signal.metadata || signal.features || {},
-        allowed: signal.allowed !== false, // Default to true if signal was generated
-        reason: signal.reason || (signal.metadata && signal.metadata.reason) || null,
-        created_at: new Date().toISOString()
-      });
+    const row = {
+      ...(maybeId ? { id: maybeId } : {}),
+      user_id: USER_ID,
+      symbol: signal.symbol,
+      strategy: signal.strategy, // strategy_name enum
+      decided_at: decidedAt,
+      side, // position_side enum
+      score: signal.strength || signal.score || 0,
+      confidence: signal.confidence || signal.strength || 0,
+      meta_prob: signal.metaLabel || signal.metaProb || null,
+      features: signal.metadata || signal.features || {},
+      allowed: signal.allowed !== false, // Default to true if signal was generated
+      reason: signal.reason || (signal.metadata && signal.metadata.reason) || null,
+      created_at: new Date().toISOString()
+    };
+
+    // TASK_014 P5: session stamp with schema-tolerant fallback (session-stamp.ts).
+    const { error } = await writeWithSessionStamp({
+      table: 'signals',
+      row,
+      stamp: currentSessionStamp(),
+      support: sessionColumnSupport,
+      write: async (payload) => {
+        const { error } = await supabase.from('signals').insert(payload);
+        return { error };
+      },
+      logger,
+    });
 
     if (error) {
       logger.error('Failed to sync signal to Supabase:', error);

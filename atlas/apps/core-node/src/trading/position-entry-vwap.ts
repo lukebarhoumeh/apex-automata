@@ -36,7 +36,11 @@ interface PositionLike {
   side?: 'long' | 'short' | 'flat';
   averagePrice?: number;
   trades?: TradeLike[];
+  metadata?: Record<string, unknown>;
 }
+
+/** Metadata key PositionTracker.hydrateOpenPositions stamps with the persisted `entry_price`. */
+export const HYDRATED_ENTRY_PRICE_KEY = 'hydratedEntryPrice';
 
 export function computeRawEntryFillPrice(position: PositionLike): number {
   const fallback = Number.isFinite(position.averagePrice) ? (position.averagePrice as number) : 0;
@@ -60,4 +64,27 @@ export function computeRawEntryFillPrice(position: PositionLike): number {
   }
 
   return totalSize > 0 ? totalNotional / totalSize : fallback;
+}
+
+/**
+ * Entry price to persist on `positions.entry_price`, or `0` when none is known.
+ *
+ * Order: raw entry-fill VWAP (`computeRawEntryFillPrice`) → the `entry_price` the
+ * position was hydrated with (`metadata.hydratedEntryPrice`) → `averagePrice`.
+ *
+ * The hydrated fallback matters on close: PositionTracker zeroes `averagePrice`
+ * when a position goes flat, and a position hydrated from Supabase has no entry
+ * fill in `trades`, so without it the close write was skipped and the row stayed
+ * `closed_at IS NULL` forever — re-hydrated as a phantom open position by every
+ * later session (found by the paper-UI honesty smoke test, PR #64).
+ */
+export function resolvePersistedEntryPrice(position: PositionLike): number {
+  const raw = computeRawEntryFillPrice(position);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+
+  const hydrated = Number(position.metadata?.[HYDRATED_ENTRY_PRICE_KEY]);
+  if (Number.isFinite(hydrated) && hydrated > 0) return hydrated;
+
+  const avg = Number(position.averagePrice);
+  return Number.isFinite(avg) && avg > 0 ? avg : 0;
 }

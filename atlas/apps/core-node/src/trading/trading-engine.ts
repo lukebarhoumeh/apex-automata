@@ -70,6 +70,18 @@ export interface TradingEngineConfig {
    * product specs for the session come from here, never from `guardrails.account`.
    */
   liveAccountTruth?: LiveAccountTruth;
+
+  /**
+   * Trading session identity minted by the API server before `start()`
+   * (`trading_sessions.session_id` + open time). Threaded into TradeAnalytics so
+   * `/api/analytics/*`, `trade_log.session_id` and `/api/status.sessionId` are ONE id.
+   * Optional: CLI / tests without a session row keep the analytics' own id.
+   */
+  session?: {
+    sessionId: string;
+    /** Epoch ms. */
+    startedAt: number;
+  };
 }
 
 export interface TradingEngineEvents {
@@ -1046,6 +1058,9 @@ export class TradingEngine extends EventEmitter {
       initialEquity,
       mode: this.config.mode,
       equitySampleIntervalMs: 60_000, // Sample equity every minute
+      // Bind analytics to the API server's session so every surface reports one id.
+      sessionId: this.config.session?.sessionId,
+      sessionStartedAt: this.config.session?.startedAt,
     };
     
     this.tradeAnalytics = new TradeAnalytics(analyticsConfig, this.logger);
@@ -1882,6 +1897,16 @@ export class TradingEngine extends EventEmitter {
   // Get recent closed trades
   public getRecentTrades(limit: number = 50): TradeRecord[] {
     return this.tradeAnalytics?.getRecentTrades(limit) || [];
+  }
+
+  /** Every closed trade of the current analytics session (oldest first); empty when not running. */
+  public getClosedTrades(): TradeRecord[] {
+    return this.tradeAnalytics?.getClosedTrades() || [];
+  }
+
+  /** Open trades tracked by analytics (positions opened in this session and not yet closed). */
+  public getOpenTrades(): TradeRecord[] {
+    return this.tradeAnalytics?.getOpenTrades() || [];
   }
 
   // Get equity curve
