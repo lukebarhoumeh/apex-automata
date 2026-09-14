@@ -10,11 +10,23 @@
  *   cards, signal feed, etc.) from flickering when the rate limiter trips.
  */
 
+import { isUiPreview, resolvePreviewFetch } from "@/lib/ui-preview";
+
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
 
 type FetchJsonResult<T> = { ok: true; data: T } | { ok: false };
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<FetchJsonResult<T>> {
+  if (isUiPreview()) {
+    const preview = resolvePreviewFetch(path, init?.method ?? "GET");
+    if (!preview || preview.status === 400 || preview.status === 503) {
+      return { ok: false };
+    }
+    if (preview.status === 429) throw new Error(`rate-limited: ${path}`);
+    if (preview.status >= 500) throw new Error(`server error ${preview.status}: ${path}`);
+    if (preview.status >= 400) return { ok: false };
+    return { ok: true, data: preview.body as T };
+  }
   let res: Response;
   try {
     res = await fetch(`${API_URL}${path}`, init);

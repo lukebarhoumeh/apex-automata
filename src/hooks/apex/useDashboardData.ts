@@ -11,6 +11,7 @@ import { mergeStrategyPolicy } from "@/lib/strategy-policy";
 import { hasActiveSession, sessionKey, sessionWindow, type SessionScope } from "@/lib/session-scope";
 import { useActiveSession } from "@/runtime/session";
 import { supabase } from "@/integrations/supabase/client";
+import { isUiPreview } from "@/lib/ui-preview";
 import {
   countActiveMarkets,
   fetchEquityCurve,
@@ -239,6 +240,7 @@ export function useOpenPositions() {
   return useQuery<readonly Position[]>({
     queryKey: ["apex", "positions"],
     queryFn: async () => {
+      if (isUiPreview()) return [];
       const { data, error } = await supabase
         .from("positions")
         .select(

@@ -16,10 +16,16 @@ import {
 import { mergeStrategyPolicy } from "@/lib/strategy-policy";
 import { hasActiveSession, sessionKey, sessionWindow, type SessionScope } from "@/lib/session-scope";
 import { useActiveSession } from "@/runtime/session";
+import { isUiPreview, resolvePreviewFetch } from "@/lib/ui-preview";
 
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
 
 async function fetchJsonOrNull<T>(path: string): Promise<T | null> {
+  if (isUiPreview()) {
+    const preview = resolvePreviewFetch(path);
+    if (!preview || preview.status === 400 || preview.status >= 400) return null;
+    return preview.body as T;
+  }
   let res: Response;
   try {
     res = await fetch(`${API_URL}${path}`);
