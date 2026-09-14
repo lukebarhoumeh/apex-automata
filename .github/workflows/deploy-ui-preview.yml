@@ -1,0 +1,83 @@
+name: deploy-ui-preview
+
+# Static GitHub Pages build of the React shell with VITE_UI_PREVIEW=1.
+# Does NOT attach the trading runtime, Coinbase keys, or the production
+# Supabase project. Paper-SoT pages render idle/stopped; Model/Backtest/
+# Journal/Alerts/Settings stay the existing seeded DEMO surfaces.
+#
+# First-time setup: repo Settings → Pages → Source = GitHub Actions.
+# Site URL: https://lukebarhoumeh.github.io/apex-automata/
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'index.html'
+      - 'vite.config.ts'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/deploy-ui-preview.yml'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build static UI preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+
+      - name: Install workspace deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build UI preview (no live runtime, dummy public keys)
+        env:
+          VITE_UI_PREVIEW: '1'
+          VITE_SUPABASE_URL: https://preview.invalid
+          VITE_SUPABASE_PUBLISHABLE_KEY: preview-not-a-key
+          VITE_BASE: /apex-automata/
+        run: pnpm build
+
+      - name: SPA fallback for GitHub Pages
+        run: cp dist/index.html dist/404.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        name: Deploy
+        uses: actions/deploy-pages@v4

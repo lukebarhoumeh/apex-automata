@@ -5,8 +5,12 @@ import { ThemeProvider } from "next-themes";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
+import { installUiPreviewFetch } from "@/lib/ui-preview";
 import App from "./App.tsx";
 import "./index.css";
+
+// Must run before any runtime/Supabase fetch. No-op unless VITE_UI_PREVIEW=1.
+installUiPreviewFetch();
 
 // Self-heal defaults (P5):
 // - Exponential backoff with jitter so a 429 storm calms down instead of
