@@ -1544,7 +1544,7 @@ export class TradingEngine extends EventEmitter {
           .join(', ');
         
         this.logger.error(`Market data gap detected on ALL symbols: ${symbolDetails} - triggering kill switch`);
-        this.riskEngine?.activateKillSwitch(`Market data gap detected: ${symbolDetails}`);
+        this.riskEngine?.activateKillSwitch(`Market data gap detected: ${symbolDetails}`, 'data_gap');
       } else if (staleSymbols.length > 0) {
         // Log warning for partial staleness
         const symbolDetails = staleSymbols
@@ -1929,12 +1929,16 @@ export class TradingEngine extends EventEmitter {
     this.tradeAnalytics?.endTickProcessing();
   }
 
-  // Emergency stop
+  /**
+   * Operator-initiated emergency stop: latch the kill switch as a
+   * `manual_killswitch` halt (non-daily, survives rollover) and then stop
+   * the engine.
+   */
   public async emergencyStop(reason: string): Promise<void> {
     this.logger.error(`Emergency stop triggered: ${reason}`);
     
     if (this.riskEngine) {
-      this.riskEngine.activateKillSwitch(reason);
+      this.riskEngine.activateKillSwitch(reason, 'manual_killswitch');
     }
 
     await this.stop();

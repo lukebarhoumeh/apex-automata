@@ -584,6 +584,16 @@ export class RiskEngine extends EventEmitter {
         if (resetSource) {
           await this.persistClearedRiskState(resetSource);
         }
+
+        // risk_metrics only records *that* the switch is latched, not why.
+        // Recover the structured reason from today's still-open risk_events
+        // row so getRiskStatus() reports HALTED + reasonCode (e.g.
+        // manual_killswitch, data_gap) instead of RUNNING with entries
+        // silently blocked. Read-only; skipped whenever the halt was
+        // discarded above.
+        if (this.killSwitchActive && !this.riskStateMachine.isHalted()) {
+          await this.riskStateMachine.loadPersistedState();
+        }
       }
 
       // Load account metrics for today to get weekly tracking. Skip when
@@ -1496,7 +1506,13 @@ export class RiskEngine extends EventEmitter {
     }
   }
 
-  private triggerKillSwitch(reason: string, reasonCode: RiskHaltReasonCode = 'unknown'): void {
+  /**
+   * Latch the kill switch and halt the state machine with a structured
+   * reason. `reasonCode` is deliberately required: the old `'unknown'`
+   * default let un-coded callers persist an `unknown` halt that the desk
+   * could not tell apart from a real loss stop.
+   */
+  private triggerKillSwitch(reason: string, reasonCode: RiskHaltReasonCode): void {
     if (this.killSwitchActive) {
       return; // Already triggered
     }
@@ -1913,9 +1929,22 @@ export class RiskEngine extends EventEmitter {
     this.logger.info('Daily risk metrics reset');
   }
 
-  // Manual kill switch control
-  public activateKillSwitch(reason: string): void {
-    this.triggerKillSwitch(`Manual activation: ${reason}`);
+  /**
+   * Halt trading from outside the guardrail checks (operator kill switch,
+   * market-data gap, emergency stop). The caller must say why with a
+   * structured `RiskHaltReasonCode` — `manual_killswitch` for operator
+   * paths, `data_gap` for the all-symbols-stale monitor — so the halt is
+   * never persisted as `unknown`. Both of those codes are non-daily and
+   * therefore survive the risk-day rollover until an operator resumes.
+   *
+   * `reason` is stored verbatim as the halt's `reasonText`; callers already
+   * supply operator-readable context, so no prefix is added here.
+   *
+   * @param reason Human-readable halt text (persisted as `reasonText`).
+   * @param reasonCode Structured halt code persisted to `risk_events.event_type`.
+   */
+  public activateKillSwitch(reason: string, reasonCode: RiskHaltReasonCode): void {
+    this.triggerKillSwitch(reason, reasonCode);
   }
 
   /**

@@ -2816,7 +2816,7 @@ app.post('/api/engine/kill', async (req, res) => {
     if (tradingEngine) {
       // Do NOT stop the engine - just halt trading
       // The engine stays alive for market data and status updates
-      tradingEngine.getRiskEngineInstance()?.activateKillSwitch(reason);
+      tradingEngine.getRiskEngineInstance()?.activateKillSwitch(reason, 'manual_killswitch');
     }
     
     // Update metrics
@@ -2829,9 +2829,13 @@ app.post('/api/engine/kill', async (req, res) => {
     // mode so RiskEngine's mode-scoped clears (paper reset / live resume)
     // only ever touch their own rows; falls back to the legacy shape until
     // the risk_state_execution_mode migration is applied.
+    // `event_type` is a `RiskHaltReasonCode`: the restore path casts it back
+    // to a reason code and the state machine's resume clears rows by it, so
+    // it must be the same `manual_killswitch` the RiskEngine halt above uses
+    // (this row is the only record when the engine is not running).
     const killEventRow = {
       user_id: USER_ID,
-      event_type: 'kill_switch',
+      event_type: 'manual_killswitch',
       details: { reason },
       active: true,
       triggered_at: new Date().toISOString()
@@ -4328,7 +4332,7 @@ app.post('/api/risk/killswitch', async (req, res) => {
   }
 
   if (active) {
-    riskEngine.activateKillSwitch(reason || 'Manual activation via API');
+    riskEngine.activateKillSwitch(reason || 'Manual activation via API', 'manual_killswitch');
     logger.warn('Kill switch activated via API', { reason });
   } else {
     await riskEngine.deactivateKillSwitch();
