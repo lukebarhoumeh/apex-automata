@@ -3,7 +3,11 @@ export interface PortfolioRisk {
   // Consumers must render an empty-state ("--") rather than a hardcoded fallback so we never lie about live equity.
   equity: number | null;
   exposure: number;
-  heat: number;
+  /**
+   * exposure / equity × 100 (shared definition: lib/portfolio-heat). null when
+   * equity is unknown — render "—", never a 0 that reads as "flat".
+   */
+  heat: number | null;
   heatCap: number;
   dd: number;
   ddCap: number;
@@ -22,9 +26,12 @@ export interface RiskRadarAxis {
 
 export interface SymbolCap {
   s: string;
-  used: number;
-  cap: number;
-  pct: number;
+  /** Open notional (USD) from the engine's positions; null when no per-symbol source is available. */
+  used: number | null;
+  /** guardrails per_symbol max_notional_usd; null when the symbol has no configured cap. */
+  cap: number | null;
+  /** used / cap × 100; null when either side is unknown. */
+  pct: number | null;
 }
 
 export interface ExposureNode {

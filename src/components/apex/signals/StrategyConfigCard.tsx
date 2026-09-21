@@ -1,5 +1,6 @@
 import { TrendingUp, Activity } from "lucide-react";
 import { Panel } from "@/components/apex/Panel";
+import { RATE_UNDEFINED_TITLE, formatWinRate } from "@/lib/strategy-session-counts";
 import { cn } from "@/lib/utils";
 import type { StrategyConfig, StrategyDisabledBy } from "@/types/strategy";
 
@@ -94,27 +95,46 @@ export function StrategyConfigCard({ strat }: Props) {
         ))}
 
         <div className="border-t border-obsidian-line pt-3">
-          <div className="grid grid-cols-4 gap-4">
+          <div className="grid grid-cols-5 gap-3">
             <div title="Win rate over this session's closed trades">
               <div className="mono text-[10px] uppercase text-fg-2">WIN RATE</div>
-              <div className="mono text-[17px] text-fg-0">
-                {inert || strat.stats.trades === 0 ? "—" : `${(strat.stats.winRate * 100).toFixed(1)}%`}
+              <div
+                className={cn("mono text-[17px]", inert || strat.stats.closed === 0 ? "text-fg-3" : "text-fg-0")}
+                title={inert || strat.stats.closed === 0 ? RATE_UNDEFINED_TITLE : undefined}
+                data-testid={`strategy-config-${strat.id}-win`}
+              >
+                {inert ? "—" : formatWinRate(strat.stats.winRate, strat.stats.closed, 1)}
               </div>
             </div>
             <div title="Average R per closed trade — not reported by the runtime yet">
               <div className="mono text-[10px] uppercase text-fg-2">AVG R</div>
               <div className="mono text-[17px] text-fg-3">—</div>
             </div>
-            <div title="Closed trades attributed to this strategy in the ACTIVE session (TradeAnalytics)">
-              <div className="mono text-[10px] uppercase text-fg-2">TRADES · SESSION</div>
-              <div className="mono text-[17px] text-fg-0" data-testid={`strategy-config-${strat.id}-trades`}>
-                {inert ? "—" : strat.stats.trades}
+            <div title="Positions opened AND closed in the ACTIVE session, attributed to this strategy (TradeAnalytics / sessionStats)">
+              <div className="mono text-[10px] uppercase text-fg-2">CLOSED (SESSION)</div>
+              <div className="mono text-[17px] text-fg-0" data-testid={`strategy-config-${strat.id}-closed`}>
+                {inert ? "—" : strat.stats.closed}
               </div>
             </div>
-            <div title="Signals the plugin emitted this run — most are filtered before any order is routed">
-              <div className="mono text-[10px] uppercase text-fg-2">SIGNALS</div>
-              <div className="mono text-[17px] text-fg-1" data-testid={`strategy-config-${strat.id}-signals`}>
-                {inert ? "—" : strat.stats.signals}
+            <div title="Open positions (live) attributed to this strategy — engine PositionTracker, hydrated positions from a prior session included">
+              <div className="mono text-[10px] uppercase text-fg-2">OPEN (LIVE)</div>
+              <div
+                className={cn("mono text-[17px]", inert || strat.stats.open === null ? "text-fg-3" : "text-fg-0")}
+                data-testid={`strategy-config-${strat.id}-open`}
+              >
+                {inert || strat.stats.open === null ? "—" : strat.stats.open}
+                {!inert && strat.stats.hydratedOpen !== null && strat.stats.hydratedOpen > 0 && (
+                  <span className="ml-1 text-[10px] text-fg-2">({strat.stats.hydratedOpen} hydrated)</span>
+                )}
+              </div>
+            </div>
+            <div title="Signals this strategy EMITTED in the active session (sessionStats.signalsGenerated — cleared every gate). Not trades.">
+              <div className="mono text-[10px] uppercase text-fg-2">SIGNALS EMITTED</div>
+              <div
+                className={cn("mono text-[17px]", inert || strat.stats.signals === null ? "text-fg-3" : "text-fg-1")}
+                data-testid={`strategy-config-${strat.id}-signals`}
+              >
+                {inert || strat.stats.signals === null ? "—" : strat.stats.signals}
               </div>
             </div>
           </div>

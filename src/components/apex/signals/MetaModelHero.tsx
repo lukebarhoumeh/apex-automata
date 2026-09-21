@@ -1,6 +1,7 @@
 import { Brain } from "lucide-react";
 import { Panel } from "@/components/apex/Panel";
 import { Stat } from "@/components/apex/Stat";
+import { formatModelMetric } from "@/lib/strategy-session-counts";
 import type { MetaModelInfo } from "@/types/strategy";
 import type { SignalRecord } from "@/types/signals";
 
@@ -12,7 +13,8 @@ interface Props {
 export function MetaModelHero({ meta, signals }: Props) {
   const accepted = signals.filter((s) => s.state === "ACCEPTED").length;
   const rejected = signals.filter((s) => s.state === "REJECTED").length;
-  const acceptRate = signals.length > 0 ? accepted / signals.length : 0;
+  const acceptRate = signals.length > 0 ? accepted / signals.length : null;
+  const metric = (v: number | null) => formatModelMetric(v, meta.mlLoaded);
 
   return (
     <Panel header={false} pad={0} tone="accent" className="relative overflow-hidden">
@@ -35,22 +37,32 @@ export function MetaModelHero({ meta, signals }: Props) {
             </div>
             <div className="flex flex-col">
               <span className="mono text-[10px] font-medium uppercase tracking-[0.12em] text-accent">
-                META MODEL · ML FILTER
+                {meta.mlLoaded ? "META MODEL · ML FILTER" : "META-FILTER · RULE-BASED"}
               </span>
               <span className="text-[15px] font-medium text-fg-0">{meta.name}</span>
             </div>
           </div>
-          <p className="max-w-[440px] text-[12.5px] leading-[1.55] text-fg-1">
-            The meta model gates every signal across strategies. Trained on{" "}
-            <span className="mono text-fg-0">{meta.trainedOn.toLocaleString()}</span> historical trades, ROC-AUC{" "}
-            <span className="mono text-up">{meta.rocAuc.toFixed(2)}</span>. Raise the threshold for higher quality;
-            lower for more volume.
+          <p className="max-w-[440px] text-[12.5px] leading-[1.55] text-fg-1" data-testid="meta-model-copy">
+            {meta.mlLoaded ? (
+              <>
+                The meta model gates every signal across strategies. Trained on{" "}
+                <span className="mono text-fg-0">{(meta.trainedOn ?? 0).toLocaleString()}</span> historical trades, ROC-AUC{" "}
+                <span className="mono text-up">{(meta.rocAuc ?? 0).toFixed(2)}</span>. Raise the threshold for higher
+                quality; lower for more volume.
+              </>
+            ) : (
+              <>
+                Every signal is gated by the rule-based meta-filter (cold-streak cooldown, time-of-day window, optional
+                ATR / strength / volume gates). No ML model is loaded, so ROC-AUC, precision, recall and F1 are not
+                defined.
+              </>
+            )}
           </p>
-          <div className="mt-1 flex flex-wrap items-start gap-6">
-            <Stat label="ROC AUC"   value={`${(meta.rocAuc * 100).toFixed(1)}%`}   tone="accent" />
-            <Stat label="PRECISION" value={`${(meta.precision * 100).toFixed(1)}%`} />
-            <Stat label="RECALL"    value={`${(meta.recall * 100).toFixed(1)}%`} />
-            <Stat label="F1"        value={`${(meta.f1 * 100).toFixed(1)}%`} />
+          <div className="mt-1 flex flex-wrap items-start gap-6" data-testid="meta-model-metrics">
+            <Stat label="ROC AUC"   value={metric(meta.rocAuc)}    tone="accent" />
+            <Stat label="PRECISION" value={metric(meta.precision)} />
+            <Stat label="RECALL"    value={metric(meta.recall)} />
+            <Stat label="F1"        value={metric(meta.f1)} />
           </div>
         </div>
 
@@ -101,12 +113,18 @@ export function MetaModelHero({ meta, signals }: Props) {
           <div>
             <div className="mb-1 flex justify-between text-[11px]">
               <span className="mono text-[10px] uppercase text-fg-2">ACCEPTANCE RATE</span>
-              <span className="mono text-accent">{(acceptRate * 100).toFixed(1)}%</span>
+              <span
+                className={acceptRate === null ? "mono text-fg-3" : "mono text-accent"}
+                title={acceptRate === null ? "No signals this session — rate not defined." : undefined}
+                data-testid="meta-acceptance-rate"
+              >
+                {acceptRate === null ? "—" : `${(acceptRate * 100).toFixed(1)}%`}
+              </span>
             </div>
             <div className="h-1.5 w-full rounded-full bg-obsidian-3">
               <div
                 className="h-full rounded-full bg-accent"
-                style={{ width: `${acceptRate * 100}%`, boxShadow: "0 0 8px hsl(var(--accent-glow))" }}
+                style={{ width: `${(acceptRate ?? 0) * 100}%`, boxShadow: "0 0 8px hsl(var(--accent-glow))" }}
               />
             </div>
           </div>

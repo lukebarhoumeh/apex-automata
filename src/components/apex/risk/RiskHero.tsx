@@ -1,6 +1,7 @@
 import { Power } from "lucide-react";
 import { Panel } from "@/components/apex/Panel";
 import { Pill } from "@/components/apex/Pill";
+import { formatHeatPct } from "@/lib/portfolio-heat";
 import { cn } from "@/lib/utils";
 import type { PortfolioRisk, KillLadderRow } from "@/types/risk";
 
@@ -17,20 +18,20 @@ function CircuitBar({
   tone,
 }: {
   label: string;
-  v: number;
+  /** null → value unknown; bar stays empty and the label reads "—". */
+  v: number | null;
   cap: number;
   unit: string;
   tone: string;
 }) {
-  const pct = Math.min(100, (v / cap) * 100);
+  const pct = v === null ? 0 : Math.min(100, (v / cap) * 100);
   return (
     <div>
       <div className="mb-0.5 flex justify-between text-[11px]">
         <span className="mono text-[10px] uppercase tracking-[0.12em] text-fg-2">{label}</span>
         <span className="mono text-[11px]">
-          <span className="text-fg-0">
-            {v.toFixed(1)}
-            {unit}
+          <span className={v === null ? "text-fg-3" : "text-fg-0"}>
+            {v === null ? "—" : `${v.toFixed(1)}${unit}`}
           </span>
           <span className="text-fg-3">
             {" "}
@@ -91,7 +92,14 @@ export function RiskHero({ portfolio, killLadder }: Props) {
               {portfolio.equity !== null ? `$${portfolio.equity.toLocaleString()}` : "--"}
             </span>{" "}
             equity. Heat at{" "}
-            <span className="mono text-accent">{portfolio.heat.toFixed(2)}%</span>, drawdown{" "}
+            <span
+              className="mono text-accent"
+              title={portfolio.heat === null ? "No live equity — heat not defined." : "Open exposure / equity"}
+              data-testid="risk-hero-heat"
+            >
+              {formatHeatPct(portfolio.heat, 2)}
+            </span>
+            , drawdown{" "}
             <span className="mono text-up">{portfolio.dd.toFixed(1)}%</span>.
           </p>
           <div className="flex gap-2">

@@ -4,16 +4,33 @@ import { Sparkline } from "@/components/apex/Sparkline";
 import { HeatBar } from "@/components/apex/HeatBar";
 import { fmt } from "@/components/apex/format";
 import { cn } from "@/lib/utils";
+import { formatHeatPct } from "@/lib/portfolio-heat";
 import { shortSessionId } from "@/lib/session-scope";
+import {
+  RATE_UNDEFINED_TITLE,
+  formatExpectancyR,
+  formatWinLoss,
+  formatWinRate,
+  heroSessionSentence,
+} from "@/lib/strategy-session-counts";
 import { useSessionUptime } from "@/components/apex/shell/useSessionUptime";
 import type { SessionStats } from "@/types/session";
 import type { MarketRegime } from "@/types/regime";
 import type { EquityPoint } from "@/types/equity";
+import { countHydratedPositions, type Position } from "@/types/positions";
 
 interface HeroStatePanelProps {
   session: SessionStats;
   regime: MarketRegime;
   intradayEquity: readonly EquityPoint[];
+  /**
+   * Engine open positions (`useOpenPositions`, hydrated flagged). Drives the
+   * "N open live" sentence and the Open (live) stat; falls back to the PnL
+   * snapshot's `openPositionsCount` when omitted.
+   */
+  openPositions?: readonly Position[];
+  /** Sum of `sessionStats.signalsGenerated` over registered strategies; null when unknown. */
+  signalsEmitted?: number | null;
 }
 
 interface ModeCopy {
@@ -33,7 +50,7 @@ const MODE_COPY: Record<SessionStats["mode"], ModeCopy> = {
   stopped: { label: "STOPPED", subtitle: "No active session — engine idle",                                      dotColor: "#6a7588",            verb: "stopped", scanning: false },
 };
 
-export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePanelProps) {
+export function HeroStatePanel({ session, regime, intradayEquity, openPositions, signalsEmitted = null }: HeroStatePanelProps) {
   // Session P&L now reads straight from the backend; no fake drift.
   // Mock-era animation (random-walk tick every 1.1s) removed 2026-04-22.
   const pnl = session.pnl;
@@ -42,10 +59,22 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
   const mode = MODE_COPY[session.mode];
   const sparkData = intradayEquity.slice(-60).map((p) => p.v);
   const pnlUp = pnl >= 0;
-  const heatPctLabel = `${session.heat.toFixed(1)}% / ${session.heatCap.toFixed(1)}%`;
+  // Heat: exposure / equity from the PnL snapshot (same SoT as the Risk desk);
+  // "—" when equity is unknown rather than a 0% that reads as flat.
+  const heatPctLabel = `${formatHeatPct(session.heat, 1)} / ${session.heatCap.toFixed(1)}%`;
   // Uptime ticks from /api/status → sessionStartedAt via the same hook as the
   // sidebar session card — never from TradeAnalytics' start time or page mount.
   const uptime = useSessionUptime(session.sessionStartedAt);
+
+  // Open (live): engine positions when supplied (hydrated included), else the
+  // PnL snapshot's count. Closed: TradeAnalytics. Two different things — the
+  // sentence says both so three hydrated longs never read as "flat".
+  const closed = session.trades;
+  const openCount = openPositions ? openPositions.length : session.openPositions;
+  const hydratedOpen = openPositions ? countHydratedPositions(openPositions) : null;
+  const sentence = heroSessionSentence(closed, openCount, hydratedOpen);
+  const winRate = formatWinRate(session.winRate, closed, 1);
+  const rateTitle = closed === 0 ? RATE_UNDEFINED_TITLE : undefined;
 
   return (
     <div
@@ -123,12 +152,15 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
           </div>
 
           <p className="max-w-[380px] text-[12.5px] leading-[1.55] text-fg-1">
-            {mode.subtitle}. Signals are gated by the rule-based meta-filter (no ML model).
-            Closed{" "}
-            <span className="mono" style={{ color: "hsl(var(--accent-2))" }}>
-              {session.trades}
-            </span>{" "}
-            {session.trades === 1 ? "trade" : "trades"} this session.
+            {mode.subtitle}. Signals are gated by the rule-based meta-filter (no ML model).{" "}
+            <span
+              className="mono"
+              style={{ color: "hsl(var(--accent-2))" }}
+              title="Closed = positions opened and closed this session (TradeAnalytics). Open live = engine open positions now, including any hydrated from a prior session."
+              data-testid="hero-session-sentence"
+            >
+              {sentence}
+            </span>
           </p>
 
           <div className="mt-1 flex items-center gap-2">
@@ -178,8 +210,10 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
             />
             <MiniStat
               label="In R"
-              value={`+${session.pnlR.toFixed(2)}R`}
-              tone="accent"
+              value={formatExpectancyR(session.pnlR, closed)}
+              tone={session.pnlR === null || closed === 0 ? "muted" : "accent"}
+              title={closed === 0 ? RATE_UNDEFINED_TITLE : "Expectancy per closed trade, in R (TradeAnalytics)"}
+              testId="hero-in-r"
             />
           </div>
 
@@ -204,10 +238,20 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
         <div className="flex flex-col gap-2.5 border-l border-obsidian-line pl-7">
           <div className="flex items-center justify-between">
             <div className="label">Portfolio heat</div>
-            <span className="mono text-[11px] text-fg-1">{heatPctLabel}</span>
+            <span
+              className="mono text-[11px] text-fg-1"
+              title={
+                session.heat === null
+                  ? "No live equity in the PnL snapshot — heat not defined."
+                  : "Open exposure / equity (PnL snapshot) — same definition as the Risk desk"
+              }
+              data-testid="hero-heat"
+            >
+              {heatPctLabel}
+            </span>
           </div>
           <div className="relative">
-            <HeatBar value={session.heat} cap={session.heatCap} warn={0.66} />
+            <HeatBar value={session.heat ?? 0} cap={session.heatCap} warn={0.66} />
             <span
               aria-hidden
               className="absolute top-[-2px] h-2 w-px bg-warn"
@@ -219,10 +263,46 @@ export function HeroStatePanel({ session, regime, intradayEquity }: HeroStatePan
           <div className="my-1.5 h-px bg-obsidian-line" />
 
           <div className="flex flex-wrap gap-x-5 gap-y-3">
-            <QuickStat label="Win rate" value={`${(session.winRate * 100).toFixed(1)}%`} tone="up" />
-            <QuickStat label="Trades" value={String(session.trades)} />
-            <QuickStat label="W/L" value={`${session.wins}/${session.losses}`} />
-            <QuickStat label="Regime" value={regime.label} small />
+            <QuickStat
+              label="Win rate"
+              value={winRate}
+              tone={winRate === "—" ? "muted" : "up"}
+              title={rateTitle}
+              testId="hero-win-rate"
+            />
+            <QuickStat
+              label="W/L"
+              value={formatWinLoss(session.wins, session.losses, closed)}
+              tone={closed === 0 ? "muted" : undefined}
+              title={rateTitle}
+              testId="hero-win-loss"
+            />
+            <QuickStat
+              label="Signals emitted"
+              value={signalsEmitted === null ? "—" : String(signalsEmitted)}
+              tone={signalsEmitted === null ? "muted" : undefined}
+              title="Signals emitted this session across registered strategies (sessionStats.signalsGenerated) — not trades"
+              testId="hero-signals-emitted"
+            />
+            <QuickStat
+              label="Closed (session)"
+              value={String(closed)}
+              title="Positions opened and closed this session (TradeAnalytics)"
+              testId="hero-closed"
+            />
+            <QuickStat
+              label="Open (live)"
+              value={openCount === null ? "—" : String(openCount)}
+              tone={openCount === null ? "muted" : undefined}
+              title={
+                hydratedOpen !== null && hydratedOpen > 0
+                  ? `${hydratedOpen} of ${openCount} carried from a prior session (hydrated at engine start)`
+                  : "Engine open positions now"
+              }
+              sub={hydratedOpen !== null && hydratedOpen > 0 ? `${hydratedOpen} hydrated` : undefined}
+              testId="hero-open"
+            />
+            <QuickStat label="Regime" value={regime.label} title={regime.subtitle ?? undefined} small />
             <QuickStat label="TF" value={regime.timeframe} />
             <QuickStat label="Uptime" value={uptime} />
           </div>
@@ -237,11 +317,13 @@ function MiniStat({
   value,
   tone = "neutral",
   title,
+  testId,
 }: {
   label: string;
   value: string;
   tone?: "up" | "down" | "accent" | "neutral" | "muted";
   title?: string;
+  testId?: string;
 }) {
   const COLOR: Record<typeof tone, string> = {
     up: "text-up",
@@ -255,7 +337,9 @@ function MiniStat({
       <span className="mono text-[9px] font-medium uppercase tracking-[0.12em] text-fg-2">
         {label}
       </span>
-      <span className={cn("mono font-medium", COLOR[tone])}>{value}</span>
+      <span className={cn("mono font-medium", COLOR[tone])} data-testid={testId}>
+        {value}
+      </span>
     </div>
   );
 }
@@ -263,25 +347,43 @@ function MiniStat({
 function QuickStat({
   label,
   value,
+  sub,
   tone,
   small,
+  title,
+  testId,
 }: {
   label: string;
   value: string;
-  tone?: "up" | "down" | "accent";
+  /** Secondary note rendered after the value, e.g. "3 hydrated". */
+  sub?: string;
+  tone?: "up" | "down" | "accent" | "muted";
   small?: boolean;
+  title?: string;
+  testId?: string;
 }) {
-  const color = tone === "up" ? "text-up" : tone === "down" ? "text-down" : tone === "accent" ? "text-accent" : "text-fg-0";
+  const color =
+    tone === "up"
+      ? "text-up"
+      : tone === "down"
+        ? "text-down"
+        : tone === "accent"
+          ? "text-accent"
+          : tone === "muted"
+            ? "text-fg-3"
+            : "text-fg-0";
   return (
-    <div className="flex flex-col gap-0.5" style={{ minWidth: small ? 84 : 56 }}>
+    <div className="flex flex-col gap-0.5" style={{ minWidth: small ? 84 : 56 }} title={title}>
       <span className="mono text-[9px] font-medium uppercase tracking-[0.12em] text-fg-2">
         {label}
       </span>
       <span
         className={cn("mono font-medium", color)}
         style={{ fontSize: small ? 11 : 15, letterSpacing: small ? "0.04em" : "-0.01em" }}
+        data-testid={testId}
       >
         {value}
+        {sub && <span className="ml-1 text-[9.5px] font-normal text-fg-2">({sub})</span>}
       </span>
     </div>
   );
