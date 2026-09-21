@@ -195,10 +195,14 @@ describe('guardrails.yaml — disabled_strategies state (F4 follow-up §8)', () 
     expect(new Set(guardrails.disabled_strategies)).toEqual(new Set(['vwap_mr', 'breakout', 'momentum']));
   });
 
-  it('buildPerSymbolDisabledStrategies(guardrails) flattens to exactly the two perp symbols', () => {
+  it('buildPerSymbolDisabledStrategies(guardrails) flattens to the two perp symbols plus the CFM paper symbol (every builtin off — NOT strategy GO)', () => {
     expect(buildPerSymbolDisabledStrategies(guardrails)).toEqual({
       'ETH-PERP-INTX': ['momentum'],
       'BTC-PERP-INTX': ['momentum'],
+      // Card SH-QMAKER-CFM-PAPER-v0 (2026-09-21): the CFM venue is wired for
+      // paper infra only; all built-in strategies stay disabled on it until a
+      // card strategy is authorised (pinned by `pnpm check:config`).
+      'BIP-20DEC30-CDE': ['trend_follow', 'momentum', 'vwap_mr', 'breakout'],
     });
   });
 });

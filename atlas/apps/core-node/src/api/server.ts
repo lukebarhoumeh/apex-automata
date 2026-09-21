@@ -48,8 +48,11 @@ import path from 'path';
 import { loadAndValidateEnv } from '../core/env';
 import client from 'prom-client';
 import { OHLCV } from '../indicators/technical';
-import { loadGuardrails, resolveLiveConfig } from '../config/loadGuardrails';
+import { loadGuardrails, resolveLiveConfig, resolveCfmConfig } from '../config/loadGuardrails';
 import { FeeModel } from '../core/fee-model';
+import { CfmGuard, CfmFlattenRequiredEvent, CfmLeverageSnapshot } from '../trading/cfm/cfm-guard';
+import { OrderOpsThrottle } from '../trading/execution/order-ops-throttle';
+import { resolveEntryExecution } from '../trading/execution/execution-policy';
 import { isMissingColumnError } from '../core/postgrest-errors';
 import { validateSchemaOrFail } from '../config/validateSchema';
 import { OrderRequest } from '../exchanges/coinbase';
@@ -577,6 +580,34 @@ let perpsAdapter: CoinbasePerpsAdapter | null = null;
 let exchangeRegistry: ExchangeRegistry | null = null;
 let hyperliquidAdapter: HyperliquidAdapter | null = null;
 let activeSpotToPerpsMap: Map<string, string> = new Map();
+// CFM / CDE paper symbols (card SH-QMAKER-CFM-PAPER-v0): spot proxy → *-CDE
+// symbols whose quotes + candles are mirrored from it (desk seal (a)). Paper
+// only — populated only when the engine starts in paper mode.
+let activeSpotToCfmMap: Map<string, string[]> = new Map();
+// Venue guard for the *-CDE paper symbols: Charter ≤2× kill + Fri-break flatten.
+let cfmGuard: CfmGuard | null = null;
+
+/** Mirror a spot tick onto every *-CDE symbol proxied by it (quote, monitor, tracker, engine mark). */
+function mirrorSpotTickToCfm(spotSymbol: string, quote: { bid: number; ask: number; last: number }): void {
+  const cfmSymbols = activeSpotToCfmMap.get(spotSymbol);
+  if (!cfmSymbols || !tradingEngine) return;
+  for (const cfmSymbol of cfmSymbols) {
+    tradingEngine.getPaperSimulator?.()?.updateMarketQuote(cfmSymbol, quote);
+    tradingEngine.getPositionMonitor?.()?.updatePrice(cfmSymbol, quote.last);
+    tradingEngine.getPositionTrackerInstance?.()?.updateMarketPrice(cfmSymbol, quote.last);
+    tradingEngine.setMarketPrice(cfmSymbol, quote.last);
+  }
+}
+
+/** Tear down the CFM guard (engine stop / startup-failure cleanup). */
+function stopCfmGuard(): void {
+  if (cfmGuard) {
+    cfmGuard.stop();
+    cfmGuard.removeAllListeners();
+    cfmGuard = null;
+  }
+  activeSpotToCfmMap = new Map();
+}
 
 // Engine Supervisor for 24/7 resilience
 const supervisor = new EngineSupervisor({}, logger);
@@ -727,6 +758,12 @@ function processTickerForCandles(ticker: { product_id: string; price: string; la
         const perpsSymbol = activeSpotToPerpsMap.get(symbol);
         if (perpsSymbol && signalProcessor) {
           signalProcessor.addCandle(perpsSymbol, candle);
+        }
+        // Same spot-proxy mirror for *-CDE paper symbols (desk seal (a)). Every
+        // built-in strategy is disabled on them, so this feeds the harness's
+        // candle buffers without producing routable signals.
+        for (const cfmSymbol of activeSpotToCfmMap.get(symbol) ?? []) {
+          signalProcessor?.addCandle(cfmSymbol, candle);
         }
       } catch (err) {
         logger.error('Failed to add candle to signal processor', err);
@@ -1003,6 +1040,12 @@ app.get('/api/status', (req, res) => {
       degraded: reconcilerState.degraded,
       degradedReason: reconcilerState.degradedReason,
     } : null,
+    // CFM / CDE paper harness (card SH-QMAKER-CFM-PAPER-v0): guard state
+    // (break phase, Charter leverage, latches) + order-op counters (post-only
+    // accept/miss, edits, 429s, maker/taker mix). null when no *-CDE paper
+    // symbols are active. Infra only — NOT strategy GO.
+    cfm: cfmGuard ? cfmGuard.getStatus() : null,
+    orderOps: tradingEngine ? tradingEngine.getOrderOpsStats() : null,
   });
 });
 
@@ -1180,11 +1223,36 @@ app.post('/api/engine/start', async (req, res) => {
     }
     activeSpotToPerpsMap = spotToPerpsMap;
 
+    // CFM / CDE paper symbols (card SH-QMAKER-CFM-PAPER-v0) — PAPER ONLY. There
+    // is no live *-CDE execution path (and none is implied here): in live mode
+    // the block is dropped with a warning so a live session can never route to
+    // a venue the engine cannot execute on. Quote path = spot proxy (seal (a)).
+    const cfmSymbolConfig = guardrails.cfm_symbols ?? {};
+    const configuredCfmSymbols = Object.keys(cfmSymbolConfig);
+    const cfmSymbols: string[] = mode === 'paper' ? configuredCfmSymbols : [];
+    if (mode !== 'paper' && configuredCfmSymbols.length > 0) {
+      logger.warn('cfm_symbols are PAPER-ONLY — dropped for this live session (no live *-CDE path is wired; not CONFIRM_LIVE)', {
+        dropped: configuredCfmSymbols,
+      });
+    }
+    const spotToCfmMap = new Map<string, string[]>();
+    for (const cfmSymbol of cfmSymbols) {
+      const proxy = cfmSymbolConfig[cfmSymbol].spot_proxy;
+      if (!spotSymbols.includes(proxy)) {
+        logger.warn('CFM paper symbol has no subscribed spot proxy — it will receive no quotes', { cfmSymbol, proxy });
+        continue;
+      }
+      spotToCfmMap.set(proxy, [...(spotToCfmMap.get(proxy) ?? []), cfmSymbol]);
+    }
+    activeSpotToCfmMap = spotToCfmMap;
+
     logger.info('Dynamic products list built', {
       spot: spotSymbols,
       perps: perpsSymbols,
+      cfm: cfmSymbols,
       engineProducts,
       spotToPerpsMapping: Object.fromEntries(spotToPerpsMap),
+      spotToCfmMapping: Object.fromEntries(spotToCfmMap),
     });
 
     // Clone guardrails so the engine session never mutates the process-wide config
@@ -1452,7 +1520,9 @@ app.post('/api/engine/start', async (req, res) => {
       //      live perps mark instead of staying frozen at entry.
       const perpsSymbol = activeSpotToPerpsMap.get(ticker.product_id);
       if (perpsSymbol && tradingEngine) {
-        tradingEngine.getPaperSimulator?.()?.updateMarketPrice(perpsSymbol, price);
+        // Mirror the full quote (bid/ask, not just last) so post-only geometry
+        // on the mirrored symbol is evaluated against a real touch.
+        tradingEngine.getPaperSimulator?.()?.updateMarketQuote(perpsSymbol, { bid, ask, last: price });
         tradingEngine.getPositionMonitor?.()?.updatePrice(perpsSymbol, price);
         tradingEngine.getPositionTrackerInstance?.()?.updateMarketPrice(perpsSymbol, price);
         // AND the engine's own marketPrices map — risk engine's checkOrder
@@ -1462,6 +1532,9 @@ app.post('/api/engine/start', async (req, res) => {
         // stop-loss detection fires every second but can never close.
         tradingEngine.setMarketPrice(perpsSymbol, price);
       }
+
+      // *-CDE paper symbols: same spot-proxy bridge (card SH-QMAKER-CFM-PAPER-v0).
+      mirrorSpotTickToCfm(ticker.product_id, { bid, ask, last: price });
     });
 
     tradingEngine.on('order:created', async (order) => {
@@ -1471,6 +1544,28 @@ app.post('/api/engine/start', async (req, res) => {
         await syncOrderToSupabase(order);
       } catch (err) {
         logger.error('Failed to handle order:created', { error: String(err) });
+      }
+    });
+
+    // Paper post-only misses (card SH-QMAKER-CFM-PAPER-v0 blocker 1) and
+    // in-place re-quotes (blocker 2) are terminal / state changes on an order
+    // the blotter already knows about — persist them so every attempt is
+    // attributable (metric: post-only accept %, edit count).
+    tradingEngine.on('order:rejected', async (order, reason) => {
+      try {
+        broadcast({ type: 'OrderUpdate', payload: { ...order, rejectReason: reason } });
+        await syncOrderToSupabase(order);
+      } catch (err) {
+        logger.error('Failed to handle order:rejected', { error: String(err) });
+      }
+    });
+
+    tradingEngine.on('order:edited', async (order) => {
+      try {
+        broadcast({ type: 'OrderUpdate', payload: order });
+        await syncOrderToSupabase(order);
+      } catch (err) {
+        logger.error('Failed to handle order:edited', { error: String(err) });
       }
     });
 
@@ -1752,6 +1847,16 @@ app.post('/api/engine/start', async (req, res) => {
       signalProcessor.loadPerSymbolOverridesFromGuardrails(guardrails.perps_symbols);
       logger.info('Loaded per-symbol strategy overrides (perps)', {
         symbols: Object.keys(guardrails.perps_symbols),
+      });
+    }
+
+    // CFM / CDE paper symbols: same plumbing (paper only; every built-in strategy
+    // is disabled on them via disabled_strategies until a card strategy lands).
+    if (cfmSymbols.length > 0 && guardrails.cfm_symbols) {
+      signalProcessor.loadPerSymbolOverridesFromGuardrails(guardrails.cfm_symbols);
+      logger.info('Loaded per-symbol strategy overrides (cfm, paper only)', {
+        symbols: cfmSymbols,
+        disabled: Object.fromEntries(cfmSymbols.map((s) => [s, guardrails.cfm_symbols?.[s]?.disabled_strategies ?? []])),
       });
     }
 
@@ -2299,22 +2404,15 @@ app.post('/api/engine/start', async (req, res) => {
           return routeRejected(routedExchange, 'sizing', 'position_multiplier_zero');
         }
 
-        const orderTypeSetting = guardrails.execution.order_type;
-        let orderType: 'limit' | 'market' = 'limit';
-        let postOnly = orderTypeSetting === 'post_only';
-        let limitPrice = entryPrice;
-
-        if (orderTypeSetting === 'market') {
-          orderType = 'market';
-          postOnly = false;
-        } else if (orderTypeSetting === 'marketable_limit') {
-          const priceOffsetBps = guardrails.execution.price_offset_ticks;
-          const priceDelta = entryPrice * (priceOffsetBps / 10000);
-          limitPrice = signal.direction === 'buy' ? entryPrice + priceDelta : entryPrice - priceDelta;
-          if (limitPrice <= 0) {
-            limitPrice = entryPrice;
-          }
-        }
+        // Per-venue execution policy (card SH-QMAKER-CFM-PAPER-v0 blocker 1):
+        // *-CDE → guardrails.cfm.execution (TRUE post-only at the signal price,
+        // never chased); everything else → legacy guardrails.execution.order_type
+        // (marketable_limit ± price_offset_ticks bps today). See
+        // trading/execution/execution-policy.ts.
+        const execution = resolveEntryExecution(signal.symbol, guardrails, entryPrice, signal.direction);
+        const orderType = execution.orderType;
+        const postOnly = execution.postOnly;
+        const limitPrice = execution.limitPrice;
 
         const baseOrder = {
           product_id: signal.symbol,
@@ -2338,6 +2436,9 @@ app.post('/api/engine/start', async (req, res) => {
           positionMultiplier,
           size: computedSize,
           orderType,
+          executionPolicy: execution.policy,
+          postOnly,
+          noChase: execution.noChase,
           notionalUsd: (computedSize * entryPrice),
           limitPrice: limitPriceStr
         });
@@ -2420,6 +2521,11 @@ app.post('/api/engine/start', async (req, res) => {
             takeProfit: signal.takeProfit,
             intendedEntryPrice: entryPrice,
             notionalUsd: computedSize * entryPrice,
+            executionPolicy: execution.policy,
+            postOnly,
+            // OrderManager honours metadata.noChase: a venue post-only rejection
+            // is terminal (logged miss), never re-priced toward the market.
+            noChase: execution.noChase,
           }
         });
         if (order) {
@@ -2459,6 +2565,68 @@ app.post('/api/engine/start', async (req, res) => {
 
     // Start the engine
     await tradingEngine.start('api_request');
+
+    // CFM / CDE paper harness guard (card SH-QMAKER-CFM-PAPER-v0 blocker 5) —
+    // only when *-CDE paper symbols are active (paper mode by construction):
+    //   - Charter ≤2× cap as a pre-trade gate + kill (reason `leverage_breach`)
+    //     + flatten of *-CDE inventory on breach;
+    //   - CDE Fri 17:00–18:00 ET break: entries blocked ahead of it, resting
+    //     *-CDE orders cancelled + inventory flattened before the gap;
+    //   - re-quote budget (`cfm.execution.max_requotes_per_sec`) on editOrder.
+    // Wired here (not inside the engine) so the engine stays venue-agnostic.
+    if (cfmSymbols.length > 0) {
+      const cfmConfig = resolveCfmConfig(engineGuardrails);
+      const riskEngine = tradingEngine.getRiskEngineInstance();
+      const engineRef = tradingEngine;
+      if (!riskEngine) {
+        throw new Error('CFM paper symbols configured but the RiskEngine is not initialised');
+      }
+      cfmGuard = new CfmGuard(
+        {
+          symbols: cfmSymbols,
+          maxLeverage: cfmConfig.max_leverage,
+          hoursGap: {
+            entryBlockLeadMin: cfmConfig.hours_gap.entry_block_lead_min,
+            flattenLeadMin: cfmConfig.hours_gap.flatten_lead_min,
+          },
+          logger,
+        },
+        {
+          getOpenPositions: () =>
+            engineRef.getOpenPositions().map((p) => ({ symbol: p.symbol, side: p.side, size: p.size, marketPrice: p.marketPrice })),
+          getEquityUsd: () => riskEngine.getAccountEquity(),
+        },
+      );
+      riskEngine.registerPreTradeGate(cfmGuard.preTradeGate());
+      cfmGuard.on('cfm:leverage_breach', (snapshot: CfmLeverageSnapshot) => {
+        riskEngine.activateKillSwitch(
+          `CFM Charter leverage cap breached: *-CDE gross $${snapshot.grossNotionalUsd.toFixed(2)} = ` +
+            `${Number.isFinite(snapshot.leverage) ? snapshot.leverage.toFixed(2) : '∞'}× of equity $${snapshot.equityUsd.toFixed(2)} (cap ${snapshot.maxLeverage}×)`,
+          'leverage_breach',
+        );
+      });
+      cfmGuard.on('cfm:flatten_required', (event: CfmFlattenRequiredEvent) => {
+        engineRef
+          .flattenSymbols(event.symbols, { reason: event.reason })
+          .then((result) => {
+            logger.warn('CFM flatten completed', { reason: event.reason, phase: event.phase, ...result });
+            broadcast({ type: 'RiskEvent', payload: { type: 'cfm_flatten', reason: event.reason, phase: event.phase, ...result } });
+          })
+          .catch((err) => {
+            logger.error('CFM flatten failed', { reason: event.reason, error: err instanceof Error ? err.message : String(err) });
+          });
+      });
+      cfmGuard.start(15_000);
+      tradingEngine.setRequoteThrottle(new OrderOpsThrottle({ maxOpsPerSec: cfmConfig.execution.max_requotes_per_sec }));
+      logger.info('CFM paper harness guard armed (infra only — NOT strategy GO, NOT CONFIRM_LIVE)', {
+        symbols: cfmSymbols,
+        maxLeverage: cfmConfig.max_leverage,
+        execution: cfmConfig.execution,
+        hoursGap: cfmConfig.hours_gap,
+        quotePath: 'spot_proxy',
+        spotToCfmMapping: Object.fromEntries(spotToCfmMap),
+      });
+    }
 
     // Update supervisor state
     supervisor.setDesiredState('running', mode as any);
@@ -2515,6 +2683,10 @@ app.post('/api/engine/start', async (req, res) => {
       activeSymbols,
       perpsSymbols: perpsSymbols,
       spotToPerpsMapping: Object.fromEntries(activeSpotToPerpsMap),
+      // CFM / CDE paper harness symbols (empty in live — never a live unlock).
+      cfmSymbols,
+      spotToCfmMapping: Object.fromEntries(activeSpotToCfmMap),
+      cfmGuard: cfmGuard ? cfmGuard.getStatus() : null,
       // Live only: what the session is actually sizing/charging from (TASK_011).
       liveAccount: liveAccountSummary ?? null,
       evGateMode: mode === 'live' ? resolveLiveConfig(engineGuardrails).ev_gate_mode : null,
@@ -2551,6 +2723,7 @@ app.post('/api/engine/start', async (req, res) => {
       }
       hyperliquidAdapter = null;
       activeSpotToPerpsMap = new Map();
+      stopCfmGuard();
       if (signalProcessor) {
         signalProcessor = null;
       }
@@ -2831,6 +3004,7 @@ app.post('/api/engine/stop', async (req, res) => {
     exchangeRegistry = null;
     hyperliquidAdapter = null;
     activeSpotToPerpsMap = new Map();
+    stopCfmGuard();
 
     // Update supervisor actual state
     supervisor.setActualState('stopped', 'api_stop_request');

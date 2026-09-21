@@ -615,22 +615,7 @@ export class PaperTradingSimulator extends EventEmitter {
       this.checkLimitOrderFill(order, quote, { onPlacement: true });
     }
 
-    // Return order response
-    const response: PaperOrderResponse = {
-      id: order.id,
-      product_id: order.productId,
-      side: order.side,
-      type: order.type,
-      size: order.size.toString(),
-      price: order.price !== undefined ? order.price.toString() : undefined,
-      post_only: order.postOnly,
-      status: order.status,
-      filled_size: order.filledSize.toString(),
-      executed_value: order.executedValue.toString(),
-      created_at: order.createdAt.toISOString(),
-      fill_fees: this.calculateFees(order).toString(),
-      settled: order.status === 'done'
-    };
+    const response = this.toResponse(order);
 
     this.logger.info('Paper order placed', {
       orderId: order.id,
@@ -640,7 +625,7 @@ export class PaperTradingSimulator extends EventEmitter {
       size: order.size,
       price: order.price ?? null,
       postOnly: order.postOnly,
-      status: order.status
+      status: response.status
     });
 
     return response;
@@ -734,6 +719,12 @@ export class PaperTradingSimulator extends EventEmitter {
       this.checkLimitOrderFill(order, quote, { onPlacement: true });
     }
 
+    return this.toResponse(order);
+  }
+
+  /** Wire-shaped view of a simulated order (status read fresh — fills may have just landed). */
+  private toResponse(order: SimulatedOrder): PaperOrderResponse {
+    const status: SimulatedOrderStatus = order.status;
     return {
       id: order.id,
       product_id: order.productId,
@@ -742,12 +733,12 @@ export class PaperTradingSimulator extends EventEmitter {
       size: order.size.toString(),
       price: order.price !== undefined ? order.price.toString() : undefined,
       post_only: order.postOnly,
-      status: order.status,
+      status,
       filled_size: order.filledSize.toString(),
       executed_value: order.executedValue.toString(),
       created_at: order.createdAt.toISOString(),
       fill_fees: this.calculateFees(order).toString(),
-      settled: order.status === 'done',
+      settled: status === 'done',
     };
   }
 

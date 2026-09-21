@@ -36,6 +36,12 @@ export interface PerSymbolDisableSourceConfig {
   per_symbol?: Record<string, { disabled_strategies?: string[] }>;
   perps_symbols?: Record<string, { disabled_strategies?: string[] }>;
   hyperliquid_symbols?: Record<string, { disabled_strategies?: string[] }>;
+  /**
+   * CFM / CDE paper symbols (card SH-QMAKER-CFM-PAPER-v0). Every built-in
+   * strategy is listed here until a card strategy is authorised, which is
+   * how "infra wired, NOT strategy GO" is enforced at the signal gate.
+   */
+  cfm_symbols?: Record<string, { disabled_strategies?: string[] }>;
 }
 
 /**
@@ -59,6 +65,7 @@ export function buildPerSymbolDisabledStrategies(
     guardrails.per_symbol,
     guardrails.perps_symbols,
     guardrails.hyperliquid_symbols,
+    guardrails.cfm_symbols,
   ];
   for (const block of blocks) {
     if (!block) continue;
