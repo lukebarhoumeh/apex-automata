@@ -1,5 +1,8 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { computePortfolioHeatPct } from "@/lib/portfolio-heat";
+import { fetchSessionOpenPositions, type EngineOpenPosition } from "@/lib/session-blotter-fetch";
+import { sessionKey } from "@/lib/session-scope";
+import { useActiveSession } from "@/runtime/session";
 import type {
   ExposureNode,
   KillLadderRow,
@@ -191,15 +194,39 @@ function buildKillLadder(portfolio: PortfolioRisk, killActive: boolean): KillLad
   });
 }
 
+/** Open notional (USD) per symbol from the engine's open positions, at the engine mark. */
+export function notionalBySymbol(positions: readonly EngineOpenPosition[] | null): ReadonlyMap<string, number> | null {
+  if (positions === null) return null;
+  const out = new Map<string, number>();
+  for (const p of positions) {
+    const size = Math.abs(Number(p.size));
+    const px = Number(p.marketPrice) > 0 ? Number(p.marketPrice) : Number(p.averagePrice);
+    if (!Number.isFinite(size) || size <= 0 || !Number.isFinite(px) || px <= 0) continue;
+    out.set(p.symbol, (out.get(p.symbol) ?? 0) + size * px);
+  }
+  return out;
+}
+
 /**
  * Exposure tree rooted at the REAL open notional from the PnL snapshot
  * (`exposureUsd`) — the same number the hero heat and Risk hero use. The
  * Risk page used to add a hard-coded five-figure demo inflate to this total.
- * Per-symbol children are pending a runtime breakdown; until then the single
- * child states what the total is, never a fabricated allocation.
+ * Children are the engine's per-symbol notionals when `/api/positions` is
+ * available; otherwise a single child states what the total is — never a
+ * fabricated allocation.
  */
-export function buildExposureTree(exposureUsd: number): ExposureNode {
-  const exposure = Number.isFinite(exposureUsd) ? Math.max(0, exposureUsd) : 0;
+export function buildExposureTree(
+  exposureUsd: number,
+  bySymbol: ReadonlyMap<string, number> | null = null,
+): ExposureNode {
+  const children: ExposureNode[] = bySymbol
+    ? [...bySymbol.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([label, value]) => ({ label, value: Math.round(value) }))
+    : [];
+  const childTotal = children.reduce((acc, c) => acc + c.value, 0);
+  const exposure = Number.isFinite(exposureUsd) && exposureUsd > 0 ? Math.round(exposureUsd) : childTotal;
+  if (children.length > 0) return { label: "Portfolio", value: exposure, children };
   return {
     label: "Portfolio",
     value: exposure,
@@ -210,15 +237,21 @@ export function buildExposureTree(exposureUsd: number): ExposureNode {
   };
 }
 
-function buildSymbolCaps(): SymbolCap[] {
-  // With no open-exposure-per-symbol feed, show configured caps at zero use.
-  // Once /api/risk/analytics grows a per-symbol breakdown, we'll plug that in.
-  return Object.entries(PER_SYMBOL_CAP).map(([s, cap]) => ({
-    s,
-    used: 0,
-    cap,
-    pct: 0,
-  }));
+/**
+ * Per-symbol caps (guardrails) against the engine's open notional. `used` is
+ * null — rendered "—" — when no per-symbol source is available, never a $0
+ * that reads as "nothing on" while positions are open. Symbols with open
+ * notional but no configured cap are listed with `cap: null`.
+ */
+export function buildSymbolCaps(bySymbol: ReadonlyMap<string, number> | null): SymbolCap[] {
+  const rows: SymbolCap[] = Object.entries(PER_SYMBOL_CAP).map(([s, cap]) => {
+    const used = bySymbol ? Math.round(bySymbol.get(s) ?? 0) : null;
+    return { s, used, cap, pct: used === null ? null : (used / cap) * 100 };
+  });
+  for (const [s, used] of bySymbol ?? []) {
+    if (!(s in PER_SYMBOL_CAP)) rows.push({ s, used: Math.round(used), cap: null, pct: null });
+  }
+  return rows;
 }
 
 // Minimal placeholder correlation matrix (6x6 identity) — correlation view
@@ -233,17 +266,21 @@ const IDENTITY_CORR: readonly (readonly number[])[] = CORR_LABELS.map((_, i) =>
 // ============================================================
 
 export function useRiskData() {
+  const scope = useActiveSession();
   return useQuery<RiskData>({
-    queryKey: ["apex", "risk-data"],
+    queryKey: ["apex", "risk-data", sessionKey(scope)],
     queryFn: async () => {
-      const [status, pnl, riskStatus, blocked] = await Promise.all([
+      const [status, pnl, riskStatus, blocked, positions] = await Promise.all([
         fetchJsonOrNull<BackendStatus>("/api/status"),
         fetchJsonOrNull<BackendPnL>("/api/pnl"),
         fetchJsonOrNull<BackendRiskStatus>("/api/risk/status"),
         fetchJsonOrNull<BackendBlockedSymbols>("/api/risk/blocked/symbols"),
+        // Engine open positions (session-scoped) for the per-symbol split.
+        fetchSessionOpenPositions(scope, 50).catch(() => null),
       ]);
 
       const portfolio = buildPortfolio(status, pnl, riskStatus);
+      const bySymbol = notionalBySymbol(positions?.engineOpenPositions ?? null);
       const openPositions = riskStatus?.positions.open ?? 0;
       const maxPositions = riskStatus?.positions.max ?? 4;
       const blockedCount = blocked?.count ?? 0;
@@ -255,11 +292,11 @@ export function useRiskData() {
 
       return {
         portfolio,
-        symbolCaps: buildSymbolCaps(),
+        symbolCaps: buildSymbolCaps(bySymbol),
         radar: buildRadar(portfolio, blockedCount, openPositions, maxPositions),
         corr: IDENTITY_CORR,
         corrLabels: [...CORR_LABELS],
-        tree: buildExposureTree(portfolio.exposure),
+        tree: buildExposureTree(portfolio.exposure, bySymbol),
         killLadder: buildKillLadder(portfolio, killSwitchActive),
       };
     },

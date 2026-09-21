@@ -264,15 +264,17 @@ export function useMetaModel() {
       ].filter(Boolean).length;
       return {
         // Label explicitly clarifies this is the rule-based filter, not an
-        // ML model. MetaModelHero renders this as the header.
+        // ML model. MetaModelHero renders this as the header; the ML quality
+        // metrics are null → "—" because there is no model to measure.
         name: "Rule-based · cold-streak + time filter (ML not loaded)",
         features,
-        rocAuc: 0,
-        precision: 0,
-        recall: 0,
-        f1: 0,
+        mlLoaded: false,
+        rocAuc: null,
+        precision: null,
+        recall: null,
+        f1: null,
         threshold: 0.5,
-        trainedOn: 0,
+        trainedOn: null,
       };
     },
     staleTime: 30_000,

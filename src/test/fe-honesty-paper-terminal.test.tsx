@@ -30,7 +30,7 @@ import {
   markToMarketEquity,
 } from "@/hooks/apex/useDashboardData";
 import { mapStrategyConfigs } from "@/hooks/apex/useSignalsData";
-import { buildExposureTree, buildPortfolio } from "@/hooks/apex/useRiskData";
+import { buildExposureTree, buildPortfolio, buildSymbolCaps, notionalBySymbol } from "@/hooks/apex/useRiskData";
 import { normalizeSnapshot, snapshotFromStatus } from "@/hooks/usePnLSnapshot";
 import { computePortfolioHeatPct, formatHeatPct } from "@/lib/portfolio-heat";
 import { markStatusLabel, openPositionsSubtitle, resolvePositionMark } from "@/lib/position-pnl";
@@ -42,6 +42,7 @@ import {
 } from "@/lib/session-blotter-fetch";
 import {
   formatExpectancyR,
+  formatModelMetric,
   formatWinLoss,
   formatWinRate,
   heroSessionSentence,
@@ -54,6 +55,8 @@ import { RegimeCard } from "@/components/apex/dashboard/RegimeCard";
 import { StrategyCards } from "@/components/apex/dashboard/StrategyCards";
 import { ActivePositionsStrip } from "@/components/apex/orders/ActivePositionsStrip";
 import { RiskHero } from "@/components/apex/risk/RiskHero";
+import { SymbolCapsTable } from "@/components/apex/risk/SymbolCapsTable";
+import { MetaModelHero } from "@/components/apex/signals/MetaModelHero";
 import { StrategyConfigCard } from "@/components/apex/signals/StrategyConfigCard";
 import type {
   BackendRuntimeStatus,
@@ -203,6 +206,29 @@ describe("A — no hard-coded demo numbers in the Risk / PnL paths", () => {
       children: [{ label: "No open positions", value: 0 }],
     });
     expect(buildExposureTree(Number.NaN).value).toBe(0);
+  });
+
+  it("exposure tree children and per-symbol caps come from the engine's open notional, — when unavailable", () => {
+    const bySymbol = notionalBySymbol(THREE_HYDRATED)!;
+    // ETH 0.5 × 3050 + BTC 0.1 × 60500 + SOL 10 × 148
+    expect([...bySymbol.entries()]).toEqual([["ETH-USD", 1_525], ["BTC-USD", 6_050], ["SOL-USD", 1_480]]);
+    expect(notionalBySymbol(null)).toBeNull();
+
+    const tree = buildExposureTree(9_055, bySymbol);
+    expect(tree.value).toBe(9_055);
+    expect(tree.children?.map((c) => [c.label, c.value])).toEqual([["BTC-USD", 6_050], ["ETH-USD", 1_525], ["SOL-USD", 1_480]]);
+    // Snapshot exposure missing → the root is the sum of the children, not 0.
+    expect(buildExposureTree(0, bySymbol).value).toBe(9_055);
+
+    const caps = buildSymbolCaps(bySymbol);
+    expect(caps.find((c) => c.s === "BTC-USD")).toMatchObject({ used: 6_050, cap: 3_000 });
+    expect(caps.find((c) => c.s === "BTC-USD")!.pct).toBeCloseTo(201.67, 1);
+    expect(caps.find((c) => c.s === "AVAX-USD")).toMatchObject({ used: 0, pct: 0 });
+    // No per-symbol source → null, rendered "—", never $0.
+    expect(buildSymbolCaps(null).every((c) => c.used === null && c.pct === null)).toBe(true);
+    const { getByTestId } = render(<SymbolCapsTable caps={buildSymbolCaps(null)} />);
+    expect(getByTestId("symbol-cap-BTC-USD").textContent).toContain("—");
+    expect(getByTestId("symbol-cap-BTC-USD").textContent).not.toContain("$0");
   });
 
   it("PnL snapshot is never fabricated: status without .pnl → null, payload without equity → null", () => {
@@ -509,6 +535,30 @@ describe("regime — primary word is Chop / Trend, detector detail is the subtit
     const { getByTestId } = render(<RegimeCard regime={REGIME_CHOP} />);
     expect(getByTestId("regime-label").textContent).toBe("Chop");
     expect(getByTestId("regime-subtitle").textContent).toBe("Chop · ranging conditions");
+  });
+});
+
+describe("Signals meta hero — no placeholder 0.0% for an ML model that is not loaded", () => {
+  it("renders — for ROC AUC / precision / recall / F1 and the acceptance rate without signals", () => {
+    expect(formatModelMetric(null, false)).toBe("—");
+    expect(formatModelMetric(0, false)).toBe("—");
+    expect(formatModelMetric(0.625, true)).toBe("62.5%");
+    const meta = {
+      name: "Rule-based · cold-streak + time filter (ML not loaded)",
+      features: 2,
+      mlLoaded: false,
+      rocAuc: null,
+      precision: null,
+      recall: null,
+      f1: null,
+      threshold: 0.5,
+      trainedOn: null,
+    };
+    const { getByTestId, container } = render(<MetaModelHero meta={meta} signals={[]} />);
+    expect(getByTestId("meta-model-metrics").textContent).not.toMatch(/0\.0%/);
+    expect(getByTestId("meta-acceptance-rate").textContent).toBe("—");
+    expect(getByTestId("meta-model-copy").textContent).toMatch(/No ML model is loaded/);
+    expect(container.textContent).toContain("META-FILTER · RULE-BASED");
   });
 });
 

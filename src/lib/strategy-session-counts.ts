@@ -135,6 +135,12 @@ export function formatWinLoss(wins: number, losses: number, closed: number): str
   return closed <= 0 ? "—" : `${wins}/${losses}`;
 }
 
+/** `62.5%` for a defined ML quality metric; "—" when no model is loaded (never a placeholder 0.0%). */
+export function formatModelMetric(value: number | null, mlLoaded: boolean): string {
+  if (!mlLoaded || value === null || !Number.isFinite(value)) return "—";
+  return `${(value * 100).toFixed(1)}%`;
+}
+
 /** `3 open` / `3 open (2 hydrated)`. */
 export function formatOpenLive(open: number | null, hydratedOpen: number | null): string {
   if (open === null) return "—";

@@ -26,9 +26,12 @@ export interface RiskRadarAxis {
 
 export interface SymbolCap {
   s: string;
-  used: number;
-  cap: number;
-  pct: number;
+  /** Open notional (USD) from the engine's positions; null when no per-symbol source is available. */
+  used: number | null;
+  /** guardrails per_symbol max_notional_usd; null when the symbol has no configured cap. */
+  cap: number | null;
+  /** used / cap × 100; null when either side is unknown. */
+  pct: number | null;
 }
 
 export interface ExposureNode {

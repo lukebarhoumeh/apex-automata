@@ -72,10 +72,16 @@ export interface StrategyConfig {
 export interface MetaModelInfo {
   name: string;
   features: number;
-  rocAuc: number;
-  precision: number;
-  recall: number;
-  f1: number;
+  /**
+   * False in this codebase: the meta-filter is rule-based and no ML model is
+   * loaded, so ROC-AUC / precision / recall / F1 are undefined and render "—"
+   * (never a placeholder 0.0%).
+   */
+  mlLoaded: boolean;
+  rocAuc: number | null;
+  precision: number | null;
+  recall: number | null;
+  f1: number | null;
   threshold: number;
-  trainedOn: number;
+  trainedOn: number | null;
 }
