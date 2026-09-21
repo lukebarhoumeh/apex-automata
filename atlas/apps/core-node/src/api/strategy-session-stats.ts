@@ -35,6 +35,13 @@ export interface StrategyDescriptorLike {
   enabled?: boolean | null;
   /** Plugin `getStats().signalsGenerated` — a SIGNAL counter, mirrored verbatim. */
   signalsGenerated?: number | null;
+  /**
+   * Session-scoped emitted signal count (signals that cleared every gate).
+   * When provided, takes precedence over `signalsGenerated` for the
+   * `sessionStats.signalsGenerated` field so the FE number matches
+   * `/api/signals?session_id=<active>`.
+   */
+  sessionSignalsEmitted?: number | null;
 }
 
 /** Bucket for trades whose position carried no strategy tag. */
@@ -49,6 +56,12 @@ export interface StrategySessionStats {
   closedTrades: number;
   /** Positions opened in this session and still open. */
   openTrades: number;
+  /**
+   * Positions opened in a prior session and hydrated at engine start.
+   * NOT included in `openTrades` (which is session-scoped).
+   * FE should render these separately (e.g. "2 carried from prior session").
+   */
+  hydratedOpenCount: number;
   wins: number;
   losses: number;
   breakeven: number;
@@ -65,9 +78,9 @@ export interface StrategySessionStats {
   /** Epoch ms of the most recent exit in the session; `null` when none. */
   lastTradeAt: number | null;
   /**
-   * Mirrored plugin counter. Counts signals the strategy emitted this session —
-   * NOT trades. Kept so callers migrating off `/api/strategies.stats` see the
-   * same number side by side with `closedTrades`.
+   * Session-scoped emitted signal count. When the signal processor provides
+   * `sessionSignalsEmitted`, this mirrors it (matching `/api/signals` session
+   * count). Falls back to the plugin counter when unavailable.
    */
   signalsGenerated: number | null;
 }
@@ -75,6 +88,7 @@ export interface StrategySessionStats {
 export interface StrategySessionStatsTotals {
   closedTrades: number;
   openTrades: number;
+  hydratedOpenCount: number;
   wins: number;
   losses: number;
   breakeven: number;
@@ -101,9 +115,10 @@ export interface StrategySessionStatsReport {
 
 export const STRATEGY_SESSION_STATS_NOTES: readonly string[] = [
   'closedTrades counts positions opened AND closed in this engine session; positions hydrated from a prior session are excluded.',
+  'hydratedOpenCount counts positions opened in a prior session and hydrated at engine start — not included in openTrades.',
   'winRate and avgTradeUsd are null until the first closed trade — render "—", not 0%.',
   'pnlToday is realized USD on closed trades whose exit falls on riskDay (UTC); it differs from realizedPnlUsd when the session spans midnight UTC.',
-  'signalsGenerated is the plugin signal counter mirrored from /api/strategies.stats — it is NOT a trade count.',
+  'signalsGenerated is the session-scoped emitted signal count (signals that cleared all gates) — it mirrors /api/signals?session_id=<active>.',
 ];
 
 function toEpochMs(value: Date | number | string | null | undefined): number | null {
@@ -126,9 +141,15 @@ function normalizeStrategyId(strategy: string | null | undefined): string {
   return trimmed.length > 0 ? trimmed : UNKNOWN_STRATEGY_ID;
 }
 
+/** Position-like shape for hydrated opens (only strategy tag needed). */
+export interface HydratedOpenLike {
+  strategy?: string | null;
+}
+
 interface Bucket {
   closed: StrategyTradeLike[];
   open: number;
+  hydratedOpen: number;
 }
 
 /**
@@ -136,6 +157,7 @@ interface Bucket {
  *
  * @param input.closedTrades Closed trades of the session (`TradeAnalytics.getRecentTrades(Infinity)`).
  * @param input.openTrades Open trades of the session (`TradeAnalytics.getOpenTrades()`).
+ * @param input.hydratedOpenPositions Positions hydrated from a prior session (PositionTracker opens with `metadata.hydratedFromSupabase`).
  * @param input.strategies Registered plugins; every one appears in the output even with zero trades.
  * @param input.session Active session identity from the API runtime state.
  * @param input.engineRunning Whether the engine is running (report is empty-but-honest otherwise).
@@ -144,6 +166,7 @@ interface Bucket {
 export function buildStrategySessionStats(input: {
   closedTrades: readonly StrategyTradeLike[];
   openTrades?: readonly StrategyTradeLike[];
+  hydratedOpenPositions?: readonly HydratedOpenLike[];
   strategies: readonly StrategyDescriptorLike[];
   session: { sessionId: string | null; sessionStartedAt: number | null; executionMode: ExecutionMode | null };
   engineRunning: boolean;
@@ -157,7 +180,7 @@ export function buildStrategySessionStats(input: {
     const id = normalizeStrategyId(strategy);
     let bucket = buckets.get(id);
     if (!bucket) {
-      bucket = { closed: [], open: 0 };
+      bucket = { closed: [], open: 0, hydratedOpen: 0 };
       buckets.set(id, bucket);
     }
     return bucket;
@@ -165,6 +188,7 @@ export function buildStrategySessionStats(input: {
 
   for (const trade of input.closedTrades) bucketFor(trade.strategy).closed.push(trade);
   for (const trade of input.openTrades ?? []) bucketFor(trade.strategy).open += 1;
+  for (const pos of input.hydratedOpenPositions ?? []) bucketFor(pos.strategy).hydratedOpen += 1;
 
   // Registered strategies first (registry order), then any strategy that only
   // appears on trades (e.g. a plugin unregistered mid-session, or 'unknown').
@@ -177,7 +201,7 @@ export function buildStrategySessionStats(input: {
 
   const strategies: StrategySessionStats[] = orderedIds.map((strategyId) => {
     const descriptor = registered.get(strategyId);
-    const bucket = buckets.get(strategyId) ?? { closed: [], open: 0 };
+    const bucket = buckets.get(strategyId) ?? { closed: [], open: 0, hydratedOpen: 0 };
 
     let wins = 0;
     let losses = 0;
@@ -207,12 +231,21 @@ export function buildStrategySessionStats(input: {
     }
 
     const closedTrades = bucket.closed.length;
+    const sessionEmitted = descriptor?.sessionSignalsEmitted;
+    const pluginCounter = descriptor?.signalsGenerated;
+    const resolvedSignals =
+      typeof sessionEmitted === 'number' && Number.isFinite(sessionEmitted)
+        ? sessionEmitted
+        : typeof pluginCounter === 'number' && Number.isFinite(pluginCounter)
+          ? pluginCounter
+          : null;
     return {
       strategyId,
       name: descriptor?.name ?? null,
       enabled: descriptor ? Boolean(descriptor.enabled) : null,
       closedTrades,
       openTrades: bucket.open,
+      hydratedOpenCount: bucket.hydratedOpen,
       wins,
       losses,
       breakeven,
@@ -223,10 +256,7 @@ export function buildStrategySessionStats(input: {
       avgTradeUsd: closedTrades > 0 ? realizedPnlUsd / closedTrades : null,
       feesUsd,
       lastTradeAt,
-      signalsGenerated:
-        typeof descriptor?.signalsGenerated === 'number' && Number.isFinite(descriptor.signalsGenerated)
-          ? descriptor.signalsGenerated
-          : null,
+      signalsGenerated: resolvedSignals,
     };
   });
 
@@ -234,6 +264,7 @@ export function buildStrategySessionStats(input: {
     (acc, s) => ({
       closedTrades: acc.closedTrades + s.closedTrades,
       openTrades: acc.openTrades + s.openTrades,
+      hydratedOpenCount: acc.hydratedOpenCount + s.hydratedOpenCount,
       wins: acc.wins + s.wins,
       losses: acc.losses + s.losses,
       breakeven: acc.breakeven + s.breakeven,
@@ -242,7 +273,7 @@ export function buildStrategySessionStats(input: {
       pnlToday: acc.pnlToday + s.pnlToday,
       feesUsd: acc.feesUsd + s.feesUsd,
     }),
-    { closedTrades: 0, openTrades: 0, wins: 0, losses: 0, breakeven: 0, winRate: null, realizedPnlUsd: 0, pnlToday: 0, feesUsd: 0 },
+    { closedTrades: 0, openTrades: 0, hydratedOpenCount: 0, wins: 0, losses: 0, breakeven: 0, winRate: null, realizedPnlUsd: 0, pnlToday: 0, feesUsd: 0 },
   );
   totals.winRate = totals.closedTrades > 0 ? totals.wins / totals.closedTrades : null;
 

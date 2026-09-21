@@ -195,6 +195,9 @@ export class SignalProcessor extends EventEmitter {
   private signalArbiter: SignalArbiter;
   private enableArbiter: boolean;
 
+  /** Session-scoped per-strategy emitted signal counts (only signals that clear all gates). */
+  private sessionSignalCounts: Map<string, number> = new Map();
+
   constructor(config: SignalProcessorConfig, logger: Logger) {
     super();
     this.config = config;
@@ -1307,6 +1310,10 @@ export class SignalProcessor extends EventEmitter {
 
     // Emit signal
     this.emit('signal:generated', adjustedSignal);
+    this.sessionSignalCounts.set(
+      adjustedSignal.strategy,
+      (this.sessionSignalCounts.get(adjustedSignal.strategy) ?? 0) + 1,
+    );
     this.logger.info('Signal generated', {
       symbol: adjustedSignal.symbol,
       strategy: adjustedSignal.strategy,
@@ -1675,6 +1682,15 @@ export class SignalProcessor extends EventEmitter {
    */
   public getRegisteredStrategies(): StrategyPlugin[] {
     return this.strategyRegistry.getAll();
+  }
+
+  /**
+   * Session-scoped per-strategy emitted signal counts.
+   * Only counts signals that cleared every gate (regime, meta, arbiter, dedup).
+   * Matches the count `/api/signals?session_id=<active>` would return.
+   */
+  public getSessionSignalCounts(): ReadonlyMap<string, number> {
+    return this.sessionSignalCounts;
   }
 
   /**
