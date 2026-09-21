@@ -25,30 +25,44 @@ import { marketForSymbol } from '../core/symbol-utils';
 export const ROUTED_EXCHANGE_COINBASE_SPOT = 'coinbase' as const;
 /** Coinbase International Exchange perps (`XXX-PERP-INTX`). Same id as `CoinbasePerpsAdapter`. */
 export const ROUTED_EXCHANGE_COINBASE_PERPS = 'coinbase-perps' as const;
+/**
+ * Coinbase Financial Markets / CDE nano futures (`XXX-<expiry>-CDE`). Paper
+ * harness venue only (card SH-QMAKER-CFM-PAPER-v0); no live adapter carries
+ * this id. Any future live path is Advanced Trade `/cfm/*` — not INTX/drb.
+ */
+export const ROUTED_EXCHANGE_COINBASE_CFM = 'coinbase-cfm' as const;
 
 /** Execution venue ids the router can stamp today. */
 export type RoutedExchangeId =
   | typeof ROUTED_EXCHANGE_COINBASE_SPOT
-  | typeof ROUTED_EXCHANGE_COINBASE_PERPS;
+  | typeof ROUTED_EXCHANGE_COINBASE_PERPS
+  | typeof ROUTED_EXCHANGE_COINBASE_CFM;
 
 /**
  * Resolve the execution venue for a product symbol.
  *
  * Paper and live both execute every symbol through the engine's single
  * Coinbase path (paper: `PaperTradingSimulator`, which prices `*-PERP-INTX`
- * at the `coinbase.perps_intx` fee tier and settles it in USD collateral), so
- * the venue is a pure function of the symbol:
+ * at the `coinbase.perps_intx` fee tier, `*-CDE` at the `coinbase.cfm_nano`
+ * cost-plus book, and settles both in USD collateral), so the venue is a
+ * pure function of the symbol:
  *
- *   resolveRoutedExchange('ETH-USD')        === 'coinbase'
- *   resolveRoutedExchange('ETH-PERP-INTX')  === 'coinbase-perps'
+ *   resolveRoutedExchange('ETH-USD')          === 'coinbase'
+ *   resolveRoutedExchange('ETH-PERP-INTX')    === 'coinbase-perps'
+ *   resolveRoutedExchange('BIP-20DEC30-CDE')  === 'coinbase-cfm'
  *
  * Hyperliquid is deliberately absent: `guardrails.hyperliquid.enabled` only
  * governs whether the HL adapter connects; signal routing to HL is not wired.
  */
 export function resolveRoutedExchange(symbol: string): RoutedExchangeId {
-  return marketForSymbol(symbol) === 'perps'
-    ? ROUTED_EXCHANGE_COINBASE_PERPS
-    : ROUTED_EXCHANGE_COINBASE_SPOT;
+  switch (marketForSymbol(symbol)) {
+    case 'perps':
+      return ROUTED_EXCHANGE_COINBASE_PERPS;
+    case 'cfm':
+      return ROUTED_EXCHANGE_COINBASE_CFM;
+    default:
+      return ROUTED_EXCHANGE_COINBASE_SPOT;
+  }
 }
 
 /**
