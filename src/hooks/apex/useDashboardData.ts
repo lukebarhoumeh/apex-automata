@@ -8,10 +8,15 @@ import type { EquityPoint, EquityRange } from "@/types/equity";
 import type { KpiTile } from "@/types/kpi";
 import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
 import { mergeStrategyPolicy } from "@/lib/strategy-policy";
-import { fetchSessionBlotterRows, SIGNALS_DISPLAY_TIME_COLUMN } from "@/lib/session-blotter-fetch";
+import {
+  fetchSessionBlotterRows,
+  fetchSessionOpenPositions,
+  SIGNALS_DISPLAY_TIME_COLUMN,
+  type EngineOpenPosition,
+  type SessionOpenPositionsResult,
+} from "@/lib/session-blotter-fetch";
 import { hasActiveSession, sessionKey, type SessionScope } from "@/lib/session-scope";
 import { useActiveSession } from "@/runtime/session";
-import { supabase } from "@/integrations/supabase/client";
 import {
   countActiveMarkets,
   fetchEquityCurve,
@@ -189,7 +194,7 @@ export function useEquityCurve(range: EquityRange) {
 }
 
 // ============================================================
-// Open positions: Supabase positions table
+// Open positions: GET /api/positions (engine truth, session-scoped)
 // ============================================================
 
 interface PositionRow {
@@ -214,7 +219,8 @@ function num(v: unknown): number {
   return 0;
 }
 
-function mapPosition(row: PositionRow): Position {
+/** Supabase `positions` row → UI position (fallback path only). */
+export function mapPosition(row: PositionRow): Position {
   const side = row.side?.toUpperCase() === "SHORT" ? "SHORT" : "LONG";
 
   // The positions table stores no mark price. Marks come from the runtime
@@ -233,28 +239,70 @@ function mapPosition(row: PositionRow): Position {
     strat: row.strategy ?? "—",
     conf: 0,
     sparkline: [],
+    // Hydrated rows keep the OPENING session's session_id, so a session_id
+    // fallback read never returns one; only the engine path can flag them.
+    hydratedFromPriorSession: false,
   };
 }
 
+/**
+ * In-memory engine position (`/api/positions` → `engineOpenPositions`) → UI
+ * position. This is the PositionTracker's own list, so the dashboard and
+ * Orders open counts equal the engine's by construction, hydrated positions
+ * included (flagged, never hidden and never counted as this session's trades).
+ */
+export function mapEnginePosition(p: EngineOpenPosition): Position {
+  const side = (p.side ?? "").toLowerCase() === "short" ? "SHORT" : "LONG";
+  const openedMs =
+    typeof p.openTime === "number" ? p.openTime : typeof p.openTime === "string" ? Date.parse(p.openTime) : NaN;
+  const mark = num(p.marketPrice);
+  return {
+    id: p.id,
+    sym: p.symbol,
+    side,
+    qty: num(p.size),
+    entry: num(p.averagePrice),
+    stop: num(p.stopPrice),
+    target: num(p.takeProfit),
+    opened: Number.isFinite(openedMs) ? formatEpoch(openedMs) : "—",
+    strat: p.strategy ?? "—",
+    conf: 0,
+    // The engine's own mark (what its unrealized P&L is computed at). Live WS
+    // marks still take precedence at render time; this is the fallback so an
+    // engine-marked position is never valued "at entry".
+    mark: mark > 0 ? mark : undefined,
+    sparkline: [],
+    hydratedFromPriorSession: Boolean(p.hydratedFromPriorSession),
+  };
+}
+
+/**
+ * Open positions for the fetched session result: engine opens when the API
+ * provided them (truth, incl. hydrated), else the session-scoped rows.
+ */
+export function mapSessionOpenPositions(result: SessionOpenPositionsResult): Position[] {
+  if (result.engineOpenPositions !== null) {
+    return result.engineOpenPositions
+      .filter((p) => (p.side ?? "").toLowerCase() !== "flat" && num(p.size) > 0)
+      .map(mapEnginePosition);
+  }
+  return (result.rows as PositionRow[]).map(mapPosition);
+}
+
+/**
+ * Open positions of the ACTIVE session only. Prefers
+ * `GET /api/positions?session_id=&execution_mode=&status=open` (engine
+ * `engineOpenPositions`, hydrated flagged); Supabase fallback is filtered by
+ * `session_id` + `closed_at IS NULL`. Empty without a session — never an
+ * unscoped `closed_at IS NULL` sweep across prior runs.
+ */
 export function useOpenPositions() {
+  const scope = useActiveSession();
   return useQuery<readonly Position[]>({
-    queryKey: ["apex", "positions"],
-    queryFn: async () => {
-      const { data, error } = await supabase
-        .from("positions")
-        .select(
-          "id,symbol,strategy,side,qty_open,entry_price,stop_price_at_entry,take_profit_price,opened_at,closed_at",
-        )
-        .is("closed_at", null)
-        .order("opened_at", { ascending: false })
-        .limit(50);
-      // Throw on transient errors so React Query keeps the last-good list
-      // instead of clearing the positions table while a refetch stumbles.
-      if (error) throw new Error(`positions fetch: ${error.message}`);
-      return (data as PositionRow[] | null)?.map(mapPosition) ?? [];
-    },
+    queryKey: ["apex", "positions", sessionKey(scope)],
+    queryFn: async () => mapSessionOpenPositions(await fetchSessionOpenPositions(scope, 50)),
     staleTime: 2_000,
-    refetchInterval: 20_000,
+    refetchInterval: hasActiveSession(scope) ? 20_000 : false,
     placeholderData: keepPreviousData,
   });
 }

@@ -3,10 +3,10 @@ import { Panel } from "@/components/apex/Panel";
 import { Pill } from "@/components/apex/Pill";
 import { Sparkline } from "@/components/apex/Sparkline";
 import { fmt, fmtSign } from "@/components/apex/format";
-import { computePositionPnl } from "@/lib/position-pnl";
+import { computePositionPnl, markStatusLabel, resolvePositionMark } from "@/lib/position-pnl";
 import { cn } from "@/lib/utils";
 import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
-import type { Position } from "@/types/positions";
+import { countHydratedPositions, type Position } from "@/types/positions";
 
 interface PositionsTableProps {
   positions: readonly Position[];
@@ -16,12 +16,13 @@ interface PositionsTableProps {
 
 const NO_MARKS: LiveMarks = {};
 
-function markStatusLabel(rows: readonly Position[], marks: LiveMarks): string {
-  if (rows.length === 0) return "";
-  const marked = rows.filter((p) => marks[p.sym] !== undefined).length;
-  if (marked === 0) return "no live marks";
-  if (marked === rows.length) return "live marks";
-  return `marks ${marked}/${rows.length}`;
+export const HYDRATED_TITLE =
+  "Opened in a prior session and hydrated at engine start — live and counted as open, not one of this session's trades.";
+
+/** `3 active` / `3 active · 3 hydrated from prior session`. */
+export function openPositionsSubtitle(positions: readonly Position[]): string {
+  const hydrated = countHydratedPositions(positions);
+  return `${positions.length} active${hydrated > 0 ? ` · ${hydrated} hydrated from prior session` : ""}`;
 }
 
 /**
@@ -34,7 +35,7 @@ export function PositionsTable({ positions, marks = NO_MARKS }: PositionsTablePr
       header
       pad={0}
       title="Open positions"
-      subtitle={`${positions.length} active`}
+      subtitle={openPositionsSubtitle(positions)}
       right={
         <span className="mono text-[10.5px] text-fg-2">{markStatusLabel(positions, marks)}</span>
       }
@@ -59,7 +60,7 @@ export function PositionsTable({ positions, marks = NO_MARKS }: PositionsTablePr
           </thead>
           <tbody>
             {positions.map((p) => (
-              <PositionRow key={p.id} position={p} mark={marks[p.sym]?.price} />
+              <PositionRow key={p.id} position={p} mark={resolvePositionMark(p, marks).mark} />
             ))}
           </tbody>
         </table>
@@ -94,7 +95,20 @@ function PositionRow({ position, mark }: { position: Position; mark: number | un
 
   return (
     <tr className="group h-9 border-b border-obsidian-line transition-colors hover:bg-obsidian-2">
-      <td className="px-3 text-[12.5px] font-medium text-fg-0">{position.sym}</td>
+      <td className="px-3 text-[12.5px] font-medium text-fg-0">
+        <span className="inline-flex items-center gap-1.5">
+          {position.sym}
+          {position.hydratedFromPriorSession && (
+            <span
+              className="mono rounded-sm border border-obsidian-line-2 bg-obsidian-3 px-1 py-px text-[8.5px] uppercase tracking-[0.08em] text-fg-2"
+              title={HYDRATED_TITLE}
+              data-testid={`position-hydrated-${position.id}`}
+            >
+              hydrated
+            </span>
+          )}
+        </span>
+      </td>
       <td className="px-3">
         <Pill tone={position.side === "LONG" ? "up" : "down"} className="!text-[9.5px]">
           {position.side}

@@ -2,10 +2,11 @@ import { ArrowRight, ArrowUp, ArrowDown } from "lucide-react";
 import { Panel } from "@/components/apex/Panel";
 import { Pill } from "@/components/apex/Pill";
 import { fmt } from "@/components/apex/format";
-import { computePositionPnl, computeStopTargetProgress } from "@/lib/position-pnl";
+import { HYDRATED_TITLE } from "@/components/apex/dashboard/PositionsTable";
+import { computePositionPnl, computeStopTargetProgress, markStatusLabel, resolvePositionMark } from "@/lib/position-pnl";
 import { cn } from "@/lib/utils";
 import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
-import type { Position } from "@/types/positions";
+import { countHydratedPositions, type Position } from "@/types/positions";
 
 interface ActivePositionsStripProps {
   positions: readonly Position[];
@@ -21,8 +22,9 @@ const NO_MARKS: LiveMarks = {};
  * props on every render — no local ticking state, no synthetic jitter.
  */
 export function ActivePositionsStrip({ positions, marks = NO_MARKS, onViewAll }: ActivePositionsStripProps) {
-  const markedCount = positions.filter((p) => marks[p.sym] !== undefined).length;
-  const feedLive = positions.length > 0 && markedCount === positions.length;
+  const marksLabel = markStatusLabel(positions, marks);
+  const feedLive = marksLabel === "live marks";
+  const hydrated = countHydratedPositions(positions);
 
   return (
     <Panel header={false} pad={0}>
@@ -32,10 +34,13 @@ export function ActivePositionsStrip({ positions, marks = NO_MARKS, onViewAll }:
           <span className={feedLive ? "dot-live" : "inline-block h-1.5 w-1.5 rounded-full bg-fg-3"} />
           <span className="label">Active positions</span>
           <Pill tone="accent">{positions.length} OPEN</Pill>
-          {positions.length > 0 && !feedLive && (
-            <span className="mono text-[10px] uppercase tracking-[0.09em] text-fg-3">
-              marks {markedCount}/{positions.length}
+          {hydrated > 0 && (
+            <span title={HYDRATED_TITLE} data-testid="active-positions-hydrated">
+              <Pill tone="default">{hydrated} HYDRATED</Pill>
             </span>
+          )}
+          {positions.length > 0 && !feedLive && (
+            <span className="mono text-[10px] uppercase tracking-[0.09em] text-fg-3">{marksLabel}</span>
           )}
         </div>
         <button
@@ -50,7 +55,7 @@ export function ActivePositionsStrip({ positions, marks = NO_MARKS, onViewAll }:
 
       <div className="grid grid-cols-3 divide-x divide-obsidian-line">
         {positions.map((p) => (
-          <PositionCard key={p.id} position={p} mark={marks[p.sym]?.price} />
+          <PositionCard key={p.id} position={p} mark={resolvePositionMark(p, marks).mark} />
         ))}
       </div>
     </Panel>
@@ -83,7 +88,14 @@ function PositionCard({ position, mark }: { position: Position; mark: number | u
             {position.side}
           </Pill>
         </div>
-        <Pill tone="default">{position.strat.replace("_", " ")}</Pill>
+        <div className="flex items-center gap-1.5">
+          {position.hydratedFromPriorSession && (
+            <span title={HYDRATED_TITLE}>
+              <Pill tone="default">HYDRATED</Pill>
+            </span>
+          )}
+          <Pill tone="default">{position.strat.replace("_", " ")}</Pill>
+        </div>
       </div>
 
       <div className="flex items-start justify-between">
