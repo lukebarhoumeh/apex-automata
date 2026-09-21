@@ -71,3 +71,9 @@ pnpm exec tsx src/cli/backtest.ts \
 ```
 
 Line 1 of the summary is the data stamp (`DATA: REAL`); `atlas/var/backtest_results/report_*.txt` carries the same stamp on its first line plus per-symbol provenance.
+
+## `deploy-ui-preview.yml` — static GitHub Pages UI
+
+**Triggers** on `workflow_dispatch` and on pushes to `main` that touch the frontend. Builds with `VITE_UI_PREVIEW=1` and dummy public keys so the Pages site never talks to the live runtime, Coinbase, or the production Supabase project.
+
+**First-time setup:** repo Settings → Pages → Source = GitHub Actions. URL: `https://lukebarhoumeh.github.io/apex-automata/`.

@@ -1,6 +1,8 @@
 // Runtime Client - Direct connection to Atlas Node.js backend
 // API Reference: https://github.com/atlasbot/core-node
 
+import { isUiPreview, resolvePreviewFetch } from "@/lib/ui-preview";
+
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || 'http://localhost:3001';
 
 // ============= Types =============
@@ -179,6 +181,14 @@ export interface SignalsConfig {
 
 class RuntimeClient {
   private async request<T>(path: string, options?: RequestInit): Promise<T> {
+    if (isUiPreview()) {
+      const preview = resolvePreviewFetch(path, options?.method ?? 'GET');
+      if (!preview || preview.status >= 400) {
+        const err = (preview?.body as { error?: string } | undefined)?.error ?? 'UI preview — engine is not connected';
+        throw new Error(err);
+      }
+      return preview.body as T;
+    }
     const response = await fetch(`${API_URL}${path}`, {
       ...options,
       headers: {
@@ -196,6 +206,7 @@ class RuntimeClient {
   // ============= Health =============
   
   async checkHealth(): Promise<boolean> {
+    if (isUiPreview()) return true;
     try {
       const response = await fetch(`${API_URL}/health`, {
         signal: AbortSignal.timeout(3000),

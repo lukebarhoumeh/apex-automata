@@ -8,6 +8,7 @@
 
 import { normalizeRuntimeEvent, getUnknownTypes, getUnknownTypesCount } from './normalizeEvent';
 import { getConnectivityService } from '../connectivity/RuntimeConnectivityService';
+import { isUiPreview } from '@/lib/ui-preview';
 import type { 
   CanonicalEventType, 
   RuntimeEventEnvelope, 
@@ -339,7 +340,8 @@ let clientInstance: RuntimeWsClient | null = null;
 
 export function getRuntimeWsClient(): RuntimeWsClient {
   if (!clientInstance) {
-    clientInstance = new RuntimeWsClient(true);
+    // Preview builds are static — do not open (or retry) a WS to localhost.
+    clientInstance = new RuntimeWsClient(!isUiPreview());
   }
   return clientInstance;
 }

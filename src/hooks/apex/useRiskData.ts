@@ -7,10 +7,16 @@ import type {
   RiskRadarAxis,
   SymbolCap,
 } from "@/types/risk";
+import { isUiPreview, resolvePreviewFetch } from "@/lib/ui-preview";
 
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
 
 async function fetchJsonOrNull<T>(path: string): Promise<T | null> {
+  if (isUiPreview()) {
+    const preview = resolvePreviewFetch(path);
+    if (!preview || preview.status === 400 || preview.status === 503 || preview.status >= 400) return null;
+    return preview.body as T;
+  }
   let res: Response;
   try {
     res = await fetch(`${API_URL}${path}`);

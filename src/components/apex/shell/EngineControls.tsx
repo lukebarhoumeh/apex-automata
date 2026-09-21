@@ -7,6 +7,7 @@ import { useConnectivity } from "@/runtime/connectivity";
 import { useRuntimeStatus } from "@/hooks/useRuntimeStatus";
 import { deriveEnginePill, type EnginePillTone } from "@/runtime/state/deriveEnginePill";
 import { cn } from "@/lib/utils";
+import { isUiPreview } from "@/lib/ui-preview";
 
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
 
@@ -63,7 +64,9 @@ export function EngineControls() {
     onError: (err: Error) => toast.error("Kill failed", { description: err.message }),
   });
 
+  const preview = isUiPreview();
   const busy = start.isPending || stop.isPending || kill.isPending;
+  const controlsLocked = busy || preview;
 
   return (
     <div className="flex items-center gap-2">
@@ -85,7 +88,7 @@ export function EngineControls() {
         <button
           type="button"
           onClick={() => stop.mutate()}
-          disabled={busy}
+          disabled={controlsLocked}
           className={cn(
             "inline-flex items-center gap-1.5 rounded-md border border-obsidian-line bg-obsidian-2 px-2.5 py-1.5 text-[11px] font-medium text-fg-1 transition-colors",
             "hover:bg-obsidian-3 disabled:opacity-50 disabled:cursor-not-allowed",
@@ -98,7 +101,8 @@ export function EngineControls() {
         <button
           type="button"
           onClick={() => start.mutate()}
-          disabled={busy}
+          disabled={controlsLocked}
+          title={preview ? "UI preview — engine is not connected" : undefined}
           className={cn(
             "inline-flex items-center gap-1.5 rounded-md border border-up/40 bg-up/10 px-2.5 py-1.5 text-[11px] font-medium text-up transition-colors",
             "hover:bg-up/20 hover:border-up/60 disabled:opacity-50 disabled:cursor-not-allowed",
@@ -113,7 +117,7 @@ export function EngineControls() {
       <button
         type="button"
         onClick={() => kill.mutate()}
-        disabled={busy || !engineRunning}
+        disabled={controlsLocked || !engineRunning}
         className={cn(
           "inline-flex items-center gap-1.5 rounded-md border border-down/40 bg-down/10 px-2.5 py-1.5 text-[11px] font-medium text-down transition-colors",
           "hover:bg-down/20 hover:border-down/60 disabled:opacity-40 disabled:cursor-not-allowed",
