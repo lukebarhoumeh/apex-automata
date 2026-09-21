@@ -4,6 +4,9 @@ export * from './types';
 // Exchange registry
 export { ExchangeRegistry } from './exchange-registry';
 
+// Signal → venue routing verdicts (persisted on signals.routed_exchange / allowed)
+export * from './signal-route';
+
 // Adapters
 export { CoinbaseAdapter } from './coinbase-adapter';
 export { CoinbasePerpsAdapter } from './coinbase-perps-adapter';
