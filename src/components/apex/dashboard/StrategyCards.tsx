@@ -105,7 +105,7 @@ export function StrategyCards({ strategies }: StrategyCardsProps) {
                 ? "never registered — emits no signals"
                 : !s.sessionScoped
                   ? "no session ledger"
-                  : `${s.signals} ${s.signals === 1 ? "signal" : "signals"} emitted · ${s.trades} routed to ${s.trades === 1 ? "a trade" : "trades"}`}
+                  : `${s.signals} ${s.signals === 1 ? "signal" : "signals"} · ${s.trades} closed ${s.trades === 1 ? "trade" : "trades"}`}
             </div>
           </button>
         );
