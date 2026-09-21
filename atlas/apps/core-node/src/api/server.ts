@@ -17,6 +17,12 @@ import { buildStrategyPolicy } from '../strategies/strategy-policy';
 import { resolvePersistedEntryPrice } from '../trading/position-entry-vwap';
 import { buildFillRow, FILLS_UPSERT_ON_CONFLICT, FillRowFillRef, FillRowOrderRef } from '../persistence/fill-row';
 import { SessionColumnSupport, SessionStamp, writeWithSessionStamp } from '../persistence/session-stamp';
+import {
+  describePositionUpsertError,
+  PositionsConflictTargetSupport,
+  resolvePositionsConflictTarget,
+  upsertPositionRow,
+} from '../persistence/position-upsert';
 import { writeSignalRouteVerdict } from '../persistence/signal-route-verdict';
 import {
   resolveRoutedExchange,
@@ -332,6 +338,14 @@ logger.info('Using fixed USER_ID for single-user mode:', USER_ID);
 // the blotter read endpoints consult the same instance so one failed probe
 // switches every path to the legacy shape at once.
 const sessionColumnSupport = new SessionColumnSupport();
+
+// Conflict target for `positions` upserts. Defaults to the row's UUID `id`;
+// migration 20260511000000_positions_history_preserve.sql dropped the
+// UNIQUE (user_id, symbol) the legacy target relied on, and a 42P10 on the
+// configured target switches this process to `id` for good. See
+// persistence/position-upsert.ts.
+const positionsConflictSupport = new PositionsConflictTargetSupport(resolvePositionsConflictTarget(), { logger });
+logger.info('positions upsert conflict target', positionsConflictSupport.snapshot());
 
 // Session stamp for persisted rows. Set the moment the engine starts building
 // (so anything written during start-up already carries the id) and cleared when
@@ -4891,36 +4905,26 @@ async function syncPositionToSupabase(position: any) {
       realized_pnl_usd: Number(position.realizedPnL ?? position.realizedPnl ?? position.realized_pnl_usd ?? 0),
     };
 
-    // Conflict-target selection.
+    // Conflict target: the position's UUID `id` (its primary key, stable for
+    // the whole open → update → close lifecycle). Migration
+    // 20260511000000_positions_history_preserve.sql replaced the unconditional
+    // UNIQUE (user_id, symbol) with a partial open-only index, which Postgres
+    // will NOT infer for ON CONFLICT (user_id, symbol) — every write on the
+    // legacy target fails with 42P10. `positionsConflictSupport` starts at the
+    // env-configured target and switches to `id` on the first 42P10; see
+    // persistence/position-upsert.ts.
     //
-    // Legacy: UNIQUE(user_id, symbol) → upserting a NEW position for a symbol
-    //         that already has CLOSED history overwrites the historical row.
-    //         Migration 20260203_step7_persistence_hardening.sql:135.
-    //
-    // After migration 20260511_positions_history_preserve.sql is applied
-    // (partial unique index on (user_id, symbol) WHERE closed_at IS NULL),
-    // the (user_id, symbol) constraint is dropped and we conflict-resolve
-    // on the position's UUID `id` instead — which is stable for the whole
-    // lifecycle of one position, so updates still upsert correctly and
-    // historical rows are never touched.
-    //
-    // POSITIONS_HISTORY_PRESERVE=true gates this — keep at default (false)
-    // until the migration is applied; the user can flip it once Supabase
-    // is updated.
-    const preserveHistory = (process.env.POSITIONS_HISTORY_PRESERVE ?? 'false').toLowerCase() === 'true';
-    const onConflictTarget = preserveHistory ? 'id' : 'user_id,symbol';
-
     // TASK_014 P5: `session_id` on a position is the session that OPENED it. A
     // position hydrated from a prior session is re-written without the stamp so
     // the opening session's value survives its close in this session.
     const stamp = position.metadata?.hydratedFromSupabase ? null : currentSessionStamp();
-    const { error } = await writeWithSessionStamp({
-      table: 'positions',
+    const { error, onConflictTarget, conflictFellBack, stamped } = await upsertPositionRow({
       row: mappedPosition,
       stamp,
-      support: sessionColumnSupport,
-      write: async (payload) => {
-        const { error } = await supabase.from('positions').upsert(payload, { onConflict: onConflictTarget });
+      sessionSupport: sessionColumnSupport,
+      conflictSupport: positionsConflictSupport,
+      upsert: async (payload, onConflict) => {
+        const { error } = await supabase.from('positions').upsert(payload, { onConflict });
         return { error };
       },
       logger,
@@ -4931,9 +4935,12 @@ async function syncPositionToSupabase(position: any) {
         error: error.message,
         code: (error as any).code,
         onConflictTarget,
+        conflictFellBack,
+        stamped,
         positionId: mappedPosition.id,
         symbol: mappedPosition.symbol,
-        preserveHistory,
+        closedAt,
+        hint: describePositionUpsertError(error, onConflictTarget),
       });
     }
   } catch (error) {
