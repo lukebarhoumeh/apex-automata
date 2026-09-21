@@ -34,6 +34,7 @@ import { FeeModel } from '../core/fee-model';
 import { ACCOUNT_TRUTH_STALE, ACCOUNT_TRUTH_UNAVAILABLE } from './account/live-account-truth';
 import { isMissingColumnError, isMissingTableError } from '../core/postgrest-errors';
 import { ExecutionModeScope, normalizeExecutionMode } from './risk/execution-mode-scope';
+import type { PreTradeGate, PreTradeGateContext } from './risk/pre-trade-gate';
 
 /** Closed trades kept for the realized payoff (avg win / avg loss) used by the live EV gate. */
 export const REALIZED_PAYOFF_WINDOW = 50;
@@ -159,6 +160,8 @@ export interface RiskEngineConfig {
 export interface RiskCheck {
   passed: boolean;
   reason?: string;
+  /** Veto code from a registered pre-trade gate, when that is what failed the check. */
+  gateCode?: string;
   checks: {
     positionSize: boolean;
     totalExposure: boolean;
@@ -167,6 +170,8 @@ export interface RiskCheck {
     openOrders: boolean;
     openPositions: boolean;
     killSwitch: boolean;
+    /** False when a registered pre-trade gate (venue guard) vetoed the order. */
+    venueGate?: boolean;
   };
 }
 
@@ -236,6 +241,9 @@ export class RiskEngine extends EventEmitter {
   private riskStateMachine: RiskStateMachine;
   private riskMath: RiskMath;
   private dailyStopThresholdR: number;
+
+  /** Venue guards consulted by `checkOrder` (see `registerPreTradeGate`). */
+  private preTradeGates: PreTradeGate[] = [];
 
   // #A3 (2026-05-18): pre-trade EV gate
   private feeModel: FeeModel | null;
@@ -1049,6 +1057,39 @@ export class RiskEngine extends EventEmitter {
       check.checks.dailyLoss = false;
       this.emit('risk:check:failed', order.client_oid || '', check.reason);
       return check;
+    }
+
+    // Venue guards (registered pre-trade gates, e.g. the CFM Charter ≤2× cap and
+    // the CDE Fri-break gate). Each gate decides for its own symbols and whether
+    // reduce-only exits pass; the first veto fails the check.
+    if (this.preTradeGates.length > 0) {
+      const gateContext: PreTradeGateContext = {
+        symbol,
+        side: order.side,
+        isReduceOnly,
+        newAbsNotional: exposureSim.newAbsNotional,
+        currentAbsNotional: exposureSim.currentAbsNotional,
+        orderValueUsd: orderValue,
+        equityUsd: this.getCurrentEquityForSizing(),
+      };
+      for (const gate of this.preTradeGates) {
+        const decision = gate(gateContext);
+        if (decision && !decision.allowed) {
+          check.passed = false;
+          check.gateCode = decision.code;
+          check.reason = decision.code ? `${decision.code}: ${decision.reason ?? 'vetoed by venue gate'}` : decision.reason ?? 'vetoed by venue gate';
+          check.checks.venueGate = false;
+          this.logger.warn('Risk check vetoed by pre-trade gate', {
+            symbol,
+            side: order.side,
+            code: decision.code,
+            reason: decision.reason,
+            isReduceOnly,
+          });
+          this.emit('risk:check:failed', order.client_oid || '', check.reason);
+          return check;
+        }
+      }
     }
     
     // Reduce-only exits are allowed even when limits are breached; we still validate sizing best-effort.
@@ -1927,6 +1968,21 @@ export class RiskEngine extends EventEmitter {
     this.metrics.maxDrawdown = 0;
 
     this.logger.info('Daily risk metrics reset');
+  }
+
+  /**
+   * Register a venue guard consulted by `checkOrder()` for every order. Gates
+   * are venue-scoped by construction (they return `null` for symbols they do
+   * not govern), so the RiskEngine stays exchange-agnostic.
+   *
+   * @param gate Pre-trade gate (see `risk/pre-trade-gate.ts`).
+   * @returns Unregister function.
+   */
+  public registerPreTradeGate(gate: PreTradeGate): () => void {
+    this.preTradeGates.push(gate);
+    return () => {
+      this.preTradeGates = this.preTradeGates.filter((g) => g !== gate);
+    };
   }
 
   /**

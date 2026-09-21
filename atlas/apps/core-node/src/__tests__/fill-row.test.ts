@@ -63,7 +63,7 @@ describe('buildFillRow — P2: order_id is the client UUID, exchange id goes to 
     expect(row.external_order_id).toBe('cb-exchange-order-1');
   });
 
-  it('carries every other column over unchanged from the previous inline writer', () => {
+  it('carries every other column over unchanged from the previous inline writer (+ the fee_side pair, 2026-09-21)', () => {
     const order = { id: randomUUID(), exchangeOrderId: 'cb-exchange-order-1' };
     const row = buildFillRow({ userId: USER_ID, order, fill: legacyFill({ liquidity: 'M' }) });
 
@@ -77,6 +77,10 @@ describe('buildFillRow — P2: order_id is the client UUID, exchange id goes to 
       fee_currency: 'USD',
       fee_amount: 1.25,
       maker: true,
+      // Card SH-QMAKER-CFM-PAPER-v0 blocker 3: explicit attribution columns
+      // (migration 20260921180000, written schema-tolerantly by server.ts).
+      fee_side: 'maker',
+      fee_side_source: 'exchange',
       filled_at: '2026-09-10T15:00:00.000Z',
     };
     expect(row).toEqual(expected);
@@ -147,13 +151,24 @@ describe('buildFillRow — P2: order_id is the client UUID, exchange id goes to 
     expect(() => buildFillRow({ userId: USER_ID, order: noOrder, fill })).toThrow(FILL_ORDER_ID_MISSING);
   });
 
-  it('keeps legacy edge-case semantics: undefined trade_id -> null, non-maker liquidity -> maker=false', () => {
+  it('keeps legacy edge-case semantics: undefined trade_id -> null, taker liquidity -> maker=false', () => {
     const order = { id: randomUUID(), exchangeOrderId: 'x' };
     const { trade_id: _omitted, ...fillWithoutTradeId } = legacyFill({ liquidity: 'T' });
     const row = buildFillRow({ userId: USER_ID, order, fill: fillWithoutTradeId });
 
     expect(row.trade_id).toBeNull();
     expect(row.maker).toBe(false);
+    expect(row.fee_side).toBe('taker');
+  });
+
+  it('2026-09-21: an UNKNOWN liquidity is persisted as maker=null / fee_side=null, never coerced to taker', () => {
+    const order = { id: randomUUID(), exchangeOrderId: 'x' };
+    const { liquidity: _omitted, ...fillWithoutLiquidity } = legacyFill({});
+    const row = buildFillRow({ userId: USER_ID, order, fill: fillWithoutLiquidity });
+
+    expect(row.maker).toBeNull();
+    expect(row.fee_side).toBeNull();
+    expect(row.fee_side_source).toBeNull();
   });
 
   it('upsert conflict target is unchanged', () => {

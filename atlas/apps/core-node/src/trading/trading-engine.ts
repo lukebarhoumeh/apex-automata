@@ -6,7 +6,13 @@ import { OrderManager, OrderManagerConfig, ManagedOrder } from './order-manager'
 import { PositionTracker, PositionTrackerConfig, Position } from './position-tracker';
 import { RiskEngine, RiskEngineConfig, RiskMetrics } from './risk-engine';
 import { SecretManager, SecretConfig } from '../config/secrets';
-import { PaperTradingSimulator, PaperTradingConfig } from './paper-trading-simulator';
+import {
+  PaperTradingSimulator,
+  PaperTradingConfig,
+  PaperContractSpec,
+  PaperOrderRejectedError,
+} from './paper-trading-simulator';
+import { OrderOpsThrottle } from './execution/order-ops-throttle';
 import { PositionMonitor, PositionMonitorConfig } from './position-monitor';
 import { TradeAnalytics, TradeAnalyticsConfig, SessionStats, TradeRecord } from './trade-analytics';
 import { GuardrailConfig, resolveLiveConfig } from '../config/loadGuardrails';
@@ -121,6 +127,12 @@ export interface OrderRejection {
   /** `risk_engine` = pre-trade RiskEngine.checkOrder; `paper_validation` = simulator refused the order. */
   source: 'risk_engine' | 'paper_validation';
   reason: string;
+  /**
+   * Machine-readable code when the source supplies one (paper:
+   * `PaperRejectCode`, e.g. `POST_ONLY_WOULD_CROSS`). Lets the router count
+   * post-only misses without parsing `reason`.
+   */
+  code?: string;
   /** Epoch ms. */
   at: number;
 }
@@ -175,6 +187,10 @@ export class TradingEngine extends EventEmitter {
 
   // Most recent createOrder() null-return (see OrderRejection); cleared on the next accepted order.
   private lastOrderRejection: OrderRejection | null = null;
+  /** Engine-level order-mutation counters (see `getOrderOpsStats`). */
+  private orderOps = { edits: 0, editFallbackCancelReplace: 0 };
+  /** Optional re-quote budget / 429 cooldown applied to `editOrder` (wired by the API layer). */
+  private requoteThrottle: OrderOpsThrottle | null = null;
   
   // Per-symbol market data timestamp tracking for data gap detection
   private lastMarketDataPerSymbol: Map<string, number> = new Map();
@@ -1358,6 +1374,15 @@ export class TradingEngine extends EventEmitter {
     // tier the way every prior paper run was. See SPRINT-PLAN-FINAL.md
     // §1.4 / B5 for the quant impact (paper EV biased ~55 bps RT).
     const feeModel = FeeModel.fromGuardrails(this.guardrails);
+
+    // CFM / CDE paper symbols trade in contracts: the simulator needs the
+    // contract size (lot rounding + $/contract exchange floor) and the venue
+    // tick. Sourced from guardrails.cfm_symbols — never hardcoded here.
+    const contractSpecs: Record<string, PaperContractSpec> = {};
+    for (const [symbol, spec] of Object.entries(this.guardrails.cfm_symbols ?? {})) {
+      contractSpecs[symbol] = { contractSize: spec.contract_size, priceIncrementUsd: spec.price_increment_usd };
+    }
+
     const config: PaperTradingConfig = {
       initialBalances: new Map([
         ['USD', this.guardrails.account.equity_usd],
@@ -1367,7 +1392,8 @@ export class TradingEngine extends EventEmitter {
       feeModel,
       venue: 'coinbase',
       slippage: 0.001,  // 0.1%
-      latencyMs: 100    // 100ms simulated latency
+      latencyMs: 100,   // 100ms simulated latency
+      contractSpecs,
     };
 
     this.paperSimulator = new PaperTradingSimulator(config, this.logger);
@@ -1768,7 +1794,12 @@ export class TradingEngine extends EventEmitter {
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
           const normalized = reason.toLowerCase();
+          // Structured simulator rejections (post-only would cross, below one
+          // contract, no quote, insufficient balance …) carry a code; the
+          // substring matches remain for the legacy plain-Error messages.
+          const rejectCode = error instanceof PaperOrderRejectedError ? error.code : undefined;
           const isValidationError =
+            rejectCode !== undefined ||
             normalized.includes('insufficient') ||
             normalized.includes('order size must be greater than zero') ||
             normalized.includes('invalid order size');
@@ -1776,6 +1807,9 @@ export class TradingEngine extends EventEmitter {
           if (managedOrder) {
             managedOrder.status = 'rejected';
             managedOrder.updatedAt = new Date();
+            if (rejectCode) {
+              managedOrder.metadata = { ...(managedOrder.metadata ?? {}), rejectCode, rejectReason: reason };
+            }
           }
 
           if (this.orderManager) {
@@ -1786,18 +1820,27 @@ export class TradingEngine extends EventEmitter {
           if (isValidationError) {
             this.logger.warn('Paper order rejected', {
               reason,
+              code: rejectCode ?? null,
               productId: request.product_id,
               side: request.side,
               size: request.size,
               price: request.price ?? null,
+              postOnly: Boolean((request as OrderRequest).post_only),
             });
             this.lastOrderRejection = {
               productId: request.product_id,
               side: request.side,
               source: 'paper_validation',
               reason,
+              ...(rejectCode ? { code: rejectCode } : {}),
               at: Date.now(),
             };
+            // The attempt was already tracked + `order:created`; surface the
+            // terminal state so the blotter row is persisted as rejected (card
+            // metric: post-only accept % needs every miss logged).
+            if (managedOrder) {
+              this.emit('order:rejected', managedOrder, reason);
+            }
             return null;
           }
 
@@ -1892,6 +1935,199 @@ export class TradingEngine extends EventEmitter {
     const activeOrders = this.orderManager!.getActiveOrders();
     this.riskEngine!.updateOpenOrderCount(activeOrders.length);
     return result;
+  }
+
+  /**
+   * Re-quote an open limit order in place — preferred over cancel+new
+   * (card SH-QMAKER-CFM-PAPER-v0 blocker 2: `/orders/edit` > cancel/replace,
+   * fewer order-mutation calls under the REST 429 budget).
+   *
+   * Paper: `PaperTradingSimulator.editOrder` keeps the order id and re-checks
+   * post-only geometry (a crossing edit on a post-only order is refused and
+   * the order is left resting — never chased). Live: `OrderManager.editOrder`
+   * uses the venue edit when the exchange client supports it and otherwise
+   * falls back to an explicit, logged cancel+new.
+   *
+   * @param orderId Engine (client) order id.
+   * @param changes New `price` and/or `size`.
+   * @returns The managed order after the edit, or `null` when the edit was
+   *   refused (paper validation — see `getLastOrderRejection()`).
+   */
+  public async editOrder(orderId: string, changes: { price?: number; size?: number }): Promise<ManagedOrder | null> {
+    if (!this.isRunning) {
+      throw new Error('Trading engine not running');
+    }
+    if (!this.orderManager) {
+      throw new Error('OrderManager not initialized');
+    }
+
+    // Re-quote budget + 429 cooldown (cancel/replace storms are the desk's
+    // flagged failure mode). Waits, never drops.
+    if (this.requoteThrottle) {
+      await this.requoteThrottle.acquire('edit');
+    }
+
+    if (this.config.mode === 'paper' && this.paperSimulator) {
+      const managed = this.orderManager.getOrder(orderId);
+      if (!managed) {
+        throw new Error(`Order ${orderId} not found`);
+      }
+      try {
+        const response = await this.paperSimulator.editOrder(orderId, changes);
+        managed.price = response.price !== undefined ? parseFloat(response.price) : managed.price;
+        managed.size = parseFloat(response.size);
+        managed.updatedAt = new Date();
+        managed.metadata = {
+          ...(managed.metadata ?? {}),
+          editCount: ((managed.metadata?.editCount as number | undefined) ?? 0) + 1,
+        };
+        const terminal = new Set(['filled', 'done', 'cancelled', 'canceled', 'rejected', 'failed']);
+        if (!terminal.has(String(managed.status || '').toLowerCase())) {
+          managed.status = response.status;
+        }
+        this.orderOps.edits += 1;
+        this.emit('order:edited', managed);
+        return managed;
+      } catch (error) {
+        if (error instanceof PaperOrderRejectedError) {
+          const reason = error.message;
+          this.logger.warn('Paper order edit rejected (order left unchanged)', {
+            orderId,
+            code: error.code,
+            reason,
+            changes,
+          });
+          this.lastOrderRejection = {
+            productId: managed.productId ?? managed.product,
+            side: managed.side,
+            source: 'paper_validation',
+            reason,
+            code: error.code,
+            at: Date.now(),
+          };
+          return null;
+        }
+        throw error;
+      }
+    }
+
+    let result: Awaited<ReturnType<OrderManager['editOrder']>>;
+    try {
+      result = await this.orderManager.editOrder(orderId, changes);
+      this.requoteThrottle?.observeSuccess();
+    } catch (error) {
+      if (this.requoteThrottle?.observeError(error)) {
+        this.logger.warn('Order edit hit venue rate limit — re-quote cooldown opened', {
+          orderId,
+          throttle: this.requoteThrottle.getStats(),
+        });
+      }
+      throw error;
+    }
+    if (result.viaEdit) this.orderOps.edits += 1;
+    else this.orderOps.editFallbackCancelReplace += 1;
+    this.emit('order:edited', result.order);
+    const activeOrders = this.orderManager.getActiveOrders();
+    this.riskEngine!.updateOpenOrderCount(activeOrders.length);
+    return result.order;
+  }
+
+  /**
+   * Flatten a set of symbols: cancel every active order on them, then close
+   * every open position with a reduce-only market order tagged `flatten`.
+   * Used by venue guards (CDE Fri-break flatten, Charter leverage breach) via
+   * the API wiring; venue-agnostic here.
+   *
+   * Order matters (same as `/api/control/close-all`): cancel first so resting
+   * orders cannot re-open inventory or hold risk-engine slots after the close.
+   * Failures are collected, never thrown — one bad symbol must not stop the
+   * others from flattening.
+   *
+   * @param symbols Products to flatten.
+   * @param context.reason Persisted on the flatten orders' metadata (e.g. `cde_hours_gap`).
+   */
+  public async flattenSymbols(
+    symbols: string[],
+    context: { reason: string },
+  ): Promise<{ ordersCancelled: number; positionsClosed: number; failures: Array<{ symbol: string; step: 'cancel' | 'close'; error: string }> }> {
+    const targets = new Set(symbols);
+    const result = { ordersCancelled: 0, positionsClosed: 0, failures: [] as Array<{ symbol: string; step: 'cancel' | 'close'; error: string }> };
+    if (!this.isRunning || targets.size === 0) return result;
+
+    for (const order of this.getActiveOrders()) {
+      const symbol = order.productId ?? order.product;
+      if (!targets.has(symbol)) continue;
+      try {
+        if (await this.cancelOrder(order.id)) {
+          result.ordersCancelled += 1;
+          this.logger.info('Flatten: cancelled resting order', { orderId: order.id, symbol, reason: context.reason });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        result.failures.push({ symbol, step: 'cancel', error: message });
+        this.logger.error('Flatten: failed to cancel order (continuing)', { orderId: order.id, symbol, error: message });
+      }
+    }
+
+    for (const position of this.getOpenPositions()) {
+      if (!targets.has(position.symbol) || position.side === 'flat' || !(Math.abs(position.size) > 0)) continue;
+      const side: 'buy' | 'sell' = position.side === 'long' ? 'sell' : 'buy';
+      try {
+        const order = await this.createOrder(
+          { product_id: position.symbol, side, type: 'market', size: Math.abs(position.size).toString() },
+          { strategy: 'system', metadata: { tag: 'flatten', reason: context.reason, positionId: position.id } },
+        );
+        if (order) {
+          result.positionsClosed += 1;
+          this.logger.warn('Flatten: closing position', {
+            positionId: position.id,
+            symbol: position.symbol,
+            side: position.side,
+            size: position.size,
+            orderId: order.id,
+            reason: context.reason,
+          });
+        } else {
+          const rejection = this.getLastOrderRejection();
+          result.failures.push({ symbol: position.symbol, step: 'close', error: rejection?.reason ?? 'flatten order not created' });
+          this.logger.error('Flatten: exit order not created', { symbol: position.symbol, rejection });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        result.failures.push({ symbol: position.symbol, step: 'close', error: message });
+        this.logger.error('Flatten: failed to close position (continuing)', { symbol: position.symbol, error: message });
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Install (or clear) the re-quote throttle applied to `editOrder`. Wired by
+   * the API layer from `guardrails.cfm.execution.max_requotes_per_sec` so the
+   * engine stays venue-agnostic.
+   */
+  public setRequoteThrottle(throttle: OrderOpsThrottle | null): void {
+    this.requoteThrottle = throttle;
+  }
+
+  /**
+   * Order-operation counters for the session (card metric: 429 / edit count).
+   * Paper: the simulator's counters (placed / filled / cancelled / edited /
+   * post-only misses / maker-taker mix). Both modes: engine-level edit and
+   * cancel+new-fallback counts plus the throttle's 429 / wait counters.
+   */
+  public getOrderOpsStats(): {
+    edits: number;
+    editFallbackCancelReplace: number;
+    paper: ReturnType<PaperTradingSimulator['getOrderOpsStats']> | null;
+    throttle: ReturnType<OrderOpsThrottle['getStats']> | null;
+  } {
+    return {
+      ...this.orderOps,
+      paper: this.paperSimulator ? this.paperSimulator.getOrderOpsStats() : null,
+      throttle: this.requoteThrottle ? this.requoteThrottle.getStats() : null,
+    };
   }
 
   // Get current positions

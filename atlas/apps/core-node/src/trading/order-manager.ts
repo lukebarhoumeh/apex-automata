@@ -65,9 +65,19 @@ export interface OrderManagerEvents {
   'order:placed': (order: ManagedOrder) => void;
   'order:filled': (order: ManagedOrder, fill: Fill) => void;
   'order:cancelled': (order: ManagedOrder) => void;
+  'order:edited': (order: ManagedOrder) => void;
   'order:failed': (order: ManagedOrder, error: Error) => void;
   'twap:slice': (parentId: string, slice: TWAPSlice) => void;
   'twap:complete': (order: TWAPOrder) => void;
+}
+
+/** True when an exchange error is a post-only ("would have been taker") rejection. */
+function isPostOnlyRejection(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const kind = (error as { kind?: string }).kind;
+  if (kind === 'post_only') return true;
+  const message = String((error as { message?: string }).message ?? '').toLowerCase();
+  return message.includes('post-only') || message.includes('post only');
 }
 
 export class OrderManager extends EventEmitter {
@@ -254,11 +264,22 @@ export class OrderManager extends EventEmitter {
   }
 
   // Create a standard order
+  /**
+   * Create and place an order.
+   *
+   * @param request Exchange order request (client id is minted here).
+   * @param init.metadata Free-form metadata carried on the managed order.
+   * @param init.strategy Originating strategy id.
+   * @param init.noChase When true (or `metadata.noChase === true`) a post-only
+   *   rejection is TERMINAL: the order fails as a logged miss instead of being
+   *   re-priced and retried (card SH-QMAKER-CFM-PAPER-v0: never chase).
+   */
   public async createOrder(
     request: Omit<OrderRequest, 'client_oid'>,
     init?: {
       metadata?: Record<string, any>;
       strategy?: string;
+      noChase?: boolean;
     }
   ): Promise<ManagedOrder> {
     const clientOrderId = uuidv4();
@@ -293,10 +314,14 @@ export class OrderManager extends EventEmitter {
 
     try {
       managedOrder.status = 'placing';
-      const exchangeOrder = await this.placeOrderWithRetry({
-        ...request,
-        client_oid: clientOrderId
-      });
+      const noChase = init?.noChase === true || init?.metadata?.noChase === true;
+      const exchangeOrder = await this.placeOrderWithRetry(
+        {
+          ...request,
+          client_oid: clientOrderId,
+        },
+        { noChase },
+      );
 
       managedOrder.exchangeOrderId = exchangeOrder.id;
       this.exchangeIdToManagedId.set(exchangeOrder.id, managedOrder.id);
@@ -514,10 +539,17 @@ export class OrderManager extends EventEmitter {
     await this.persistOrder(twapOrder);
   }
 
-  // Place order with retry logic for post-only
-  private async placeOrderWithRetry(request: OrderRequest): Promise<CoinbaseOrder> {
+  /**
+   * Place an order with the legacy post-only re-quote loop.
+   *
+   * Legacy behaviour (TWAP slices): a post-only rejection re-prices the order
+   * 5 bps MORE passive and retries up to `postOnlyRetries` times. With
+   * `noChase` the first post-only rejection is terminal — the miss is logged
+   * and thrown, the price is never touched (card kill bar: any chase → VOID).
+   */
+  private async placeOrderWithRetry(request: OrderRequest, options: { noChase?: boolean } = {}): Promise<CoinbaseOrder> {
     let retries = 0;
-    const maxRetries = request.post_only ? this.config.postOnlyRetries : this.config.maxOrderRetries;
+    const maxRetries = request.post_only && !options.noChase ? this.config.postOnlyRetries : this.config.maxOrderRetries;
 
     while (retries < maxRetries) {
       try {
@@ -525,18 +557,27 @@ export class OrderManager extends EventEmitter {
         return order;
       } catch (error: any) {
         retries++;
-        
+
         // Check if it's a post-only rejection
-        if (request.post_only && error.message?.includes('post-only')) {
+        if (request.post_only && isPostOnlyRejection(error)) {
+          if (options.noChase) {
+            this.logger.warn('Post-only order rejected — no chase: leaving as a logged miss (price unchanged)', {
+              productId: request.product_id,
+              side: request.side,
+              price: request.price ?? null,
+              clientOrderId: request.client_oid,
+            });
+            throw error;
+          }
           this.logger.warn(`Post-only order rejected, retry ${retries}/${maxRetries}`);
-          
+
           // Adjust price slightly to make it post-only
           if (request.price && request.side === 'buy') {
             request.price = (parseFloat(request.price) * 0.9995).toFixed(2);
           } else if (request.price && request.side === 'sell') {
             request.price = (parseFloat(request.price) * 1.0005).toFixed(2);
           }
-          
+
           // Wait before retry
           await new Promise(resolve => setTimeout(resolve, 1000 * retries));
         } else {
@@ -546,6 +587,93 @@ export class OrderManager extends EventEmitter {
     }
 
     throw new Error(`Failed to place order after ${maxRetries} retries`);
+  }
+
+  /**
+   * Re-quote an open limit order in place (`price` and/or `size`), preferring
+   * the venue's edit endpoint over cancel+new.
+   *
+   * - When the exchange client exposes `editOrder(exchangeOrderId, { price, size })`
+   *   (Advanced Trade `POST /orders/edit`), the managed order keeps its id and
+   *   `viaEdit` is true. A refused venue edit throws — the order is left as it was.
+   * - Otherwise the fallback is an EXPLICIT, logged cancel + new order carrying the
+   *   same strategy/metadata (`viaEdit: false`); the new managed order is returned.
+   *
+   * @param orderId Managed (client) order id.
+   * @param changes New price and/or size. Coinbase requires both on the wire;
+   *   whichever is omitted is resent unchanged.
+   */
+  public async editOrder(
+    orderId: string,
+    changes: { price?: number; size?: number },
+  ): Promise<{ order: ManagedOrder; viaEdit: boolean }> {
+    const order = this.orders.get(orderId);
+    if (!order) {
+      throw new Error(`Order ${orderId} not found`);
+    }
+    if (order.type !== 'limit') {
+      throw new Error(`Order ${orderId} is not a limit order (type=${order.type}); only limit orders can be edited`);
+    }
+    if (!['open', 'pending', 'placing'].includes(String(order.status))) {
+      throw new Error(`Order ${orderId} is not editable (status=${order.status})`);
+    }
+    if (changes.price === undefined && changes.size === undefined) {
+      throw new Error('editOrder requires a new price and/or size');
+    }
+    const newPrice = changes.price ?? order.price;
+    const newSize = changes.size ?? order.size;
+    if (newPrice === undefined || !Number.isFinite(newPrice) || newPrice <= 0) {
+      throw new Error(`Invalid edit price ${changes.price}`);
+    }
+    if (!Number.isFinite(newSize) || newSize <= 0) {
+      throw new Error(`Invalid edit size ${changes.size}`);
+    }
+
+    const editable = this.exchange as unknown as {
+      editOrder?: (exchangeOrderId: string, edit: { price: string; size: string }) => Promise<boolean>;
+    };
+
+    if (typeof editable.editOrder === 'function' && order.exchangeOrderId) {
+      const ok = await editable.editOrder(order.exchangeOrderId, { price: String(newPrice), size: String(newSize) });
+      if (!ok) {
+        throw new Error(`Exchange refused edit of order ${orderId} (exchange id ${order.exchangeOrderId}); order left unchanged`);
+      }
+      order.price = newPrice;
+      order.size = newSize;
+      order.updatedAt = new Date();
+      order.metadata = { ...(order.metadata ?? {}), editCount: ((order.metadata?.editCount as number | undefined) ?? 0) + 1 };
+      await this.persistOrder(order);
+      this.emit('order:edited', order);
+      return { order, viaEdit: true };
+    }
+
+    this.logger.warn('edit_unsupported_fallback_cancel_replace: exchange client has no editOrder — cancelling and re-placing', {
+      orderId,
+      exchangeOrderId: order.exchangeOrderId ?? null,
+      productId: order.product,
+      price: newPrice,
+      size: newSize,
+    });
+    const cancelled = await this.cancelOrder(orderId);
+    if (!cancelled) {
+      throw new Error(`Could not cancel order ${orderId} for cancel+replace fallback; order left unchanged`);
+    }
+    const replacement = await this.createOrder(
+      {
+        product_id: order.product,
+        side: order.side,
+        type: 'limit',
+        size: String(newSize),
+        price: String(newPrice),
+        post_only: Boolean(order.metadata?.postOnly),
+      },
+      {
+        strategy: order.strategy,
+        metadata: { ...(order.metadata ?? {}), replacedOrderId: orderId, editFallback: 'cancel_replace' },
+        noChase: order.metadata?.noChase === true,
+      },
+    );
+    return { order: replacement, viaEdit: false };
   }
 
   // Cancel order

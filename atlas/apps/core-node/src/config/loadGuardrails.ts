@@ -81,10 +81,23 @@ const FeeSideSchema = z.object({
   taker_bps: z.number(),
 });
 
+// Cost-plus book (Coinbase Financial Markets / CDE nano futures): a percentage
+// commission PLUS a per-contract exchange floor, STACKED — never blended into a
+// single bps figure. Cite `CFM-NANO-H1-v0.2` + `CFM-NANO-COSTPLUS-ADV1`
+// (2026-09-11 sheet, rates reconfirmed 2026-09-21; DRAFT working model, not
+// v1.0). Never mixed with the spot book (`SPOT-INTRO-50-90` live /
+// `PAPER-FeeModel-SPOT-25-40` paper).
+const CostPlusFeeSchema = FeeSideSchema.extend({
+  exchange_fee_per_contract_usd: z.number().nonnegative(),
+});
+
 const FeesSchema = z.object({
   coinbase: z.object({
     spot: FeeSideSchema,
     perps_intx: FeeSideSchema,
+    // Optional so pre-CFM fixtures keep validating; FeeModel throws its usual
+    // "no fee configuration" error when a `*-CDE` symbol is priced without it.
+    cfm_nano: CostPlusFeeSchema.optional(),
   }),
   hyperliquid: z.object({
     perps: FeeSideSchema,
@@ -92,6 +105,89 @@ const FeesSchema = z.object({
 });
 
 export type FeesConfig = z.infer<typeof FeesSchema>;
+export type CostPlusFeeConfig = z.infer<typeof CostPlusFeeSchema>;
+
+// ---------------------------------------------------------------------------
+// CFM / CDE nano futures — PAPER harness wiring (card SH-QMAKER-CFM-PAPER-v0).
+// Infra only: NOT a strategy GO, NOT a live unlock. Live `*-CDE` execution is
+// deliberately not wired (api/server.ts drops cfm_symbols in live mode).
+// ---------------------------------------------------------------------------
+
+/** Charter leverage cap for the CFM venue — binds even though the venue UI offers ~4×. */
+export const CFM_CHARTER_MAX_LEVERAGE = 2;
+
+// Execution policy for `*-CDE` paper symbols. The schema only admits TRUE
+// post-only with no chase: this venue cannot be configured to send a
+// marketable order from the canonical router (card kill bar: any chase /
+// taker entry fill → VOID).
+const CfmExecutionSchema = z
+  .object({
+    order_type: z.literal('post_only').default('post_only'),
+    no_chase: z.literal(true).default(true),
+    // Re-quote (`/orders/edit`) budget per second across all `*-CDE` orders —
+    // cancel/replace storms are the REST 429 / WS disconnect failure mode the
+    // desk flagged (WS ~8 msg/s caution).
+    max_requotes_per_sec: z.number().positive().default(4),
+  })
+  .default({});
+
+// CDE crypto weekly break: Friday 17:00–18:00 America/New_York. The break
+// itself is a venue fact carried in code (trading/cfm/cde-hours.ts); these
+// leads say how early the harness stops opening new `*-CDE` positions and
+// starts flattening ahead of it. `flatten_lead_min` must not exceed
+// `entry_block_lead_min` (you stop entering before you start flattening).
+const CfmHoursGapSchema = z
+  .object({
+    entry_block_lead_min: z.number().int().nonnegative().default(30),
+    flatten_lead_min: z.number().int().nonnegative().default(10),
+  })
+  .default({})
+  .refine((v) => v.flatten_lead_min <= v.entry_block_lead_min, {
+    message: 'cfm.hours_gap.flatten_lead_min must be <= entry_block_lead_min',
+  });
+
+const CfmConfigSchema = z
+  .object({
+    max_leverage: z.number().positive().max(CFM_CHARTER_MAX_LEVERAGE),
+    execution: CfmExecutionSchema,
+    hours_gap: CfmHoursGapSchema,
+  })
+  .optional();
+
+export type CfmConfig = NonNullable<z.infer<typeof CfmConfigSchema>>;
+
+/** Effective CFM config: the parsed block or its defaults (Charter cap, post-only, default leads). */
+export function resolveCfmConfig(guardrails: { cfm?: CfmConfig }): CfmConfig {
+  return guardrails.cfm ?? (CfmConfigSchema.parse({ max_leverage: CFM_CHARTER_MAX_LEVERAGE }) as CfmConfig);
+}
+
+// Per-symbol CFM contract spec + limits. Sizes flow through the engine in
+// UNDERLYING units (like `*-PERP-INTX`); `contract_size` converts to contracts
+// at the venue boundary (paper: lot rounding + per-contract exchange floor).
+const CfmSymbolLimitSchema = z.object({
+  max_notional_usd: z.number().nonnegative(),
+  max_daily_loss_usd: z.number().nonnegative(),
+  /** Underlying units per contract (BIP: 0.01 BTC; ETP: 0.1 ETH — public catalog). */
+  contract_size: z.number().positive(),
+  /** Minimum price fluctuation per underlying unit in USD (BIP: $5 per BTC = $0.05 per contract). */
+  price_increment_usd: z.number().positive(),
+  /**
+   * Paper quote path: the spot product whose ticks/candles are mirrored onto
+   * this symbol (desk seal (a) = spot proxy). Must be a `per_symbol` key.
+   */
+  spot_proxy: z.string().min(1),
+  strategy_overrides: StrategyOverridesSchema,
+  disabled_strategies: PerSymbolDisabledStrategiesSchema,
+});
+
+export type CfmSymbolLimit = z.infer<typeof CfmSymbolLimitSchema>;
+
+const CfmSymbolsSchema = z
+  .record(z.string(), CfmSymbolLimitSchema)
+  .refine((symbols) => Object.keys(symbols).every((s) => s.toUpperCase().endsWith('-CDE')), {
+    message: 'cfm_symbols keys must be Coinbase Derivatives Exchange products (`*-CDE`)',
+  })
+  .optional();
 
 // Momentum strategy parameter overrides — optional top-level block.
 // When present these values are forwarded to the MomentumStrategy plugin
@@ -231,6 +327,11 @@ export const GuardrailsSchema = z.object({
     funding_check_interval_sec: z.number().int().positive().optional(),
   }).optional(),
   hyperliquid_symbols: z.record(z.string(), HyperliquidSymbolLimitSchema).optional(),
+  // CFM / CDE nano futures — paper harness only (card SH-QMAKER-CFM-PAPER-v0).
+  // `cfm` carries the venue policy (Charter ≤2×, true post-only, Fri-break
+  // leads); `cfm_symbols` carries contract specs + limits per `*-CDE` product.
+  cfm: CfmConfigSchema,
+  cfm_symbols: CfmSymbolsSchema,
   execution: z.object({
     order_type: z.string(),
     price_offset_ticks: z.number().int().nonnegative(),

@@ -33,6 +33,7 @@ export type RiskHaltReasonCode =
   | 'rapid_loss'          // Lost too much too fast
   | 'manual_killswitch'   // User-triggered halt
   | 'symbol_blocked'      // Per-symbol limit hit
+  | 'leverage_breach'     // Venue leverage cap breached (CFM Charter ≤2×) — non-daily, operator resume
   | 'unknown';            // Catch-all
 
 /**

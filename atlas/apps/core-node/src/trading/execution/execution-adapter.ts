@@ -180,6 +180,15 @@ export interface IExecutionAdapter extends EventEmitter {
   cancelOrder(clientOrderId: string): Promise<void>;
 
   /**
+   * Re-quote an open limit order in place (price and/or size) when the venue
+   * supports it — preferred over cancel+new (card SH-QMAKER-CFM-PAPER-v0
+   * blocker 2). Resolves `true` on a confirmed edit, `false` when the venue
+   * refused it (order left unchanged). Optional: adapters without a venue edit
+   * omit it and callers fall back to cancel+new explicitly.
+   */
+  editOrder?(clientOrderId: string, changes: { price?: number; size?: number }): Promise<boolean>;
+
+  /**
    * Cancel all orders for a symbol (optional)
    */
   cancelAllOrders(symbol?: string): Promise<void>;

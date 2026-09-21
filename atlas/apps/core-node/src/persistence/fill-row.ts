@@ -27,9 +27,25 @@
  *   - P6  durable writes: `server.ts` can hand the built row to `SupabaseWriter`
  * The P2 invariant (`order_id` = client UUID, exchange id only in `external_order_id`)
  * is pinned by `__tests__/fill-row.test.ts` and must survive those extensions.
+ *
+ * Fee-side attribution (card SH-QMAKER-CFM-PAPER-v0 blocker 3, 2026-09-21):
+ *   - `maker` is TRI-STATE: `true` maker, `false` taker, `null` unknown. The old
+ *     `liquidity === 'M'` boolean silently wrote every unknown side as taker.
+ *   - `fee_side` / `fee_side_source` (migration 20260921180000, STAGED) carry the
+ *     explicit desk vocabulary; `server.ts` writes them schema-tolerantly via
+ *     persistence/optional-columns.ts until the migration is applied.
+ *   - An unresolvable side is persisted as `null` — "unlogged fee_side" — and is
+ *     VOID for the card by construction, never disguised as a taker fill.
  */
 
 import { SessionStamp, SessionStampColumns, stampSessionColumns } from './session-stamp';
+import {
+  FeeSide,
+  FeeSideSource,
+  feeSideToMakerFlag,
+  resolveFeeSide,
+  resolveFeeSideSource,
+} from '../trading/fee-side';
 
 /** The engine-side order the fill belongs to (`ManagedOrder` shape, structurally typed). */
 export interface FillRowOrderRef {
@@ -53,7 +69,12 @@ export interface FillRowFillRef {
   price: string | number;
   size: string | number;
   fee?: string | number | null;
+  /** Legacy liquidity flag (`'M' | 'T'`) or adapter spelling (`'maker' | 'taker'`). */
   liquidity?: string | null;
+  /** Explicit fee side when the producer already resolved it (paper simulator). Wins over `liquidity`. */
+  fee_side?: string | null;
+  /** Provenance of the attribution (`exchange` | `simulated` | `inferred`). */
+  fee_side_source?: string | null;
   created_at?: string | null;
 }
 
@@ -67,7 +88,12 @@ export interface FillRow {
   quantity: number;
   fee_currency: string;
   fee_amount: number;
-  maker: boolean;
+  /** Tri-state: `true` maker, `false` taker, `null` unknown / unlogged. */
+  maker: boolean | null;
+  /** Explicit fee side (migration 20260921180000); `null` when unresolvable. */
+  fee_side: FeeSide | null;
+  /** Where `fee_side` came from; `null` when `fee_side` is null. */
+  fee_side_source: FeeSideSource | null;
   filled_at: string | null | undefined;
 }
 
@@ -77,8 +103,38 @@ export type StampedFillRow = FillRow & SessionStampColumns;
 /** Upsert conflict target used for `fills` writes (unchanged from the inline writer). */
 export const FILLS_UPSERT_ON_CONFLICT = 'user_id,trade_id';
 
+/**
+ * Columns added by migration 20260921180000 (`fills_fee_side`). Written
+ * schema-tolerantly: when PostgREST reports them missing the writer strips
+ * them and retries with the legacy shape (see persistence/optional-columns.ts).
+ */
+export const FILL_FEE_SIDE_COLUMNS = ['fee_side', 'fee_side_source'] as const;
+
 /** Error code raised when a fill arrives without a resolvable client order id. */
 export const FILL_ORDER_ID_MISSING = 'FILL_ORDER_ID_MISSING';
+
+/**
+ * Resolve the fee side + provenance for a fill.
+ *
+ * Priority: an explicit `fill.fee_side` (paper simulator, future adapters)
+ * wins over the legacy `liquidity` flag. Provenance comes from
+ * `fill.fee_side_source` when the producer stamped it; a legacy `liquidity`
+ * value without provenance is treated as exchange-reported (that is what the
+ * Coinbase `Fill` message carries). An unresolvable side yields
+ * `{ feeSide: null, source: null }` — never a default of taker.
+ *
+ * @param fill Fill payload from `order:filled`.
+ */
+export function resolveFillFeeSide(fill: Pick<FillRowFillRef, 'liquidity' | 'fee_side' | 'fee_side_source'>): {
+  feeSide: FeeSide | null;
+  source: FeeSideSource | null;
+} {
+  const explicit = resolveFeeSide(fill.fee_side);
+  const feeSide = explicit ?? resolveFeeSide(fill.liquidity);
+  if (feeSide === null) return { feeSide: null, source: null };
+  const source = resolveFeeSideSource(fill.fee_side_source) ?? 'exchange';
+  return { feeSide, source };
+}
 
 function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
@@ -145,6 +201,8 @@ export function buildFillRow(input: {
     );
   }
 
+  const { feeSide, source } = resolveFillFeeSide(fill);
+
   const row: FillRow = {
     user_id: userId,
     order_id: order.id,
@@ -154,7 +212,9 @@ export function buildFillRow(input: {
     quantity: Number.parseFloat(String(fill.size)),
     fee_currency: 'USD',
     fee_amount: Number.parseFloat(String(fill.fee)),
-    maker: fill.liquidity === 'M',
+    maker: feeSideToMakerFlag(feeSide),
+    fee_side: feeSide,
+    fee_side_source: source,
     filled_at: fill.created_at,
   };
 

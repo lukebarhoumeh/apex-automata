@@ -3,19 +3,19 @@
  * short?" so backtest, paper and live agree (TASK_012 step 3 / TASK_017 B2).
  *
  * Coinbase spot cannot short: a SELL with no inventory is rejected by the
- * exchange, and a SELL with inventory liquidates holdings. Only perpetual
- * venues (Coinbase INTX perps, Hyperliquid) support short entries. The
- * `guardrails.strategy.allow_short` flag is therefore necessary but NOT
- * sufficient — shorting requires `allow_short && capabilities.shorting`.
+ * exchange, and a SELL with inventory liquidates holdings. Only derivative
+ * venues (Coinbase INTX perps, CFM/CDE futures, Hyperliquid) support short
+ * entries. The `guardrails.strategy.allow_short` flag is therefore necessary
+ * but NOT sufficient — shorting requires `allow_short && capabilities.shorting`.
  *
- * Symbol convention: `XXX-PERP-INTX` is a perp; everything else is spot
- * (see `core/symbol-utils.marketForSymbol`).
+ * Symbol convention: `XXX-PERP-INTX` is a perp, `XXX-<expiry>-CDE` is a CFM
+ * future; everything else is spot (see `core/symbol-utils.marketForSymbol`).
  */
 
 import { marketForSymbol } from '../../core/symbol-utils';
 
 /** Market venue class. Mirrors `core/fee-model.Market`. */
-export type MarketVenue = 'spot' | 'perps';
+export type MarketVenue = 'spot' | 'perps' | 'cfm';
 
 export interface VenueCapabilities {
   /** True when the venue supports opening short positions. */
@@ -36,9 +36,10 @@ export function venueForSymbol(symbol: string): MarketVenue {
  *
  *   spot  → { shorting: false }
  *   perps → { shorting: true }
+ *   cfm   → { shorting: true }   (futures: long and short)
  */
 export function capabilitiesForVenue(venue: MarketVenue): VenueCapabilities {
-  return { shorting: venue === 'perps' };
+  return { shorting: venue === 'perps' || venue === 'cfm' };
 }
 
 /**

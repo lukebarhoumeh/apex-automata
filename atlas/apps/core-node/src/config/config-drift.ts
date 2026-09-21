@@ -38,7 +38,9 @@ export type DriftViolationCode =
   | 'strategies_json_has_params'
   | 'pin_mismatch'
   | 'pin_floor_breached'
-  | 'pin_list_missing_entry';
+  | 'pin_list_missing_entry'
+  | 'cfm_symbol_strategy_enabled'
+  | 'cfm_symbol_proxy_missing';
 
 export interface DriftViolation {
   code: DriftViolationCode;
@@ -66,13 +68,19 @@ const SCAN_SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'var', '.pnpm', 
 
 interface ScalarPin {
   key: string;
-  expected: number | boolean;
+  expected: number | boolean | string;
 }
 
 /**
  * Exact-value desk pins (2026-09-10). `key` is a dotted path into the
  * parsed canonical YAML; symbol names contain `-` but never `.`, so a plain
  * split is safe.
+ *
+ * 2026-09-21 (TM DESK SoT, card SH-QMAKER-CFM-PAPER-v0) added the fee-book
+ * pins: the paper spot book is `PAPER-FeeModel-SPOT-25-40` and the CFM book
+ * is `CFM-NANO-COSTPLUS-ADV1` (9.5 / 10 bps + $0.10/ct floor). Pinning both
+ * is how "books never mix" is enforced — neither may be edited toward the
+ * other (or toward live `SPOT-INTRO-50-90`) without a two-file change.
  */
 export const SCALAR_PINS: readonly ScalarPin[] = [
   { key: 'filters.atr_volatility_min', expected: 0.005 },
@@ -82,6 +90,16 @@ export const SCALAR_PINS: readonly ScalarPin[] = [
   { key: 'risk.min_ev_threshold', expected: 0 },
   { key: 'perps_symbols.ETH-PERP-INTX.strategy_overrides.momentum.takeProfitAtr', expected: 6.0 },
   { key: 'perps_symbols.BTC-PERP-INTX.strategy_overrides.momentum.takeProfitAtr', expected: 6.0 },
+  // Fee books (cite locks) — never mix.
+  { key: 'fees.coinbase.spot.maker_bps', expected: 25 },
+  { key: 'fees.coinbase.spot.taker_bps', expected: 40 },
+  { key: 'fees.coinbase.cfm_nano.maker_bps', expected: 9.5 },
+  { key: 'fees.coinbase.cfm_nano.taker_bps', expected: 10 },
+  { key: 'fees.coinbase.cfm_nano.exchange_fee_per_contract_usd', expected: 0.1 },
+  // CFM venue policy — Charter ≤2×, true post-only, never chased.
+  { key: 'cfm.max_leverage', expected: 2 },
+  { key: 'cfm.execution.order_type', expected: 'post_only' },
+  { key: 'cfm.execution.no_chase', expected: true },
 ];
 
 /**
@@ -350,6 +368,48 @@ function checkPins(guardrails: GuardrailConfig, out: DriftViolation[]): void {
 }
 
 /**
+ * CFM paper symbols (card SH-QMAKER-CFM-PAPER-v0, infra only — NOT strategy GO):
+ *
+ *   1. every built-in strategy must be in the symbol's `disabled_strategies`
+ *      until the card's strategy lands under its own GO, so wiring the venue
+ *      never lets an existing strategy trade `*-CDE` by accident;
+ *   2. `spot_proxy` must name a `per_symbol` spot product — that is the only
+ *      paper quote path (desk seal (a)); a dangling proxy means no ticks.
+ */
+function checkCfmSymbols(guardrails: GuardrailConfig, out: DriftViolation[]): void {
+  const file = CANONICAL_GUARDRAILS_REPO_PATH;
+  const cfmSymbols = guardrails.cfm_symbols ?? {};
+  const spotSymbols = new Set(Object.keys(guardrails.per_symbol ?? {}));
+  const builtin = getBuiltinStrategyIds();
+
+  for (const [symbol, cfg] of Object.entries(cfmSymbols)) {
+    const disabled = new Set(cfg.disabled_strategies ?? []);
+    for (const id of builtin) {
+      if (!disabled.has(id)) {
+        out.push({
+          code: 'cfm_symbol_strategy_enabled',
+          file,
+          key: `cfm_symbols.${symbol}.disabled_strategies`,
+          message:
+            `Built-in strategy "${id}" is not disabled on CFM paper symbol ${symbol}. ` +
+            'CFM wiring is infra only (NOT strategy GO); every built-in strategy must be listed until a card strategy is authorised.',
+        });
+      }
+    }
+    if (!spotSymbols.has(cfg.spot_proxy)) {
+      out.push({
+        code: 'cfm_symbol_proxy_missing',
+        file,
+        key: `cfm_symbols.${symbol}.spot_proxy`,
+        message:
+          `cfm_symbols.${symbol}.spot_proxy = ${JSON.stringify(cfg.spot_proxy)} is not a per_symbol spot product; ` +
+          'the paper quote path mirrors spot ticks onto the CFM symbol, so the proxy must be subscribed.',
+      });
+    }
+  }
+}
+
+/**
  * Run every drift check against a repository root.
  *
  * @param repoRoot Absolute path to the repo checkout (the directory that
@@ -366,6 +426,7 @@ export function checkConfigDrift(repoRoot: string): DriftCheckResult {
   if (guardrails) {
     checkStrategiesJson(repoRoot, guardrails, violations, checked);
     checkPins(guardrails, violations);
+    checkCfmSymbols(guardrails, violations);
   }
 
   return { violations, checked };
