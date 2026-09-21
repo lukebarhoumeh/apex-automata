@@ -23,7 +23,9 @@
  *
  * Legacy (paper / backtest) semantics are preserved bit-for-bit for the default inputs:
  * taker both sides (2 * fee * notional), W = TP_R * size (haircut 1), and a missing win
- * rate default-ALLOWS with a structured warn (cold-start safe).
+ * rate default-ALLOWS with a structured warn (cold-start safe). "Missing" covers both
+ * `winRate: null/undefined` and a win rate paired with an explicit `sampleSize: 0` — a
+ * MetaFilter record with no closed trades is not an observation (see `observedWinRate`).
  *
  * Live semantics (TASK_011) are opt-in through the extra inputs RiskEngine supplies in
  * live mode:
@@ -131,6 +133,43 @@ export interface WinRatePrior {
 }
 
 export const DEFAULT_WIN_RATE_PRIOR: WinRatePrior = { p0: 0.40, n0: 30 };
+
+/**
+ * Minimal shape of a MetaFilter `StrategyPerformance` record as far as the EV
+ * gate is concerned. Kept structural so the router does not have to import
+ * the full MetaFilter type.
+ */
+export interface StrategyPerformanceLike {
+  /** Closed trades behind `winRate`. */
+  totalTrades: number;
+  /** wins / totalTrades — `0` when no trade has closed yet. */
+  winRate: number;
+}
+
+/**
+ * Win rate that is actually backed by closed trades, or `null` when the
+ * record is empty.
+ *
+ * `MetaFilter.filter()` seeds a `{ totalTrades: 0, winRate: 0 }` record for
+ * a strategy the first time it evaluates one of its signals, i.e. BEFORE the
+ * router runs the EV gate. Reading `perf.winRate` directly therefore yields
+ * an "observed" `p = 0` on every cold start and `EV = -L - fees < 0` rejects
+ * every signal, so no trade ever closes and `p` never moves (the 0-order
+ * paper sessions of 2026-05-18 → 2026-09-21). This helper is the paper/live
+ * router's counterpart of the backtester's
+ * `estimateWinRateWithPrior(perf ? { wins, losses } : null)`: a record with
+ * no closed trades carries no win-rate evidence and MUST reach the gate as
+ * `null` so the documented cold-start path applies.
+ */
+export function observedWinRate(
+  perf: StrategyPerformanceLike | null | undefined,
+): number | null {
+  if (!perf) return null;
+  const n = Number(perf.totalTrades);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const winRate = Number(perf.winRate);
+  return Number.isFinite(winRate) ? winRate : null;
+}
 
 /**
  * Posterior-mean win rate under a Beta prior:
@@ -279,7 +318,14 @@ export function evaluateEvGate(
   const sampleSize = typeof inputs.sampleSize === 'number' && Number.isFinite(inputs.sampleSize) && inputs.sampleSize > 0
     ? inputs.sampleSize
     : 0;
-  const hasObservedWinRate = pRaw !== null && pRaw !== undefined && Number.isFinite(pRaw);
+  // An explicit `sampleSize: 0` says "no closed trade backs this win rate":
+  // that is a seeded/empty performance record, not an observation. Treating
+  // it as observed made `p = 0` and rejected every cold-start signal (see
+  // `observedWinRate`). `sampleSize` left undefined keeps legacy semantics.
+  const explicitZeroSample =
+    typeof inputs.sampleSize === 'number' && Number.isFinite(inputs.sampleSize) && inputs.sampleSize <= 0;
+  const hasObservedWinRate =
+    pRaw !== null && pRaw !== undefined && Number.isFinite(pRaw) && !explicitZeroSample;
 
   let p: number;
   let pSource: EvGateResult['pSource'];
@@ -300,10 +346,15 @@ export function evaluateEvGate(
     // Legacy default-ALLOW when MetaFilter has no perf data yet for this strategy.
     // Cold-start must not block paper trading; we need outcomes to bootstrap p.
     if (!hasObservedWinRate) {
-      logger?.warn('EV gate: no MetaFilter win-rate — default-allow', { symbol, strategy });
+      const reason = explicitZeroSample && pRaw !== null && pRaw !== undefined
+        ? 'zero_sample_win_rate_default_allow'
+        : 'missing_win_rate_default_allow';
+      logger?.warn('EV gate: no MetaFilter win-rate — default-allow', {
+        symbol, strategy, reason, winRate: pRaw ?? null, sampleSize: inputs.sampleSize ?? null,
+      });
       return {
         allowed: true,
-        reason: 'missing_win_rate_default_allow',
+        reason,
         ev: 0,
         threshold: minEvThreshold,
         p: 0,
