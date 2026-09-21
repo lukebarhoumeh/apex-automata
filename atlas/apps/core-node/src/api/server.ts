@@ -3351,8 +3351,9 @@ app.get('/api/analytics/trades', (req, res) => {
  *
  * GET /api/analytics/strategies[?session_id=<active id>]
  *   → { sessionId, sessionStartedAt, executionMode, engineRunning, riskDay,
- *       strategies: [{ strategyId, name, enabled, closedTrades, openTrades, wins, losses,
- *                      breakeven, winRate|null, realizedPnlUsd, pnlToday, closedTradesToday,
+ *       strategies: [{ strategyId, name, enabled, closedTrades, openTrades,
+ *                      hydratedOpenCount, wins, losses, breakeven,
+ *                      winRate|null, realizedPnlUsd, pnlToday, closedTradesToday,
  *                      avgTradeUsd|null, feesUsd, lastTradeAt|null, signalsGenerated|null }],
  *       totals, notes }
  *
@@ -3381,15 +3382,21 @@ app.get('/api/analytics/strategies', (req, res) => {
   }
 
   const engineRunning = tradingEngine !== null && tradingEngine.engineRunning;
+  const sessionCounts = signalProcessor?.getSessionSignalCounts();
+  const hydratedOpens = engineRunning
+    ? (tradingEngine!.getOpenPositions?.() ?? []).filter((p: any) => p.metadata?.hydratedFromSupabase)
+    : [];
   res.json(buildStrategySessionStats({
     closedTrades: engineRunning ? tradingEngine!.getClosedTrades() : [],
     openTrades: engineRunning ? tradingEngine!.getOpenTrades() : [],
+    hydratedOpenPositions: hydratedOpens.map((p: any) => ({ strategy: p.strategy ?? null })),
     strategies: signalProcessor
       ? signalProcessor.getRegisteredStrategies().map((s) => ({
           id: s.id,
           name: s.name,
           enabled: s.enabled,
           signalsGenerated: s.getStats?.()?.signalsGenerated ?? null,
+          sessionSignalsEmitted: sessionCounts?.get(s.id) ?? 0,
         }))
       : [],
     session: activeSessionBlock(),
@@ -4000,14 +4007,20 @@ app.get('/api/strategies', (req, res) => {
 
   const strategies = signalProcessor.getRegisteredStrategies();
   const engineRunning = tradingEngine !== null && tradingEngine.engineRunning;
+  const sessionCounts = signalProcessor.getSessionSignalCounts();
+  const hydratedOpens = engineRunning
+    ? (tradingEngine!.getOpenPositions?.() ?? []).filter((p: any) => p.metadata?.hydratedFromSupabase)
+    : [];
   const sessionReport = buildStrategySessionStats({
     closedTrades: engineRunning ? tradingEngine!.getClosedTrades() : [],
     openTrades: engineRunning ? tradingEngine!.getOpenTrades() : [],
+    hydratedOpenPositions: hydratedOpens.map((p: any) => ({ strategy: p.strategy ?? null })),
     strategies: strategies.map((s) => ({
       id: s.id,
       name: s.name,
       enabled: s.enabled,
       signalsGenerated: s.getStats?.()?.signalsGenerated ?? null,
+      sessionSignalsEmitted: sessionCounts.get(s.id) ?? 0,
     })),
     session: activeSessionBlock(),
     engineRunning,
@@ -4039,7 +4052,7 @@ app.get('/api/strategies', (req, res) => {
       riskDay: sessionReport.riskDay,
     },
     statsNote:
-      'stats.signalsGenerated counts strategy SIGNALS, not trades. Use sessionStats.closedTrades / pnlToday / winRate (session-scoped) for trade figures.',
+      'stats.signalsGenerated counts strategy SIGNALS, not trades. sessionStats.signalsGenerated is session-scoped (emitted signals that cleared all gates, matching /api/signals).',
   });
 });
 

@@ -38,6 +38,7 @@ describe('buildStrategySessionStats', () => {
       enabled: true,
       closedTrades: 0,
       openTrades: 0,
+      hydratedOpenCount: 0,
       wins: 0,
       losses: 0,
       winRate: null,
@@ -47,7 +48,7 @@ describe('buildStrategySessionStats', () => {
       lastTradeAt: null,
       signalsGenerated: 4,
     });
-    expect(report.totals).toMatchObject({ closedTrades: 0, winRate: null, realizedPnlUsd: 0, pnlToday: 0 });
+    expect(report.totals).toMatchObject({ closedTrades: 0, hydratedOpenCount: 0, winRate: null, realizedPnlUsd: 0, pnlToday: 0 });
     expect(report).toMatchObject({ ...SESSION, engineRunning: true, riskDay: '2026-09-11', generatedAt: NOW });
     expect(report.notes).toEqual(STRATEGY_SESSION_STATS_NOTES);
   });
@@ -67,6 +68,7 @@ describe('buildStrategySessionStats', () => {
     expect(momentum).toMatchObject({
       closedTrades: 3,
       openTrades: 1,
+      hydratedOpenCount: 0,
       wins: 1,
       losses: 1,
       breakeven: 1,
@@ -84,6 +86,7 @@ describe('buildStrategySessionStats', () => {
     expect(report.totals).toEqual({
       closedTrades: 4,
       openTrades: 2,
+      hydratedOpenCount: 0,
       wins: 2,
       losses: 1,
       breakeven: 1,
@@ -149,11 +152,111 @@ describe('buildStrategySessionStats', () => {
 
     expect(report).toMatchObject({ sessionId: null, sessionStartedAt: null, executionMode: null, engineRunning: false, strategies: [] });
     expect(report.totals.closedTrades).toBe(0);
+    expect(report.totals.hydratedOpenCount).toBe(0);
     expect(report.totals.winRate).toBeNull();
   });
 
   it('utcRiskDay is the UTC calendar day', () => {
     expect(utcRiskDay(Date.parse('2026-09-11T23:59:59.999Z'))).toBe('2026-09-11');
     expect(utcRiskDay(Date.parse('2026-09-12T00:00:00.000Z'))).toBe('2026-09-12');
+  });
+});
+
+describe('sessionSignalsEmitted takes precedence over plugin signalsGenerated', () => {
+  it('uses sessionSignalsEmitted when provided, ignoring the plugin counter', () => {
+    const strategies = [
+      { id: 'momentum', name: 'Momentum', enabled: true, signalsGenerated: 20, sessionSignalsEmitted: 3 },
+      { id: 'trend_follow', name: 'Trend Follow', enabled: true, signalsGenerated: 10, sessionSignalsEmitted: 0 },
+    ];
+
+    const report = buildStrategySessionStats({ closedTrades: [], strategies, session: SESSION, engineRunning: true, now: NOW });
+
+    expect(report.strategies.find((s) => s.strategyId === 'momentum')!.signalsGenerated).toBe(3);
+    expect(report.strategies.find((s) => s.strategyId === 'trend_follow')!.signalsGenerated).toBe(0);
+  });
+
+  it('falls back to plugin counter when sessionSignalsEmitted is null/undefined', () => {
+    const strategies = [
+      { id: 'momentum', name: 'Momentum', enabled: true, signalsGenerated: 7, sessionSignalsEmitted: null },
+      { id: 'trend_follow', name: 'Trend Follow', enabled: true, signalsGenerated: 2 },
+    ];
+
+    const report = buildStrategySessionStats({ closedTrades: [], strategies, session: SESSION, engineRunning: true, now: NOW });
+
+    expect(report.strategies.find((s) => s.strategyId === 'momentum')!.signalsGenerated).toBe(7);
+    expect(report.strategies.find((s) => s.strategyId === 'trend_follow')!.signalsGenerated).toBe(2);
+  });
+
+  it('handles sessionSignalsEmitted = 0 correctly (zero is a valid session-scoped count)', () => {
+    const strategies = [
+      { id: 'momentum', name: 'Momentum', enabled: true, signalsGenerated: 15, sessionSignalsEmitted: 0 },
+    ];
+
+    const report = buildStrategySessionStats({ closedTrades: [], strategies, session: SESSION, engineRunning: true, now: NOW });
+
+    expect(report.strategies.find((s) => s.strategyId === 'momentum')!.signalsGenerated).toBe(0);
+  });
+});
+
+describe('hydratedOpenCount', () => {
+  it('counts hydrated open positions per strategy separately from session openTrades', () => {
+    const openTrades = [{ strategy: 'momentum' }];
+    const hydratedOpenPositions = [
+      { strategy: 'momentum' },
+      { strategy: 'trend_follow' },
+      { strategy: 'trend_follow' },
+    ];
+
+    const report = buildStrategySessionStats({
+      closedTrades: [],
+      openTrades,
+      hydratedOpenPositions,
+      strategies: STRATEGIES,
+      session: SESSION,
+      engineRunning: true,
+      now: NOW,
+    });
+
+    const momentum = report.strategies.find((s) => s.strategyId === 'momentum')!;
+    expect(momentum.openTrades).toBe(1);
+    expect(momentum.hydratedOpenCount).toBe(1);
+
+    const trend = report.strategies.find((s) => s.strategyId === 'trend_follow')!;
+    expect(trend.openTrades).toBe(0);
+    expect(trend.hydratedOpenCount).toBe(2);
+
+    expect(report.totals.openTrades).toBe(1);
+    expect(report.totals.hydratedOpenCount).toBe(3);
+  });
+
+  it('is 0 when no hydrated positions are provided', () => {
+    const report = buildStrategySessionStats({ closedTrades: [], strategies: STRATEGIES, session: SESSION, engineRunning: true, now: NOW });
+
+    for (const s of report.strategies) {
+      expect(s.hydratedOpenCount).toBe(0);
+    }
+    expect(report.totals.hydratedOpenCount).toBe(0);
+  });
+
+  it('buckets untagged hydrated positions under "unknown"', () => {
+    const hydratedOpenPositions = [
+      { strategy: null },
+      { strategy: undefined },
+      { strategy: 'momentum' },
+    ];
+
+    const report = buildStrategySessionStats({
+      closedTrades: [],
+      hydratedOpenPositions,
+      strategies: STRATEGIES,
+      session: SESSION,
+      engineRunning: true,
+      now: NOW,
+    });
+
+    const unknown = report.strategies.find((s) => s.strategyId === UNKNOWN_STRATEGY_ID)!;
+    expect(unknown.hydratedOpenCount).toBe(2);
+    expect(report.strategies.find((s) => s.strategyId === 'momentum')!.hydratedOpenCount).toBe(1);
+    expect(report.totals.hydratedOpenCount).toBe(3);
   });
 });
