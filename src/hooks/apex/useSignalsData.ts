@@ -5,7 +5,6 @@ import type {
   StrategyParam,
   MetaModelInfo,
 } from "@/types/strategy";
-import { supabase } from "@/integrations/supabase/client";
 import {
   fetchSessionTrades,
   fetchStrategyPolicy,
@@ -14,7 +13,8 @@ import {
   type BackendTradeRecord,
 } from "@/services/apexDashboardApi";
 import { mergeStrategyPolicy } from "@/lib/strategy-policy";
-import { hasActiveSession, sessionKey, sessionWindow, type SessionScope } from "@/lib/session-scope";
+import { fetchSessionBlotterRows, SIGNALS_DISPLAY_TIME_COLUMN } from "@/lib/session-blotter-fetch";
+import { hasActiveSession, sessionKey, type SessionScope } from "@/lib/session-scope";
 import { useActiveSession } from "@/runtime/session";
 
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
@@ -90,26 +90,23 @@ export function mapSignalRecord(row: SignalRow, killed: ReadonlySet<string> = ne
 }
 
 /**
- * Signals decided since the ACTIVE session opened. `public.signals` has no
- * session_id column (see lib/session-scope.ts) so the scope is the session's
- * time window; with no session the stream is empty, never last run's rows.
+ * Signals for the ACTIVE session (`GET /api/signals` / session_id filter).
+ * With no session the stream is empty, never last run's rows.
  */
-export async function fetchSessionSignalStream(scope: SessionScope, limit = 60): Promise<SignalRecord[]> {
-  const window = sessionWindow(scope);
-  if (!window) return [];
-  const [{ data, error }, policy] = await Promise.all([
-    supabase
-      .from("signals")
-      .select("id,symbol,strategy,decided_at,side,score,confidence,meta_prob,allowed,reason")
-      .gte("decided_at", window.since)
-      .lte("decided_at", window.until)
-      .order("decided_at", { ascending: false })
-      .limit(limit),
+export async function fetchSessionSignalStream(
+  scope: SessionScope & { mode?: "paper" | "live" | null },
+  limit = 60,
+): Promise<SignalRecord[]> {
+  const [rows, policy] = await Promise.all([
+    fetchSessionBlotterRows("signals", scope, limit, {
+      select: "id,symbol,strategy,decided_at,side,score,confidence,meta_prob,allowed,reason",
+      orderColumn: "decided_at",
+      timeWindowColumn: SIGNALS_DISPLAY_TIME_COLUMN,
+    }),
     fetchStrategyPolicy(),
   ]);
-  if (error) throw new Error(`signal-stream fetch: ${error.message}`);
   const killed = new Set(policy?.disabledStrategies ?? []);
-  return (data as SignalRow[] | null)?.map((row) => mapSignalRecord(row, killed)) ?? [];
+  return (rows as SignalRow[]).map((row) => mapSignalRecord(row, killed));
 }
 
 export function useSignalStream() {

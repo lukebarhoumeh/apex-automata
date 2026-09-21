@@ -6,13 +6,14 @@
  * attributable to that session — never seeded demo data and never rows an
  * earlier run wrote to the same Supabase project.
  *
- * API gap (documented for Apex Engineering): `public.orders`, `fills`,
- * `positions` and `signals` carry no `session_id` column, so the only honest
- * scope the UI can apply to those tables is the session's own time window:
- * `created_at >= sessionStartedAt`. Rows written by the active engine are
- * always inside that window; rows from prior sessions never are. With no
- * active session there is nothing to attribute, so callers must render an
- * empty state instead of querying at all.
+ * Blotter tables (`orders`, `fills`, `signals`, `positions`) carry
+ * `session_id` / `execution_mode` when migration 20260911170000 is applied.
+ * Prefer `GET /api/orders|fills|signals|positions` or filter
+ * `session_id = activeSessionId`, with the session time window only as a
+ * fallback for unstamped legacy rows (`session_id IS NULL AND created_at >=
+ * sessionStartedAt`). Hydrated positions/orders restamped to the active
+ * session id must appear even when `created_at` predates `sessionStartedAt`.
+ * With no active session, render empty — never bleed prior runs.
  */
 
 import { fmtDuration } from "@/components/apex/format";

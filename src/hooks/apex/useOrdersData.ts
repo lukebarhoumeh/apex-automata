@@ -8,17 +8,12 @@ import type {
   FillRecord,
   OrderStats,
 } from "@/types/orders";
-import { supabase } from "@/integrations/supabase/client";
-import { hasActiveSession, sessionKey, sessionWindow, type SessionScope } from "@/lib/session-scope";
+import { fetchSessionBlotterRows } from "@/lib/session-blotter-fetch";
+import { hasActiveSession, sessionKey, type SessionScope } from "@/lib/session-scope";
 import { useActiveSession } from "@/runtime/session";
 
 // ============================================================
-// Orders — Supabase public.orders table, scoped to the ACTIVE session
-//
-// `orders` / `fills` carry no session_id column (API gap, see
-// lib/session-scope.ts), so the blotter reads only rows stamped at or after
-// /api/status → sessionStartedAt. Without an active session nothing is
-// queried: an empty blotter is the honest state, not last run's history.
+// Orders — active session via GET /api/orders (session_id SoT), Supabase fallback
 // ============================================================
 
 interface OrderRow {
@@ -109,19 +104,16 @@ function mapOrder(row: OrderRow): OrderRecord {
   };
 }
 
-/** Orders created since the active session opened; `[]` with no session. */
-export async function fetchSessionOrders(scope: SessionScope, limit = 100): Promise<OrderRecord[]> {
-  const window = sessionWindow(scope);
-  if (!window) return [];
-  const { data, error } = await supabase
-    .from("orders")
-    .select("id,external_order_id,symbol,side,type,status,price,quantity,strategy,created_at,updated_at")
-    .gte("created_at", window.since)
-    .lte("created_at", window.until)
-    .order("created_at", { ascending: false })
-    .limit(limit);
-  if (error) throw new Error(`orders fetch: ${error.message}`);
-  return (data as OrderRow[] | null)?.map(mapOrder) ?? [];
+/** Orders for the active session (`session_id` match or legacy window); `[]` with no session. */
+export async function fetchSessionOrders(
+  scope: SessionScope & { mode?: "paper" | "live" | null },
+  limit = 100,
+): Promise<OrderRecord[]> {
+  const rows = await fetchSessionBlotterRows("orders", scope, limit, {
+    select: "id,external_order_id,symbol,side,type,status,price,quantity,strategy,created_at,updated_at",
+    orderColumn: "created_at",
+  });
+  return (rows as OrderRow[]).map(mapOrder);
 }
 
 export function useOrders() {
@@ -163,22 +155,16 @@ function mapFill(row: FillRow): FillRecord {
   };
 }
 
-/** Fills stamped since the active session opened; `[]` with no session. */
-export async function fetchSessionFills(scope: SessionScope, limit = 50): Promise<FillRecord[]> {
-  const window = sessionWindow(scope);
-  if (!window) return [];
-  const { data, error } = await supabase
-    .from("fills")
-    .select("id,order_id,price,quantity,fee_amount,slippage_bps,filled_at,orders!inner(symbol,side)")
-    .gte("filled_at", window.since)
-    .lte("filled_at", window.until)
-    .order("filled_at", { ascending: false })
-    .limit(limit);
-  if (error) throw new Error(`fills fetch: ${error.message}`);
-  // Supabase joins return the embedded table as an object (for !inner with
-  // a single FK) or an array; normalize to object form for mapFill.
-  const rows = (data as unknown as (Omit<FillRow, "orders"> & { orders: FillRow["orders"] | FillRow["orders"][] })[] | null) ?? [];
-  return rows.map((r) =>
+/** Fills for the active session; `[]` with no session. */
+export async function fetchSessionFills(
+  scope: SessionScope & { mode?: "paper" | "live" | null },
+  limit = 50,
+): Promise<FillRecord[]> {
+  const rows = await fetchSessionBlotterRows("fills", scope, limit, {
+    select: "id,order_id,price,quantity,fee_amount,slippage_bps,filled_at,orders!inner(symbol,side)",
+    orderColumn: "filled_at",
+  });
+  return (rows as (Omit<FillRow, "orders"> & { orders: FillRow["orders"] | FillRow["orders"][] })[]).map((r) =>
     mapFill({
       ...r,
       orders: Array.isArray(r.orders) ? r.orders[0] ?? null : r.orders,

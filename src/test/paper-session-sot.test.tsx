@@ -3,8 +3,8 @@
  *
  * - Strategy cards count the session's closed trades (TradeAnalytics), never
  *   the plugin's emitted-signal counter.
- * - Orders / fills / signals are scoped to the active session's time window
- *   (tables carry no session_id) and render honest empty states without one.
+ * - Orders / fills / signals prefer session_id (API or Supabase) with a time
+ *   window only for unstamped legacy rows; honest empty states without a session.
  * - Killed strategies (guardrails disabled_strategies) carry a killed flag.
  * - One session clock: hero, footer and sidebar all derive from
  *   /api/status → sessionStartedAt.
@@ -38,6 +38,7 @@ import {
   shortSessionId,
   SESSION_WINDOW_SKEW_MS,
 } from "@/lib/session-scope";
+import { buildSessionBlotterOrFilter } from "@/lib/session-blotter-fetch";
 import { deriveFooterSessionText } from "@/components/apex/shell/footer-chips";
 import { DEMO_PATHS, NAV } from "@/components/apex/shell/nav-config";
 import { OrderBlotter, blotterEmptyMessage } from "@/components/apex/orders/OrderBlotter";
@@ -135,10 +136,20 @@ describe("strategy cards — trades come from the session ledger, not signalsGen
       </MemoryRouter>,
     );
     expect(getByTestId("strategy-card-trend_follow-trades").textContent).toBe("1");
-    expect(getByTestId("strategy-card-trend_follow-signals").textContent).toBe("8 signals emitted · 1 routed to a trade");
+    expect(getByTestId("strategy-card-trend_follow-signals").textContent).toBe("8 signals · 1 closed trade");
     expect(getByTestId("strategy-card-momentum-trades").textContent).toBe("—");
     expect(getByTestId("strategy-card-momentum-pnl").textContent).toBe("—");
     expect(getByTestId("strategy-card-momentum-signals").textContent).toContain("never registered");
+  });
+});
+
+describe("session scope — session_id filter with legacy window fallback", () => {
+  it("builds session_id.or(unstamped-in-window) for blotter Supabase reads", () => {
+    expect(buildSessionBlotterOrFilter("orders", SCOPE_ACTIVE)).toBe(
+      "session_id.eq.sess_1789137459103_bnd3mn,and(session_id.is.null,created_at.gte.2026-09-11T15:30:00.000Z)",
+    );
+    expect(buildSessionBlotterOrFilter("fills", SCOPE_ACTIVE)).toContain("filled_at.gte.");
+    expect(buildSessionBlotterOrFilter("orders", SCOPE_NONE)).toBeNull();
   });
 });
 

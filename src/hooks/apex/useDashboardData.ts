@@ -8,7 +8,8 @@ import type { EquityPoint, EquityRange } from "@/types/equity";
 import type { KpiTile } from "@/types/kpi";
 import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
 import { mergeStrategyPolicy } from "@/lib/strategy-policy";
-import { hasActiveSession, sessionKey, sessionWindow, type SessionScope } from "@/lib/session-scope";
+import { fetchSessionBlotterRows, SIGNALS_DISPLAY_TIME_COLUMN } from "@/lib/session-blotter-fetch";
+import { hasActiveSession, sessionKey, type SessionScope } from "@/lib/session-scope";
 import { useActiveSession } from "@/runtime/session";
 import { supabase } from "@/integrations/supabase/client";
 import {
@@ -395,28 +396,21 @@ export function recordToFeedEvent(r: SignalRecord): FeedEvent {
   };
 }
 
-/**
- * Signals decided since the ACTIVE session opened. `public.signals` has no
- * session_id column (see lib/session-scope.ts), so the scope is the session's
- * time window; with no session the panel is empty rather than showing rows an
- * earlier run wrote.
- */
-async function fetchSessionSignals(limit: number, scope: SessionScope): Promise<SignalRecord[]> {
-  const window = sessionWindow(scope);
-  if (!window) return [];
-  const [{ data, error }, policy] = await Promise.all([
-    supabase
-      .from("signals")
-      .select("id,symbol,strategy,decided_at,side,score,confidence,meta_prob,allowed,reason")
-      .gte("decided_at", window.since)
-      .lte("decided_at", window.until)
-      .order("decided_at", { ascending: false })
-      .limit(limit),
+/** Signals for the ACTIVE session (session_id SoT via API or Supabase). */
+async function fetchSessionSignals(
+  limit: number,
+  scope: SessionScope & { mode?: "paper" | "live" | null },
+): Promise<SignalRecord[]> {
+  const [rows, policy] = await Promise.all([
+    fetchSessionBlotterRows("signals", scope, limit, {
+      select: "id,symbol,strategy,decided_at,side,score,confidence,meta_prob,allowed,reason",
+      orderColumn: "decided_at",
+      timeWindowColumn: SIGNALS_DISPLAY_TIME_COLUMN,
+    }),
     fetchStrategyPolicy(),
   ]);
-  if (error) throw new Error(`signals fetch: ${error.message}`);
   const killed = killedStrategyIds(policy);
-  return (data as SignalRow[] | null)?.map((row) => mapSignalRecord(row, killed)) ?? [];
+  return (rows as SignalRow[]).map((row) => mapSignalRecord(row, killed));
 }
 
 export function useSignalRecords() {
