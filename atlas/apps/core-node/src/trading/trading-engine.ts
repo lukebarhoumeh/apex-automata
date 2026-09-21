@@ -2033,6 +2033,76 @@ export class TradingEngine extends EventEmitter {
   }
 
   /**
+   * Flatten a set of symbols: cancel every active order on them, then close
+   * every open position with a reduce-only market order tagged `flatten`.
+   * Used by venue guards (CDE Fri-break flatten, Charter leverage breach) via
+   * the API wiring; venue-agnostic here.
+   *
+   * Order matters (same as `/api/control/close-all`): cancel first so resting
+   * orders cannot re-open inventory or hold risk-engine slots after the close.
+   * Failures are collected, never thrown — one bad symbol must not stop the
+   * others from flattening.
+   *
+   * @param symbols Products to flatten.
+   * @param context.reason Persisted on the flatten orders' metadata (e.g. `cde_hours_gap`).
+   */
+  public async flattenSymbols(
+    symbols: string[],
+    context: { reason: string },
+  ): Promise<{ ordersCancelled: number; positionsClosed: number; failures: Array<{ symbol: string; step: 'cancel' | 'close'; error: string }> }> {
+    const targets = new Set(symbols);
+    const result = { ordersCancelled: 0, positionsClosed: 0, failures: [] as Array<{ symbol: string; step: 'cancel' | 'close'; error: string }> };
+    if (!this.isRunning || targets.size === 0) return result;
+
+    for (const order of this.getActiveOrders()) {
+      const symbol = order.productId ?? order.product;
+      if (!targets.has(symbol)) continue;
+      try {
+        if (await this.cancelOrder(order.id)) {
+          result.ordersCancelled += 1;
+          this.logger.info('Flatten: cancelled resting order', { orderId: order.id, symbol, reason: context.reason });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        result.failures.push({ symbol, step: 'cancel', error: message });
+        this.logger.error('Flatten: failed to cancel order (continuing)', { orderId: order.id, symbol, error: message });
+      }
+    }
+
+    for (const position of this.getOpenPositions()) {
+      if (!targets.has(position.symbol) || position.side === 'flat' || !(Math.abs(position.size) > 0)) continue;
+      const side: 'buy' | 'sell' = position.side === 'long' ? 'sell' : 'buy';
+      try {
+        const order = await this.createOrder(
+          { product_id: position.symbol, side, type: 'market', size: Math.abs(position.size).toString() },
+          { strategy: 'system', metadata: { tag: 'flatten', reason: context.reason, positionId: position.id } },
+        );
+        if (order) {
+          result.positionsClosed += 1;
+          this.logger.warn('Flatten: closing position', {
+            positionId: position.id,
+            symbol: position.symbol,
+            side: position.side,
+            size: position.size,
+            orderId: order.id,
+            reason: context.reason,
+          });
+        } else {
+          const rejection = this.getLastOrderRejection();
+          result.failures.push({ symbol: position.symbol, step: 'close', error: rejection?.reason ?? 'flatten order not created' });
+          this.logger.error('Flatten: exit order not created', { symbol: position.symbol, rejection });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        result.failures.push({ symbol: position.symbol, step: 'close', error: message });
+        this.logger.error('Flatten: failed to close position (continuing)', { symbol: position.symbol, error: message });
+      }
+    }
+
+    return result;
+  }
+
+  /**
    * Install (or clear) the re-quote throttle applied to `editOrder`. Wired by
    * the API layer from `guardrails.cfm.execution.max_requotes_per_sec` so the
    * engine stays venue-agnostic.
