@@ -1,4 +1,5 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { computePortfolioHeatPct } from "@/lib/portfolio-heat";
 import type {
   ExposureNode,
   KillLadderRow,
@@ -100,7 +101,7 @@ const KILL_LADDER_TEMPLATE: readonly Omit<KillLadderRow, "tripped">[] = [
 // Mappers
 // ============================================================
 
-function buildPortfolio(
+export function buildPortfolio(
   status: BackendStatus | null,
   pnl: BackendPnL | null,
   riskStatus: BackendRiskStatus | null,
@@ -120,8 +121,9 @@ function buildPortfolio(
   const exposure =
     pnlSnapshot?.exposureUsd ?? riskStatus?.metrics.currentExposure ?? 0;
 
-  // Heat: only meaningful when we have real equity. Otherwise show 0 (no equity → no heat).
-  const heat = equity && equity > 0 ? (exposure / equity) * 100 : 0;
+  // Heat: exposure / equity via the shared definition the dashboard hero also
+  // uses. `null` (→ "—") without real equity — never a 0 that reads as flat.
+  const heat = computePortfolioHeatPct(exposure, equity);
 
   const consecLosses = riskStatus?.metrics.consecutiveLosses ?? 0;
 
@@ -149,7 +151,7 @@ function buildRadar(
 ): RiskRadarAxis[] {
   const concentration = maxPositions > 0 ? (openPositions / maxPositions) * 100 : 0;
   const ddPct = (portfolio.dd / Math.max(portfolio.ddCap, 0.001)) * 100;
-  const heatPct = (portfolio.heat / Math.max(portfolio.heatCap, 0.001)) * 100;
+  const heatPct = ((portfolio.heat ?? 0) / Math.max(portfolio.heatCap, 0.001)) * 100;
   const liquidityPenalty = Math.min(100, blocked * 25);
   const consecPct = (portfolio.consecLosses / Math.max(portfolio.consecCap, 1)) * 100;
 
@@ -189,11 +191,22 @@ function buildKillLadder(portfolio: PortfolioRisk, killActive: boolean): KillLad
   });
 }
 
-function buildEmptyTree(): ExposureNode {
+/**
+ * Exposure tree rooted at the REAL open notional from the PnL snapshot
+ * (`exposureUsd`) — the same number the hero heat and Risk hero use. The
+ * Risk page used to add a hard-coded `+ $86,162` demo inflate to this total.
+ * Per-symbol children are pending a runtime breakdown; until then the single
+ * child states what the total is, never a fabricated allocation.
+ */
+export function buildExposureTree(exposureUsd: number): ExposureNode {
+  const exposure = Number.isFinite(exposureUsd) ? Math.max(0, exposureUsd) : 0;
   return {
     label: "Portfolio",
-    value: 0,
-    children: [{ label: "No open positions", value: 0 }],
+    value: exposure,
+    children:
+      exposure > 0
+        ? [{ label: "Open positions · per-symbol split not reported", value: exposure }]
+        : [{ label: "No open positions", value: 0 }],
   };
 }
 
@@ -246,7 +259,7 @@ export function useRiskData() {
         radar: buildRadar(portfolio, blockedCount, openPositions, maxPositions),
         corr: IDENTITY_CORR,
         corrLabels: [...CORR_LABELS],
-        tree: buildEmptyTree(),
+        tree: buildExposureTree(portfolio.exposure),
         killLadder: buildKillLadder(portfolio, killSwitchActive),
       };
     },

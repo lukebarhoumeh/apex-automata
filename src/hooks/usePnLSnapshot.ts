@@ -13,6 +13,8 @@
  * - INITIAL_BALANCE constants
  * - Local equity calculations
  * - Session stats totalPnl for equity display
+ * - A fabricated equity anchor when the runtime reports none (`snapshot` is
+ *   `null` → render "—"; never "$50,000 + dailyPnl")
  */
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -32,14 +34,31 @@ const API_URL = import.meta.env.VITE_RUNTIME_API_URL || 'http://localhost:3001';
 // Fallback poll interval when WS disconnected
 const FALLBACK_POLL_INTERVAL = 5000;
 
+function finiteNumber(...candidates: unknown[]): number | null {
+  for (const c of candidates) {
+    if (typeof c === 'number' && Number.isFinite(c)) return c;
+    if (typeof c === 'string' && c.trim() !== '') {
+      const n = Number(c);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
 /**
  * Normalize backend payload to PnLSnapshot
  * Backend may use different casing or field names
+ *
+ * Returns `null` when the payload carries no finite `totalEquityUsd`: equity
+ * is the one field we must never invent, so a payload without it is "no
+ * snapshot" (rendered "—"), not a zeroed-out snapshot.
  */
-function normalizeSnapshot(raw: unknown): PnLSnapshot | null {
+export function normalizeSnapshot(raw: unknown): PnLSnapshot | null {
   if (!raw || typeof raw !== 'object') return null;
   
   const data = raw as Record<string, unknown>;
+  const totalEquityUsd = finiteNumber(data.totalEquityUsd, data.total_equity_usd);
+  if (totalEquityUsd === null) return null;
   
   // Handle both camelCase and snake_case from backend
   return {
@@ -52,7 +71,7 @@ function normalizeSnapshot(raw: unknown): PnLSnapshot | null {
     dayStartEquityUsd: Number(data.dayStartEquityUsd || data.day_start_equity_usd || 0),
     realizedPnlUsd: Number(data.realizedPnlUsd || data.realized_pnl_usd || 0),
     unrealizedPnlUsd: Number(data.unrealizedPnlUsd || data.unrealized_pnl_usd || 0),
-    totalEquityUsd: Number(data.totalEquityUsd || data.total_equity_usd || 0),
+    totalEquityUsd,
     dailyPnlUsd: Number(data.dailyPnlUsd || data.daily_pnl_usd || 0),
     dailyPnlR: Number(data.dailyPnlR || data.daily_pnl_r || 0),
     riskUnitUsd: Number(data.riskUnitUsd || data.risk_unit_usd || 0),
@@ -63,31 +82,16 @@ function normalizeSnapshot(raw: unknown): PnLSnapshot | null {
 }
 
 /**
- * Build a PnL snapshot object from /api/status response shape
- * when /api/pnl is not available and .pnl is missing from status.
+ * Snapshot from the `/api/status` envelope. The runtime nests the SAME PnL
+ * object under `.pnl` (null while the engine is stopped). There is no other
+ * source of equity on that payload: when `.pnl` is missing we return `null`
+ * and the UI renders "—". We never synthesise a snapshot from `status.risk`
+ * with an invented equity anchor (this used to fabricate $50,000).
  */
-function buildSnapshotFromStatus(status: Record<string, unknown>): Record<string, unknown> | null {
-  const risk = status.risk as Record<string, unknown> | undefined;
-  if (!risk) return null;
-  
-  const dailyPnlUsd = Number(risk.dailyPnLUsd ?? 0);
-  const exposureUsd = Number(risk.exposureUsd ?? 0);
-  
-  return {
-    ts: Number(status.timestamp ?? Date.now()),
-    executionMode: status.mode ?? 'paper',
-    riskDay: new Date().toISOString().split('T')[0],
-    sessionStartEquityUsd: 50_000,
-    dayStartEquityUsd: 50_000,
-    totalEquityUsd: 50_000 + dailyPnlUsd,
-    dailyPnlUsd,
-    dailyPnlR: 0,
-    riskUnitUsd: 500,
-    realizedPnlUsd: 0,
-    unrealizedPnlUsd: 0,
-    exposureUsd,
-    openPositionsCount: 0,
-  };
+export function snapshotFromStatus(status: unknown): PnLSnapshot | null {
+  if (!status || typeof status !== 'object') return null;
+  const pnl = (status as Record<string, unknown>).pnl;
+  return pnl ? normalizeSnapshot(pnl) : null;
 }
 
 /**
@@ -133,21 +137,20 @@ export const usePnLSnapshot = (): PnLSnapshotState => {
         if (response.ok) {
           const data = await response.json();
           const normalized = normalizeSnapshot(data);
-          if (normalized && (normalized.totalEquityUsd > 0 || normalized.dailyPnlUsd !== 0)) {
+          if (normalized) {
             lastSnapshotTsRef.current = normalized.ts;
             if (source !== 'ws') setSource('rest');
             return normalized;
           }
         }
         
-        // Fall back to /api/status which has pnl nested under .pnl
+        // /api/pnl is 503 while the engine is stopped; /api/status is always
+        // 200 and nests the same snapshot under `.pnl` (null when stopped).
         response = await fetch(`${API_URL}/api/status`);
         if (!response.ok) return null;
         
         const statusData = await response.json();
-        // Extract from .pnl sub-object first, then fall back to building from .risk
-        const pnlData = statusData.pnl || buildSnapshotFromStatus(statusData);
-        const normalized = normalizeSnapshot(pnlData);
+        const normalized = snapshotFromStatus(statusData);
         
         if (normalized) {
           lastSnapshotTsRef.current = normalized.ts;

@@ -3,7 +3,11 @@ export interface PortfolioRisk {
   // Consumers must render an empty-state ("--") rather than a hardcoded fallback so we never lie about live equity.
   equity: number | null;
   exposure: number;
-  heat: number;
+  /**
+   * exposure / equity × 100 (shared definition: lib/portfolio-heat). null when
+   * equity is unknown — render "—", never a 0 that reads as "flat".
+   */
+  heat: number | null;
   heatCap: number;
   dd: number;
   ddCap: number;

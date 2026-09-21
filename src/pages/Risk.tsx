@@ -13,7 +13,8 @@ export default function Risk() {
   if (!risk.data) return null;
   const R = risk.data;
   const radarComposite = Math.round(R.radar.reduce((s, r) => s + r.v, 0) / R.radar.length);
-  const treeTotal = R.tree.value + 86_162;
+  // Real open notional only (PnL snapshot exposureUsd) — no demo inflate.
+  const treeTotal = R.tree.value;
 
   return (
     <div className="flex flex-col gap-4 p-6">
@@ -79,12 +80,16 @@ export default function Risk() {
           pad={20}
           title="EXPOSURE TREE"
           right={
-            <span className="mono rounded-full border border-obsidian-line-2 bg-obsidian-3 px-2 py-0.5 text-[10px] uppercase text-fg-1">
+            <span
+              className="mono rounded-full border border-obsidian-line-2 bg-obsidian-3 px-2 py-0.5 text-[10px] uppercase text-fg-1"
+              title="Open notional exposure from the runtime PnL snapshot (exposureUsd)"
+              data-testid="exposure-tree-total"
+            >
               TOTAL ${treeTotal.toLocaleString()}
             </span>
           }
         >
-          <ExposureTree node={R.tree} maxVal={R.tree.value} />
+          <ExposureTree node={R.tree} maxVal={Math.max(R.tree.value, 1)} />
         </Panel>
 
         <KillSwitchLadder rows={R.killLadder} />
