@@ -17,6 +17,17 @@ import { buildStrategyPolicy } from '../strategies/strategy-policy';
 import { resolvePersistedEntryPrice } from '../trading/position-entry-vwap';
 import { buildFillRow, FILLS_UPSERT_ON_CONFLICT, FillRowFillRef, FillRowOrderRef } from '../persistence/fill-row';
 import { SessionColumnSupport, SessionStamp, writeWithSessionStamp } from '../persistence/session-stamp';
+import { writeSignalRouteVerdict } from '../persistence/signal-route-verdict';
+import {
+  resolveRoutedExchange,
+  routeEngineRejected,
+  routeError,
+  routeExitPlaced,
+  routeOrderPlaced,
+  routeRejected,
+  type SignalRouteVerdict,
+} from '../exchanges/signal-route';
+import { observedWinRate } from '../trading/risk/ev-gate';
 import {
   activeSessionWindow,
   buildSessionScopeMeta,
@@ -1986,11 +1997,21 @@ app.post('/api/engine/start', async (req, res) => {
           );
         }
         
-        // Store signal in Supabase
+        // Store the canonical signal BEFORE routing. `orders.signal_id` is a
+        // foreign key to `signals.id` and the order:created handler upserts the
+        // order row concurrently with routing, so the signal row must already
+        // exist. The router's verdict is applied to this row afterwards
+        // (persistSignalRouteVerdict) — `signals.allowed` / `routed_exchange`
+        // reflect what the router actually did, not a pre-routing default.
         await syncSignalToSupabase(signal);
-        
-        // Create order if risk checks pass
-        try {
+
+        // Route the canonical signal to an order. The gate chain is wrapped so
+        // that EVERY exit yields a SignalRouteVerdict (venue + placed / rejected
+        // + reason) — the return type makes a silent `return;` a compile error,
+        // which is how routed_exchange=NULL on allowed signals slipped through
+        // before (DESK GO 2026-09-21).
+        const routedExchange = resolveRoutedExchange(signal.symbol);
+        const routeSignalToOrder = async (): Promise<SignalRouteVerdict> => {
         const shortAllowed = Boolean(guardrails.strategy.allow_short);
         const isExitSignal = signal.direction === 'sell' && !shortAllowed;
         
@@ -2016,7 +2037,7 @@ app.post('/api/engine/start', async (req, res) => {
               killSwitchActive: runtimeState.killSwitch.active,
             },
           });
-          return;
+          return routeRejected(routedExchange, 'runtime_state', reason);
         }
 
         const signalTime = signal.timestamp instanceof Date ? signal.timestamp : new Date(signal.timestamp ?? Date.now());
@@ -2041,7 +2062,7 @@ app.post('/api/engine/start', async (req, res) => {
               strength: signal.strength,
               context: { shortAllowed },
             });
-            return;
+            return routeRejected(routedExchange, 'routing', 'exit_no_open_position');
           }
 
           // Enforce minimum hold time — don't exit positions too early (fee drag killer)
@@ -2068,7 +2089,7 @@ app.post('/api/engine/start', async (req, res) => {
                 minHoldSec: Math.round(minHoldMs / 1000),
               },
             });
-            return;
+            return routeRejected(routedExchange, 'routing', 'exit_position_too_young');
           }
           
           const closeOrder: Omit<OrderRequest, 'client_oid'> = {
@@ -2094,8 +2115,9 @@ app.post('/api/engine/start', async (req, res) => {
           
           if (exit) {
             logger.info('Exited long position from sell signal', { orderId: exit.id, symbol: signal.symbol, size: openPosition.size });
+            return routeExitPlaced(routedExchange, exit.id);
           }
-          return;
+          return routeEngineRejected(routedExchange, 'exit_order_not_created');
         }
 
         // Reversal-intent decoration (audit fix #2). The cross-venue
@@ -2138,7 +2160,7 @@ app.post('/api/engine/start', async (req, res) => {
         const arbiterDecision = signalArbitrator.arbitrate(signal, openPositions);
         if (!arbiterDecision.allow) {
           // Rejection already logged + counted inside the arbitrator
-          return;
+          return routeRejected(routedExchange, 'cross_venue', arbiterDecision.reason ?? 'arbitrator_rejected');
         }
 
         // Time filter guardrail (audit fix #6). `allowed_hours_utc` is a
@@ -2161,7 +2183,7 @@ app.post('/api/engine/start', async (req, res) => {
               strength: signal.strength,
               context: { hour, allowedHours: hours },
             });
-            return;
+            return routeRejected(routedExchange, 'time', `hour_not_allowed (utc=${hour})`);
           }
         }
 
@@ -2183,7 +2205,7 @@ app.post('/api/engine/start', async (req, res) => {
               strength: signal.strength,
               context: { atrPct, atrMin, atrMax },
             });
-            return;
+            return routeRejected(routedExchange, 'atr_vol', `${reason} (atrPct=${atrPct.toFixed(5)})`);
           }
         }
 
@@ -2208,7 +2230,7 @@ app.post('/api/engine/start', async (req, res) => {
                 positionsWithHighFunding: riskSummary.positionsWithHighFunding,
               },
             });
-            return;
+            return routeRejected(routedExchange, 'funding_bias', 'excessive_funding_rate');
           }
         }
 
@@ -2243,7 +2265,7 @@ app.post('/api/engine/start', async (req, res) => {
               isPerpsSymbol,
             },
           });
-          return;
+          return routeRejected(routedExchange, 'sizing', 'guardrail_size_zero_or_invalid');
         }
 
         // Apply regime-based position multiplier from signal metadata
@@ -2268,7 +2290,7 @@ app.post('/api/engine/start', async (req, res) => {
             strength: signal.strength,
             context: { rawSize, positionMultiplier, computedSize },
           });
-          return;
+          return routeRejected(routedExchange, 'sizing', 'position_multiplier_zero');
         }
 
         const orderTypeSetting = guardrails.execution.order_type;
@@ -2330,6 +2352,14 @@ app.post('/api/engine/start', async (req, res) => {
         // prior instead of allow-by-default, live fee tier, maker entry
         // leg only when post-only, enforce|shadow per live.ev_gate_mode.
         // See docs/research/2026-05-18_f4-hl-backtest-validation.md §4.1.
+        // Cold start: MetaFilter.filter() has already seeded a
+        // `{ totalTrades: 0, winRate: 0 }` record for this strategy by the time
+        // we get here, so `perf.winRate` is 0 — NOT null — on every fresh
+        // session. Passing it straight through made the gate price p = 0 and
+        // reject every signal (EV = -L - fees), which is why no paper order was
+        // created between 2026-05-18 (A3 landed) and 2026-09-21. Only a win
+        // rate backed by closed trades is evidence; otherwise the gate's
+        // documented default-allow path applies.
         const strategyPerf = signalProcessor!.getStrategyPerformance(signal.strategy);
         const evGate = tradingEngine!.getRiskEngineInstance()?.evaluateSignalEv({
           symbol: signal.symbol,
@@ -2339,7 +2369,7 @@ app.post('/api/engine/start', async (req, res) => {
           stopPrice,
           takeProfit: typeof signal.takeProfit === 'number' ? signal.takeProfit : 0,
           size: computedSize,
-          winRate: strategyPerf?.winRate ?? null,
+          winRate: observedWinRate(strategyPerf),
           sampleSize: strategyPerf?.totalTrades ?? 0,
           // Paper keeps the legacy taker-both-sides assumption bit-for-bit.
           entryLiquidity: mode === 'live' && orderType === 'limit' && postOnly ? 'maker' : 'taker',
@@ -2371,7 +2401,7 @@ app.post('/api/engine/start', async (req, res) => {
               feeUsd: evGate.feeUsd,
             },
           });
-          return;
+          return routeRejected(routedExchange, 'ev_gate', evGate.reason ?? 'ev_below_threshold');
         }
 
         const order = await tradingEngine!.createOrder(orderRequest, {
@@ -2398,10 +2428,22 @@ app.post('/api/engine/start', async (req, res) => {
             strategy: signal.strategy,
             direction: signal.direction,
           });
+          return routeOrderPlaced(routedExchange, order.id);
         }
-      } catch (error) {
-        logger.error('Failed to place order from signal:', error);
-      }
+        // createOrder returned null: pre-trade risk check or paper validation
+        // declined (detail is in the engine's warn log). The signal DID reach
+        // the venue path, so routed_exchange is stamped and allowed=false.
+        return routeEngineRejected(routedExchange, 'order_not_created');
+        };
+
+        let verdict: SignalRouteVerdict;
+        try {
+          verdict = await routeSignalToOrder();
+        } catch (error) {
+          logger.error('Failed to place order from signal:', error);
+          verdict = routeError(routedExchange, error instanceof Error ? error.message : String(error));
+        }
+        await persistSignalRouteVerdict(signal, verdict);
       } catch (err) {
         logger.error('Failed to handle signal:generated', { error: String(err) });
       }
@@ -4947,6 +4989,62 @@ async function syncSignalToSupabase(signal: any) {
     }
   } catch (error) {
     logger.error('Error syncing signal:', error);
+  }
+}
+
+/**
+ * Apply the router's verdict to the canonical `signals` row that
+ * `syncSignalToSupabase` inserted before routing: `allowed` becomes "an order
+ * was placed", `routed_exchange` is stamped when the signal reached a venue's
+ * execution path, and `reason` carries `"<stage>: <why>"` for anything that
+ * was not placed. Write ordering + schema tolerance are documented in
+ * persistence/signal-route-verdict.ts. Never throws.
+ */
+async function persistSignalRouteVerdict(
+  signal: { id?: unknown; symbol?: string; strategy?: string },
+  verdict: SignalRouteVerdict,
+): Promise<void> {
+  try {
+    const result = await writeSignalRouteVerdict({
+      signalId: signal.id,
+      verdict,
+      update: async (patch) => {
+        const { error } = await supabase
+          .from('signals')
+          .update(patch)
+          .eq('id', signal.id as string)
+          .eq('user_id', USER_ID);
+        return { error };
+      },
+      logger,
+    });
+
+    if (result.error) {
+      logger.error('Failed to persist signal routing verdict to Supabase:', {
+        error: result.error.message,
+        code: result.error.code,
+        signalId: signal.id,
+        symbol: signal.symbol,
+        outcome: verdict.outcome,
+        routedExchange: verdict.routedExchange,
+      });
+      return;
+    }
+
+    if (result.attempted) {
+      logger.info('Signal routing verdict persisted', {
+        signalId: signal.id,
+        symbol: signal.symbol,
+        strategy: signal.strategy,
+        outcome: verdict.outcome,
+        stage: verdict.stage,
+        orderId: verdict.orderId,
+        fellBack: result.fellBack,
+        ...result.patch,
+      });
+    }
+  } catch (error) {
+    logger.error('Error persisting signal routing verdict:', error);
   }
 }
 
