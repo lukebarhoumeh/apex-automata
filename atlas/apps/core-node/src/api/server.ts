@@ -15,8 +15,9 @@ import {
 import { buildRegimeGateConfig, evaluateRegimeGate } from '../strategies/regime-gate';
 import { buildStrategyPolicy } from '../strategies/strategy-policy';
 import { resolvePersistedEntryPrice } from '../trading/position-entry-vwap';
-import { buildFillRow, FILLS_UPSERT_ON_CONFLICT, FillRowFillRef, FillRowOrderRef } from '../persistence/fill-row';
+import { buildFillRow, FILLS_UPSERT_ON_CONFLICT, FILL_FEE_SIDE_COLUMNS, FillRowFillRef, FillRowOrderRef } from '../persistence/fill-row';
 import { SessionColumnSupport, SessionStamp, writeWithSessionStamp } from '../persistence/session-stamp';
+import { writeWithOptionalColumns } from '../persistence/optional-columns';
 import { writeSignalRouteVerdict } from '../persistence/signal-route-verdict';
 import {
   resolveRoutedExchange,
@@ -332,6 +333,11 @@ logger.info('Using fixed USER_ID for single-user mode:', USER_ID);
 // the blotter read endpoints consult the same instance so one failed probe
 // switches every path to the legacy shape at once.
 const sessionColumnSupport = new SessionColumnSupport();
+
+// Same idea for `fills.fee_side` / `fills.fee_side_source` (migration
+// 20260921180000, card SH-QMAKER-CFM-PAPER-v0 blocker 3): remembered per table
+// so a pre-migration schema costs one failed probe per re-probe window.
+const feeSideColumnSupport = new SessionColumnSupport();
 
 // Session stamp for persisted rows. Set the moment the engine starts building
 // (so anything written during start-up already carries the id) and cleared when
@@ -4795,18 +4801,45 @@ async function syncOrderToSupabase(order: any) {
  * Persist a fill. TASK_014 P2: `fills.order_id` is the FK to `orders.id` (client UUID),
  * so the row is built from the engine-side `order`, and the exchange's order id goes to
  * `external_order_id` — see persistence/fill-row.ts for the mapping and its tests.
+ *
+ * Fee-side attribution (card SH-QMAKER-CFM-PAPER-v0 blocker 3): the row carries
+ * tri-state `maker` plus `fee_side` / `fee_side_source`. The two explicit columns
+ * land with migration 20260921180000 and are written schema-tolerantly (stripped +
+ * retried once when PostgREST reports them missing). An unresolvable side is
+ * persisted as NULL and logged — "unlogged fee_side" is VOID for the card, so it
+ * must be visible, never disguised as taker.
  */
 async function syncFillToSupabase(order: FillRowOrderRef, fill: FillRowFillRef) {
   try {
     const row = buildFillRow({ userId: USER_ID, order, fill });
-    // TASK_014 P5: session stamp with schema-tolerant fallback (session-stamp.ts).
+    if (row.fee_side === null) {
+      logger.warn('Fill persisted with UNLOGGED fee_side (VOID for SH-QMAKER-CFM-PAPER-v0)', {
+        orderId: order.id,
+        externalOrderId: row.external_order_id,
+        tradeId: row.trade_id,
+        liquidity: fill.liquidity ?? null,
+      });
+    }
+    // TASK_014 P5: session stamp with schema-tolerant fallback (session-stamp.ts),
+    // composed over the fee_side optional-column fallback (optional-columns.ts).
     const { error } = await writeWithSessionStamp({
       table: 'fills',
       row: row as unknown as Record<string, unknown>,
       stamp: currentSessionStamp(),
       support: sessionColumnSupport,
       write: async (payload) => {
-        const { error } = await supabase.from('fills').upsert(payload, { onConflict: FILLS_UPSERT_ON_CONFLICT });
+        const { error } = await writeWithOptionalColumns({
+          table: 'fills',
+          row: payload,
+          columns: FILL_FEE_SIDE_COLUMNS,
+          support: feeSideColumnSupport,
+          migrationHint: '20260921180000',
+          logger,
+          write: async (shape) => {
+            const { error } = await supabase.from('fills').upsert(shape, { onConflict: FILLS_UPSERT_ON_CONFLICT });
+            return { error };
+          },
+        });
         return { error };
       },
       logger,

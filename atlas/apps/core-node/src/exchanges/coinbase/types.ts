@@ -81,6 +81,20 @@ export interface Fill {
   side: 'buy' | 'sell';
   settled: boolean;
   usd_volume: string;
+  /**
+   * Explicit fee-side attribution (card SH-QMAKER-CFM-PAPER-v0 blocker 3).
+   * Producers that KNOW the side stamp it here; `liquidity` stays for legacy
+   * consumers. See trading/fee-side.ts.
+   */
+  fee_side?: 'maker' | 'taker';
+  /** Provenance of `fee_side`: venue-reported, paper-simulated or locally inferred. */
+  fee_side_source?: 'exchange' | 'simulated' | 'inferred';
+  /** Cost-plus books (CFM): percentage commission leg of `fee`, USD decimal string. */
+  commission?: string;
+  /** Cost-plus books (CFM): per-contract exchange floor leg of `fee`, USD decimal string. */
+  exchange_fee?: string;
+  /** Cost-plus books (CFM): contracts this fill represents (decimal string). */
+  contracts?: string;
 }
 
 export interface Account {
