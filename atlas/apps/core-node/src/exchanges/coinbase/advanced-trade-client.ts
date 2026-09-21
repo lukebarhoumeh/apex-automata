@@ -390,6 +390,39 @@ export interface AtCancelResult {
   failure_reason?: string;
 }
 
+/** `POST /orders/edit` / `/orders/edit_preview` request. Coinbase requires BOTH fields. */
+export interface AtEditOrderBody {
+  order_id: string;
+  /** New limit price (decimal string, already aligned to `quote_increment`). */
+  price: string;
+  /** New base size (decimal string, already aligned to `base_increment`). */
+  size: string;
+}
+
+/** One entry of the `errors` array Coinbase returns on a refused edit / edit preview. */
+export interface AtEditError {
+  edit_failure_reason?: string;
+  preview_failure_reason?: string;
+}
+
+export type AtEditOrderResult =
+  | { ok: true; orderId: string; raw: unknown }
+  | { ok: false; orderId: string; code: string; message: string; raw: unknown };
+
+export interface AtEditPreviewResult {
+  ok: boolean;
+  errors: AtEditError[];
+  slippage?: string;
+  order_total?: string;
+  commission_total?: string;
+  quote_size?: string;
+  base_size?: string;
+  best_bid?: string;
+  best_ask?: string;
+  average_filled_price?: string;
+  raw: unknown;
+}
+
 export interface AtKeyPermissions {
   can_view: boolean;
   can_trade: boolean;
@@ -890,6 +923,90 @@ export class AdvancedTradeRestClient {
     });
   }
 
+  /**
+   * POST /orders/edit — re-price / re-size a resting limit order IN PLACE
+   * (preferred over cancel + new: one mutation call, one order lifecycle, no
+   * queue-position reset from a fresh id). Coinbase only edits open limit
+   * GTC orders and requires both `price` and `size` on the wire.
+   *
+   * Business refusals (`success:false`, `errors[].edit_failure_reason`, HTTP
+   * 4xx validation) resolve to `{ ok:false, code, message }` — the order is
+   * left as it was. Transport / auth / 429 / 5xx failures throw (429 is
+   * retried by `request()` honouring `Retry-After`, bounded by `maxRetries`).
+   */
+  public async editOrder(body: AtEditOrderBody): Promise<AtEditOrderResult> {
+    if (!body.order_id) {
+      return { ok: false, orderId: '', code: 'ORDER_ID_REQUIRED', message: 'order_id is required', raw: null };
+    }
+    if (!body.price || !body.size) {
+      return {
+        ok: false,
+        orderId: body.order_id,
+        code: 'PRICE_AND_SIZE_REQUIRED',
+        message: 'Coinbase edit requires both price and size',
+        raw: null,
+      };
+    }
+
+    let raw: Record<string, unknown>;
+    try {
+      raw = await this.request<Record<string, unknown>>('POST', `${BROKERAGE}/orders/edit`, { body });
+    } catch (error) {
+      if (error instanceof CoinbaseApiError && isBusinessRejectStatus(error.httpStatus)) {
+        return {
+          ok: false,
+          orderId: body.order_id,
+          code: error.coinbaseCode ?? `HTTP_${error.httpStatus}`,
+          message: error.coinbaseMessage ?? error.message,
+          raw: { status: error.httpStatus, code: error.coinbaseCode, message: error.coinbaseMessage },
+        };
+      }
+      throw error;
+    }
+
+    if (raw.success === true) {
+      return { ok: true, orderId: body.order_id, raw };
+    }
+    const { code, message } = firstEditError(raw);
+    this.logger.warn('Advanced Trade order edit refused', { orderId: body.order_id, code, message });
+    return { ok: false, orderId: body.order_id, code, message, raw };
+  }
+
+  /**
+   * POST /orders/edit_preview — validate an edit and get the venue's view of
+   * the resulting order (slippage, totals, best bid/ask) without mutating it.
+   * Never throws on a business refusal: `ok:false` with `errors`.
+   */
+  public async previewEditOrder(body: AtEditOrderBody): Promise<AtEditPreviewResult> {
+    let raw: Record<string, unknown>;
+    try {
+      raw = await this.request<Record<string, unknown>>('POST', `${BROKERAGE}/orders/edit_preview`, { body });
+    } catch (error) {
+      if (error instanceof CoinbaseApiError && isBusinessRejectStatus(error.httpStatus)) {
+        return {
+          ok: false,
+          errors: [{ edit_failure_reason: error.coinbaseCode ?? `HTTP_${error.httpStatus}` }],
+          raw: { status: error.httpStatus, code: error.coinbaseCode, message: error.coinbaseMessage },
+        };
+      }
+      throw error;
+    }
+    const errors = Array.isArray(raw.errors) ? (raw.errors as AtEditError[]) : [];
+    return {
+      ok: errors.length === 0,
+      errors,
+      slippage: str(raw.slippage),
+      order_total: str(raw.order_total),
+      commission_total: str(raw.commission_total),
+      quote_size: str(raw.quote_size),
+      base_size: str(raw.base_size),
+      best_bid: str(raw.best_bid),
+      best_ask: str(raw.best_ask),
+      average_filled_price: str(raw.average_filled_price),
+      raw,
+    };
+  }
+
   /** Legacy: cancel one order, returning the ids Coinbase confirmed as cancelled. */
   public async cancelOrder(orderId: string): Promise<string[]> {
     const results = await this.cancelOrders([orderId]);
@@ -1072,6 +1189,17 @@ export class AdvancedTradeRestClient {
 
 function isBusinessRejectStatus(status: number): boolean {
   return status >= 400 && status < 500 && ![401, 403, 404, 408, 429].includes(status);
+}
+
+/** First `errors[]` entry of a refused edit, folded into a (code, message) pair. */
+function firstEditError(raw: Record<string, unknown>): { code: string; message: string } {
+  const errors = Array.isArray(raw.errors) ? (raw.errors as AtEditError[]) : [];
+  const first = errors[0];
+  const code = str(first?.edit_failure_reason) ?? str(first?.preview_failure_reason) ?? str(raw.failure_reason) ?? 'UNKNOWN_EDIT_FAILURE';
+  const message = str(first?.preview_failure_reason) && str(first?.edit_failure_reason)
+    ? `${first!.edit_failure_reason} (preview: ${first!.preview_failure_reason})`
+    : code;
+  return { code, message };
 }
 
 function toApiError(

@@ -12,6 +12,7 @@ import {
   PaperContractSpec,
   PaperOrderRejectedError,
 } from './paper-trading-simulator';
+import { OrderOpsThrottle } from './execution/order-ops-throttle';
 import { PositionMonitor, PositionMonitorConfig } from './position-monitor';
 import { TradeAnalytics, TradeAnalyticsConfig, SessionStats, TradeRecord } from './trade-analytics';
 import { GuardrailConfig, resolveLiveConfig } from '../config/loadGuardrails';
@@ -188,6 +189,8 @@ export class TradingEngine extends EventEmitter {
   private lastOrderRejection: OrderRejection | null = null;
   /** Engine-level order-mutation counters (see `getOrderOpsStats`). */
   private orderOps = { edits: 0, editFallbackCancelReplace: 0 };
+  /** Optional re-quote budget / 429 cooldown applied to `editOrder` (wired by the API layer). */
+  private requoteThrottle: OrderOpsThrottle | null = null;
   
   // Per-symbol market data timestamp tracking for data gap detection
   private lastMarketDataPerSymbol: Map<string, number> = new Map();
@@ -1958,6 +1961,12 @@ export class TradingEngine extends EventEmitter {
       throw new Error('OrderManager not initialized');
     }
 
+    // Re-quote budget + 429 cooldown (cancel/replace storms are the desk's
+    // flagged failure mode). Waits, never drops.
+    if (this.requoteThrottle) {
+      await this.requoteThrottle.acquire('edit');
+    }
+
     if (this.config.mode === 'paper' && this.paperSimulator) {
       const managed = this.orderManager.getOrder(orderId);
       if (!managed) {
@@ -2002,7 +2011,19 @@ export class TradingEngine extends EventEmitter {
       }
     }
 
-    const result = await this.orderManager.editOrder(orderId, changes);
+    let result: Awaited<ReturnType<OrderManager['editOrder']>>;
+    try {
+      result = await this.orderManager.editOrder(orderId, changes);
+      this.requoteThrottle?.observeSuccess();
+    } catch (error) {
+      if (this.requoteThrottle?.observeError(error)) {
+        this.logger.warn('Order edit hit venue rate limit — re-quote cooldown opened', {
+          orderId,
+          throttle: this.requoteThrottle.getStats(),
+        });
+      }
+      throw error;
+    }
     if (result.viaEdit) this.orderOps.edits += 1;
     else this.orderOps.editFallbackCancelReplace += 1;
     this.emit('order:edited', result.order);
@@ -2012,19 +2033,30 @@ export class TradingEngine extends EventEmitter {
   }
 
   /**
+   * Install (or clear) the re-quote throttle applied to `editOrder`. Wired by
+   * the API layer from `guardrails.cfm.execution.max_requotes_per_sec` so the
+   * engine stays venue-agnostic.
+   */
+  public setRequoteThrottle(throttle: OrderOpsThrottle | null): void {
+    this.requoteThrottle = throttle;
+  }
+
+  /**
    * Order-operation counters for the session (card metric: 429 / edit count).
    * Paper: the simulator's counters (placed / filled / cancelled / edited /
    * post-only misses / maker-taker mix). Both modes: engine-level edit and
-   * cancel+new-fallback counts.
+   * cancel+new-fallback counts plus the throttle's 429 / wait counters.
    */
   public getOrderOpsStats(): {
     edits: number;
     editFallbackCancelReplace: number;
     paper: ReturnType<PaperTradingSimulator['getOrderOpsStats']> | null;
+    throttle: ReturnType<OrderOpsThrottle['getStats']> | null;
   } {
     return {
       ...this.orderOps,
       paper: this.paperSimulator ? this.paperSimulator.getOrderOpsStats() : null,
+      throttle: this.requoteThrottle ? this.requoteThrottle.getStats() : null,
     };
   }
 

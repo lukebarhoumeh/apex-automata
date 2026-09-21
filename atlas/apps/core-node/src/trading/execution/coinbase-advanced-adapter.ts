@@ -588,6 +588,86 @@ export class CoinbaseAdvancedExecutionAdapter extends EventEmitter implements IE
     }
   }
 
+  /**
+   * Re-quote an open limit order in place via `POST /orders/edit` (card
+   * SH-QMAKER-CFM-PAPER-v0 blocker 2: edit > cancel+new). Price is aligned to
+   * `quote_increment` in the side-conservative direction and size is rounded
+   * down to `base_increment`; Coinbase requires both on the wire, so whichever
+   * is omitted is resent unchanged.
+   *
+   * Resolves `true` on a confirmed edit (tracked price/size updated; the user
+   * stream / poll keeps reconciling fills as before) and `false` when the venue
+   * refused it — the order is left exactly as it was, never re-sent, never
+   * chased. Transport / rate-limit errors propagate so the caller's throttle
+   * can observe them.
+   */
+  public async editOrder(clientOrderId: string, changes: { price?: number; size?: number }): Promise<boolean> {
+    if (!this.running) {
+      throw new Error('Advanced Trade live adapter not running');
+    }
+    const tracked = this.orders.get(clientOrderId);
+    if (!tracked?.exchangeOrderId) {
+      this.logger.warn('Cannot edit — no exchange order id for client order', { clientOrderId, status: tracked?.status });
+      return false;
+    }
+    if (TERMINAL.has(tracked.status) || tracked.type !== 'limit') {
+      this.logger.warn('Edit skipped — order is not an open limit order', {
+        clientOrderId,
+        status: tracked.status,
+        type: tracked.type,
+      });
+      return false;
+    }
+    const spec = this.productSpecs.get(tracked.symbol);
+    if (!spec) {
+      this.logger.warn('Edit skipped — no product spec for symbol', { clientOrderId, symbol: tracked.symbol });
+      return false;
+    }
+    if (changes.price === undefined && changes.size === undefined) {
+      return false;
+    }
+
+    let price = tracked.price;
+    if (changes.price !== undefined) {
+      if (!Number.isFinite(changes.price) || changes.price <= 0) return false;
+      price = decimalRoundToIncrement(changes.price, spec.quoteIncrement, limitRounding(tracked.side));
+    }
+    let size = tracked.requestedQty;
+    if (changes.size !== undefined) {
+      if (!Number.isFinite(changes.size) || changes.size <= 0) return false;
+      size = decimalRoundToIncrement(changes.size, spec.baseIncrement, 'down');
+      if (decimalIsZero(size) || decimalCompare(size, spec.baseMinSize) < 0) {
+        this.logger.warn('Edit skipped — new size below base_min_size', { clientOrderId, size, baseMinSize: spec.baseMinSize });
+        return false;
+      }
+    }
+    if (!price) return false;
+
+    const result = await this.client.editOrder({ order_id: tracked.exchangeOrderId, price, size });
+    if (!result.ok) {
+      this.logger.warn('Advanced Trade edit refused — order left unchanged (no chase)', {
+        clientOrderId,
+        exchangeOrderId: tracked.exchangeOrderId,
+        code: result.code,
+        message: result.message,
+        requested: { price, size },
+        current: { price: tracked.price, size: tracked.requestedQty },
+      });
+      return false;
+    }
+
+    tracked.price = price;
+    tracked.requestedQty = size;
+    tracked.updatedAt = this.now();
+    this.logger.info('Advanced Trade order edited in place', {
+      clientOrderId,
+      exchangeOrderId: tracked.exchangeOrderId,
+      price,
+      size,
+    });
+    return true;
+  }
+
   /** Cancel by client order id. `order_canceled` is emitted ONLY on confirmed success. */
   public async cancelOrder(clientOrderId: string): Promise<void> {
     if (!this.running) {
