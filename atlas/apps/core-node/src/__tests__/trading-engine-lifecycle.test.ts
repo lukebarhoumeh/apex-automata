@@ -252,6 +252,88 @@ describe('TradingEngine Lifecycle', () => {
     });
   });
 
+  /**
+   * P0 (DESK GO 2026-09-21): every TradingEngine -> RiskEngine.activateKillSwitch
+   * call must carry a structured RiskHaltReasonCode. Before, both paths
+   * below omitted it and the halt persisted as `unknown`.
+   */
+  describe('Kill Switch reason codes', () => {
+    // mockConfig.exchange.environment = 'sandbox' -> DATA_GAP_THRESHOLDS.sandbox = 60s,
+    // so the monitor ticks every 30s and the startup grace period is 60s.
+    const GAP_MS = 60_000;
+    const CHECK_INTERVAL_MS = GAP_MS / 2;
+    const GRACE_MS = 60_000;
+
+    function armDataGapMonitor(lastDataAgeBySymbol: Record<string, number>) {
+      const riskEngine = { activateKillSwitch: vi.fn() };
+      (engine as any).riskEngine = riskEngine;
+      (engine as any).isRunning = true;
+      (engine as any).engineStartTime = Date.now() - GRACE_MS - 1;
+      (engine as any).activeSymbols = Object.keys(lastDataAgeBySymbol);
+      for (const [symbol, ageMs] of Object.entries(lastDataAgeBySymbol)) {
+        (engine as any).lastMarketDataPerSymbol.set(symbol, Date.now() - ageMs);
+      }
+      (engine as any).startDataGapMonitor();
+      return riskEngine;
+    }
+
+    afterEach(() => {
+      // Tear down the interval by hand: engineState is still 'stopped', so
+      // the outer afterEach's stop() short-circuits and never reaches it.
+      if ((engine as any).dataGapMonitor) {
+        clearInterval((engine as any).dataGapMonitor);
+        (engine as any).dataGapMonitor = null;
+      }
+      (engine as any).isRunning = false;
+    });
+
+    it('all-symbols market-data gap activates the kill switch as data_gap', () => {
+      const riskEngine = armDataGapMonitor({ 'BTC-USD': GAP_MS + 5_000, 'ETH-USD': GAP_MS + 5_000 });
+
+      vi.advanceTimersByTime(CHECK_INTERVAL_MS);
+
+      expect(riskEngine.activateKillSwitch).toHaveBeenCalledTimes(1);
+      expect(riskEngine.activateKillSwitch).toHaveBeenCalledWith(
+        expect.stringMatching(/^Market data gap detected: BTC-USD\(\d+s\), ETH-USD\(\d+s\)$/),
+        'data_gap'
+      );
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.stringContaining('Market data gap detected on ALL symbols')
+      );
+    });
+
+    it('partial staleness only warns and does not touch the kill switch', () => {
+      const riskEngine = armDataGapMonitor({ 'BTC-USD': GAP_MS + 5_000, 'ETH-USD': 0 });
+
+      vi.advanceTimersByTime(CHECK_INTERVAL_MS);
+
+      expect(riskEngine.activateKillSwitch).not.toHaveBeenCalled();
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Stale data on some symbols (not all): BTC-USD(')
+      );
+    });
+
+    it('stale data inside the startup grace period is ignored', () => {
+      const riskEngine = armDataGapMonitor({ 'BTC-USD': GAP_MS + 5_000 });
+      (engine as any).engineStartTime = Date.now();
+
+      vi.advanceTimersByTime(CHECK_INTERVAL_MS);
+
+      expect(riskEngine.activateKillSwitch).not.toHaveBeenCalled();
+    });
+
+    it('emergencyStop(reason) activates the kill switch as manual_killswitch with the operator text', async () => {
+      const riskEngine = { activateKillSwitch: vi.fn() };
+      (engine as any).riskEngine = riskEngine;
+
+      await engine.emergencyStop('Operator emergency stop');
+
+      expect(riskEngine.activateKillSwitch).toHaveBeenCalledTimes(1);
+      expect(riskEngine.activateKillSwitch).toHaveBeenCalledWith('Operator emergency stop', 'manual_killswitch');
+      expect(mockLogger.error).toHaveBeenCalledWith('Emergency stop triggered: Operator emergency stop');
+    });
+  });
+
   describe('Fatal Error Handling', () => {
     it('should emit fatal event for supervisor', () => {
       const fatalHandler = vi.fn();
