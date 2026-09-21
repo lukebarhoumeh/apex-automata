@@ -1044,7 +1044,17 @@ app.get('/api/status', (req, res) => {
     // (break phase, Charter leverage, latches) + order-op counters (post-only
     // accept/miss, edits, 429s, maker/taker mix). null when no *-CDE paper
     // symbols are active. Infra only — NOT strategy GO.
-    cfm: cfmGuard ? cfmGuard.getStatus() : null,
+    cfm: cfmGuard
+      ? {
+          ...cfmGuard.getStatus(),
+          // Paper quote path (spot proxy): the mirrored top-of-book per *-CDE symbol + age.
+          quotePath: 'spot_proxy',
+          spotToCfmMapping: Object.fromEntries(activeSpotToCfmMap),
+          quotes: Object.fromEntries(
+            cfmGuard.getSymbols().map((symbol) => [symbol, tradingEngine?.getPaperSimulator?.()?.getQuoteSnapshot(symbol) ?? null]),
+          ),
+        }
+      : null,
     orderOps: tradingEngine ? tradingEngine.getOrderOpsStats() : null,
   });
 });

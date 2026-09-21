@@ -170,6 +170,7 @@ export class PaperTradingSimulator extends EventEmitter {
   private orders: Map<string, SimulatedOrder> = new Map();
   private marketPrices: Map<string, number> = new Map();
   private quotes: Map<string, PaperQuote> = new Map();
+  private quoteUpdatedAt: Map<string, number> = new Map();
   /** Symbol used to mark a non-USD balance bucket (e.g. BIP → BIP-20DEC30-CDE). */
   private markSymbolByCurrency: Map<string, string> = new Map();
   private orderSequence = 0;
@@ -469,10 +470,19 @@ export class PaperTradingSimulator extends EventEmitter {
       ask = last;
     }
     this.quotes.set(productId, { bid, ask, last });
+    this.quoteUpdatedAt.set(productId, Date.now());
     this.marketPrices.set(productId, last);
 
     // Check if any resting limit orders can be filled
     this.checkLimitOrders(productId);
+  }
+
+  /** Quote plus its wall-clock age (status / quote-path observability). */
+  public getQuoteSnapshot(productId: string): (PaperQuote & { updatedAt: number; ageMs: number }) | null {
+    const quote = this.quotes.get(productId);
+    const updatedAt = this.quoteUpdatedAt.get(productId);
+    if (!quote || updatedAt === undefined) return null;
+    return { ...quote, updatedAt, ageMs: Math.max(0, Date.now() - updatedAt) };
   }
 
   /**
@@ -1162,6 +1172,7 @@ export class PaperTradingSimulator extends EventEmitter {
     this.orders.clear();
     this.marketPrices.clear();
     this.quotes.clear();
+    this.quoteUpdatedAt.clear();
     this.markSymbolByCurrency.clear();
     this.orderSequence = 0;
     this.fillSequence = 0;
