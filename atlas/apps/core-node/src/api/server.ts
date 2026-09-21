@@ -2117,7 +2117,7 @@ app.post('/api/engine/start', async (req, res) => {
             logger.info('Exited long position from sell signal', { orderId: exit.id, symbol: signal.symbol, size: openPosition.size });
             return routeExitPlaced(routedExchange, exit.id);
           }
-          return routeEngineRejected(routedExchange, 'exit_order_not_created');
+          return engineRejectionVerdict(routedExchange, signal.symbol, 'exit_order_not_created');
         }
 
         // Reversal-intent decoration (audit fix #2). The cross-venue
@@ -2431,9 +2431,11 @@ app.post('/api/engine/start', async (req, res) => {
           return routeOrderPlaced(routedExchange, order.id);
         }
         // createOrder returned null: pre-trade risk check or paper validation
-        // declined (detail is in the engine's warn log). The signal DID reach
-        // the venue path, so routed_exchange is stamped and allowed=false.
-        return routeEngineRejected(routedExchange, 'order_not_created');
+        // declined. The signal DID reach the venue path, so routed_exchange is
+        // stamped and allowed=false, with the engine's own reason when it is
+        // ours (same symbol, just now) — e.g. a soft-launch cap or min-notional
+        // reject shows up in the blotter instead of a generic slug.
+        return engineRejectionVerdict(routedExchange, signal.symbol);
         };
 
         let verdict: SignalRouteVerdict;
@@ -4990,6 +4992,31 @@ async function syncSignalToSupabase(signal: any) {
   } catch (error) {
     logger.error('Error syncing signal:', error);
   }
+}
+
+/** How recent an engine rejection must be to be attributed to the signal just routed. */
+const ENGINE_REJECTION_ATTRIBUTION_MS = 5_000;
+
+/**
+ * Build the `engine_rejected` verdict for a `createOrder()` that returned
+ * `null`, carrying the engine's own reason when it belongs to this symbol and
+ * happened just now (the position monitor's flatten orders share the same
+ * path, so match symbol + recency rather than trusting "last").
+ */
+function engineRejectionVerdict(
+  routedExchange: ReturnType<typeof resolveRoutedExchange>,
+  symbol: string,
+  fallbackReason = 'order_not_created',
+): SignalRouteVerdict {
+  const rejection = tradingEngine?.getLastOrderRejection() ?? null;
+  const attributable =
+    rejection !== null &&
+    rejection.productId === symbol &&
+    Date.now() - rejection.at <= ENGINE_REJECTION_ATTRIBUTION_MS;
+  if (!attributable) {
+    return routeEngineRejected(routedExchange, fallbackReason);
+  }
+  return routeEngineRejected(routedExchange, rejection.reason, rejection.source);
 }
 
 /**

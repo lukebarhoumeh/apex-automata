@@ -110,6 +110,21 @@ export interface TradingEngineEvents {
  */
 export type EngineState = 'stopped' | 'starting' | 'running' | 'stopping' | 'halted';
 
+/**
+ * Why `createOrder()` last returned `null` without throwing. Lets the signal
+ * router persist the engine's actual reason (e.g. a soft-launch cap or
+ * min-notional reject) onto the signal's blotter row instead of a generic slug.
+ */
+export interface OrderRejection {
+  productId: string;
+  side: 'buy' | 'sell';
+  /** `risk_engine` = pre-trade RiskEngine.checkOrder; `paper_validation` = simulator refused the order. */
+  source: 'risk_engine' | 'paper_validation';
+  reason: string;
+  /** Epoch ms. */
+  at: number;
+}
+
 // Startup grace period before data gap checks begin (ms)
 const STARTUP_GRACE_PERIOD_MS = 60_000; // 60 seconds
 
@@ -157,6 +172,9 @@ export class TradingEngine extends EventEmitter {
   // Order timing for latency tracking
   private orderTimestamps: Map<string, number> = new Map();
   private orderTimestampsCleanupInterval: NodeJS.Timeout | null = null;
+
+  // Most recent createOrder() null-return (see OrderRejection); cleared on the next accepted order.
+  private lastOrderRejection: OrderRejection | null = null;
   
   // Per-symbol market data timestamp tracking for data gap detection
   private lastMarketDataPerSymbol: Map<string, number> = new Map();
@@ -1665,8 +1683,16 @@ export class TradingEngine extends EventEmitter {
       
       if (!riskCheck.passed) {
         this.logger.warn(`Order rejected by risk engine: ${riskCheck.reason}`);
+        this.lastOrderRejection = {
+          productId: request.product_id,
+          side: request.side,
+          source: 'risk_engine',
+          reason: riskCheck.reason ?? 'risk_check_failed',
+          at: Date.now(),
+        };
         return null;
       }
+      this.lastOrderRejection = null;
 
       // Paper trading mode
       if (this.config.mode === 'paper' && this.paperSimulator) {
@@ -1765,6 +1791,13 @@ export class TradingEngine extends EventEmitter {
               size: request.size,
               price: request.price ?? null,
             });
+            this.lastOrderRejection = {
+              productId: request.product_id,
+              side: request.side,
+              source: 'paper_validation',
+              reason,
+              at: Date.now(),
+            };
             return null;
           }
 
@@ -1878,6 +1911,16 @@ export class TradingEngine extends EventEmitter {
   
   public getRiskEngineInstance(): RiskEngine | null {
     return this.riskEngine;
+  }
+
+  /**
+   * Why the most recent `createOrder()` returned `null` (pre-trade risk reject or
+   * paper validation), or `null` when the last order was accepted. Callers should
+   * match `productId` (and recency) — the position monitor's flatten orders share
+   * this path.
+   */
+  public getLastOrderRejection(): OrderRejection | null {
+    return this.lastOrderRejection;
   }
   
   public getPositionTrackerInstance(): PositionTracker | null {

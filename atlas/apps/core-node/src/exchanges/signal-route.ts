@@ -97,9 +97,17 @@ export function routeRejected(routedExchange: RoutedExchangeId, stage: string, r
   return { outcome: 'rejected', routedExchange, stage, reason };
 }
 
-/** Verdict when the engine was reached but declined to create an order. */
-export function routeEngineRejected(routedExchange: RoutedExchangeId, reason: string): SignalRouteVerdict {
-  return { outcome: 'engine_rejected', routedExchange, stage: 'risk_engine', reason };
+/**
+ * Verdict when the engine was reached but declined to create an order.
+ * @param stage Which engine layer declined: `risk_engine` (pre-trade check, default)
+ *   or `paper_validation` (simulator refused the order).
+ */
+export function routeEngineRejected(
+  routedExchange: RoutedExchangeId,
+  reason: string,
+  stage: 'risk_engine' | 'paper_validation' = 'risk_engine',
+): SignalRouteVerdict {
+  return { outcome: 'engine_rejected', routedExchange, stage, reason };
 }
 
 /** Verdict when routing threw before a decision was reached. */
