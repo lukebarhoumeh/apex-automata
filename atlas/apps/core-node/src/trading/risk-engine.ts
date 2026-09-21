@@ -584,6 +584,16 @@ export class RiskEngine extends EventEmitter {
         if (resetSource) {
           await this.persistClearedRiskState(resetSource);
         }
+
+        // risk_metrics only records *that* the switch is latched, not why.
+        // Recover the structured reason from today's still-open risk_events
+        // row so getRiskStatus() reports HALTED + reasonCode (e.g.
+        // manual_killswitch, data_gap) instead of RUNNING with entries
+        // silently blocked. Read-only; skipped whenever the halt was
+        // discarded above.
+        if (this.killSwitchActive && !this.riskStateMachine.isHalted()) {
+          await this.riskStateMachine.loadPersistedState();
+        }
       }
 
       // Load account metrics for today to get weekly tracking. Skip when

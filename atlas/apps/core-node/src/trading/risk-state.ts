@@ -264,8 +264,9 @@ export class RiskStateMachine extends EventEmitter {
       ...context,
     });
 
-    // Persist
-    this.persistRiskEvent('halt', reasonCode, context).catch(e => {
+    // Persist. reasonText/daily ride along in `details` so loadPersistedState()
+    // can rebuild the exact halt (not just its code) after a restart.
+    this.persistRiskEvent('halt', reasonCode, context, { reasonText, daily }).catch(e => {
       this.logger.error('Failed to persist halt event', { error: e.message });
     });
 
@@ -416,7 +417,8 @@ export class RiskStateMachine extends EventEmitter {
   private async persistRiskEvent(
     eventType: 'halt' | 'resume',
     reasonCode: RiskHaltReasonCode,
-    context?: HaltContext
+    context?: HaltContext,
+    halt?: { reasonText: string; daily: boolean }
   ): Promise<void> {
     if (!this.supabase || !this.userId) return;
     const supabase = this.supabase;
@@ -427,6 +429,7 @@ export class RiskStateMachine extends EventEmitter {
       details: {
         eventType,
         reasonCode,
+        ...(halt ? { reasonText: halt.reasonText, daily: halt.daily } : {}),
         ...context,
       },
       triggered_at: new Date().toISOString(),
@@ -521,13 +524,16 @@ export class RiskStateMachine extends EventEmitter {
         const details = event.details || {};
         const reasonCode = (event.event_type as RiskHaltReasonCode) || 'unknown';
         
-        // Restore halt state
+        // Restore halt state. Rows written before reasonText/daily were
+        // persisted (and the API's own manual-kill row, which carries
+        // `details.reason`) fall back to the code's static daily-ness so a
+        // restored manual_killswitch / data_gap never auto-clears on rollover.
         this.currentState = {
           state: 'HALTED',
           reasonCode,
-          reasonText: details.reasonText || `Restored: ${reasonCode}`,
+          reasonText: details.reasonText || details.reason || `Restored: ${reasonCode}`,
           since: new Date(event.triggered_at).getTime(),
-          daily: details.daily ?? true,
+          daily: typeof details.daily === 'boolean' ? details.daily : isDailyHaltReason(reasonCode),
           context: details,
         };
         this.lastStateChange = new Date(event.triggered_at).getTime();
