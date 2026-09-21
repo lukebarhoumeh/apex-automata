@@ -1,13 +1,22 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import type { BotMode, SessionStats } from "@/types/session";
-import type { Position } from "@/types/positions";
+import { countHydratedPositions, type Position } from "@/types/positions";
 import type { SignalRecord, FeedEvent, SignalState, SignalSide } from "@/types/signals";
 import type { StrategyCardData, StrategyStatus } from "@/types/strategy";
-import type { MarketRegime, RegimeMeter, RegimeMeterTone } from "@/types/regime";
+import type { MarketRegime, RegimeLabel, RegimeMeter, RegimeMeterTone } from "@/types/regime";
 import type { EquityPoint, EquityRange } from "@/types/equity";
 import type { KpiTile } from "@/types/kpi";
 import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
+import { computePortfolioHeatPct } from "@/lib/portfolio-heat";
+import { resolvePositionMark } from "@/lib/position-pnl";
 import { mergeStrategyPolicy } from "@/lib/strategy-policy";
+import {
+  formatOpenLive,
+  formatWinRate,
+  heroSessionSentence,
+  resolveStrategySessionCounts,
+  type StrategyOpenPositionLike,
+} from "@/lib/strategy-session-counts";
 import {
   fetchSessionBlotterRows,
   fetchSessionOpenPositions,
@@ -28,6 +37,8 @@ import {
   fetchStrategies,
   fetchStrategyPolicy,
   summarizeTradesByStrategy,
+  type BackendEquityCurve,
+  type BackendPnlSnapshot,
   type BackendRegimeEntry,
   type BackendRuntimeStatus,
   type BackendSessionStats,
@@ -52,6 +63,10 @@ function formatTime(iso: string | null | undefined): string {
 function formatEpoch(ms: number | null | undefined): string {
   if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) return "—";
   return new Date(ms).toISOString().slice(11, 19);
+}
+
+function finiteOrNull(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
 // ============================================================
@@ -92,21 +107,30 @@ export function mapSessionStats(
       ? status.sessionStartedAt
       : null;
 
+  // Heat / exposure / open count: the PnL snapshot on /api/status — the same
+  // object the Risk desk reads, so hero heat == Risk heat by construction.
+  const snapshot = status?.pnl ?? null;
+  const exposureUsd = finiteOrNull(snapshot?.exposureUsd);
+  const heat = computePortfolioHeatPct(exposureUsd, finiteOrNull(snapshot?.totalEquityUsd));
+  const openPositions = finiteOrNull(snapshot?.openPositionsCount);
+
   if (!raw) {
     return {
       sessionId,
       sessionStartedAt,
       openedAt: formatEpoch(sessionStartedAt),
-      pnl: 0,
-      pnlR: 0,
+      pnl: unrealized ?? 0,
+      pnlR: null,
       realized: 0,
       unrealized,
       trades: 0,
       wins: 0,
       losses: 0,
-      winRate: 0,
-      heat: 0,
+      winRate: null,
+      heat,
       heatCap: 3.0,
+      exposureUsd,
+      openPositions,
       maxDrawDown: 0,
       mode,
       engineVersion: "v2.4.1",
@@ -115,21 +139,25 @@ export function mapSessionStats(
   }
 
   const realized = raw.totalPnl ?? 0;
+  const trades = raw.totalTrades ?? 0;
   return {
     sessionId,
     sessionStartedAt,
     openedAt: sessionStartedAt ? formatEpoch(sessionStartedAt) : formatTime(raw.startTime),
     // Session P&L = closed-trade P&L (TradeAnalytics) + open P&L (PositionTracker).
     pnl: realized + (unrealized ?? 0),
-    pnlR: raw.expectancy ?? 0,
+    // Rates are undefined until the first close — null, never 0 / 0%.
+    pnlR: trades > 0 ? finiteOrNull(raw.expectancy) : null,
     realized,
     unrealized,
-    trades: raw.totalTrades ?? 0,
+    trades,
     wins: raw.winningTrades ?? 0,
     losses: raw.losingTrades ?? 0,
-    winRate: raw.winRate ?? 0,
-    heat: 0,
+    winRate: trades > 0 ? finiteOrNull(raw.winRate) : null,
+    heat,
     heatCap: 3.0,
+    exposureUsd,
+    openPositions,
     maxDrawDown: raw.maxDrawdownPct ?? 0,
     mode,
     engineVersion: "v2.4.1",
@@ -169,23 +197,53 @@ function sliceByRange(points: EquityPoint[], range: EquityRange): EquityPoint[] 
   return points;
 }
 
+/**
+ * Mark-to-market session equity from the PnL snapshot:
+ * `sessionStartEquityUsd + realizedPnlUsd + unrealizedPnlUsd` (the contract
+ * definition in runtime/pnl/types.ts). null when any component is missing —
+ * never a constant. Used as the curve's live last point so the header does
+ * not sit at the closed-trade equity ("$10,000 +0.00%") while the hero's
+ * unrealized P&L moves.
+ */
+export function markToMarketEquity(pnl: BackendPnlSnapshot | null | undefined): number | null {
+  if (!pnl) return null;
+  const start = finiteOrNull(pnl.sessionStartEquityUsd);
+  const realized = finiteOrNull(pnl.realizedPnlUsd);
+  const unrealized = finiteOrNull(pnl.unrealizedPnlUsd);
+  if (start === null || realized === null || unrealized === null) return null;
+  return start + realized + unrealized;
+}
+
+/**
+ * Equity points for the chart: the TradeAnalytics curve (closed-trade
+ * equity, sampled) with the live mark-to-market equity appended as the last
+ * point when a snapshot exists. Empty when the engine is stopped.
+ */
+export function buildEquityPoints(res: BackendEquityCurve | null, pnl: BackendPnlSnapshot | null | undefined): EquityPoint[] {
+  if (!res) return [];
+  const anchor = finiteOrNull(res.currentEquity) ?? finiteOrNull(res.sessionStartEquity);
+  const points: EquityPoint[] = [];
+  for (const p of res.equityCurve) {
+    const v = finiteOrNull(p.equity) ?? anchor;
+    if (v !== null) points.push({ t: points.length, v });
+  }
+  const mtm = markToMarketEquity(pnl) ?? anchor;
+  if (mtm !== null) {
+    // Two points minimum so the chart draws a line, not a broken dataset.
+    if (points.length === 0) points.push({ t: 0, v: finiteOrNull(res.sessionStartEquity) ?? mtm });
+    points.push({ t: points.length, v: mtm });
+  }
+  return points;
+}
+
 export function useEquityCurve(range: EquityRange) {
   return useQuery<EquityPoint[]>({
     queryKey: ["apex", "equity", range],
     queryFn: async () => {
-      const res = await fetchEquityCurve();
-      if (!res) return [];
-      const points: EquityPoint[] = res.equityCurve.map((p, i) => ({
-        t: i,
-        v: p.equity ?? res.currentEquity,
-      }));
-      // Ensure at least one point so the chart renders a flat line instead
-      // of breaking on an empty dataset.
-      if (points.length === 0) {
-        points.push({ t: 0, v: res.currentEquity });
-        points.push({ t: 1, v: res.currentEquity });
-      }
-      return sliceByRange(points, range);
+      // Curve + status in parallel: the status PnL snapshot provides the live
+      // mark-to-market equity for the last point.
+      const [res, status] = await Promise.all([fetchEquityCurve(), fetchRuntimeStatus()]);
+      return sliceByRange(buildEquityPoints(res, status?.pnl), range);
     },
     staleTime: 10_000,
     refetchInterval: 30_000,
@@ -334,35 +392,46 @@ export function useMetaFilterStatus() {
 // ============================================================
 
 /**
- * Strategy cards. Trade counts / P&L / win rate come from the ACTIVE session's
- * TradeAnalytics ledger (`/api/analytics/trades`), bucketed by plugin id — the
- * same ledger the hero's "Trades" QuickStat sums, so the numbers agree by
- * construction. `stats.signalsGenerated` is surfaced separately as `signals`:
- * it counts emitted signals (most are filtered before order routing) and was
- * previously shown as "Trades", producing phantom trades on a zero-trade run.
+ * Strategy cards — three DISTINCT session counts per strategy, resolved by
+ * `resolveStrategySessionCounts` (shared with the Signals page so the two
+ * never disagree):
+ *
+ * - signals emitted  `sessionStats.signalsGenerated` (session-scoped, #72)
+ * - closed (session) `sessionStats.closedTrades` / TradeAnalytics ledger
+ * - open (live)      engine open positions (`/api/positions`), hydrated
+ *                    positions included and counted separately
+ *
+ * P&L is the CLOSED-trade realized P&L (labelled as such); the engine's
+ * unrealized P&L over open positions is carried alongside so a strategy
+ * holding three hydrated longs never renders as "flat".
  *
  * @param trades `null` when the engine is stopped (no session ledger).
+ * @param openPositions engine opens for the active session; `null` when unavailable.
  */
 export function mapStrategyCards(
   registered: readonly BackendStrategy[],
   policy: BackendStrategyPolicy | null,
   trades: readonly BackendTradeRecord[] | null = null,
+  openPositions: readonly StrategyOpenPositionLike[] | null = null,
 ): StrategyCardData[] {
   const byStrategy = summarizeTradesByStrategy(trades);
   return mergeStrategyPolicy(registered, policy).map((m) => {
     const status: StrategyStatus =
       m.disabledBy === "guardrails" ? "killed" : m.enabled ? "on" : "off";
-    const summary = byStrategy[m.id];
+    const c = resolveStrategySessionCounts(m.id, m.registered, byStrategy[m.id], openPositions);
     return {
       id: m.id,
       name: m.name,
       status,
       disabledBy: m.disabledBy,
-      pnlSession: summary?.pnl ?? 0,
-      trades: summary?.trades ?? 0,
-      signals: m.registered?.stats?.signalsGenerated ?? 0,
-      winRate: summary?.winRate ?? 0,
-      sessionScoped: trades !== null,
+      pnlSession: c.pnlClosed,
+      pnlOpen: c.pnlOpen,
+      closed: c.closed,
+      open: c.open,
+      hydratedOpen: c.hydratedOpen,
+      signals: c.signals,
+      winRate: c.winRate,
+      sessionScoped: trades !== null || m.registered?.sessionStats != null,
       sparkline: [],
     };
   });
@@ -374,15 +443,17 @@ export function useStrategyStatus() {
     // Keyed by session so a new run never inherits last run's cards.
     queryKey: ["apex", "strategy-status", sessionKey(scope)],
     queryFn: async () => {
-      // Registered plugins (runtime) + guardrails policy (SoT) + the session's
-      // closed-trade ledger in parallel so a strategy killed in guardrails.yaml
-      // renders as killed, not missing, and trade counts are session-true.
-      const [registered, policy, trades] = await Promise.all([
+      // Registered plugins (runtime, with sessionStats) + guardrails policy
+      // (SoT) + the session's closed-trade ledger + the engine's open
+      // positions in parallel so a strategy killed in guardrails.yaml renders
+      // as killed, not missing, and every count is session-true.
+      const [registered, policy, trades, positions] = await Promise.all([
         fetchStrategies(),
         fetchStrategyPolicy(),
         fetchSessionTrades(),
+        fetchSessionOpenPositions(scope, 50),
       ]);
-      return mapStrategyCards(registered, policy, trades);
+      return mapStrategyCards(registered, policy, trades, positions.engineOpenPositions);
     },
     staleTime: 10_000,
     refetchInterval: 30_000,
@@ -487,13 +558,24 @@ export function useSignalFeed() {
 // Regime: /api/regime/status → MarketRegime
 // ============================================================
 
-function labelFromRegime(r: string): string {
-  const k = r.toLowerCase();
-  if (k === "strong_trend" || k === "weak_trend") return "TRENDING";
-  if (k === "ranging") return "RANGING";
-  if (k === "high_volatility") return "CHOPPY";
-  if (k === "chop") return "CHOPPY";
-  return r.toUpperCase();
+/**
+ * Desk word + detail for a detector regime. One vocabulary everywhere —
+ * `/api/status.regime` says `trend` | `chop`, so the primary word is "Trend"
+ * or "Chop" and the detector's finer state ("ranging conditions") is the
+ * subtitle. The panel used to headline "RANGING" while the status chip said
+ * chop.
+ */
+export function deskRegime(r: string | null | undefined): { label: RegimeLabel | string; subtitle: string | null } {
+  const k = (r ?? "").trim().toLowerCase();
+  if (k === "") return { label: "—", subtitle: null };
+  if (k === "strong_trend") return { label: "Trend", subtitle: "strong trend" };
+  if (k === "weak_trend") return { label: "Trend", subtitle: "weak trend" };
+  if (k === "trend" || k === "trending") return { label: "Trend", subtitle: null };
+  if (k === "ranging") return { label: "Chop", subtitle: "ranging conditions" };
+  if (k === "chop" || k === "choppy") return { label: "Chop", subtitle: "choppy conditions" };
+  if (k === "high_volatility") return { label: "Chop", subtitle: "high volatility" };
+  // Unknown detector state: show it verbatim rather than guess a desk word.
+  return { label: r as string, subtitle: null };
 }
 
 function buildMeters(r: BackendRegimeEntry): RegimeMeter[] {
@@ -542,6 +624,8 @@ export function useMarketRegime() {
       if (!entry) {
         return {
           label: "—",
+          subtitle: null,
+          detectorRegime: null,
           timeframe: "4h",
           meters: [
             { key: "adx", label: "ADX", value: 0, cap: 60, display: "—", tone: "info" },
@@ -551,8 +635,11 @@ export function useMarketRegime() {
           ],
         };
       }
+      const desk = deskRegime(entry.regime);
       return {
-        label: labelFromRegime(entry.regime),
+        label: desk.label,
+        subtitle: desk.subtitle,
+        detectorRegime: entry.regime,
         timeframe: "4h",
         meters: buildMeters(entry),
       };
@@ -567,6 +654,78 @@ export function useMarketRegime() {
 // KPIs: derived from session + positions + equity
 // ============================================================
 
+/**
+ * KPI tiles from the session stats + open positions. Pure so the tile copy
+ * (win-rate dash at zero closes, exposure SoT, hydrated opens) is testable.
+ */
+export function buildDashboardKpis(
+  session: SessionStats | undefined,
+  positions: readonly Position[] | undefined,
+  marks: LiveMarks,
+  sparkSource: readonly number[],
+): KpiTile[] {
+  // Exposure: the PnL snapshot's exposureUsd is the SoT (same number as Risk
+  // and the hero heat). Only when the snapshot is missing do we sum positions
+  // at the runtime mark (WS, else engine) — never at entry.
+  const snapshotExposure = session?.exposureUsd ?? null;
+  const marked = positions ? positions.filter((p) => resolvePositionMark(p, marks).mark !== undefined) : [];
+  const unmarked = positions ? positions.length - marked.length : 0;
+  const derivedExposure =
+    positions && marked.length > 0
+      ? marked.reduce((acc, p) => acc + (resolvePositionMark(p, marks).mark as number) * p.qty, 0)
+      : null;
+  const exposureUsd = snapshotExposure ?? derivedExposure;
+  const hydrated = positions ? countHydratedPositions(positions) : 0;
+  const openCount = positions ? positions.length : (session?.openPositions ?? null);
+
+  const closed = session?.trades ?? 0;
+  const winRate = session ? formatWinRate(session.winRate, closed, 1) : "—";
+
+  return [
+    {
+      key: "win",
+      label: "Win rate",
+      value: winRate,
+      delta: !session
+        ? ""
+        : closed === 0
+          ? "no closed trades this session — rate not defined"
+          : `${session.wins} winners / ${closed} closed`,
+      tone: "up",
+      sparkline: sparkSource,
+    },
+    {
+      key: "pnl",
+      label: "Session P&L",
+      value: session ? `${session.pnl >= 0 ? "+" : "-"}$${Math.abs(session.pnl).toLocaleString()}` : "—",
+      delta: session ? heroSessionSentence(closed, openCount, hydrated > 0 ? hydrated : null) : "",
+      tone: session && session.pnl >= 0 ? "up" : "down",
+      sparkline: sparkSource,
+    },
+    {
+      key: "dd",
+      label: "Max DD",
+      value: session ? `-${session.maxDrawDown.toFixed(2)}%` : "—",
+      delta: "session",
+      tone: "down",
+      sparkline: sparkSource,
+    },
+    {
+      key: "exposure",
+      label: "Open exposure",
+      value: exposureUsd === null ? "—" : `$${Math.round(exposureUsd).toLocaleString()}`,
+      delta:
+        openCount === null
+          ? "open positions unknown"
+          : `${formatOpenLive(openCount, hydrated > 0 ? hydrated : null)}${
+              snapshotExposure === null && unmarked > 0 ? ` · ${unmarked} without mark (excluded)` : ""
+            }`,
+      tone: "neutral",
+      sparkline: sparkSource,
+    },
+  ];
+}
+
 export function useDashboardKpis(marks: LiveMarks = {}): { data: KpiTile[] } {
   const session = useSessionStats();
   const positions = useOpenPositions();
@@ -575,52 +734,5 @@ export function useDashboardKpis(marks: LiveMarks = {}): { data: KpiTile[] } {
   const sparkSource =
     equity.data && equity.data.length >= 2 ? equity.data.map((p) => p.v).slice(-24) : [0, 0];
 
-  // Notional at the runtime mark when one exists, else at entry (labelled).
-  const exposureUsd = positions.data
-    ? positions.data.reduce((acc, p) => acc + (marks[p.sym]?.price ?? p.entry) * p.qty, 0)
-    : 0;
-  const unmarked = positions.data ? positions.data.filter((p) => marks[p.sym] === undefined).length : 0;
-
-  const tiles: KpiTile[] = [
-    {
-      key: "win",
-      label: "Win rate",
-      value: session.data ? `${(session.data.winRate * 100).toFixed(1)}%` : "—",
-      delta: session.data
-        ? `${session.data.wins} winners / ${session.data.trades} total`
-        : "",
-      tone: "up",
-      sparkline: sparkSource,
-    },
-    {
-      key: "pnl",
-      label: "Session P&L",
-      value: session.data
-        ? `${session.data.pnl >= 0 ? "+" : "-"}$${Math.abs(session.data.pnl).toLocaleString()}`
-        : "—",
-      delta: session.data ? `${session.data.trades} trades` : "",
-      tone: session.data && session.data.pnl >= 0 ? "up" : "down",
-      sparkline: sparkSource,
-    },
-    {
-      key: "dd",
-      label: "Max DD",
-      value: session.data ? `-${session.data.maxDrawDown.toFixed(2)}%` : "—",
-      delta: "session",
-      tone: "down",
-      sparkline: sparkSource,
-    },
-    {
-      key: "exposure",
-      label: "Open exposure",
-      value: `$${Math.round(exposureUsd).toLocaleString()}`,
-      delta: positions.data
-        ? `${positions.data.length} positions${unmarked > 0 ? ` · ${unmarked} at entry (no mark)` : ""}`
-        : "0 positions",
-      tone: "neutral",
-      sparkline: sparkSource,
-    },
-  ];
-
-  return { data: tiles };
+  return { data: buildDashboardKpis(session.data, positions.data, marks, sparkSource) };
 }

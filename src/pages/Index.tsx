@@ -34,12 +34,21 @@ export default function Dashboard() {
     return null;
   }
 
+  // Signals emitted this session = Σ sessionStats.signalsGenerated over the
+  // registered strategies (null when no strategy reports a counter).
+  const signalsEmitted = strategies.data.reduce<number | null>(
+    (acc, s) => (s.signals === null ? acc : (acc ?? 0) + s.signals),
+    null,
+  );
+
   return (
     <div className="flex flex-col gap-4 p-6">
       <HeroStatePanel
         session={session.data}
         regime={regime.data}
         intradayEquity={equity.data}
+        openPositions={positions.data}
+        signalsEmitted={signalsEmitted}
       />
 
       <KpiRow tiles={kpis} />

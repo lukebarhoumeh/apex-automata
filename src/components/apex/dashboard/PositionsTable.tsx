@@ -3,10 +3,16 @@ import { Panel } from "@/components/apex/Panel";
 import { Pill } from "@/components/apex/Pill";
 import { Sparkline } from "@/components/apex/Sparkline";
 import { fmt, fmtSign } from "@/components/apex/format";
-import { computePositionPnl, markStatusLabel, resolvePositionMark } from "@/lib/position-pnl";
+import {
+  HYDRATED_TITLE,
+  computePositionPnl,
+  markStatusLabel,
+  openPositionsSubtitle,
+  resolvePositionMark,
+} from "@/lib/position-pnl";
 import { cn } from "@/lib/utils";
 import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
-import { countHydratedPositions, type Position } from "@/types/positions";
+import type { Position } from "@/types/positions";
 
 interface PositionsTableProps {
   positions: readonly Position[];
@@ -15,15 +21,6 @@ interface PositionsTableProps {
 }
 
 const NO_MARKS: LiveMarks = {};
-
-export const HYDRATED_TITLE =
-  "Opened in a prior session and hydrated at engine start — live and counted as open, not one of this session's trades.";
-
-/** `3 active` / `3 active · 3 hydrated from prior session`. */
-export function openPositionsSubtitle(positions: readonly Position[]): string {
-  const hydrated = countHydratedPositions(positions);
-  return `${positions.length} active${hydrated > 0 ? ` · ${hydrated} hydrated from prior session` : ""}`;
-}
 
 /**
  * Open positions valued at the runtime's real marks. Rows are derived from

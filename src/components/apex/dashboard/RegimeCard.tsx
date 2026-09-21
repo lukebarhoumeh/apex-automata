@@ -32,11 +32,19 @@ export function RegimeCard({ regime, className }: RegimeCardProps) {
       className={cn("h-full", className)}
     >
       <div className="flex flex-col gap-5">
-        <div
-          className="serif-ital text-fg-0"
-          style={{ fontSize: 40, lineHeight: 1, fontWeight: 500, letterSpacing: "-0.015em" }}
-        >
-          {regime.label}
+        <div title={regime.detectorRegime ? `Detector regime: ${regime.detectorRegime}` : undefined}>
+          <div
+            className="serif-ital text-fg-0"
+            style={{ fontSize: 40, lineHeight: 1, fontWeight: 500, letterSpacing: "-0.015em" }}
+            data-testid="regime-label"
+          >
+            {regime.label}
+          </div>
+          {regime.subtitle && (
+            <div className="mono mt-1.5 text-[10.5px] uppercase tracking-[0.1em] text-fg-2" data-testid="regime-subtitle">
+              {regime.label} · {regime.subtitle}
+            </div>
+          )}
         </div>
 
         <div className="flex flex-col gap-3">

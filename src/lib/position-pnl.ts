@@ -1,5 +1,15 @@
 import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
-import type { Position, PositionSide } from "@/types/positions";
+import { countHydratedPositions, type Position, type PositionSide } from "@/types/positions";
+
+/** Tooltip for the hydrated chip on positions carried from a prior session. */
+export const HYDRATED_TITLE =
+  "Opened in a prior session and hydrated at engine start — live and counted as open, not one of this session's trades.";
+
+/** `3 active` / `3 active · 3 hydrated from prior session`. */
+export function openPositionsSubtitle(positions: readonly Position[]): string {
+  const hydrated = countHydratedPositions(positions);
+  return `${positions.length} active${hydrated > 0 ? ` · ${hydrated} hydrated from prior session` : ""}`;
+}
 
 /** Where a position's mark came from, for the panel's marks label. */
 export type MarkOrigin = "ws" | "engine" | null;

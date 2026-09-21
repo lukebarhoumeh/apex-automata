@@ -88,13 +88,15 @@ const trade = (o: Partial<BackendTradeRecord>): BackendTradeRecord => ({
 const SCOPE_ACTIVE = { sessionId: "sess_1789137459103_bnd3mn", sessionStartedAt: Date.UTC(2026, 8, 11, 15, 30, 0) };
 const SCOPE_NONE = { sessionId: null, sessionStartedAt: null };
 
-describe("strategy cards — trades come from the session ledger, not signalsGenerated", () => {
-  it("renders 0 trades for a zero-trade session even when the plugin emitted 8 signals", () => {
+describe("strategy cards — closed trades come from the session ledger, not signalsGenerated", () => {
+  it("renders 0 closed for a zero-trade session even when the plugin emitted 8 signals", () => {
     const cards = mapStrategyCards([TF_REGISTERED], POLICY, []);
     const tf = cards.find((c) => c.id === "trend_follow")!;
-    expect(tf.trades).toBe(0);
+    expect(tf.closed).toBe(0);
     expect(tf.signals).toBe(8);
     expect(tf.pnlSession).toBe(0);
+    // No closed trades → the rate is undefined, never 0.
+    expect(tf.winRate).toBeNull();
     expect(tf.sessionScoped).toBe(true);
   });
 
@@ -112,34 +114,34 @@ describe("strategy cards — trades come from the session ledger, not signalsGen
     expect(Object.keys(summary)).not.toContain("undefined");
 
     const tf = mapStrategyCards([TF_REGISTERED], POLICY, ledger).find((c) => c.id === "trend_follow")!;
-    expect(tf).toMatchObject({ trades: 3, pnlSession: 9, signals: 8 });
+    expect(tf).toMatchObject({ closed: 3, pnlSession: 9, signals: 8 });
     expect(tf.winRate).toBeCloseTo(2 / 3);
   });
 
   it("marks cards as not session-scoped when the engine is stopped (no ledger)", () => {
     const cards = mapStrategyCards([], POLICY, null);
     expect(cards.every((c) => c.sessionScoped === false)).toBe(true);
-    expect(cards.find((c) => c.id === "trend_follow")).toMatchObject({ status: "off", disabledBy: "engine-offline", trades: 0 });
+    expect(cards.find((c) => c.id === "trend_follow")).toMatchObject({ status: "off", disabledBy: "engine-offline", closed: 0 });
   });
 
-  it("Signals page config cards separate TRADES · SESSION from SIGNALS", () => {
+  it("Signals page config cards separate CLOSED (SESSION) from SIGNALS EMITTED", () => {
     const cfg = mapStrategyConfigs([TF_REGISTERED], POLICY, [trade({ strategy: "trend_follow", realizedPnl: 1 })]);
-    expect(cfg.find((c) => c.id === "trend_follow")!.stats).toMatchObject({ trades: 1, signals: 8 });
+    expect(cfg.find((c) => c.id === "trend_follow")!.stats).toMatchObject({ closed: 1, signals: 8 });
     expect(cfg.find((c) => c.id === "breakout")).toMatchObject({ enabled: false, disabledBy: "guardrails" });
   });
 
-  it("renders — for killed strategies and the emitted/routed split for active ones", () => {
-    const cards = mapStrategyCards([TF_REGISTERED], POLICY, [trade({ strategy: "trend_follow", realizedPnl: 1 })]);
+  it("renders — for killed strategies and the emitted / closed / open split for active ones", () => {
+    const cards = mapStrategyCards([TF_REGISTERED], POLICY, [trade({ strategy: "trend_follow", realizedPnl: 1 })], []);
     const { getByTestId } = render(
       <MemoryRouter>
         <StrategyCards strategies={cards} />
       </MemoryRouter>,
     );
-    expect(getByTestId("strategy-card-trend_follow-trades").textContent).toBe("1");
-    expect(getByTestId("strategy-card-trend_follow-signals").textContent).toBe("8 signals · 1 closed trade");
-    expect(getByTestId("strategy-card-momentum-trades").textContent).toBe("—");
+    expect(getByTestId("strategy-card-trend_follow-closed").textContent).toBe("1");
+    expect(getByTestId("strategy-card-trend_follow-signals").textContent).toBe("8 signals emitted · 1 closed · 0 open");
+    expect(getByTestId("strategy-card-momentum-closed").textContent).toBe("—");
     expect(getByTestId("strategy-card-momentum-pnl").textContent).toBe("—");
-    expect(getByTestId("strategy-card-momentum-signals").textContent).toContain("never registered");
+    expect(getByTestId("strategy-card-momentum-signals").textContent).toBe("never registered — emits no signals");
   });
 });
 

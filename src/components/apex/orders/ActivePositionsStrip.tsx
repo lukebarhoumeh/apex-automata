@@ -2,8 +2,13 @@ import { ArrowRight, ArrowUp, ArrowDown } from "lucide-react";
 import { Panel } from "@/components/apex/Panel";
 import { Pill } from "@/components/apex/Pill";
 import { fmt } from "@/components/apex/format";
-import { HYDRATED_TITLE } from "@/components/apex/dashboard/PositionsTable";
-import { computePositionPnl, computeStopTargetProgress, markStatusLabel, resolvePositionMark } from "@/lib/position-pnl";
+import {
+  HYDRATED_TITLE,
+  computePositionPnl,
+  computeStopTargetProgress,
+  markStatusLabel,
+  resolvePositionMark,
+} from "@/lib/position-pnl";
 import { cn } from "@/lib/utils";
 import type { LiveMarks } from "@/hooks/apex/useLiveMarks";
 import { countHydratedPositions, type Position } from "@/types/positions";

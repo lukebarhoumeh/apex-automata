@@ -173,8 +173,11 @@ export interface BackendEquityCurvePoint {
 
 export interface BackendEquityCurve {
   equityCurve: readonly BackendEquityCurvePoint[];
-  highWaterMark: number;
-  currentEquity: number;
+  highWaterMark: number | null;
+  /** Same number as `/api/status.pnl.totalEquityUsd`; null when no snapshot. */
+  currentEquity: number | null;
+  /** Session anchor (`sessionStartEquityUsd`); absent on older backends. */
+  sessionStartEquity?: number | null;
   maxDrawdown: number;
 }
 
@@ -187,22 +190,73 @@ export async function fetchEquityCurve(): Promise<BackendEquityCurve | null> {
 // Strategies
 // ============================================================
 
+/**
+ * Session-scoped per-strategy stats mirrored on each `/api/strategies` entry
+ * (`sessionStats`, same shape as `/api/analytics/strategies`). Contract from
+ * API PRs #64/#72:
+ *
+ * - `signalsGenerated` — signals this strategy EMITTED in the active session
+ *   (cleared every gate; mirrors `/api/signals?session_id=`). Falls back to
+ *   the plugin's lifetime counter only on a backend without session counts.
+ * - `closedTrades` / `openTrades` — positions opened in THIS session.
+ * - `hydratedOpenCount` — opens carried from a prior session and hydrated at
+ *   engine start. NOT included in `openTrades`; absent on pre-#72 backends.
+ * - `winRate` — `null` until the first close (render "—", never 0%).
+ */
+export interface BackendStrategySessionStats {
+  strategyId: string;
+  name: string | null;
+  enabled: boolean | null;
+  closedTrades: number;
+  openTrades: number;
+  hydratedOpenCount?: number;
+  wins: number;
+  losses: number;
+  breakeven: number;
+  winRate: number | null;
+  realizedPnlUsd: number;
+  pnlToday: number;
+  closedTradesToday: number;
+  avgTradeUsd: number | null;
+  feesUsd: number;
+  lastTradeAt: number | null;
+  signalsGenerated: number | null;
+}
+
 export interface BackendStrategy {
   id: string;
   name: string;
   description: string;
   category: "trend" | "mean-reversion" | string;
   enabled: boolean;
+  tags?: readonly string[];
+  config?: Record<string, unknown>;
+  /**
+   * Plugin's own counter block. `signalsGenerated` here is a PROCESS-LIFETIME
+   * signal counter — never a trade count and not session-scoped. Prefer
+   * `sessionStats.signalsGenerated`.
+   */
   stats?: {
     signalsGenerated?: number;
     lastSignalTime?: string;
     signalsByDirection?: { buy: number; sell: number };
     avgSignalStrength?: number;
   };
+  /** Session-scoped stats (#64/#72); `null` when the engine is stopped. */
+  sessionStats?: BackendStrategySessionStats | null;
 }
 
 export interface BackendStrategiesPayload {
   strategies: readonly BackendStrategy[];
+  total?: number;
+  enabled?: number;
+  session?: {
+    sessionId: string | null;
+    sessionStartedAt: number | null;
+    executionMode: "paper" | "live" | null;
+    engineRunning: boolean;
+    riskDay: string;
+  };
 }
 
 export async function fetchStrategies(): Promise<readonly BackendStrategy[]> {
@@ -226,15 +280,20 @@ export interface BackendRuntimeStatus {
   activeSymbols?: readonly string[];
   candlesBuffered?: Record<string, number>;
   /** PositionTracker/RiskEngine snapshot; null while the engine is stopped. */
-  pnl?: {
-    realizedPnlUsd: number;
-    unrealizedPnlUsd: number;
-    totalEquityUsd: number;
-    dailyPnlUsd: number;
-    dailyPnlR: number;
-    openPositionsCount: number;
-    exposureUsd: number;
-  } | null;
+  pnl?: BackendPnlSnapshot | null;
+}
+
+/** The slice of the canonical PnL snapshot (`/api/pnl` == `/api/status.pnl`) the dashboard reads. */
+export interface BackendPnlSnapshot {
+  /** Equity the session opened with (anchor for mark-to-market). */
+  sessionStartEquityUsd?: number;
+  realizedPnlUsd: number;
+  unrealizedPnlUsd: number;
+  totalEquityUsd: number;
+  dailyPnlUsd: number;
+  dailyPnlR: number;
+  openPositionsCount: number;
+  exposureUsd: number;
 }
 
 export async function fetchRuntimeStatus(): Promise<BackendRuntimeStatus | null> {

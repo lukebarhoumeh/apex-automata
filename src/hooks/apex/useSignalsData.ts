@@ -9,11 +9,17 @@ import {
   fetchSessionTrades,
   fetchStrategyPolicy,
   summarizeTradesByStrategy,
+  type BackendStrategy,
   type BackendStrategyPolicy,
   type BackendTradeRecord,
 } from "@/services/apexDashboardApi";
 import { mergeStrategyPolicy } from "@/lib/strategy-policy";
-import { fetchSessionBlotterRows, SIGNALS_DISPLAY_TIME_COLUMN } from "@/lib/session-blotter-fetch";
+import { resolveStrategySessionCounts, type StrategyOpenPositionLike } from "@/lib/strategy-session-counts";
+import {
+  fetchSessionBlotterRows,
+  fetchSessionOpenPositions,
+  SIGNALS_DISPLAY_TIME_COLUMN,
+} from "@/lib/session-blotter-fetch";
 import { hasActiveSession, sessionKey, type SessionScope } from "@/lib/session-scope";
 import { useActiveSession } from "@/runtime/session";
 
@@ -124,21 +130,6 @@ export function useSignalStream() {
 // Strategies — /api/strategies mapped to StrategyConfig
 // ============================================================
 
-interface BackendStrategy {
-  id: string;
-  name: string;
-  description: string;
-  category: string;
-  tags?: readonly string[];
-  enabled: boolean;
-  config?: Record<string, unknown>;
-  stats?: {
-    signalsGenerated?: number;
-    avgSignalStrength?: number;
-    signalsByDirection?: { buy?: number; sell?: number };
-  };
-}
-
 function keyToLabel(key: string): string {
   const spaced = key.replace(/([A-Z])/g, " $1").trim();
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
@@ -179,15 +170,19 @@ function kindFromCategory(category: string): StrategyConfig["kind"] {
 }
 
 /**
- * Strategy config cards. `stats.trades` is the ACTIVE session's closed-trade
- * count from TradeAnalytics (`/api/analytics/trades`); `stats.signals` is the
- * plugin's emitted-signal counter. They were conflated before, which showed
- * emitted signals as trades.
+ * Strategy config cards. Counts come from the same resolver as the dashboard
+ * strategy cards (`resolveStrategySessionCounts`): `stats.signals` are the
+ * signals EMITTED this session (`sessionStats.signalsGenerated`), `stats.closed`
+ * the session's closed trades, `stats.open` the engine's live opens (hydrated
+ * included). `winRate` is null at zero closes.
+ *
+ * @param openPositions engine opens for the active session; `null` when unavailable.
  */
 export function mapStrategyConfigs(
   registered: readonly BackendStrategy[],
   policy: BackendStrategyPolicy | null,
   trades: readonly BackendTradeRecord[] | null = null,
+  openPositions: readonly StrategyOpenPositionLike[] | null = null,
 ): StrategyConfig[] {
   const byStrategy = summarizeTradesByStrategy(trades);
   return mergeStrategyPolicy(registered, policy).map((m) => {
@@ -195,7 +190,7 @@ export function mapStrategyConfigs(
       .map(([k, v]) => paramFromEntry(k, v))
       .filter((p): p is StrategyParam => p !== null)
       .slice(0, 5);
-    const summary = byStrategy[m.id];
+    const c = resolveStrategySessionCounts(m.id, m.registered, byStrategy[m.id], openPositions);
     return {
       id: m.id,
       name: m.name,
@@ -205,10 +200,12 @@ export function mapStrategyConfigs(
       disabledBy: m.disabledBy,
       params,
       stats: {
-        winRate: summary?.winRate ?? 0,
+        winRate: c.winRate,
         avgR: 0,
-        trades: summary?.trades ?? 0,
-        signals: m.registered?.stats?.signalsGenerated ?? 0,
+        closed: c.closed,
+        open: c.open,
+        hydratedOpen: c.hydratedOpen,
+        signals: c.signals,
         lastR: [],
       },
     };
@@ -220,15 +217,17 @@ export function useStrategyConfigs() {
   return useQuery<readonly StrategyConfig[]>({
     queryKey: ["apex", "strategy-configs", sessionKey(scope)],
     queryFn: async () => {
-      // Registered plugins (runtime) + guardrails policy (SoT) + session trade
-      // ledger in parallel so a strategy killed in guardrails.yaml renders as
-      // killed, not missing, and trade counts are session-true.
-      const [res, policy, trades] = await Promise.all([
+      // Registered plugins (runtime, with sessionStats) + guardrails policy
+      // (SoT) + session trade ledger + engine open positions in parallel so a
+      // strategy killed in guardrails.yaml renders as killed, not missing, and
+      // every count is session-true.
+      const [res, policy, trades, positions] = await Promise.all([
         fetchJsonOrNull<{ strategies: readonly BackendStrategy[] }>("/api/strategies"),
         fetchStrategyPolicy(),
         fetchSessionTrades(),
+        fetchSessionOpenPositions(scope, 50),
       ]);
-      return mapStrategyConfigs(res?.strategies ?? [], policy, trades);
+      return mapStrategyConfigs(res?.strategies ?? [], policy, trades, positions.engineOpenPositions);
     },
     staleTime: 10_000,
     refetchInterval: 30_000,

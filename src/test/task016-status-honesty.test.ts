@@ -348,7 +348,7 @@ describe("P4 — guardrails disabled_strategies overlay", () => {
       policy,
       [],
     );
-    expect(cards.find((c) => c.id === "trend_follow")).toMatchObject({ status: "on", trades: 0, signals: 3, sessionScoped: true });
-    expect(cards.find((c) => c.id === "momentum")).toMatchObject({ status: "killed", disabledBy: "guardrails", trades: 0 });
+    expect(cards.find((c) => c.id === "trend_follow")).toMatchObject({ status: "on", closed: 0, signals: 3, sessionScoped: true });
+    expect(cards.find((c) => c.id === "momentum")).toMatchObject({ status: "killed", disabledBy: "guardrails", closed: 0 });
   });
 });

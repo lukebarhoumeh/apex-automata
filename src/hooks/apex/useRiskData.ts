@@ -194,7 +194,7 @@ function buildKillLadder(portfolio: PortfolioRisk, killActive: boolean): KillLad
 /**
  * Exposure tree rooted at the REAL open notional from the PnL snapshot
  * (`exposureUsd`) — the same number the hero heat and Risk hero use. The
- * Risk page used to add a hard-coded `+ $86,162` demo inflate to this total.
+ * Risk page used to add a hard-coded five-figure demo inflate to this total.
  * Per-symbol children are pending a runtime breakdown; until then the single
  * child states what the total is, never a fabricated allocation.
  */

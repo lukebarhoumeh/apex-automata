@@ -14,7 +14,7 @@
  * - Local equity calculations
  * - Session stats totalPnl for equity display
  * - A fabricated equity anchor when the runtime reports none (`snapshot` is
- *   `null` → render "—"; never "$50,000 + dailyPnl")
+ *   `null` → render "—"; never "<constant> + dailyPnl")
  */
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -86,7 +86,7 @@ export function normalizeSnapshot(raw: unknown): PnLSnapshot | null {
  * object under `.pnl` (null while the engine is stopped). There is no other
  * source of equity on that payload: when `.pnl` is missing we return `null`
  * and the UI renders "—". We never synthesise a snapshot from `status.risk`
- * with an invented equity anchor (this used to fabricate $50,000).
+ * with an invented equity anchor (this used to fabricate a five-figure equity).
  */
 export function snapshotFromStatus(status: unknown): PnLSnapshot | null {
   if (!status || typeof status !== 'object') return null;
