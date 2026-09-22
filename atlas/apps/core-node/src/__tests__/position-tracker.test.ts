@@ -108,6 +108,40 @@ describe('PositionTracker', () => {
     expect(summary.totalRealizedPnL).toBeCloseTo(16, 8);
     expect(summary.totalPnL).toBeCloseTo(16, 8);
   });
+
+  test('keeps the entry regime on position.metadata.regime through the close (paper kill ladder L4 attribution)', async () => {
+    const closed: any[] = [];
+    tracker.on('position:closed', (p) => closed.push(p));
+
+    // Entry fill stamps the regime the signal was opened in.
+    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '100', size: '1' }) as any, {
+      strategy: 'trend_follow',
+      tag: 'entry',
+      regime: 'weak_trend',
+    });
+    expect(tracker.getPosition('BTC-USD')!.metadata).toMatchObject({ entryTag: 'entry', regime: 'weak_trend' });
+
+    // The exit fill (position monitor stop-out) carries no regime and must not erase the entry's.
+    await tracker.processFill(makeFill({ trade_id: 2, side: 'sell', price: '95', size: '1' }) as any, {
+      strategy: 'system',
+      tag: 'stop_loss',
+    });
+
+    expect(closed).toHaveLength(1);
+    expect(closed[0]).toMatchObject({ strategy: 'trend_follow', exitReason: 'stop_loss', metadata: { regime: 'weak_trend' } });
+    expect(closed[0].realizedPnL).toBeLessThan(0);
+  });
+
+  test('backfills the regime on an existing position only when it has none', async () => {
+    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '100', size: '1' }) as any, { strategy: 'trend_follow' });
+    expect(tracker.getPosition('BTC-USD')!.metadata?.regime).toBeUndefined();
+
+    await tracker.processFill(makeFill({ trade_id: 2, side: 'buy', price: '101', size: '1' }) as any, { regime: 'choppy' });
+    expect(tracker.getPosition('BTC-USD')!.metadata?.regime).toBe('choppy');
+
+    await tracker.processFill(makeFill({ trade_id: 3, side: 'buy', price: '102', size: '1' }) as any, { regime: 'strong_trend' });
+    expect(tracker.getPosition('BTC-USD')!.metadata?.regime).toBe('choppy');
+  });
 });
 
 

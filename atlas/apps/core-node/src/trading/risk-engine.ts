@@ -644,6 +644,7 @@ export class RiskEngine extends EventEmitter {
         user_id: userId,
         event_type: transition.reasonCode,
         details: {
+          ...transition.context,
           eventType: 'ladder',
           ladderLevel: transition.level,
           reasonCode: transition.reasonCode,
@@ -651,8 +652,8 @@ export class RiskEngine extends EventEmitter {
           ...(transition.positionMultiplier !== undefined ? { positionMultiplier: transition.positionMultiplier } : {}),
           ...(transition.strategy ? { strategy: transition.strategy } : {}),
           ...(transition.regime ? { regime: transition.regime } : {}),
+          // ISO for the audit row (the context carries the epoch-ms form).
           ...(transition.until !== undefined ? { until: new Date(transition.until).toISOString() } : {}),
-          ...transition.context,
         },
         triggered_at: new Date(transition.at).toISOString(),
       };
