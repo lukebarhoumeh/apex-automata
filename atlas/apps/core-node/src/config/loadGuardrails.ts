@@ -53,12 +53,15 @@ export type HyperliquidSymbolLimit = z.infer<typeof HyperliquidSymbolLimitSchema
 export type PerSymbolLimit = z.infer<typeof PerSymbolLimitSchema>;
 export type StrategyOverrides = z.infer<typeof StrategyOverridesSchema>;
 
-// A6 (2026-05-29) — regime-conditional gates. DISABLED BY DEFAULT: when the
-// block is absent or `enabled: false`, the gate is a no-op and live/paper
-// behaviour is unchanged. Each rule blocks a strategy's signals when the
-// confidently-classified regime is in `block_regimes`, optionally scoped to
-// `venues` (spot|PERP) and/or `symbols`. Derived from the A6 diagnostic —
-// see docs/research/2026-05-29_a6-regime-conditional-gates.md.
+// A6 (2026-05-29) / TF-REGIME-GATE (2026-09-22) — regime-conditional gates.
+// Each rule blocks a strategy's NEW ENTRIES when the regime is in
+// `block_regimes`, optionally scoped to `venues` (spot|PERP) and/or `symbols`.
+// Exits / reversals are never gated. `paper_only` (default TRUE) scopes the
+// gate to paper execution: live and backtest resolve to a disabled gate unless
+// the YAML explicitly says `paper_only: false`. Enforced at the router stage
+// (api/server.ts) so a blocked entry lands in `signals.reason` for the FE.
+// Derived from the A6 diagnostic — see
+// docs/research/2026-05-29_a6-regime-conditional-gates.md.
 const RegimeNameSchema = z.enum(['strong_trend', 'weak_trend', 'ranging', 'choppy']);
 const RegimeGateRuleSchema = z.object({
   strategy: z.string(),
@@ -69,6 +72,7 @@ const RegimeGateRuleSchema = z.object({
 const RegimeGatesSchema = z
   .object({
     enabled: z.boolean().default(false),
+    paper_only: z.boolean().default(true),
     rules: z.array(RegimeGateRuleSchema).default([]),
   })
   .optional();
@@ -360,7 +364,8 @@ export const GuardrailsSchema = z.object({
   // Live-mode knobs (TASK_011). Optional; absent = fail-closed defaults via
   // `resolveLiveConfig()`. Paper mode ignores this block entirely.
   live: LiveConfigSchema.optional(),
-  // A6 (2026-05-29) — regime-conditional gates (disabled by default).
+  // A6 (2026-05-29) / TF-REGIME-GATE (2026-09-22) — regime-conditional entry
+  // gates. Paper-only by default (`paper_only`), see RegimeGatesSchema.
   regime_gates: RegimeGatesSchema,
   compliance: z.object({
     tax_method: z.string(),

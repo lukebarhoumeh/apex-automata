@@ -115,11 +115,12 @@ export interface BacktestConfigInput {
   /** RegimeFilter (regime/strategy compatibility) toggle — `--regime-gates on|off`. */
   regimeGates: boolean;
   /**
-   * A6 (2026-05-29) — force-enable the regime-conditional gates
-   * (`guardrails.regime_gates`, `--regime-conditional-gates`) for THIS run
-   * regardless of the YAML `enabled` flag. Default false: the YAML decides,
-   * and it ships `enabled: false`, so `pnpm backtest` and the E4 harness stay
-   * at live/paper parity (the gate is a no-op) unless explicitly forced.
+   * A6 (2026-05-29) — force-enable the regime-conditional entry gates
+   * (`guardrails.regime_gates`, `--regime-conditional-gates`) for THIS run.
+   * Default false: the YAML block is resolved for the `backtest` execution
+   * mode, and it ships `paper_only: true` (TF-REGIME-GATE, 2026-09-22), so
+   * `pnpm backtest` and the E4 harness keep their pre-gate baselines (the gate
+   * is a no-op) unless explicitly forced — the gate is live in PAPER only.
    */
   forceRegimeConditionalGates?: boolean;
   /** `--slippage` as a decimal rate; maps onto realism.entrySlippageBps. */
@@ -153,9 +154,10 @@ export interface BacktestConfigInput {
  */
 export function buildBacktestConfig(input: BacktestConfigInput, guardrails: GuardrailConfig): BacktestConfig {
   const { strategy, initialCapital } = input;
-  // A6: same normalised shape the live API server passes to SignalProcessor.
-  // Rules always come from guardrails.yaml; only `enabled` may be forced on.
-  const regimeConditionalGates = buildRegimeGateConfig(guardrails);
+  // A6: same normalised shape the API server's router uses, resolved for the
+  // `backtest` mode (paper_only rules resolve disabled here). Rules always
+  // come from guardrails.yaml; only `enabled` may be forced on per run.
+  const regimeConditionalGates = buildRegimeGateConfig(guardrails, 'backtest');
   if (input.forceRegimeConditionalGates) {
     regimeConditionalGates.enabled = true;
   }
@@ -232,8 +234,9 @@ export function buildBacktestConfig(input: BacktestConfigInput, guardrails: Guar
     disabledStrategies: guardrails.disabled_strategies,
     // F4 follow-up §8 (2026-05-19): same shape as the live API server reads.
     perSymbolDisabledStrategies: buildPerSymbolDisabledStrategies(guardrails),
-    // A6 (2026-05-29): regime-conditional gates — disabled by default via
-    // guardrails.regime_gates.enabled; see `forceRegimeConditionalGates`.
+    // A6 (2026-05-29): regime-conditional entry gates — resolved disabled for
+    // backtests while `regime_gates.paper_only` is true; see
+    // `forceRegimeConditionalGates`.
     regimeConditionalGates,
     // Defect #1: forward per-symbol parameter overrides.
     perSymbolOverrides: collectPerSymbolOverrides(guardrails),

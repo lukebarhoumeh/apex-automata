@@ -452,37 +452,54 @@ live:
   min_quote_usd: 20
   ev_gate_mode: enforce
 
-# A6 (2026-05-29) — Regime-conditional gates. DISABLED BY DEFAULT.
+# A6 (2026-05-29) / TF-REGIME-GATE (2026-09-22) — Regime-conditional ENTRY
+# gates. ENABLED FOR PAPER ONLY.
 # ---------------------------------------------------------------------------
-# Live/paper behaviour is UNCHANGED while `enabled: false` (the gate is a
-# no-op). Flip `enabled: true` ONLY after a human reviews the trade-count vs
-# edge trade-off in docs/research/2026-05-29_a6-regime-conditional-gates.md.
-# To MEASURE projected impact in a backtest WITHOUT changing this default:
-#   pnpm backtest --regime-conditional-gates --start-date <s> --end-date <e> --products <...>
-# (NB: the backtest CLI's `--regime-gates on|off` is the unrelated RegimeFilter
-# compatibility toggle from TASK_017 — it does NOT read this block.)
+# Scope (TF-REGIME-GATE, desk 2026-09-22):
+#   - `paper_only: true` (schema default true) — the gate is INERT when the
+#     engine starts with EXECUTION_MODE=live: live behaviour is byte-for-byte
+#     unchanged and CONFIRM_LIVE stays locked. Pinned by `pnpm check:config`
+#     (config-drift.ts SCALAR_PINS) so it cannot drift toward live in a
+#     one-file edit. Backtests also resolve to a disabled gate; measure it with
+#       pnpm backtest --regime-conditional-gates --start-date <s> --end-date <e> --products <...>
+#     (NB: the backtest CLI's `--regime-gates on|off` is the unrelated
+#     RegimeFilter compatibility toggle from TASK_017 — it does NOT read this block.)
+#   - NEW ENTRIES ONLY. A signal that opposes an open position on the same
+#     symbol (sell vs long, buy vs short) is an exit/reversal and is never
+#     gated. Position-monitor exits (stop / take-profit / trailing / time
+#     stop) never pass through this gate at all.
+#   - Enforced at the ROUTER stage (api/server.ts `signal:generated`, after the
+#     canonical `signals` row is written), so a blocked entry is persisted as
+#     `allowed = false` with
+#       reason = "regime_gate: trend_follow new entry blocked: regime=weak_trend (paper-only regime gate blocks weak_trend|choppy)"
+#     and renders REJECTED with that note in the FE signal stream. Funnel:
+#     stage `regime_gate`, reason `regime_blocked` (atlas_signal_filtered_total).
 #
-# Mechanism: each rule blocks `strategy` signals when the CONFIDENTLY-classified
-# regime (signal.metadata.regime, stamped by RegimeFilter / the strategy plugin)
-# is in `block_regimes`. Optional `venues` ([spot]|[PERP]) and `symbols` narrow
-# a rule. Low-confidence signals (no stamped regime) are never gated. Composes
-# ON TOP OF the plugin-level regimeCompatibility gate (which already refuses
-# trend_follow in ranging/choppy) and the RegimeFilter — it is strictly
-# additive, never a relaxation.
+# Mechanism: each rule blocks `strategy` entries when the regime the signal was
+# emitted in (signal.metadata.regime — the trend_follow plugin stamps the
+# RegimeDetector classification on every signal; the router falls back to the
+# live detector state) is in `block_regimes`. Regime labels are the
+# RegimeDetector's: strong_trend | weak_trend | ranging | choppy ("chop" =
+# `choppy`). Optional `venues` ([spot]|[PERP]) and `symbols` narrow a rule. An
+# unknown regime is never gated. Composes ON TOP OF the plugin-level
+# regimeCompatibility gate (which already refuses trend_follow in
+# ranging/choppy at signal generation, so `choppy` here is belt-and-braces)
+# and the RegimeFilter — strictly additive, never a relaxation.
 #
 # Empirical basis (8fea8b1 backtests, HL 4.5bps): trend_follow bleeds in
 # weak_trend — PF 0.78 (90d, n=143) and PF 0.80 (12m, n=405) — and only shows
 # positive edge in strong_trend (PF 1.41, 12m, n=16). Blocking weak_trend keeps
 # only the strong_trend edge. CAVEAT: strong_trend is rare, so this nearly
-# silences trend_follow — read the doc's §"projected impact" before enabling.
+# silences trend_follow entries in paper — see the doc's §"projected impact".
 # Momentum is intentionally NOT gated here: its regime edge is NOT stationary
 # (strong_trend PF 3.73 over 90d vs 0.46 over 12m), so a momentum regime gate
 # would overfit to one window.
 regime_gates:
-  enabled: false
+  enabled: true
+  paper_only: true
   rules:
     - strategy: trend_follow
-      block_regimes: [weak_trend]
+      block_regimes: [weak_trend, choppy]
 
 compliance:
   tax_method: FIFO
