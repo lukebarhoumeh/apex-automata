@@ -284,7 +284,7 @@ Existing `max_drawdown`, `weekly_stop`, `rapid_loss`, `error_rate`, `latency`,
 `data_gap` and `manual_killswitch` halts are unchanged and still latch the kill
 switch. While L6 is enabled it **replaces** the legacy paper daily stop
 (`risk.daily_loss_limit` as R and USD) and the `CONSECUTIVE_LOSS_LIMIT` (8)
-kill, so `/api/status.risk.thresholds.dailyStopR` reports the L6 daily-R rung.
+kill, so `RiskEngine.getRiskStatus().thresholds.dailyStopR` reports the L6 daily-R rung.
 
 Where the rungs bite:
 
@@ -301,7 +301,8 @@ Where the rungs bite:
 - **Observability** — each soft transition is a `risk:ladder:transition` event
   (forwarded as a `RiskEvent` broadcast + `alerts` row with `type: kill_ladder`),
   one `risk_events` row, and the current state is on
-  `/api/status.risk.paperKillLadder` and `/api/risk/status.paperKillLadder`.
+  `/api/risk/status.paperKillLadder` (`RiskEngine.getRiskStatus().paperKillLadder`
+  in code).
 
 Lifecycle:
 
