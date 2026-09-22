@@ -1674,13 +1674,19 @@ app.post('/api/engine/start', async (req, res) => {
     });
 
     tradingEngine.on('order:filled', async (order, fill) => {
+      // Capture the session stamp synchronously, before the first await.
+      // `engine.stop()` does not wait for this listener, so a shutdown flatten's
+      // last fills used to reach syncFillToSupabase after closeTradingSession()
+      // had already cleared activeSessionStamp — persisted with session_id NULL
+      // and invisible to the session-scoped blotter (hkub8j fills 17/18).
+      const stamp = currentSessionStamp();
       try {
         ordersFilledCounter.inc();
         // Broadcast order status update + fill
         broadcast({ type: 'OrderUpdate', payload: order });
         broadcast({ type: 'Fill', payload: fill });
-        await syncOrderToSupabase(order);
-        await syncFillToSupabase(order, fill);
+        await syncOrderToSupabase(order, stamp);
+        await syncFillToSupabase(order, fill, stamp);
         // Update account metrics after fills
         await updateAccountMetrics();
       } catch (err) {
@@ -4971,7 +4977,11 @@ async function initializeAccountMetrics() {
   }
 }
 
-async function syncOrderToSupabase(order: any) {
+/**
+ * Persist an order row. `stampAtEvent` is the session stamp captured when the
+ * triggering engine event fired; when omitted the current stamp is read here.
+ */
+async function syncOrderToSupabase(order: any, stampAtEvent?: SessionStamp | null) {
   const mapOrderStatus = (status?: string) => {
     switch ((status || '').toLowerCase()) {
       case 'open':
@@ -5080,7 +5090,9 @@ async function syncOrderToSupabase(order: any) {
 
     // TASK_014 P5: stamp session_id / execution_mode; orders hydrated from a prior
     // session keep that session's stamp (the upsert omits the columns for them).
-    const stamp = order.metadata?.hydratedFromSupabase ? null : currentSessionStamp();
+    const stamp = order.metadata?.hydratedFromSupabase
+      ? null
+      : (stampAtEvent !== undefined ? stampAtEvent : currentSessionStamp());
     const { error } = await writeWithSessionStamp({
       table: 'orders',
       row,
@@ -5112,10 +5124,18 @@ async function syncOrderToSupabase(order: any) {
  * retried once when PostgREST reports them missing). An unresolvable side is
  * persisted as NULL and logged — "unlogged fee_side" is VOID for the card, so it
  * must be visible, never disguised as taker.
+ *
+ * Trade-id integrity (TASK_014 P3, soak audit 2026-09-22): `stampAtEvent` is the
+ * session stamp captured when `order:filled` fired. It namespaces paper
+ * `trade_id`s (`paper-<sessionId>-<seq>`, see persistence/fill-row.ts) so the
+ * simulator's per-process counter can no longer upsert over a previous
+ * session's fills on `fills_user_trade_key`, and it keeps the stamp on fills
+ * that land after `closeTradingSession()` cleared the live one.
  */
-async function syncFillToSupabase(order: FillRowOrderRef, fill: FillRowFillRef) {
+async function syncFillToSupabase(order: FillRowOrderRef, fill: FillRowFillRef, stampAtEvent?: SessionStamp | null) {
   try {
-    const row = buildFillRow({ userId: USER_ID, order, fill });
+    const stamp = stampAtEvent !== undefined ? stampAtEvent : currentSessionStamp();
+    const row = buildFillRow({ userId: USER_ID, order, fill, session: stamp });
     if (row.fee_side === null) {
       logger.warn('Fill persisted with UNLOGGED fee_side (VOID for SH-QMAKER-CFM-PAPER-v0)', {
         orderId: order.id,
@@ -5129,7 +5149,7 @@ async function syncFillToSupabase(order: FillRowOrderRef, fill: FillRowFillRef) 
     const { error } = await writeWithSessionStamp({
       table: 'fills',
       row: row as unknown as Record<string, unknown>,
-      stamp: currentSessionStamp(),
+      stamp,
       support: sessionColumnSupport,
       write: async (payload) => {
         const { error } = await writeWithOptionalColumns({
