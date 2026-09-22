@@ -4,7 +4,9 @@
 
 > **Scope:** PAPER ONLY. None of the paths below are approved for `EXECUTION_MODE=live`. A live halt is a desk decision, not an ops reset.
 
-> **Last updated:** 2026-09-10. **Code of record:** `atlas/apps/core-node/src/trading/risk-engine.ts` (`loadRiskState`, `deactivateKillSwitch`, `persistClearedRiskState`), `atlas/apps/core-node/src/trading/risk-state.ts`, `atlas/apps/core-node/src/api/server.ts` (`POST /api/killswitch/deactivate`). **Single-user id:** `b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f` (`USER_ID` in `server.ts`).
+> **Last updated:** 2026-09-22. **Code of record:** `atlas/apps/core-node/src/trading/risk-engine.ts` (`loadRiskState`, `deactivateKillSwitch`, `persistClearedRiskState`), `atlas/apps/core-node/src/trading/risk-state.ts`, `atlas/apps/core-node/src/trading/risk/paper-boot-guard.ts` (`runPaperBootGuard`, `resolvePaperResetRiskStateOnStart`), `atlas/apps/core-node/src/api/server.ts` (`POST /api/engine/start`, `POST /api/killswitch/deactivate`). **Single-user id:** `b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f` (`USER_ID` in `server.ts`).
+
+> **Risk desk pins (stand-down 2026-09-22) — read before any path below.** A paper start is now **refused** (`HTTP 423`, `code: PAPER_BOOT_RISK_LATCHED`) while `risk_metrics.kill_switch_active = true` or a halt `risk_events` row (`consecutive_losses`, `daily_stop`, `manual_killswitch`, …) is still open, unless the API server runs with `RISK_CLEAR=YES`. `PAPER_RESET_RISK_STATE_ON_START=true` is **ignored** without `RISK_CLEAR=YES`. `RISK_CLEAR=YES` is the desk's CLEAR / GO — an operator does not set it on their own, and **never** against the shared prod paper Supabase during a stand-down. See `docs/risk.md` → "Paper boot pins".
 
 ---
 
@@ -24,8 +26,8 @@ The risk engine keeps its halt state in memory and mirrors it to Supabase on a *
 
 | Path | Before the fix | After the fix |
 |------|----------------|---------------|
-| `loadRiskState()` finds a `risk_metrics` row from a **previous day** | Zeroes `dailyPnL`, `maxDrawdown`, `consecutiveLosses`, `killSwitchActive` **in memory only**. The DB row keeps `kill_switch_active = true` until the next tick happens to overwrite it — never, if the engine is stopped first. | Eagerly upserts the cleared row and sweeps `risk_events.active = true` -> `false` for the user (`source: day_boundary`). |
-| `loadRiskState()` with `ignorePersistedKillSwitch` (`PAPER_RESET_RISK_STATE_ON_START=true`) | Same memory-only clear. | Same eager upsert + sweep (`source: startup_reset`). |
+| `loadRiskState()` finds a `risk_metrics` row from a **previous day** | Zeroes `dailyPnL`, `maxDrawdown`, `consecutiveLosses`, `killSwitchActive` **in memory only**. The DB row keeps `kill_switch_active = true` until the next tick happens to overwrite it — never, if the engine is stopped first. | Eagerly upserts the cleared row (`source: day_boundary`). **Since 2026-09-22:** only when the stale row is *not* latched; a latched previous-day row is restored halted with nothing written, and the `risk_events` sweep is pinned to the soft ladder codes — halt rows are never retired by a boot without CLEAR. |
+| `loadRiskState()` with `ignorePersistedKillSwitch` (`PAPER_RESET_RISK_STATE_ON_START=true`) | Same memory-only clear. | Same eager upsert + full sweep (`source: startup_reset`). **Since 2026-09-22:** `TradingEngine` only sets `ignorePersistedKillSwitch` when `RISK_CLEAR=YES` is also set; the flag alone is logged as *requested but NOT honoured*. |
 | `deactivateKillSwitch()` (`POST /api/killswitch/deactivate`, `POST /api/risk/killswitch {active:false}`) | Flipped the in-memory flag and returned. Persistence waited for the next tick. Worse: `consecutiveLosses` was **never reset**, so if the halt was a losing streak the next tick saw `consecutiveLosses >= limit` and re-halted — the resume was a no-op. `risk_events` only ever got `cleared_at` stamped; `active` stayed `true` forever, and the API's own manual-kill-switch insert (`event_type = 'kill_switch'`) was never cleared at all. | Resets the streak counters (`consecutiveLosses`, error-rate/latency windows), eagerly upserts `risk_metrics`, sweeps `risk_events`, and only then resolves — the HTTP response reports success once the DB agrees. Daily P&L is intentionally **not** re-anchored (see Path 2 caveat). |
 
 Two things that did *not* change and that you should know about:
@@ -35,16 +37,17 @@ Two things that did *not* change and that you should know about:
 
 ---
 
-## Path 1 (preferred): restart paper with `PAPER_RESET_RISK_STATE_ON_START=true`
+## Path 1 (preferred): restart paper with `PAPER_RESET_RISK_STATE_ON_START=true` **and** `RISK_CLEAR=YES`
 
-Use when the engine can be restarted. This is the only path that also re-anchors the weekly equity tracker to the current paper balance.
+Use when the engine can be restarted **and the Risk desk has issued CLEAR**. This is the only path that also re-anchors the weekly equity tracker to the current paper balance. Without `RISK_CLEAR=YES` step 4 is refused with `423 PAPER_BOOT_RISK_LATCHED` (the response body names the latch / halt rows and this remediation), and the reset flag is ignored even if the start were allowed.
 
 1. Stop the engine (keeps the API process alive):
    ```bash
    curl -X POST localhost:3001/api/engine/stop
    ```
-2. Set the flag in `.env` at the repo root (read by `dotenv` at **process** start, consumed in `TradingEngine.initializeRiskEngine()` at **engine** start):
+2. Set **both** in `.env` at the repo root (read by `dotenv` at **process** start; `RISK_CLEAR` is consumed by the paper boot guard in `POST /api/engine/start` and both are consumed in `TradingEngine.initializeRiskEngine()` at **engine** start):
    ```bash
+   RISK_CLEAR=YES                          # Risk desk CLEAR / GO only — never during a stand-down
    PAPER_RESET_RISK_STATE_ON_START=true
    ```
 3. Restart the backend process so the new env is loaded:
@@ -58,12 +61,16 @@ Use when the engine can be restarted. This is the only path that also re-anchors
      -H 'Content-Type: application/json' \
      -d '{"mode":"paper"}'
    ```
-5. Confirm in `atlas/var/logs/api-server.jsonl` (or `pm2 logs apex-backend`) that all three lines appear, in this order:
+5. Confirm in `atlas/var/logs/api-server.jsonl` (or `pm2 logs apex-backend`) that these lines appear, in this order:
+   - `Paper boot guard passed with caveats` with `code: PAPER_BOOT_RISK_CLEAR_OVERRIDE` (the guard saw the latch and let the start through under `RISK_CLEAR=YES`)
+   - `PAPER_RESET_RISK_STATE_ON_START honoured under RISK_CLEAR=YES (desk-authorised clean-slate paper boot)`
    - `Paper mode overrides active (divergence from live)` with `resetRiskStateOnStart` listed
-   - `Resetting persisted risk state for clean session start` (only logged if today's persisted row was dirty; a previous-day row is discarded by the day-boundary branch first and logs `Risk metrics from previous day detected, starting fresh` instead)
+   - `Resetting persisted risk state for clean session start` (only logged if today's persisted row was dirty; an *unlatched* previous-day row is discarded by the day-boundary branch first and logs `Risk metrics from previous day detected, starting fresh` instead)
    - `Eagerly persisting cleared risk state` with `source: 'startup_reset'`, followed by `Cleared stale active risk_events`
+
+   If you instead see `PAPER_RESET_RISK_STATE_ON_START requested but NOT honoured (no RISK_CLEAR=YES)`, the reset flag is on but `RISK_CLEAR` is not — nothing was cleared; stop and get the desk's CLEAR.
 6. Run the [verification checklist](#verification-checklist).
-7. **Set the flag back to `false`** and restart the backend again when convenient. Leaving it on means every paper restart silently discards halt state, which defeats paper/live parity (`docs/risk-parity.md`).
+7. **Set both back** (`PAPER_RESET_RISK_STATE_ON_START=false`, remove `RISK_CLEAR`) and restart the backend again when convenient. Leaving them on means every paper restart silently discards halt state, which defeats paper/live parity (`docs/risk-parity.md`) and bypasses the boot guard.
 
 ## Path 2: `POST /api/killswitch/deactivate` while the engine is running
 

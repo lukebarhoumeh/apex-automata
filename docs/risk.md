@@ -101,6 +101,8 @@ thresholdR = -(dailyLossLimit / perTradeRisk)
 | `RISK_DAY_ROLLOVER_HOUR` | `0` | Hour at which risk day rolls over |
 | `RISK_DISABLE_ERROR_RATE_IN_PAPER` | `false` | Disable error rate halt in paper mode |
 | `RISK_RESET_KILLSWITCH_ON_PAPER_START` | `false` | Clear halt on paper mode start |
+| `RISK_CLEAR` | unset | Risk desk CLEAR / GO authorisation. Exactly `YES` (like `CONFIRM_LIVE`). Without it a paper start is **refused** while the persisted paper risk state is latched, and `PAPER_RESET_RISK_STATE_ON_START` is ignored. See [Paper boot pins](#paper-boot-pins-stand-down-2026-09-22). |
+| `PAPER_RESET_RISK_STATE_ON_START` | `false` | Clean-slate paper boot (clears the kill latch, counters and every active `risk_events` row). **Only honoured together with `RISK_CLEAR=YES`.** |
 
 ### Guardrails Config
 
@@ -319,6 +321,51 @@ Lifecycle:
 
 Thresholds are desk pins (`pnpm check:config`); the `enabled` flags per rung are
 free feature flags.
+
+### Paper boot pins (stand-down 2026-09-22)
+
+Risk-required hardening around the ladder, all paper-only and all in
+`atlas/apps/core-node/src/trading/risk/paper-boot-guard.ts` unless noted.
+`RISK_CLEAR=YES` (exact value) is the desk's CLEAR / GO authorisation; nothing
+else — not `CONFIRM_LIVE`, not `yes`/`true` — counts.
+
+1. **Refuse paper start while latched** — `POST /api/engine/start` with
+   `mode: paper` runs `runPaperBootGuard()` before anything is built. If the
+   newest paper `risk_metrics` row has `kill_switch_active = true`, or any paper
+   `risk_events` row with a halt code (`consecutive_losses`, `daily_stop`,
+   `manual_killswitch`, `max_drawdown`, …) is still open (`cleared_at IS NULL`,
+   not retired), the API answers `423 Locked` with
+   `code: PAPER_BOOT_RISK_LATCHED`, the `blockers` list and a remediation string.
+   No engine is constructed, no session is minted, no `trading_sessions` row is
+   written. Soft ladder rows (L1–L5 codes) never block. If the risk state cannot
+   be read at all the start is refused with `503 PAPER_BOOT_RISK_STATE_UNVERIFIED`
+   (fail closed). `RISK_CLEAR=YES` lets the start proceed
+   (`PAPER_BOOT_RISK_CLEAR_OVERRIDE`, logged with the blockers) — the RiskEngine
+   then restores the latch, so the session boots **HALTED** until the desk also
+   resets or an operator resumes. The guard is read-only.
+2. **`PAPER_RESET_RISK_STATE_ON_START` is gated** —
+   `TradingEngine.initializeRiskEngine()` only passes
+   `ignorePersistedKillSwitch` to the RiskEngine when the flag is `true` **and**
+   `RISK_CLEAR=YES` (`resolvePaperResetRiskStateOnStart()`). The flag alone is
+   logged as *requested but NOT honoured* and treated as `false`; the paper
+   session runs with full parity and the persisted latch / halt rows stay.
+3. **A boot never clears a latch or retires halt rows on its own**
+   (`RiskEngine.loadRiskState()`): a previous-day `risk_metrics` row that is still
+   latched is restored halted exactly like a same-day one (nothing written); an
+   unlatched previous-day row still gets its counters reset and persisted, but
+   the accompanying `risk_events` sweep is pinned to the soft ladder codes. The
+   only paths that clear a latch / sweep halt rows are the authorised reset
+   (pin 2) and an operator **RESUME TRADING** (`deactivateKillSwitch`). The
+   `ladder_session_start` retire of stale soft rows is unchanged (soft codes only).
+4. **Smoke teardown** — `atlas/apps/core-node/src/cli/smoke.ts` always calls
+   `POST /api/engine/stop` (server-side `tradingEngine.stop()` +
+   `closeTradingSession()`) once its start succeeded, on the success path and
+   after any failed stage, then checks the `trading_sessions` row has
+   `ended_at`. It never requests a reset (that is server env, gated by pin 2)
+   and reports a `423` refusal verbatim.
+
+Tests: `src/__tests__/paper-boot-guard.test.ts`, `src/__tests__/paper-reset-gate.test.ts`,
+and the day-boundary cases in `src/__tests__/risk-engine-killswitch-persist.test.ts`.
 
 ## Recovery
 
