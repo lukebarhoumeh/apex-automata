@@ -94,8 +94,14 @@ export interface RiskEngineConfig {
   supabaseKey: string;
   userId?: string;
   /**
-   * If true, ignore any persisted kill switch state on startup.
-   * Useful for paper mode where sessions should start clean.
+   * If true, ignore any persisted kill switch state on startup and persist
+   * the cleared state (kill latch, counters, every active `risk_events` row).
+   *
+   * This is the ONLY boot path that clears a latch or retires halt rows, so
+   * callers must treat it as desk-authorised: `TradingEngine` only sets it
+   * when `PAPER_RESET_RISK_STATE_ON_START=true` AND `RISK_CLEAR=YES`
+   * (`resolvePaperResetRiskStateOnStart`). Without it a boot restores a
+   * latched row — same-day or previous-day — and leaves halt rows alone.
    */
   ignorePersistedKillSwitch?: boolean;
   limits: {
@@ -782,8 +788,17 @@ export class RiskEngine extends EventEmitter {
         // stopped before then). Anything that reads risk_metrics or
         // risk_events directly (UI, Grafana) saw a phantom halt.
         let resetSource: RiskStateResetSource | null = null;
+
+        // Risk desk pin (2026-09-22 stand-down): a boot never clears a
+        // persisted kill latch on its own. A previous-day row that is still
+        // latched is restored (halted) exactly like a same-day one; only an
+        // authorised reset (`ignorePersistedKillSwitch`, i.e.
+        // PAPER_RESET_RISK_STATE_ON_START together with RISK_CLEAR=YES) or an
+        // operator RESUME TRADING clears it.
+        const persistedLatch = Boolean(latestMetrics.kill_switch_active);
+        const keepStaleLatch = metricsDate !== todayStr && persistedLatch && !this.config.ignorePersistedKillSwitch;
         
-        if (metricsDate !== todayStr) {
+        if (metricsDate !== todayStr && !keepStaleLatch) {
           // Stale data from previous day - start fresh
           this.logger.info('Risk metrics from previous day detected, starting fresh', {
             storedDate: metricsDate,
@@ -797,7 +812,15 @@ export class RiskEngine extends EventEmitter {
           this.metrics.killSwitchActive = false;
           resetSource = 'day_boundary';
         } else {
-          // Restore metrics from today
+          if (keepStaleLatch) {
+            this.logger.warn('Risk metrics from previous day still carry an active kill latch; keeping it (no authorised reset)', {
+              storedDate: metricsDate,
+              today: todayStr,
+              consecutiveLosses: Number(latestMetrics.consecutive_losses ?? 0),
+              remediation: 'Risk CLEAR -> RISK_CLEAR=YES (+ PAPER_RESET_RISK_STATE_ON_START=true) or operator RESUME TRADING',
+            });
+          }
+          // Restore metrics from today (or from a still-latched previous-day row)
           this.metrics.dailyPnL = Number(latestMetrics.daily_pnl ?? 0);
           this.metrics.maxDrawdown = Number(latestMetrics.max_drawdown ?? 0);
           this.metrics.consecutiveLosses = Number(latestMetrics.consecutive_losses ?? 0);
@@ -841,7 +864,13 @@ export class RiskEngine extends EventEmitter {
           resetSource = 'startup_reset';
         }
 
-        if (resetSource) {
+        if (resetSource === 'day_boundary') {
+          // The counter reset is persisted as before (no phantom halt), but
+          // the risk_events sweep stays inside the soft ladder codes: a boot
+          // never retires a halt row (consecutive_losses, daily_stop,
+          // manual_killswitch, ...) without CLEAR — Risk desk pin 2026-09-22.
+          await this.persistClearedRiskState(resetSource, { eventTypes: LADDER_SOFT_REASON_CODES });
+        } else if (resetSource) {
           await this.persistClearedRiskState(resetSource);
         } else if (this.paperKillLadder) {
           // The ladder is in-memory and starts empty on every boot, so soft
@@ -2027,7 +2056,10 @@ export class RiskEngine extends EventEmitter {
    * hiccup must never turn a successful in-memory resume into an exception
    * at an API boundary.
    */
-  private async persistClearedRiskState(source: RiskStateResetSource): Promise<void> {
+  private async persistClearedRiskState(
+    source: RiskStateResetSource,
+    sweepScope?: { eventTypes?: readonly string[]; details?: Record<string, string> },
+  ): Promise<void> {
     if (!this.userId) {
       this.logger.debug('Skipping eager risk state persist: userId not provided', { source });
       return;
@@ -2039,9 +2071,10 @@ export class RiskEngine extends EventEmitter {
       consecutiveLosses: this.metrics.consecutiveLosses,
       dailyPnL: this.metrics.dailyPnL,
       maxDrawdown: this.metrics.maxDrawdown,
+      ...(sweepScope?.eventTypes ? { riskEventsSweepScope: [...sweepScope.eventTypes] } : {}),
     });
     await this.persistMetrics();
-    await this.clearStaleRiskEvents(source);
+    await this.clearStaleRiskEvents(source, sweepScope);
   }
 
   /**

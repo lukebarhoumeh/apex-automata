@@ -11,6 +11,14 @@
  *      forever, if the engine stopped first. Both paths must now eagerly
  *      upsert the cleared row and mark stale `risk_events` as cleared.
  *
+ *      Risk desk pin (2026-09-22 stand-down): the day-boundary path only
+ *      discards an UNLATCHED stale row, and its `risk_events` sweep is pinned
+ *      to the soft ladder codes. A stale row that still has
+ *      `kill_switch_active=true` is restored halted with nothing written;
+ *      only the authorised reset (`ignorePersistedKillSwitch`, which
+ *      TradingEngine sets solely for PAPER_RESET + RISK_CLEAR=YES) or an
+ *      operator RESUME clears a latch / retires halt rows.
+ *
  *   2. `deactivateKillSwitch()` used to flip the in-memory flag and return
  *      before anything was persisted, and never reset `consecutiveLosses`,
  *      so a streak-triggered halt re-tripped on the very next tick. It must
@@ -342,8 +350,10 @@ describe('RiskEngine kill-switch reset persistence', () => {
       );
     });
 
-    test('day-boundary discard of a stale row is persisted, not memory-only', async () => {
-      harness.respond('risk_metrics.select', () => ({ data: haltedRow(yesterdayIso()) }));
+    test('day-boundary discard of a stale (unlatched) row is persisted, not memory-only — and sweeps soft ladder rows only', async () => {
+      // Yesterday's counters, but the kill latch is NOT set: this is the only
+      // stale row a boot may discard on its own (Risk desk pin 2026-09-22).
+      harness.respond('risk_metrics.select', () => ({ data: { ...haltedRow(yesterdayIso()), kill_switch_active: false } }));
 
       engine = await waitForLoaders(new RiskEngine(baseConfig, mockLogger as any, positionTracker));
 
@@ -353,10 +363,57 @@ describe('RiskEngine kill-switch reset persistence', () => {
       const upsert = firstUpsert();
       expect(upsert).toBeDefined();
       expect(upsert.payload).toMatchObject({ kill_switch_active: false, consecutive_losses: 0, daily_pnl: 0 });
-      expect(riskEventClears()).toHaveLength(1);
+      const clears = riskEventClears();
+      expect(clears).toHaveLength(1);
+      // Halt rows (consecutive_losses, daily_stop, manual_killswitch, ...) are
+      // never retired by a boot without CLEAR: the sweep is pinned to the soft
+      // ladder codes.
+      expect(clears[0].filters).toEqual(
+        expect.arrayContaining([
+          ['eq', 'active', true],
+          ['in', 'event_type', ['size_down_consec', 'size_down_daily_r', 'strategy_freeze', 'regime_pause', 'sleeve_halt']],
+        ])
+      );
       expect(mockLogger.info).toHaveBeenCalledWith(
         'Eagerly persisting cleared risk state',
         expect.objectContaining({ source: 'day_boundary' })
+      );
+    });
+
+    test('a stale row that is still LATCHED is restored halted, not discarded — nothing is written (no RISK_CLEAR reset)', async () => {
+      harness.respond('risk_metrics.select', () => ({ data: haltedRow(yesterdayIso()) }));
+
+      engine = await waitForLoaders(new RiskEngine(baseConfig, mockLogger as any, positionTracker));
+
+      expect(engine.getMetrics().killSwitchActive).toBe(true);
+      expect(engine.getMetrics().consecutiveLosses).toBe(10);
+      expect(engine.canEnterTrades()).toBe(false);
+      expect(harness.callsFor('risk_metrics', 'upsert')).toHaveLength(0);
+      expect(riskEventClears()).toHaveLength(0);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        'Risk metrics from previous day still carry an active kill latch; keeping it (no authorised reset)',
+        expect.objectContaining({ consecutiveLosses: 10 })
+      );
+      expect(mockLogger.info).not.toHaveBeenCalledWith('Risk metrics from previous day detected, starting fresh', expect.anything());
+    });
+
+    test('a stale LATCHED row under the authorised reset (ignorePersistedKillSwitch) is cleared and swept in full', async () => {
+      harness.respond('risk_metrics.select', () => ({ data: haltedRow(yesterdayIso()) }));
+
+      engine = await waitForLoaders(
+        new RiskEngine({ ...baseConfig, ignorePersistedKillSwitch: true }, mockLogger as any, positionTracker)
+      );
+
+      expect(engine.getMetrics().killSwitchActive).toBe(false);
+      expect(engine.canEnterTrades()).toBe(true);
+      expect(firstUpsert()?.payload).toMatchObject({ kill_switch_active: false, consecutive_losses: 0 });
+      const clears = riskEventClears();
+      expect(clears).toHaveLength(1);
+      // Authorised reset: the sweep is NOT narrowed to soft codes.
+      expect(clears[0].filters.some(([m, col]) => m === 'in' && col === 'event_type')).toBe(false);
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        'Eagerly persisting cleared risk state',
+        expect.objectContaining({ source: 'startup_reset' })
       );
     });
 
