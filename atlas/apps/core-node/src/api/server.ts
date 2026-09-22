@@ -19,6 +19,11 @@ import {
   REGIME_GATE_REASON_CODE,
   REGIME_GATE_STAGE,
 } from '../strategies/regime-gate';
+import {
+  ATR_VOL_STAGE,
+  describeAtrVolatilityReject,
+  evaluateAtrVolatilityFilter,
+} from '../strategies/atr-volatility-filter';
 import { buildStrategyPolicy } from '../strategies/strategy-policy';
 import { resolvePersistedEntryPrice } from '../trading/position-entry-vwap';
 import { buildFillRow, FILLS_UPSERT_ON_CONFLICT, FILL_FEE_SIDE_COLUMNS, FillRowFillRef, FillRowOrderRef } from '../persistence/fill-row';
@@ -2448,26 +2453,39 @@ app.post('/api/engine/start', async (req, res) => {
           }
         }
 
-        // ATR volatility filter
+        // ATR volatility filter (guardrails.filters.atr_volatility_min/max).
+        // TF-ATR-FILTER-PARITY (2026-09-22): the ATR is resolved through the
+        // shared SoT (strategies/atr-volatility-filter.ts — `indicators.atr`,
+        // then trend_follow's legacy `metadata.atr`) so the 0.5% floor now
+        // applies to trend_follow entries too; the backtest mirror uses the
+        // same helper. A signal with no usable ATR still passes (unchanged),
+        // but the skip is logged instead of silent.
         const atrMin = guardrails.filters.atr_volatility_min;
         const atrMax = guardrails.filters.atr_volatility_max;
-        const atrValue = (signal.metadata?.indicators as Record<string, number> | undefined)?.atr;
-        if (typeof atrValue === 'number' && atrValue > 0) {
-          const atrPct = atrValue / entryPrice;
-          if (atrPct < atrMin || atrPct > atrMax) {
-            const reason = atrPct < atrMin ? 'atr_below_min' : 'atr_above_max';
-            recordSignalFiltered(logger, {
-              stage: 'atr_vol',
-              reason,
-              symbol: signal.symbol,
-              strategy: signal.strategy,
-              signalId: signal.id,
-              direction: signal.direction,
-              strength: signal.strength,
-              context: { atrPct, atrMin, atrMax },
-            });
-            return routeRejected(routedExchange, 'atr_vol', `${reason} (atrPct=${atrPct.toFixed(5)})`);
-          }
+        const atrVerdict = evaluateAtrVolatilityFilter({
+          metadata: signal.metadata,
+          price: entryPrice,
+          atrMin,
+          atrMax,
+        });
+        if (atrVerdict.outcome === 'no_atr') {
+          logger.debug('ATR volatility filter skipped — signal carries no usable ATR', {
+            signalId: signal.id,
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+          });
+        } else if (atrVerdict.outcome !== 'pass') {
+          recordSignalFiltered(logger, {
+            stage: ATR_VOL_STAGE,
+            reason: atrVerdict.outcome,
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            signalId: signal.id,
+            direction: signal.direction,
+            strength: signal.strength,
+            context: { atrPct: atrVerdict.atrPct, atrMin, atrMax, atrSource: atrVerdict.atrSource },
+          });
+          return routeRejected(routedExchange, ATR_VOL_STAGE, describeAtrVolatilityReject(atrVerdict));
         }
 
         // Funding bias guardrail — check if funding rate is excessive for perps symbols

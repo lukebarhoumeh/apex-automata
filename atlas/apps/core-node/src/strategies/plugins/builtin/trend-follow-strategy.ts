@@ -391,6 +391,23 @@ export class TrendFollowStrategy extends BaseStrategy {
       mtfAligned: requireMtfAlignment ? mtfAlignedReport === true : 'disabled',
     };
 
+    // TF-ATR-FILTER-PARITY (2026-09-22): stamp the strategy inputs on the
+    // canonical `metadata.indicators` path as well. The router's `atr_vol`
+    // floor (guardrails.filters.atr_volatility_min) and the ML feature capture
+    // read `metadata.indicators.atr`; this plugin only ever wrote `metadata.atr`,
+    // so every trend_follow entry was treated as "no ATR" and sub-floor entries
+    // passed the paper soak. The top-level keys below are kept unchanged for
+    // existing readers (`metadata.atr` → backtest trailing stop, blotter
+    // features). See strategies/atr-volatility-filter.ts.
+    const stampedIndicators: Record<string, number> = {
+      fastEma: currentFastEma,
+      slowEma: currentSlowEma,
+      atr: currentAtr,
+    };
+    if (currentAdx !== undefined && Number.isFinite(currentAdx)) {
+      stampedIndicators.adx = currentAdx;
+    }
+
     if (bullishCrossover && priceAboveBothEmas) {
       const stopLoss = price - stopDistance;
       const takeProfit = price + targetDistance;
@@ -403,6 +420,7 @@ export class TrendFollowStrategy extends BaseStrategy {
           stopLoss,
           takeProfit,
           reason: `Bullish EMA crossover (${emaFast}/${emaSlow}) with price confirmation`,
+          indicators: stampedIndicators,
           metadata: {
             fastEma: currentFastEma,
             slowEma: currentSlowEma,
@@ -426,6 +444,7 @@ export class TrendFollowStrategy extends BaseStrategy {
           stopLoss,
           takeProfit,
           reason: `Bearish EMA crossover (${emaFast}/${emaSlow}) with price confirmation`,
+          indicators: stampedIndicators,
           metadata: {
             fastEma: currentFastEma,
             slowEma: currentSlowEma,
