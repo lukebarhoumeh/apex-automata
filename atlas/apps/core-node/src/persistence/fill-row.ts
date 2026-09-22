@@ -20,7 +20,12 @@
  *
  * Handoff — broader TASK_014 (P1, P3–P8) is owned separately. Extend here rather
  * than re-inlining the row in server.ts:
- *   - P3  trade_id policy: exchange trade_id (live) / `paper-${sessionId}-${seq}` (paper)
+ *   - P3  trade_id policy: DONE (2026-09-22) — exchange trade_id (live) /
+ *         `paper-${sessionId}-${seq}` (paper). See `resolveFillTradeId` for why:
+ *         the simulator's per-process counter collided on `fills_user_trade_key`
+ *         UNIQUE (user_id, trade_id) and every new paper session's fill #k
+ *         upserted OVER the previous session's fill #k (soak audit 2026-09-22:
+ *         hkub8j 18 filled orders / 5 fill rows, 3z950m 3 / 0).
  *   - P5  stamping: DONE — optional `session` input adds `session_id` / `execution_mode`
  *         (columns from migration 20260911170000; schema-tolerant fallback lives in
  *         persistence/session-stamp.ts)
@@ -113,6 +118,58 @@ export const FILL_FEE_SIDE_COLUMNS = ['fee_side', 'fee_side_source'] as const;
 /** Error code raised when a fill arrives without a resolvable client order id. */
 export const FILL_ORDER_ID_MISSING = 'FILL_ORDER_ID_MISSING';
 
+/** Prefix of every namespaced paper `trade_id` (`paper-<sessionId>-<seq>`). */
+export const PAPER_TRADE_ID_PREFIX = 'paper';
+
+/** `fee_side_source` value the paper simulator stamps on every fill it emits. */
+const SIMULATED_FEE_SIDE_SOURCE = 'simulated';
+
+/**
+ * Resolve the `fills.trade_id` value for a fill — TASK_014 P3.
+ *
+ * `fills` carries `fills_user_trade_key UNIQUE (user_id, trade_id)` and the
+ * writer upserts on that pair (`FILLS_UPSERT_ON_CONFLICT`). Live fills are safe:
+ * the exchange trade id is unique per account. Paper fills are NOT: the
+ * simulator's `trade_id` is `++fillSequence`, a per-process integer that
+ * restarts at 1 on every engine start (and on `reset()`), so fill #k of a new
+ * paper session upserts over fill #k of the previous one — the old row's
+ * `order_id` / `session_id` are rewritten and the earlier session loses the
+ * fill (2026-09-22 audit: `9q7egp` fills 1–11 replaced `hkub8j` fills 1–11).
+ *
+ * Policy:
+ *   - live (or unknown mode without a simulator marker): exchange id, unchanged
+ *   - paper: `paper-<sessionId>-<seq>` — unique across sessions and processes
+ *   - paper with no session stamp (must not happen after the stamp is captured
+ *     at event time in server.ts, kept as a defensive floor): `paper-<order.id>-<seq>`
+ *     — the client order UUID is unique per order, `seq` per fill
+ *   - an already-namespaced string id is passed through untouched
+ *
+ * A fill counts as paper when the session runs in `paper` mode OR the fill
+ * itself carries the simulator's `fee_side_source: 'simulated'` marker.
+ *
+ * @param input.order Engine-side order (client UUID is the fallback namespace).
+ * @param input.fill Fill payload from `order:filled`.
+ * @param input.session Active session stamp, if known.
+ * @returns The `trade_id` column value, or `null` when the fill carries none.
+ */
+export function resolveFillTradeId(input: {
+  order: Pick<FillRowOrderRef, 'id'>;
+  fill: Pick<FillRowFillRef, 'trade_id' | 'fee_side_source'>;
+  session?: SessionStamp | null;
+}): string | null {
+  const { order, fill, session } = input;
+  if (fill.trade_id === undefined || fill.trade_id === null) return null;
+
+  const raw = String(fill.trade_id);
+  if (raw.startsWith(`${PAPER_TRADE_ID_PREFIX}-`)) return raw;
+
+  const isPaper = session?.executionMode === 'paper' || fill.fee_side_source === SIMULATED_FEE_SIDE_SOURCE;
+  if (!isPaper) return raw;
+
+  const namespace = nonEmptyString(session?.sessionId) ? session!.sessionId : order.id;
+  return `${PAPER_TRADE_ID_PREFIX}-${namespace}-${raw}`;
+}
+
 /**
  * Resolve the fee side + provenance for a fill.
  *
@@ -171,6 +228,8 @@ export function resolveFillExternalOrderId(
  * @param input.fill Fill payload.
  * @param input.session Optional active-session stamp (TASK_014 P5). When given, the row
  *   also carries `session_id` / `execution_mode`; omit it to build the legacy shape.
+ *   It is also the namespace for paper `trade_id`s (P3, `resolveFillTradeId`) — pass
+ *   the stamp captured at `order:filled` time so a shutdown flatten's fills keep it.
  * @throws {Error} `FILL_ORDER_ID_MISSING` when `order.id` is absent — the fill must not be
  *   written with the exchange id in `order_id` (that is the P2 defect), so fail loudly instead.
  */
@@ -207,7 +266,7 @@ export function buildFillRow(input: {
     user_id: userId,
     order_id: order.id,
     external_order_id: resolveFillExternalOrderId(order, fill),
-    trade_id: fill.trade_id !== undefined ? String(fill.trade_id) : null,
+    trade_id: resolveFillTradeId({ order, fill, session }),
     price: Number.parseFloat(String(fill.price)),
     quantity: Number.parseFloat(String(fill.size)),
     fee_currency: 'USD',

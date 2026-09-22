@@ -17,11 +17,16 @@ import { randomUUID } from 'node:crypto';
 import {
   buildFillRow,
   resolveFillExternalOrderId,
+  resolveFillTradeId,
   FILLS_UPSERT_ON_CONFLICT,
   FILL_ORDER_ID_MISSING,
+  PAPER_TRADE_ID_PREFIX,
   FillRow,
   FillRowOrderRef,
 } from '../persistence/fill-row';
+import type { SessionStamp } from '../persistence/session-stamp';
+import { PaperTradingSimulator } from '../trading/paper-trading-simulator';
+import { FeeModel } from '../core/fee-model';
 import { OrderManager, OrderManagerConfig, ManagedOrder } from '../trading/order-manager';
 import type { CoinbaseExchange } from '../exchanges/coinbase';
 import type { CoinbaseOrder, Fill, OrderRequest } from '../exchanges/coinbase/types';
@@ -173,6 +178,132 @@ describe('buildFillRow — P2: order_id is the client UUID, exchange id goes to 
 
   it('upsert conflict target is unchanged', () => {
     expect(FILLS_UPSERT_ON_CONFLICT).toBe('user_id,trade_id');
+  });
+});
+
+/**
+ * TASK_014 P3 — paper trade_id namespacing (soak audit 2026-09-22).
+ *
+ * `fills_user_trade_key UNIQUE (user_id, trade_id)` + upsert on that pair, while the
+ * paper simulator's trade_id is `++fillSequence` (restarts at 1 every engine start).
+ * Observed: session 9q7egp's fills 1–11 upserted OVER hkub8j's fills 1–11 → hkub8j
+ * showed 18 filled orders / 5 fill rows, 3z950m 3 / 0. Paper ids must be unique
+ * across sessions; live exchange ids must be untouched.
+ */
+describe('resolveFillTradeId / buildFillRow — P3: paper trade_id is namespaced per session', () => {
+  const paperSession: SessionStamp = { sessionId: 'sess_1790091200890_9q7egp', executionMode: 'paper' };
+  const priorPaperSession: SessionStamp = { sessionId: 'sess_1790017457369_hkub8j', executionMode: 'paper' };
+  const liveSession: SessionStamp = { sessionId: 'sess_1790100000000_live01', executionMode: 'live' };
+
+  /** Exact shape PaperTradingSimulator.recordFill emits (fee_side_source: 'simulated'). */
+  function simulatorFill(seq: number, orderId: string): Fill {
+    return legacyFill({
+      trade_id: seq,
+      order_id: orderId,
+      liquidity: 'M',
+      fee_side: 'maker',
+      fee_side_source: 'simulated',
+    } as Partial<Fill>);
+  }
+
+  it('paper session: trade_id becomes paper-<sessionId>-<seq>', () => {
+    const order = { id: randomUUID() };
+    const row = buildFillRow({ userId: USER_ID, order, fill: simulatorFill(7, order.id), session: paperSession });
+    expect(row.trade_id).toBe(`${PAPER_TRADE_ID_PREFIX}-sess_1790091200890_9q7egp-7`);
+  });
+
+  it('the exact production collision: same seq in two paper sessions yields two distinct (user_id, trade_id) keys', () => {
+    const orderA = { id: randomUUID() };
+    const orderB = { id: randomUUID() };
+    const rowA = buildFillRow({ userId: USER_ID, order: orderA, fill: simulatorFill(1, orderA.id), session: priorPaperSession });
+    const rowB = buildFillRow({ userId: USER_ID, order: orderB, fill: simulatorFill(1, orderB.id), session: paperSession });
+
+    expect(rowA.user_id).toBe(rowB.user_id);
+    expect(rowA.trade_id).not.toBe(rowB.trade_id); // pre-fix both were '1' → rowB upserted over rowA
+    expect(rowA.trade_id).toBe('paper-sess_1790017457369_hkub8j-1');
+    expect(rowB.trade_id).toBe('paper-sess_1790091200890_9q7egp-1');
+  });
+
+  it('live session: exchange trade_id is written unchanged', () => {
+    const order = { id: randomUUID(), exchangeOrderId: 'cb-exchange-order-9' };
+    const row = buildFillRow({ userId: USER_ID, order, fill: legacyFill({ trade_id: 987654 }), session: liveSession });
+    expect(row.trade_id).toBe('987654');
+  });
+
+  it('no session stamp but simulator marker present: falls back to the client order UUID namespace (never a bare seq)', () => {
+    const order = { id: randomUUID() };
+    const row = buildFillRow({ userId: USER_ID, order, fill: simulatorFill(17, order.id), session: null });
+    expect(row.trade_id).toBe(`paper-${order.id}-17`);
+  });
+
+  it('no session stamp and no simulator marker (live-shaped): unchanged legacy behaviour', () => {
+    const order = { id: randomUUID(), exchangeOrderId: 'cb-exchange-order-1' };
+    const row = buildFillRow({ userId: USER_ID, order, fill: legacyFill({ trade_id: 42 }) });
+    expect(row.trade_id).toBe('42');
+  });
+
+  it('an already-namespaced paper id passes through untouched (idempotent on replay)', () => {
+    const order = { id: randomUUID() };
+    const fill = { ...simulatorFill(3, order.id), trade_id: 'paper-sess_1790091200890_9q7egp-3' } as unknown as Fill;
+    const row = buildFillRow({ userId: USER_ID, order, fill, session: paperSession });
+    expect(row.trade_id).toBe('paper-sess_1790091200890_9q7egp-3');
+  });
+
+  it('null / undefined trade_id stays null in every mode', () => {
+    const order = { id: randomUUID() };
+    expect(resolveFillTradeId({ order, fill: { trade_id: null, fee_side_source: 'simulated' }, session: paperSession })).toBeNull();
+    expect(resolveFillTradeId({ order, fill: {}, session: liveSession })).toBeNull();
+  });
+
+  it('paper session stamp also lands on the row (P5) alongside the namespaced id', () => {
+    const order = { id: randomUUID() };
+    const row = buildFillRow({ userId: USER_ID, order, fill: simulatorFill(2, order.id), session: paperSession });
+    expect(row.session_id).toBe(paperSession.sessionId);
+    expect(row.execution_mode).toBe('paper');
+    expect(row.trade_id).toBe('paper-sess_1790091200890_9q7egp-2');
+  });
+
+  it('end-to-end: two real PaperTradingSimulator instances (two engine starts) emit the SAME raw trade_id; rows no longer collide', async () => {
+    const logger: Logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const fees = new FeeModel({
+      coinbase: { spot: { maker_bps: 25, taker_bps: 40 }, perps_intx: { maker_bps: 0, taker_bps: 5 } },
+      hyperliquid: { perps: { maker_bps: -1.5, taker_bps: 4.5 } },
+    });
+    const buildSim = () =>
+      new PaperTradingSimulator(
+        {
+          initialBalances: new Map([['USD', 100_000], ['ETH', 0]]),
+          feeModel: fees,
+          venue: 'coinbase',
+          slippage: 0,
+          latencyMs: 0,
+          depthAware: false,
+        },
+        logger,
+      );
+
+    const firstFillOf = async (sim: PaperTradingSimulator, session: SessionStamp) => {
+      const fills: Fill[] = [];
+      sim.on('fill', (f: Fill) => fills.push(f));
+      sim.updateMarketQuote('ETH-USD', { bid: 1999, ask: 2001, last: 2000 });
+      const clientOrderId = randomUUID();
+      await sim.placeOrder({ product_id: 'ETH-USD', side: 'buy', type: 'market', size: '0.1', client_oid: clientOrderId } as OrderRequest);
+      expect(fills).toHaveLength(1);
+      return { fill: fills[0], row: buildFillRow({ userId: USER_ID, order: { id: clientOrderId }, fill: fills[0], session }) };
+    };
+
+    const a = await firstFillOf(buildSim(), priorPaperSession);
+    const b = await firstFillOf(buildSim(), paperSession);
+
+    // The producer-side defect, pinned: both processes hand out trade_id 1.
+    expect(a.fill.trade_id).toBe(1);
+    expect(b.fill.trade_id).toBe(1);
+    expect(a.fill.fee_side_source).toBe('simulated');
+
+    // The persistence-side fix: distinct upsert keys, so session B cannot overwrite session A.
+    expect(a.row.trade_id).toBe(`paper-${priorPaperSession.sessionId}-1`);
+    expect(b.row.trade_id).toBe(`paper-${paperSession.sessionId}-1`);
+    expect(`${a.row.user_id}|${a.row.trade_id}`).not.toBe(`${b.row.user_id}|${b.row.trade_id}`);
   });
 });
 
