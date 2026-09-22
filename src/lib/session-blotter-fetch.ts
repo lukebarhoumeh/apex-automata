@@ -301,9 +301,11 @@ export async function fetchSessionOpenPositions(
 
 /**
  * Supabase fallback: `closed_at IS NULL` AND (`session_id = active` OR
- * unstamped inside the session window). A hydrated position keeps the
- * session_id of the run that OPENED it, so it is absent here — the API path
- * (`engineOpenPositions`) is the only source that surfaces hydrated opens.
+ * unstamped inside the session window). Positions hydrated from a prior run
+ * are restamped onto the active PAPER session at engine start (backend
+ * `persistence/position-session-restamp.ts`), so they appear here too; in a
+ * live session they keep the opening run's session_id and only the API path
+ * (`engineOpenPositions`) surfaces them.
  */
 async function fetchOpenPositionsFromSupabase(scope: SessionScopeWithMode, limit: number): Promise<unknown[]> {
   const orFilter = buildSessionBlotterOrFilter("positions", scope);

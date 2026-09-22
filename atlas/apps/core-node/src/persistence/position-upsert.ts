@@ -162,7 +162,9 @@ export interface PositionUpsertResult {
  * two row shapes (stamped, then legacy) — never a loop.
  *
  * @param params.row Mapped position row without the stamp columns.
- * @param params.stamp Active session stamp; `null` keeps the opening session's stamp (hydrated positions).
+ * @param params.stamp Session stamp to persist (see `resolvePositionWriteStamp` in
+ *   `position-session-restamp.ts`); `null` writes the legacy shape and leaves the
+ *   row's existing `session_id` untouched (live: opening session keeps it).
  * @param params.sessionSupport Shared per-table memory of the stamp columns' presence.
  * @param params.conflictSupport Shared memory of the accepted conflict target.
  * @param params.upsert The actual Supabase upsert for one payload + conflict target.

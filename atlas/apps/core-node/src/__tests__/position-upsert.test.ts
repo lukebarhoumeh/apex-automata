@@ -29,6 +29,7 @@ import {
   upsertPositionRow,
   type PositionsConflictTarget,
 } from '../persistence/position-upsert';
+import { resolvePositionWriteStamp } from '../persistence/position-session-restamp';
 import { SessionColumnSupport } from '../persistence/session-stamp';
 import { PositionTracker, type Position, type PositionTrackerConfig } from '../trading/position-tracker';
 import type { Fill } from '../exchanges/coinbase';
@@ -217,7 +218,7 @@ describe('upsertPositionRow', () => {
     expect(conflictSupport.snapshot().fellBack).toBe(false);
   });
 
-  it('keeps a hydrated position unstamped (opening session owns session_id) and still upserts on id', async () => {
+  it('a null stamp (live hydrated position: opening session keeps session_id) writes the legacy shape and still upserts on id', async () => {
     const table = liveSchemaPositionsTable();
     const conflictSupport = new PositionsConflictTargetSupport(POSITIONS_CONFLICT_TARGET_ID);
     const row = openRow({ closed_at: '2026-09-21T18:02:11.000Z', exit_price: 4400, exit_reason: 'take_profit', realized_pnl_usd: 3.9 });
@@ -367,7 +368,7 @@ describe('paper fill → positions row (live schema, session-stamped)', () => {
 
     // Same composition as api/server.ts: every position event → upsertPositionRow.
     const persist = async (position: Position) => {
-      const stamp = position.metadata?.hydratedFromSupabase ? null : STAMP;
+      const stamp = resolvePositionWriteStamp(position, STAMP);
       persisted.push(await upsertPositionRow({ row: mapPositionRow(position), stamp, sessionSupport, conflictSupport, upsert: table.upsert, logger }));
     };
     const pending: Promise<void>[] = [];

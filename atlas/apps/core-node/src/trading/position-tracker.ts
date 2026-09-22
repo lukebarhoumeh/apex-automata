@@ -161,6 +161,9 @@ export class PositionTracker extends EventEmitter {
    *   caller (TradingEngine) handles failure semantics (best-effort).
    * - Idempotent: clears the map first, so calling twice yields the same
    *   final state.
+   * - Does NOT touch the rows. Moving them onto the session that now manages
+   *   them (`positions.session_id`, paper only) is the API server's job once
+   *   the session is open — see persistence/position-session-restamp.ts.
    */
   public async hydrateOpenPositions(userId: string): Promise<number> {
     if (!userId) {
