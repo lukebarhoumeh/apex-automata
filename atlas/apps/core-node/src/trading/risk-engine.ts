@@ -228,7 +228,11 @@ export interface PaperKillLadderSizing {
 export type RiskStateResetSource = 'startup_reset' | 'day_boundary' | 'manual_resume';
 
 /** Why a paper-kill-ladder `risk_events` row was retired (audit log context). */
-export type LadderClearSource = 'ladder_size_escalation' | 'ladder_day_rollover' | 'ladder_pause_expired';
+export type LadderClearSource =
+  | 'ladder_session_start'
+  | 'ladder_size_escalation'
+  | 'ladder_day_rollover'
+  | 'ladder_pause_expired';
 
 export class RiskEngine extends EventEmitter {
   private config: RiskEngineConfig;
@@ -839,6 +843,12 @@ export class RiskEngine extends EventEmitter {
 
         if (resetSource) {
           await this.persistClearedRiskState(resetSource);
+        } else if (this.paperKillLadder) {
+          // The ladder is in-memory and starts empty on every boot, so soft
+          // rows left active by the previous process (freezes, pauses, caps)
+          // would otherwise advertise rungs this runtime is not enforcing.
+          // Size caps re-derive from the restored streak on the first tick.
+          await this.clearStaleRiskEvents('ladder_session_start', { eventTypes: LADDER_SOFT_REASON_CODES });
         }
 
         // risk_metrics only records *that* the switch is latched, not why.

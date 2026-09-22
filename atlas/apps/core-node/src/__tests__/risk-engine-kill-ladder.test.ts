@@ -852,5 +852,41 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
         expect(status.reasonCode).toBeUndefined();
       }
     );
+
+    test('a restart without CLEAR retires stale soft rows (the in-memory ladder starts empty) but leaves halts alone', async () => {
+      harness.respond('risk_metrics.select', () => ({ data: { ...latched(), kill_switch_active: false, consecutive_losses: 4 } }));
+      engine = await waitForLoaders(new RiskEngine(baseConfig, mockLogger as any, positionTracker));
+      await flush();
+
+      // Restored streak (4) re-derives the L1 cap on the first tick.
+      expect(engine.getMetrics().consecutiveLosses).toBe(4);
+      (engine as any).checkKillSwitches();
+      expect(engine.applyPaperKillLadderSizing(1).multiplier).toBe(0.5);
+      expect(engine.getRiskStatus()).toMatchObject({ tradingState: 'RUNNING', paperKillLadder: { frozenStrategies: [], regimePauses: [] } });
+
+      const sweep = harness.callsFor('risk_events', 'update').find((c) => c.filters.some(([m, col]) => m === 'in' && col === 'event_type'));
+      expect(sweep).toBeDefined();
+      expect(sweep!.payload).toMatchObject({ active: false });
+      expect(sweep!.filters).toEqual(
+        expect.arrayContaining([
+          ['eq', 'user_id', USER_ID],
+          ['eq', 'active', true],
+          ['eq', 'execution_mode', 'paper'],
+          ['in', 'event_type', ['size_down_consec', 'size_down_daily_r', 'strategy_freeze', 'regime_pause', 'sleeve_halt']],
+        ])
+      );
+      // Only soft codes are in scope — never an unscoped sweep that would retire a real halt row.
+      for (const update of harness.callsFor('risk_events', 'update')) {
+        expect(update.filters.some(([m, col]) => m === 'in' && col === 'event_type')).toBe(true);
+      }
+    });
+
+    test('without the ladder a restart performs no risk_events writes (restore stays read-only)', async () => {
+      harness.respond('risk_metrics.select', () => ({ data: { ...latched(), kill_switch_active: false } }));
+      engine = await waitForLoaders(new RiskEngine({ ...baseConfig, guardrails: baseGuardrails }, mockLogger as any, positionTracker));
+      await flush();
+      expect(harness.callsFor('risk_events', 'update')).toHaveLength(0);
+      expect(harness.callsFor('risk_events', 'insert')).toHaveLength(0);
+    });
   });
 });
