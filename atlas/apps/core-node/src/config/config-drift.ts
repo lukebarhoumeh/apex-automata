@@ -104,6 +104,19 @@ export const SCALAR_PINS: readonly ScalarPin[] = [
   // routing must stay untouched (CONFIRM_LIVE locked) — reaching live needs a
   // two-file change, never a one-line YAML flip.
   { key: 'regime_gates.paper_only', expected: true },
+  // Graduated paper kill ladder (Risk desk SoT 2026-09-22). The `enabled`
+  // flags are deliberately NOT pinned (feature flags); the rung thresholds are.
+  { key: 'paper_kill_ladder.l1_size_down.consecutive_losses', expected: 3 },
+  { key: 'paper_kill_ladder.l1_size_down.daily_r', expected: -1.0 },
+  { key: 'paper_kill_ladder.l1_size_down.position_multiplier', expected: 0.5 },
+  { key: 'paper_kill_ladder.l2_size_down.consecutive_losses', expected: 5 },
+  { key: 'paper_kill_ladder.l2_size_down.daily_r', expected: -2.0 },
+  { key: 'paper_kill_ladder.l2_size_down.position_multiplier', expected: 0.25 },
+  { key: 'paper_kill_ladder.l3_strategy_freeze.consecutive_losses', expected: 4 },
+  { key: 'paper_kill_ladder.l4_regime_pause.stop_outs', expected: 2 },
+  { key: 'paper_kill_ladder.l6_hard_kill.daily_r', expected: -4.0 },
+  { key: 'paper_kill_ladder.l6_hard_kill.consecutive_losses', expected: 12 },
+  { key: 'paper_kill_ladder.l6_hard_kill.consecutive_losses_daily_r', expected: -2.0 },
 ];
 
 /**

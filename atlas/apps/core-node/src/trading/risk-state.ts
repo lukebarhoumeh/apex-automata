@@ -18,6 +18,7 @@ import { Logger } from '../core/logger';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import type { ExecutionMode } from './risk/types';
 import { ExecutionModeScope, normalizeExecutionMode } from './risk/execution-mode-scope';
+import { isLadderSoftReasonCode } from './risk/paper-kill-ladder';
 
 /**
  * Halt reason codes (exhaustive list)
@@ -65,6 +66,8 @@ export interface HaltContext {
   errorRate?: number;
   latencyMs?: number;
   drawdownPct?: number;
+  /** Set (6) when the paper kill ladder's L6 latched this halt. */
+  ladderLevel?: number;
 }
 
 /**
@@ -91,6 +94,14 @@ const riskStateGauge = new Gauge({
   name: 'atlas_risk_state',
   help: 'Current risk state (0=running, 1=paused, 2=halted)',
 });
+
+/**
+ * How many of today's still-open `risk_events` rows `loadPersistedState()`
+ * scans for the halt to restore. Soft paper-kill-ladder rows share the table,
+ * so a single-row read could return a `size_down_*` audit row instead of the
+ * halt underneath it.
+ */
+const PERSISTED_HALT_SCAN_LIMIT = 25;
 
 /**
  * Risk state machine configuration
@@ -490,6 +501,11 @@ export class RiskStateMachine extends EventEmitter {
    * session's `execution_mode` are considered (a paper halt must never be
    * restored into a live session); pre-migration the read is unscoped, as
    * before.
+   *
+   * The paper kill ladder writes its soft rungs (`size_down_*`,
+   * `strategy_freeze`, `regime_pause`, `sleeve_halt`) to the same table as
+   * still-open audit rows. Those are not halts, so the newest row is only
+   * taken as the halt to restore after skipping them.
    */
   public async loadPersistedState(): Promise<void> {
     if (!this.supabase || !this.userId) return;
@@ -510,7 +526,7 @@ export class RiskStateMachine extends EventEmitter {
         if (scoped) {
           query = query.eq('execution_mode', this.modeScope.mode);
         }
-        return query.order('triggered_at', { ascending: false }).limit(1);
+        return query.order('triggered_at', { ascending: false }).limit(PERSISTED_HALT_SCAN_LIMIT);
       };
 
       const { data, error } = await this.modeScope.query('risk_events', 'select', () => load(true), () => load(false));
@@ -520,8 +536,9 @@ export class RiskStateMachine extends EventEmitter {
         return;
       }
 
-      if (data && data.length > 0) {
-        const event = data[0];
+      const haltRows = Array.isArray(data) ? data.filter((row) => !isLadderSoftReasonCode(row?.event_type)) : [];
+      if (haltRows.length > 0) {
+        const event = haltRows[0];
         const details = event.details || {};
         const reasonCode = (event.event_type as RiskHaltReasonCode) || 'unknown';
         

@@ -4,16 +4,25 @@ import { Logger } from '../core/logger';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { OrderRequest } from '../exchanges/coinbase';
 import { Position, PositionTracker } from './position-tracker';
-import { GuardrailConfig } from '../config/loadGuardrails';
+import { GuardrailConfig, resolvePaperKillLadderConfig } from '../config/loadGuardrails';
 import {
   RiskStateMachine,
   RiskHaltReasonCode,
+  HaltContext,
   TradingState,
   createDailyStopHalt,
   createConsecutiveLossesHalt,
   createMaxDrawdownHalt,
   isDailyHaltReason,
 } from './risk-state';
+import {
+  PaperKillLadder,
+  LADDER_SOFT_REASON_CODES,
+  type LadderEntryDecision,
+  type LadderHardKill,
+  type LadderTransition,
+  type PaperKillLadderStatus,
+} from './risk/paper-kill-ladder';
 import {
   RiskMath,
   RiskSnapshot,
@@ -194,6 +203,20 @@ export interface RiskEngineEvents {
   'risk:limit:reached': (limit: string, value: number, threshold: number) => void;
   'risk:killswitch:triggered': (reason: string) => void;
   'risk:metrics:update': (metrics: RiskMetrics) => void;
+  /** Paper kill ladder soft rung (L1–L5) escalation. L6 arrives as `risk:killswitch:triggered`. */
+  'risk:ladder:transition': (transition: LadderTransition) => void;
+}
+
+/** Sizing decision after the paper kill ladder's L1/L2 cap (see `applyPaperKillLadderSizing`). */
+export interface PaperKillLadderSizing {
+  /** Multiplier the router must apply: `min(requested, cap)`; equals the request when no rung is active. */
+  multiplier: number;
+  /** Active cap (1 when the ladder is off or no size rung is armed). */
+  cap: number;
+  /** 0 = none, 1 = L1, 2 = L2. */
+  sizeLevel: 0 | 1 | 2;
+  /** True when the cap actually reduced the requested multiplier. */
+  capped: boolean;
 }
 
 /**
@@ -203,6 +226,13 @@ export interface RiskEngineEvents {
  * discard or an operator `RESUME TRADING`.
  */
 export type RiskStateResetSource = 'startup_reset' | 'day_boundary' | 'manual_resume';
+
+/** Why a paper-kill-ladder `risk_events` row was retired (audit log context). */
+export type LadderClearSource =
+  | 'ladder_session_start'
+  | 'ladder_size_escalation'
+  | 'ladder_day_rollover'
+  | 'ladder_pause_expired';
 
 export class RiskEngine extends EventEmitter {
   private config: RiskEngineConfig;
@@ -258,6 +288,13 @@ export class RiskEngine extends EventEmitter {
 
   // TASK_014 P5: execution-mode scoping of persisted risk state (same mode as above).
   private readonly modeScope: ExecutionModeScope;
+
+  /**
+   * Graduated paper kill ladder L1–L6 (Risk desk SoT 2026-09-22). `null` in
+   * live mode or when `guardrails.paper_kill_ladder.enabled` is false, in
+   * which case every kill-switch path below behaves exactly as before.
+   */
+  private readonly paperKillLadder: PaperKillLadder | null;
 
   constructor(
     config: RiskEngineConfig,
@@ -373,6 +410,21 @@ export class RiskEngine extends EventEmitter {
       dailyStopThresholdR: this.dailyStopThresholdR,
       riskUnitUsd: this.riskMath.computeRiskUnit(),
     });
+
+    // Paper-only by construction: a live engine never instantiates the ladder,
+    // so live sizing, live loss stops and CONFIRM_LIVE are untouched.
+    const ladderConfig = resolvePaperKillLadderConfig(this.guardrails);
+    this.paperKillLadder =
+      this.executionMode === 'paper' && ladderConfig.enabled ? new PaperKillLadder(ladderConfig) : null;
+    if (this.paperKillLadder) {
+      const status = this.paperKillLadder.getStatus(Date.now());
+      this.logger.warn('Paper kill ladder enabled (paper-only divergence from live)', {
+        thresholds: status.thresholds,
+        supersedesLegacyDailyStopAndStreakKill: this.paperKillLadder.isHardKillEnabled(),
+        legacyDailyStopThresholdR: this.dailyStopThresholdR,
+        legacyConsecutiveLossLimit: this.config.killSwitches.consecutiveLossLimit,
+      });
+    }
     
     // Trade outcome hooks (drives consecutive loss + per-symbol loss tracking)
     this.positionTracker.on('position:closed', (position: Position) => {
@@ -470,6 +522,206 @@ export class RiskEngine extends EventEmitter {
     } else {
       this.metrics.consecutiveLosses = 0;
     }
+
+    if (this.paperKillLadder) {
+      this.runPaperKillLadderOnClose(position, realized);
+    }
+  }
+
+  // ============ Paper kill ladder (L1–L6) ============
+
+  /**
+   * Feed a closed trade to the ladder and evaluate every rung immediately,
+   * on a fresh risk snapshot rather than the last 5s tick, so a losing close
+   * escalates before the next entry can be sized.
+   */
+  private runPaperKillLadderOnClose(position: Position, realized: number): void {
+    const ladder = this.paperKillLadder;
+    if (!ladder) return;
+    const now = Date.now();
+
+    const closeTransitions = ladder.recordClosedTrade({
+      strategy: position.strategy,
+      symbol: position.symbol,
+      realizedPnl: realized,
+      exitReason: position.exitReason,
+      regime: typeof position.metadata?.regime === 'string' ? position.metadata.regime : undefined,
+      now,
+    });
+
+    const portfolio = this.positionTracker.getPortfolioSummary();
+    const snapshot = this.riskMath.computeSnapshot(
+      portfolio.totalRealizedPnL || 0,
+      portfolio.totalUnrealizedPnL || 0,
+    );
+    const evaluation = ladder.evaluate({
+      consecutiveLosses: this.metrics.consecutiveLosses,
+      dailyR: snapshot.dailyPnlR,
+      now,
+    });
+
+    this.applyPaperKillLadderOutcome([...closeTransitions, ...evaluation.transitions], evaluation.hardKill);
+  }
+
+  /**
+   * Tick-driven ladder pass (from `checkKillSwitches`): unrealized P&L can
+   * cross a daily-R rung between closes, and expired regime pauses are
+   * released here so their audit rows get `cleared_at`.
+   */
+  private runPaperKillLadderOnTick(): void {
+    const ladder = this.paperKillLadder;
+    if (!ladder) return;
+    const now = Date.now();
+    const snapshot = this.riskMath.getSnapshot();
+    const evaluation = ladder.evaluate({
+      consecutiveLosses: this.metrics.consecutiveLosses,
+      dailyR: snapshot?.dailyPnlR ?? 0,
+      now,
+    });
+    this.applyPaperKillLadderOutcome(evaluation.transitions, evaluation.hardKill);
+
+    for (const pause of ladder.takeExpiredRegimePauses(now)) {
+      this.logger.info('Paper kill ladder L4 regime pause expired', pause);
+      void this.clearStaleRiskEvents('ladder_pause_expired', {
+        eventTypes: ['regime_pause'],
+        details: { strategy: pause.strategy, regime: pause.regime },
+      });
+    }
+  }
+
+  /**
+   * Log + emit + persist every soft transition, then latch the kill switch
+   * when L6 fired. Soft rungs (L1–L5) never touch `killSwitchActive`.
+   */
+  private applyPaperKillLadderOutcome(transitions: LadderTransition[], hardKill: LadderHardKill | null): void {
+    for (const transition of transitions) {
+      this.logger.warn(`PAPER_KILL_LADDER L${transition.level}: ${transition.reasonText}`, {
+        reasonCode: transition.reasonCode,
+        ...transition.context,
+      });
+      this.emit('risk:ladder:transition', transition);
+      void this.persistLadderTransition(transition);
+    }
+
+    if (hardKill && !this.killSwitchActive) {
+      this.triggerKillSwitch(hardKill.reasonText, hardKill.reasonCode, hardKill.context);
+    }
+  }
+
+  /**
+   * True while the ladder's L6 is the paper authority for the daily-R stop and
+   * the losing-streak hard kill. The legacy `daily_stop` (R + USD) and
+   * `consecutive_losses` triggers are skipped in that case so the two systems
+   * cannot race to different thresholds; every other existing halt
+   * (weekly, max drawdown, rapid loss, error rate, latency, data gap, manual)
+   * is unchanged.
+   */
+  private ladderOwnsDailyStop(): boolean {
+    return this.paperKillLadder?.isHardKillEnabled() ?? false;
+  }
+
+  /** Daily stop in R that is actually in force (ladder L6 when it owns the stop, legacy otherwise). */
+  private effectiveDailyStopThresholdR(): number {
+    return this.ladderOwnsDailyStop() && this.paperKillLadder
+      ? this.paperKillLadder.getHardKillDailyR()
+      : this.dailyStopThresholdR;
+  }
+
+  /**
+   * Write one `risk_events` audit row per soft transition, stamped with the
+   * session's execution mode. A size escalation first retires the previous
+   * `size_down_*` row so `active=true` always describes the cap in force.
+   * Never throws: persistence must not break the trade-close path.
+   */
+  private async persistLadderTransition(transition: LadderTransition): Promise<void> {
+    if (!this.userId) return;
+    const userId = this.userId;
+
+    try {
+      if (transition.level === 1 || transition.level === 2) {
+        await this.clearStaleRiskEvents('ladder_size_escalation', {
+          eventTypes: ['size_down_consec', 'size_down_daily_r'],
+        });
+      }
+
+      const row = {
+        user_id: userId,
+        event_type: transition.reasonCode,
+        details: {
+          ...transition.context,
+          eventType: 'ladder',
+          ladderLevel: transition.level,
+          reasonCode: transition.reasonCode,
+          reasonText: transition.reasonText,
+          ...(transition.positionMultiplier !== undefined ? { positionMultiplier: transition.positionMultiplier } : {}),
+          ...(transition.strategy ? { strategy: transition.strategy } : {}),
+          ...(transition.regime ? { regime: transition.regime } : {}),
+          // ISO for the audit row (the context carries the epoch-ms form).
+          ...(transition.until !== undefined ? { until: new Date(transition.until).toISOString() } : {}),
+        },
+        triggered_at: new Date(transition.at).toISOString(),
+      };
+
+      const { error } = await this.modeScope.query(
+        'risk_events',
+        'insert',
+        () => this.supabase.from('risk_events').insert({ ...row, execution_mode: this.modeScope.mode }),
+        () => this.supabase.from('risk_events').insert(row),
+      );
+      if (error) {
+        if (isMissingTableError(error)) {
+          this.logger.debug('risk_events table not available');
+          return;
+        }
+        this.logger.error('Failed to persist paper kill ladder event', {
+          code: error.code,
+          message: error.message,
+          reasonCode: transition.reasonCode,
+          level: transition.level,
+        });
+      }
+    } catch (error) {
+      this.logger.error('Error persisting paper kill ladder event', error);
+    }
+  }
+
+  /** The ladder instance (null in live mode or when disabled). */
+  public getPaperKillLadder(): PaperKillLadder | null {
+    return this.paperKillLadder;
+  }
+
+  /** Ladder status for `/api/status` / `/api/risk/status`; `{ enabled: false }` when off. */
+  public getPaperKillLadderStatus(): PaperKillLadderStatus | { enabled: false } {
+    return this.paperKillLadder ? this.paperKillLadder.getStatus(Date.now()) : { enabled: false };
+  }
+
+  /**
+   * Router-side entry gate for L3 (strategy frozen) and L4 (strategy x entry
+   * regime paused). Returns `null` when the ladder is off so callers can
+   * short-circuit without special-casing live.
+   *
+   * @param input.strategy Signal strategy id.
+   * @param input.regime Regime stamped on the signal (`signal.metadata.regime`), if any.
+   */
+  public checkPaperKillLadderEntry(input: { strategy: string; regime?: string }): LadderEntryDecision | null {
+    if (!this.paperKillLadder) return null;
+    return this.paperKillLadder.checkEntry({ ...input, now: Date.now() });
+  }
+
+  /**
+   * Apply the L1/L2 position-multiplier cap to the router's requested
+   * multiplier. Identity when the ladder is off or no size rung is armed.
+   *
+   * @param requested The regime/meta-filter multiplier from the signal (defaults to 1).
+   */
+  public applyPaperKillLadderSizing(requested = 1): PaperKillLadderSizing {
+    const safeRequested = Number.isFinite(requested) && requested > 0 ? requested : 1;
+    if (!this.paperKillLadder) {
+      return { multiplier: safeRequested, cap: 1, sizeLevel: 0, capped: false };
+    }
+    const cap = this.paperKillLadder.getPositionMultiplierCap();
+    const multiplier = this.paperKillLadder.capPositionMultiplier(safeRequested);
+    return { multiplier, cap, sizeLevel: this.paperKillLadder.getSizeLevel(), capped: multiplier < safeRequested };
   }
   
   /**
@@ -591,6 +843,12 @@ export class RiskEngine extends EventEmitter {
 
         if (resetSource) {
           await this.persistClearedRiskState(resetSource);
+        } else if (this.paperKillLadder) {
+          // The ladder is in-memory and starts empty on every boot, so soft
+          // rows left active by the previous process (freezes, pauses, caps)
+          // would otherwise advertise rungs this runtime is not enforcing.
+          // Size caps re-derive from the restored streak on the first tick.
+          await this.clearStaleRiskEvents('ladder_session_start', { eventTypes: LADDER_SOFT_REASON_CODES });
         }
 
         // risk_metrics only records *that* the switch is latched, not why.
@@ -1381,7 +1639,9 @@ export class RiskEngine extends EventEmitter {
     const dailyLoss = this.dailyStartEquity - currentEquity;
     const soft = this.getSoftLaunch();
     const dailyLimitUsd = soft ? this.scaleUsd(this.dailyLossLimitUsd, soft.maxDailyLossMultiplier) : this.dailyLossLimitUsd;
-    if (!this.killSwitchActive && dailyLoss >= dailyLimitUsd) {
+    // Skipped while the paper kill ladder's L6 owns the daily stop (its
+    // daily-R rung replaces this USD guardrail in paper).
+    if (!this.killSwitchActive && !this.ladderOwnsDailyStop() && dailyLoss >= dailyLimitUsd) {
       this.triggerKillSwitch(
         `Daily loss guardrail tripped: -$${dailyLoss.toFixed(2)}`,
         'daily_stop'
@@ -1496,36 +1756,49 @@ export class RiskEngine extends EventEmitter {
       return;
     }
 
-    // Check daily loss kill switch (use R-based threshold from risk math)
-    const snapshot = this.riskMath.getSnapshot();
-    if (snapshot && this.riskMath.isDailyStopTriggered(this.dailyStopThresholdR)) {
-      const halt = createDailyStopHalt(
-        snapshot.dailyPnlUsd,
-        snapshot.dailyPnlR,
-        this.dailyStopThresholdR
-      );
-      this.triggerKillSwitch(halt.reasonText, halt.reasonCode);
-      return;
+    // Paper kill ladder: tick-driven L1/L2 escalation + L6 hard kill. When L6
+    // is enabled it is the paper authority for the daily-R stop and the
+    // losing-streak kill, so the legacy versions of those two checks below
+    // are skipped (everything else in this method still runs).
+    if (this.paperKillLadder) {
+      this.runPaperKillLadderOnTick();
+      if (this.killSwitchActive) {
+        return;
+      }
     }
 
-    // Fallback: Check daily loss in USD
-    const dailyLossLimit = this.getEffectiveKillSwitchDailyLossUsd();
-    if (this.metrics.dailyPnL <= -dailyLossLimit) {
-      this.triggerKillSwitch(
-        `Daily loss limit exceeded: -$${Math.abs(this.metrics.dailyPnL).toFixed(2)}`,
-        'daily_stop'
-      );
-      return;
-    }
+    if (!this.ladderOwnsDailyStop()) {
+      // Check daily loss kill switch (use R-based threshold from risk math)
+      const snapshot = this.riskMath.getSnapshot();
+      if (snapshot && this.riskMath.isDailyStopTriggered(this.dailyStopThresholdR)) {
+        const halt = createDailyStopHalt(
+          snapshot.dailyPnlUsd,
+          snapshot.dailyPnlR,
+          this.dailyStopThresholdR
+        );
+        this.triggerKillSwitch(halt.reasonText, halt.reasonCode);
+        return;
+      }
 
-    // Check consecutive losses
-    if (this.metrics.consecutiveLosses >= this.config.killSwitches.consecutiveLossLimit) {
-      const halt = createConsecutiveLossesHalt(
-        this.metrics.consecutiveLosses,
-        this.config.killSwitches.consecutiveLossLimit
-      );
-      this.triggerKillSwitch(halt.reasonText, halt.reasonCode);
-      return;
+      // Fallback: Check daily loss in USD
+      const dailyLossLimit = this.getEffectiveKillSwitchDailyLossUsd();
+      if (this.metrics.dailyPnL <= -dailyLossLimit) {
+        this.triggerKillSwitch(
+          `Daily loss limit exceeded: -$${Math.abs(this.metrics.dailyPnL).toFixed(2)}`,
+          'daily_stop'
+        );
+        return;
+      }
+
+      // Check consecutive losses
+      if (this.metrics.consecutiveLosses >= this.config.killSwitches.consecutiveLossLimit) {
+        const halt = createConsecutiveLossesHalt(
+          this.metrics.consecutiveLosses,
+          this.config.killSwitches.consecutiveLossLimit
+        );
+        this.triggerKillSwitch(halt.reasonText, halt.reasonCode);
+        return;
+      }
     }
 
     // Check error rate
@@ -1553,7 +1826,7 @@ export class RiskEngine extends EventEmitter {
    * default let un-coded callers persist an `unknown` halt that the desk
    * could not tell apart from a real loss stop.
    */
-  private triggerKillSwitch(reason: string, reasonCode: RiskHaltReasonCode): void {
+  private triggerKillSwitch(reason: string, reasonCode: RiskHaltReasonCode, extraContext?: Partial<HaltContext>): void {
     if (this.killSwitchActive) {
       return; // Already triggered
     }
@@ -1569,9 +1842,10 @@ export class RiskEngine extends EventEmitter {
     this.riskStateMachine.halt(reasonCode, reason, daily, {
       dailyPnlUsd: snapshot?.dailyPnlUsd,
       dailyPnlR: snapshot?.dailyPnlR,
-      thresholdR: this.dailyStopThresholdR,
+      thresholdR: this.effectiveDailyStopThresholdR(),
       consecutiveLosses: this.metrics.consecutiveLosses,
       errorRate: this.metrics.errorRate,
+      ...extraContext,
     });
     
     // Emit legacy event for backward compatibility
@@ -1786,13 +2060,34 @@ export class RiskEngine extends EventEmitter {
    * Schema-tolerant: if the deployed `risk_events` has no `active` column
    * (older snapshots), falls back to stamping `cleared_at` on rows where it
    * is still NULL.
+   *
+   * The paper kill ladder narrows the sweep with `scope`: `eventTypes`
+   * restricts it to its own soft codes (a size escalation retires the
+   * previous `size_down_*` row; a rollover retires the size rows only) and
+   * `details` matches `details->>key = value` (an expired L4 pause clears just
+   * that strategy x regime row). Without `scope` every active row goes, as before.
    */
-  private async clearStaleRiskEvents(source: RiskStateResetSource): Promise<void> {
+  private async clearStaleRiskEvents(
+    source: RiskStateResetSource | LadderClearSource,
+    scope?: { eventTypes?: readonly string[]; details?: Record<string, string> },
+  ): Promise<void> {
     if (!this.userId) {
       return;
     }
     const userId = this.userId;
     const clearedAt = new Date().toISOString();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const applyScope = <Q extends { in: (col: string, values: readonly string[]) => any; eq: (col: string, v: unknown) => any }>(query: Q): Q => {
+      let q = query;
+      if (scope?.eventTypes && scope.eventTypes.length > 0) {
+        q = q.in('event_type', scope.eventTypes);
+      }
+      for (const [key, value] of Object.entries(scope?.details ?? {})) {
+        q = q.eq(`details->>${key}`, value);
+      }
+      return q;
+    };
 
     const clearActive = (scoped: boolean) => {
       let query = this.supabase
@@ -1803,7 +2098,7 @@ export class RiskEngine extends EventEmitter {
       if (scoped) {
         query = query.eq('execution_mode', this.modeScope.mode);
       }
-      return query;
+      return applyScope(query);
     };
     const clearByClearedAt = (scoped: boolean) => {
       let query = this.supabase
@@ -1814,7 +2109,7 @@ export class RiskEngine extends EventEmitter {
       if (scoped) {
         query = query.eq('execution_mode', this.modeScope.mode);
       }
-      return query;
+      return applyScope(query);
     };
 
     try {
@@ -1918,6 +2213,8 @@ export class RiskEngine extends EventEmitter {
       maxHeat: number;
       perTradeRisk: number;
     };
+    /** Paper kill ladder state (`{ enabled: false }` in live or when the block is off). */
+    paperKillLadder: PaperKillLadderStatus | { enabled: false };
   } {
     const stateStatus = this.riskStateMachine.getStatus();
     const mathStatus = this.riskMath.getStatus();
@@ -1926,10 +2223,11 @@ export class RiskEngine extends EventEmitter {
       ...stateStatus,
       ...mathStatus,
       thresholds: {
-        dailyStopR: this.dailyStopThresholdR,
+        dailyStopR: this.effectiveDailyStopThresholdR(),
         maxHeat: this.config.limits.maxTotalExposure / this.accountEquity,
         perTradeRisk: mathStatus.perTradeRiskPct / 100,
       },
+      paperKillLadder: this.getPaperKillLadderStatus(),
     };
   }
   
@@ -1966,6 +2264,15 @@ export class RiskEngine extends EventEmitter {
     this.metrics.dailyLossPercentage = 0;
     this.metrics.consecutiveLosses = 0;
     this.metrics.maxDrawdown = 0;
+
+    // New risk day: the daily-R rungs re-arm from zero, so the L1/L2 cap and
+    // the streak counters come off (session freezes and timed pauses stay).
+    if (this.paperKillLadder) {
+      this.paperKillLadder.resetForNewRiskDay();
+      await this.clearStaleRiskEvents('ladder_day_rollover', {
+        eventTypes: ['size_down_consec', 'size_down_daily_r'],
+      });
+    }
 
     this.logger.info('Daily risk metrics reset');
   }
@@ -2032,6 +2339,9 @@ export class RiskEngine extends EventEmitter {
     this.killSwitchActive = false;
     this.metrics.killSwitchActive = false;
     this.clearHaltCounters();
+    // Operator CLEAR releases every ladder rung (size caps, freezes, pauses);
+    // the persistClearedRiskState sweep below retires their audit rows too.
+    this.paperKillLadder?.reset();
     this.logger.info('Kill switch deactivated', { wasActive });
 
     await this.persistClearedRiskState('manual_resume');

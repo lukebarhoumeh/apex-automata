@@ -5,6 +5,7 @@ import { CoinbaseExchange, CoinbaseConfig, Ticker, OrderBook, Fill, OrderRequest
 import { OrderManager, OrderManagerConfig, ManagedOrder } from './order-manager';
 import { PositionTracker, PositionTrackerConfig, Position } from './position-tracker';
 import { RiskEngine, RiskEngineConfig, RiskMetrics } from './risk-engine';
+import type { LadderTransition } from './risk/paper-kill-ladder';
 import { SecretManager, SecretConfig } from '../config/secrets';
 import {
   PaperTradingSimulator,
@@ -1462,6 +1463,26 @@ export class TradingEngine extends EventEmitter {
       this.emit('risk:alert', { type: 'kill_switch', reasons: [reasonStr], message: reasonStr });
     });
     this.riskEngine!.on('risk:metrics:update', (metrics) => this.emit('risk:metrics', metrics));
+    // Paper kill ladder soft rungs (L1–L5). Surfaced like the fee-tier change:
+    // RiskEvent broadcast + alerts row. Not a kill switch — the engine keeps running.
+    this.riskEngine!.on('risk:ladder:transition', (transition: LadderTransition) => {
+      this.logger.warn(`Paper kill ladder L${transition.level} (${transition.reasonCode}): ${transition.reasonText}`);
+      this.emit('risk:alert', {
+        type: 'kill_ladder',
+        eventType: transition.reasonCode,
+        severity: 'warning',
+        title: `Paper kill ladder L${transition.level}`,
+        message: transition.reasonText,
+        level: transition.level,
+        reasonCode: transition.reasonCode,
+        strategy: transition.strategy,
+        regime: transition.regime,
+        positionMultiplier: transition.positionMultiplier,
+        until: transition.until,
+        details: transition.context,
+        timestamp: transition.at,
+      });
+    });
   }
 
   private async validateAndSubscribeToMarketData(): Promise<void> {
@@ -1675,6 +1696,7 @@ export class TradingEngine extends EventEmitter {
       stopPrice,
       takeProfit,
       tag: managedOrder?.metadata?.tag,
+      regime: typeof managedOrder?.metadata?.regime === 'string' ? managedOrder.metadata.regime : undefined,
     });
     
     // Update risk engine metrics

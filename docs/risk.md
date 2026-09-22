@@ -47,6 +47,11 @@ The system uses an explicit state machine for trading permissions.
 
 **Daily halts** auto-clear on risk day rollover. Non-daily halts require manual reset.
 
+The paper kill ladder (below) writes additional *soft* codes to `risk_events`
+(`size_down_consec`, `size_down_daily_r`, `strategy_freeze`, `regime_pause`,
+`sleeve_halt`). They are audit rows, not halts: they never set
+`kill_switch_active` and are never restored as a halt.
+
 ## Risk Math (R Units)
 
 All risk calculations use a consistent "R" unit system.
@@ -248,6 +253,72 @@ By default, paper and live modes have **identical** risk behavior:
 Explicit opt-out flags (off by default):
 - `RISK_DISABLE_ERROR_RATE_IN_PAPER`
 - `RISK_RESET_KILLSWITCH_ON_PAPER_START`
+
+The graduated paper kill ladder below is a deliberate, desk-approved paper-only
+divergence (`guardrails.paper_kill_ladder`); the RiskEngine logs it as such at
+startup.
+
+## Graduated Paper Kill Ladder (L1–L6)
+
+Risk desk SoT 2026-09-22. **Paper execution mode only** — the `RiskEngine` builds
+`PaperKillLadder` (`atlas/apps/core-node/src/trading/risk/paper-kill-ladder.ts`)
+only when `executionMode === 'paper'` and `guardrails.paper_kill_ladder.enabled`
+is true. Live never reads the block; `CONFIRM_LIVE` is untouched. Deleting the
+block or setting `enabled: false` restores the pre-ladder paper behaviour exactly.
+
+Definitions: **consec** is the *portfolio* losing streak of closed trades (any
+strategy — `RiskEngine.metrics.consecutiveLosses`); **dailyR** is day P&L
+(realized + unrealized) in R. L3 uses a *per-strategy* streak; L6 uses the
+portfolio streak.
+
+| Level | Trigger | Action | `risk_events.event_type` | `kill_switch_active` |
+|-------|---------|--------|--------------------------|----------------------|
+| L1 | consec ≥ 3 **or** dailyR ≤ −1.0 | new entries capped at `position_multiplier` 0.5 | `size_down_consec` / `size_down_daily_r` | no |
+| L2 | consec ≥ 5 **or** dailyR ≤ −2.0 | cap 0.25 (retires the L1 row) | same codes, `details.ladderLevel = 2` | no |
+| L3 | ≥ 4 consecutive losses in **one** strategy | that strategy frozen for the session | `strategy_freeze` | no |
+| L4 | `trend_follow` stopped out (`stop_loss` / `trailing_stop`, losing) twice with entry regime `weak_trend` / `choppy` | that strategy × regime paused `pause_hours` (4h) | `regime_pause` | no |
+| L5 | sleeve breach | prep only — sleeves are not wired; disabled stub | `sleeve_halt` | no |
+| L6 | dailyR ≤ −4 **or** (consec ≥ 12 **and** dailyR ≤ −2) | hard kill | `daily_stop` / `consecutive_losses` (existing structured codes, `details.ladderLevel = 6`, never `unknown`) | **yes** |
+
+Existing `max_drawdown`, `weekly_stop`, `rapid_loss`, `error_rate`, `latency`,
+`data_gap` and `manual_killswitch` halts are unchanged and still latch the kill
+switch. While L6 is enabled it **replaces** the legacy paper daily stop
+(`risk.daily_loss_limit` as R and USD) and the `CONSECUTIVE_LOSS_LIMIT` (8)
+kill, so `RiskEngine.getRiskStatus().thresholds.dailyStopR` reports the L6 daily-R rung.
+
+Where the rungs bite:
+
+- **Sizing** — the router (`api/server.ts` `signal:generated`) applies the cap as
+  `min(signal position multiplier, cap)` via `RiskEngine.applyPaperKillLadderSizing()`
+  and logs `killLadderLevel` / `killLadderCap` on `Sizing order from signal`.
+- **Entry gate** — `RiskEngine.checkPaperKillLadderEntry({ strategy, regime })`
+  rejects L3-frozen strategies and L4-paused (strategy, entry regime) pairs;
+  rejections land in the signal funnel as stage `kill_ladder` with the ladder
+  reason code. Exits are never blocked.
+- **Regime attribution** — the signal's `metadata.regime` rides on the entry
+  order's metadata → `Position.metadata.regime`, which is what L4 reads on the
+  stop-out.
+- **Observability** — each soft transition is a `risk:ladder:transition` event
+  (forwarded as a `RiskEvent` broadcast + `alerts` row with `type: kill_ladder`),
+  one `risk_events` row, and the current state is on
+  `/api/risk/status.paperKillLadder` (`RiskEngine.getRiskStatus().paperKillLadder`
+  in code).
+
+Lifecycle:
+
+- Size caps **ratchet** (L1 → L2 only) for the risk day; a win resets the
+  streak but not the cap. Freezes hold for the session. Pauses expire on their
+  own (the tick retires their `risk_events` row).
+- **Clean session start after CLEAR** (`PAPER_RESET_RISK_STATE_ON_START`) and an
+  operator **RESUME TRADING** release every rung; the existing `risk_events`
+  sweep marks the ladder rows `active=false`.
+- **Risk-day rollover** lifts the size cap and streak counters and retires the
+  `size_down_*` rows; session freezes and timed pauses are kept.
+- Soft ladder rows share `risk_events` with halts, so
+  `RiskStateMachine.loadPersistedState()` skips them when restoring a halt.
+
+Thresholds are desk pins (`pnpm check:config`); the `enabled` flags per rung are
+free feature flags.
 
 ## Recovery
 

@@ -264,6 +264,105 @@ export function resolveLiveConfig(guardrails: { live?: LiveConfig }): LiveConfig
   return guardrails.live ?? LiveConfigSchema.parse({});
 }
 
+// ---------------------------------------------------------------------------
+// Graduated PAPER kill ladder L1–L6 (Risk desk SoT 2026-09-22).
+//
+// PAPER ONLY: RiskEngine builds the ladder only for `executionMode === 'paper'`;
+// a live session never reads this block, so the CONFIRM_LIVE path is untouched.
+// The block-level `enabled` is the master flag (absent block == disabled ==
+// today's behaviour); every rung carries its own flag so one level can be
+// switched off without disabling the ladder. Thresholds are desk pins
+// (`pnpm check:config`, config-drift.ts SCALAR_PINS).
+//
+//   L1/L2  portfolio consecutive losses OR dailyR  -> position_multiplier cap
+//   L3     per-strategy consecutive losses          -> strategy frozen for session
+//   L4     strategy x regime stop-outs              -> strategy x regime paused N hours
+//   L5     sleeve halt                              -> stub (sleeves not wired)
+//   L6     dailyR OR (consecutive losses AND dailyR)-> hard kill (kill_switch_active)
+// ---------------------------------------------------------------------------
+const LadderSizeDownSchema = z.object({
+  enabled: z.boolean().default(true),
+  /** Portfolio-level losing streak (closed trades, any strategy) that arms this rung. */
+  consecutive_losses: z.number().int().positive(),
+  /** Day P&L in R (negative) at or below which this rung arms. */
+  daily_r: z.number().negative(),
+  /** Upper bound applied to the router's position multiplier while this rung is active. */
+  position_multiplier: z.number().positive().max(1),
+});
+
+const PaperKillLadderSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    l1_size_down: LadderSizeDownSchema.default({ consecutive_losses: 3, daily_r: -1.0, position_multiplier: 0.5 }),
+    l2_size_down: LadderSizeDownSchema.default({ consecutive_losses: 5, daily_r: -2.0, position_multiplier: 0.25 }),
+    l3_strategy_freeze: z
+      .object({
+        enabled: z.boolean().default(true),
+        /** Consecutive losses in ONE strategy (session-scoped) that freeze it for the rest of the session. */
+        consecutive_losses: z.number().int().positive().default(4),
+      })
+      .default({}),
+    l4_regime_pause: z
+      .object({
+        enabled: z.boolean().default(true),
+        /** Strategies the rung watches (desk SoT: trend_follow). */
+        strategies: z.array(z.string()).default(['trend_follow']),
+        /** Entry regimes the rung watches (desk SoT: weak_trend / chop). */
+        regimes: z.array(RegimeNameSchema).default(['weak_trend', 'choppy']),
+        /** Losing stop-outs of (strategy, regime) that trigger the pause; the counter resets when it fires. */
+        stop_outs: z.number().int().positive().default(2),
+        /** Pause length in hours for that (strategy, regime) pair. */
+        pause_hours: z.number().positive().default(4),
+      })
+      .default({}),
+    l5_sleeve_halt: z
+      .object({
+        /** Prep only — sleeves are not wired, so this rung can never fire while false. */
+        enabled: z.boolean().default(false),
+      })
+      .default({}),
+    l6_hard_kill: z
+      .object({
+        enabled: z.boolean().default(true),
+        /** dailyR at or below this latches the kill switch (`daily_stop`). */
+        daily_r: z.number().negative().default(-4.0),
+        /** Portfolio losing streak that, together with `consecutive_losses_daily_r`, latches the kill switch (`consecutive_losses`). */
+        consecutive_losses: z.number().int().positive().default(12),
+        consecutive_losses_daily_r: z.number().negative().default(-2.0),
+      })
+      .default({}),
+  })
+  .superRefine((ladder, ctx) => {
+    const { l1_size_down: l1, l2_size_down: l2, l6_hard_kill: l6 } = ladder;
+    if (l2.consecutive_losses < l1.consecutive_losses) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['l2_size_down', 'consecutive_losses'], message: 'L2 consecutive_losses must be >= L1' });
+    }
+    if (l2.daily_r > l1.daily_r) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['l2_size_down', 'daily_r'], message: 'L2 daily_r must be <= L1 (more negative)' });
+    }
+    if (l2.position_multiplier > l1.position_multiplier) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['l2_size_down', 'position_multiplier'], message: 'L2 position_multiplier must be <= L1' });
+    }
+    if (l6.daily_r > l2.daily_r) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['l6_hard_kill', 'daily_r'], message: 'L6 daily_r must be <= L2 daily_r (the hard kill sits below the size-down rungs)' });
+    }
+    if (l6.consecutive_losses < l2.consecutive_losses) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['l6_hard_kill', 'consecutive_losses'], message: 'L6 consecutive_losses must be >= L2' });
+    }
+  })
+  .optional();
+
+export type PaperKillLadderConfig = NonNullable<z.infer<typeof PaperKillLadderSchema>>;
+
+/**
+ * Effective paper kill ladder config: the parsed block, or the disabled
+ * defaults when the block is absent (so fixtures and pre-ladder YAML keep
+ * today's behaviour).
+ */
+export function resolvePaperKillLadderConfig(guardrails: { paper_kill_ladder?: PaperKillLadderConfig }): PaperKillLadderConfig {
+  return guardrails.paper_kill_ladder ?? (PaperKillLadderSchema.parse({}) as PaperKillLadderConfig);
+}
+
 export const GuardrailsSchema = z.object({
   disabled_strategies: z.array(z.string()).optional().default([]),
   momentum: MomentumConfigSchema.optional(),
@@ -364,6 +463,9 @@ export const GuardrailsSchema = z.object({
   // Live-mode knobs (TASK_011). Optional; absent = fail-closed defaults via
   // `resolveLiveConfig()`. Paper mode ignores this block entirely.
   live: LiveConfigSchema.optional(),
+  // Graduated paper kill ladder L1–L6 (Risk desk SoT 2026-09-22). Optional;
+  // absent = disabled. Paper execution mode only — see `resolvePaperKillLadderConfig()`.
+  paper_kill_ladder: PaperKillLadderSchema,
   // A6 (2026-05-29) / TF-REGIME-GATE (2026-09-22) — regime-conditional entry
   // gates. Paper-only by default (`paper_only`), see RegimeGatesSchema.
   regime_gates: RegimeGatesSchema,

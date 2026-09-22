@@ -452,6 +452,66 @@ live:
   min_quote_usd: 20
   ev_gate_mode: enforce
 
+# ---------------------------------------------------------------------------
+# Graduated PAPER kill ladder L1–L6 (Risk desk SoT 2026-09-22). Tier-A, paper only.
+#
+# PAPER ONLY. atlas/apps/core-node/src/trading/risk/paper-kill-ladder.ts is built
+# by the RiskEngine only when execution_mode is `paper`; a live session never
+# reads this block and the CONFIRM_LIVE path is untouched. `enabled: false` (or
+# deleting the block) restores the pre-ladder paper behaviour exactly.
+#
+# Definitions: "consec" = PORTFOLIO consecutive losing closed trades (any
+# strategy; the RiskEngine streak). dailyR = day P&L (realized + unrealized) in
+# R, 1R = account.risk_per_trade × day-start equity ($50 at $10k / 0.5%). L3 uses
+# a PER-STRATEGY streak; L6 uses the portfolio streak.
+#
+#   L1  consec >= 3 OR dailyR <= -1.0 -> new entries capped at position_multiplier 0.5
+#       reason codes: size_down_consec / size_down_daily_r  (risk_events row, NOT kill_switch_active)
+#   L2  consec >= 5 OR dailyR <= -2.0 -> cap 0.25 (same codes, ladderLevel 2)
+#   L3  >= 4 consecutive losses in ONE strategy -> that strategy frozen for the session (strategy_freeze)
+#   L4  trend_follow stopped out twice in weak_trend / choppy (regime stamped at entry)
+#       -> trend_follow x that regime paused `pause_hours` hours (regime_pause)
+#   L5  sleeve_halt -> prep only; sleeves are not wired, so the rung is a disabled stub
+#   L6  dailyR <= -4 OR (consec >= 12 AND dailyR <= -2) -> HARD KILL: kill_switch_active with the
+#       existing structured codes (`daily_stop` / `consecutive_losses`, never `unknown`, #67).
+#       Existing max_drawdown / weekly_stop / rapid_loss / error_rate / latency / data_gap /
+#       manual_killswitch halts are unchanged. While L6 is enabled it REPLACES the legacy paper
+#       daily stop (risk.daily_loss_limit as R/USD) and the CONSECUTIVE_LOSS_LIMIT (8) hard kill.
+#
+# Size caps ratchet (L1 -> L2 only) for the risk day; freezes hold for the session; pauses
+# expire on their own. All ladder state resets on a clean session start after CLEAR
+# (PAPER_RESET_RISK_STATE_ON_START), on operator RESUME TRADING, and (caps/streaks) on
+# risk-day rollover. Thresholds are desk pins: `pnpm check:config` fails if they drift.
+# ---------------------------------------------------------------------------
+paper_kill_ladder:
+  enabled: true
+  l1_size_down:
+    enabled: true
+    consecutive_losses: 3
+    daily_r: -1.0
+    position_multiplier: 0.5
+  l2_size_down:
+    enabled: true
+    consecutive_losses: 5
+    daily_r: -2.0
+    position_multiplier: 0.25
+  l3_strategy_freeze:
+    enabled: true
+    consecutive_losses: 4
+  l4_regime_pause:
+    enabled: true
+    strategies: [trend_follow]
+    regimes: [weak_trend, choppy]
+    stop_outs: 2
+    pause_hours: 4
+  l5_sleeve_halt:
+    enabled: false
+  l6_hard_kill:
+    enabled: true
+    daily_r: -4.0
+    consecutive_losses: 12
+    consecutive_losses_daily_r: -2.0
+
 # A6 (2026-05-29) / TF-REGIME-GATE (2026-09-22) — Regime-conditional ENTRY
 # gates. ENABLED FOR PAPER ONLY.
 # ---------------------------------------------------------------------------
