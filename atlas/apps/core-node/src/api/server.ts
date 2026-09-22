@@ -51,6 +51,7 @@ import {
   type SignalRouteVerdict,
 } from '../exchanges/signal-route';
 import { observedWinRate } from '../trading/risk/ev-gate';
+import { runPaperBootGuard } from '../trading/risk/paper-boot-guard';
 import {
   activeSessionWindow,
   buildSessionScopeMeta,
@@ -1319,6 +1320,44 @@ app.post('/api/engine/start', async (req, res) => {
         return res.status(400).json({
           error: `Confirmation phrase '${expectedPhrase}' required to start live trading`,
         });
+      }
+    }
+
+    // Risk desk pin (2026-09-22 stand-down): a PAPER start is refused while the
+    // persisted paper risk state is latched — risk_metrics.kill_switch_active or
+    // an open halt risk_events row (consecutive_losses, daily_stop,
+    // manual_killswitch, ...) — unless the desk has set RISK_CLEAR=YES. Runs
+    // before anything is built: no engine, no minted session, no
+    // trading_sessions row. Soft ladder rows (L1–L5) never block. Unreadable
+    // risk state also refuses (503) — a paper session must not start on a
+    // latch it cannot see. See trading/risk/paper-boot-guard.ts.
+    if (mode === 'paper') {
+      const bootGuard = await runPaperBootGuard(supabase, { userId: USER_ID, mode, logger, env: process.env });
+      if (!bootGuard.allowed) {
+        logger.error('PAPER engine start REFUSED by the paper boot guard', {
+          code: bootGuard.code,
+          blockers: bootGuard.blockers,
+          warnings: bootGuard.warnings,
+          riskClearAuthorized: bootGuard.riskClearAuthorized,
+        });
+        return res.status(bootGuard.httpStatus).json({
+          error: bootGuard.error,
+          code: bootGuard.code,
+          blockers: bootGuard.blockers,
+          warnings: bootGuard.warnings,
+          remediation: bootGuard.remediation,
+          riskClearAuthorized: bootGuard.riskClearAuthorized,
+        });
+      }
+      if (bootGuard.code === 'PAPER_BOOT_RISK_CLEAR_OVERRIDE' || bootGuard.warnings.length > 0) {
+        logger.warn('Paper boot guard passed with caveats', {
+          code: bootGuard.code,
+          detail: bootGuard.error,
+          blockers: bootGuard.blockers,
+          warnings: bootGuard.warnings,
+        });
+      } else {
+        logger.info('Paper boot guard passed: persisted paper risk state is clear', { code: bootGuard.code });
       }
     }
 
