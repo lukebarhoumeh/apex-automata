@@ -24,6 +24,11 @@ import {
   resolvePositionsConflictTarget,
   upsertPositionRow,
 } from '../persistence/position-upsert';
+import {
+  resolvePositionWriteStamp,
+  restampHydratedOpenPositions,
+  type RestampOpenPositionsResult,
+} from '../persistence/position-session-restamp';
 import { writeSignalRouteVerdict } from '../persistence/signal-route-verdict';
 import {
   resolveRoutedExchange,
@@ -362,6 +367,11 @@ logger.info('positions upsert conflict target', positionsConflictSupport.snapsho
 // populated once the engine is actually running — see openTradingSession.
 let activeSessionStamp: SessionStamp | null = null;
 
+// Outcome of the most recent hydrated-position restamp (openTradingSession),
+// echoed on the /api/engine/start response so the desk can verify the DB and
+// the engine agree on session_id without a SQL round-trip.
+let lastHydrateRestamp: RestampOpenPositionsResult | null = null;
+
 const DEFAULT_LIVE_CONFIRM_PHRASE = 'ENABLE LIVE';
 
 // Supabase client
@@ -381,6 +391,64 @@ const supabase = createClient(
 function mintTradingSession(): { sessionId: string; startedAt: number } {
   const startedAt = Date.now();
   return { sessionId: `sess_${startedAt}_${Math.random().toString(36).slice(2, 8)}`, startedAt };
+}
+
+/**
+ * Move the `positions` rows of every position the engine hydrated at start
+ * onto the session that now manages them. Both Supabase calls are keyed by
+ * primary key `id` and fenced to this user's `closed_at IS NULL` rows; the
+ * decision tree (paper-only ownership, already-current rows, schema
+ * tolerance) lives in `persistence/position-session-restamp.ts`. Never throws
+ * — a failure is logged and reported in the result, not a failed start.
+ *
+ * @param stamp Session the hydrated rows should end up carrying.
+ */
+async function restampHydratedPositionsForSession(stamp: SessionStamp): Promise<RestampOpenPositionsResult> {
+  const hydrated = (tradingEngine?.getOpenPositions?.() ?? [])
+    .filter((p) => Boolean(p.metadata?.hydratedFromSupabase))
+    .map((p) => ({ id: p.id, symbol: p.symbol }));
+
+  try {
+    return await restampHydratedOpenPositions({
+      positions: hydrated,
+      stamp,
+      support: sessionColumnSupport,
+      read: async (ids) => {
+        const { data, error } = await supabase
+          .from('positions')
+          .select('id, symbol, session_id, execution_mode')
+          .eq('user_id', USER_ID)
+          .in('id', ids)
+          .is('closed_at', null);
+        return { data, error };
+      },
+      update: async (ids, columns) => {
+        const { data, error } = await supabase
+          .from('positions')
+          .update(columns)
+          .eq('user_id', USER_ID)
+          .in('id', ids)
+          .is('closed_at', null)
+          .select('id');
+        return { data, error };
+      },
+      logger,
+    });
+  } catch (err) {
+    logger.error('positions: hydrated open position restamp threw (non-fatal)', {
+      sessionId: stamp.sessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return {
+      outcome: 'error',
+      sessionId: stamp.sessionId,
+      hydrated: hydrated.length,
+      restamped: 0,
+      alreadyCurrent: 0,
+      rows: [],
+      error: { message: err instanceof Error ? err.message : String(err) },
+    };
+  }
 }
 
 /**
@@ -481,6 +549,17 @@ async function openTradingSession(params: {
     logger.warn('Session reconcile threw (non-fatal)', { error: String(err) });
   }
 
+  // Tier-A polish (DESK GO 2026-09-22): the open positions the engine just
+  // hydrated are managed by THIS session now. Move their rows onto the new
+  // session_id / execution_mode so the session-scoped reads (GET /api/positions,
+  // the FE Supabase fallback, strategy session stats) see the same open set the
+  // engine holds — no manual restamp SQL after a restart. Paper only: a live
+  // session keeps the opening session's stamp (unchanged). Keyed by primary key
+  // `id`, never a (user_id, symbol) conflict path, so #69's upsert-on-id and the
+  // 20260511 partial open index are untouched and closed history keeps the
+  // session that closed it. See persistence/position-session-restamp.ts.
+  lastHydrateRestamp = await restampHydratedPositionsForSession({ sessionId, executionMode: params.mode });
+
   try {
     const sessionRow = {
       session_id: sessionId,
@@ -531,6 +610,7 @@ async function closeTradingSession(params: {
   const { sessionId, sessionStartedAt, sessionInitialEquity } = runtimeState;
   // Stamp clears even when no runtimeState session was opened (start failed early).
   activeSessionStamp = null;
+  lastHydrateRestamp = null;
   if (!sessionId) return;
 
   const endedAt = Date.now();
@@ -2704,6 +2784,19 @@ app.post('/api/engine/start', async (req, res) => {
       message: `Trading engine started in ${mode} mode`,
       sessionId,
       sessionStartedAt: runtimeState.sessionStartedAt,
+      // Positions hydrated from a prior session and moved onto this session_id
+      // (paper). `outcome` is one of restamped | noop | skipped_columns_missing |
+      // skipped_mode | error — see persistence/position-session-restamp.ts.
+      hydrateRestamp: lastHydrateRestamp
+        ? {
+            outcome: lastHydrateRestamp.outcome,
+            hydrated: lastHydrateRestamp.hydrated,
+            restamped: lastHydrateRestamp.restamped,
+            alreadyCurrent: lastHydrateRestamp.alreadyCurrent,
+            symbols: lastHydrateRestamp.rows.map((row) => row.symbol),
+            fromSessionIds: [...new Set(lastHydrateRestamp.rows.map((row) => row.fromSessionId ?? null))],
+          }
+        : null,
       activeSymbols,
       perpsSymbols: perpsSymbols,
       spotToPerpsMapping: Object.fromEntries(activeSpotToPerpsMap),
@@ -5144,10 +5237,14 @@ async function syncPositionToSupabase(position: any) {
     // env-configured target and switches to `id` on the first 42P10; see
     // persistence/position-upsert.ts.
     //
-    // TASK_014 P5: `session_id` on a position is the session that OPENED it. A
-    // position hydrated from a prior session is re-written without the stamp so
-    // the opening session's value survives its close in this session.
-    const stamp = position.metadata?.hydratedFromSupabase ? null : currentSessionStamp();
+    // Session stamp: a position opened in this session carries its stamp. A
+    // position hydrated from a prior session carries it too once this session
+    // owns it (paper — openTradingSession restamped its row at start; every
+    // later write re-asserts that so the DB self-heals if the start-up UPDATE
+    // failed). In live a hydrated position is written unstamped and the opening
+    // session's value survives its close, as before (TASK_014 P5). See
+    // persistence/position-session-restamp.ts.
+    const stamp = resolvePositionWriteStamp(position, currentSessionStamp());
     const { error, onConflictTarget, conflictFellBack, stamped } = await upsertPositionRow({
       row: mappedPosition,
       stamp,
