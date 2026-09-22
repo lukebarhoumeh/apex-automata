@@ -6,6 +6,7 @@ import { OrderManager, OrderManagerConfig, ManagedOrder } from './order-manager'
 import { PositionTracker, PositionTrackerConfig, Position } from './position-tracker';
 import { RiskEngine, RiskEngineConfig, RiskMetrics } from './risk-engine';
 import type { LadderTransition } from './risk/paper-kill-ladder';
+import { resolvePaperResetRiskStateOnStart } from './risk/paper-boot-guard';
 import { SecretManager, SecretConfig } from '../config/secrets';
 import {
   PaperTradingSimulator,
@@ -938,8 +939,12 @@ export class TradingEngine extends EventEmitter {
     
     // Step 6: Paper/Live Parity - Use explicit config flags with parity defaults
     // All flags default to FALSE (parity behavior)
+    // Risk desk pin (2026-09-22 stand-down): PAPER_RESET_RISK_STATE_ON_START
+    // only takes effect next to RISK_CLEAR=YES. On its own it is ignored so a
+    // paper restart can never sweep the kill latch / active halt risk_events.
+    const paperResetGate = resolvePaperResetRiskStateOnStart();
     const paperOverrides = {
-      resetRiskStateOnStart: process.env.PAPER_RESET_RISK_STATE_ON_START === 'true',
+      resetRiskStateOnStart: paperResetGate.honored,
       disableErrorRateLimit: process.env.PAPER_DISABLE_ERROR_RATE_LIMIT === 'true',
       disableLatencyLimit: process.env.PAPER_DISABLE_LATENCY_LIMIT === 'true',
       disableDataGapLimit: process.env.PAPER_DISABLE_DATA_GAP_LIMIT === 'true',
@@ -950,6 +955,15 @@ export class TradingEngine extends EventEmitter {
     
     // Log active overrides if any (transparency)
     if (isPaper) {
+      if (paperResetGate.ignoredReason) {
+        this.logger.warn('PAPER_RESET_RISK_STATE_ON_START requested but NOT honoured (no RISK_CLEAR=YES)', {
+          requested: paperResetGate.requested,
+          riskClearAuthorized: paperResetGate.authorized,
+          reason: paperResetGate.ignoredReason,
+        });
+      } else if (paperResetGate.honored) {
+        this.logger.warn('PAPER_RESET_RISK_STATE_ON_START honoured under RISK_CLEAR=YES (desk-authorised clean-slate paper boot)');
+      }
       const activeOverrides = Object.entries(paperOverrides)
         .filter(([, v]) => v)
         .map(([k]) => k);
