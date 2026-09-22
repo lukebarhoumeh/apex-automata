@@ -60,6 +60,8 @@ export interface FillContext {
   stopPrice?: number;
   takeProfit?: number;
   tag?: string;
+  /** Market regime stamped on the entry signal; kept on `Position.metadata.regime` for exit attribution. */
+  regime?: string;
 }
 
 export interface PositionTrackerEvents {
@@ -335,12 +337,16 @@ export class PositionTracker extends EventEmitter {
         ...(position.metadata ?? {}),
         entryOrderId: fill.order_id,
         entryTag: context?.tag,
+        ...(typeof context?.regime === 'string' ? { regime: context.regime } : {}),
       };
       this.positions.set(symbol, position);
     } else {
       // Backfill context if we didn't have it at open
       if (!position.strategy && context?.strategy) {
         position.strategy = context.strategy;
+      }
+      if (typeof position.metadata?.regime !== 'string' && typeof context?.regime === 'string') {
+        position.metadata = { ...(position.metadata ?? {}), regime: context.regime };
       }
       if (!position.signalId && context?.signalId) {
         position.signalId = context.signalId;

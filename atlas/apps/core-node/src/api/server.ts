@@ -2519,6 +2519,49 @@ app.post('/api/engine/start', async (req, res) => {
           }
         }
 
+        // Paper kill ladder L3 / L4 entry gate (Risk desk SoT 2026-09-22).
+        // A strategy frozen for the session (>= N consecutive losses in that
+        // strategy) or paused in the signal's entry regime (N stop-outs in
+        // that strategy x regime) gets no new entries. Exits were already
+        // short-circuited above, so this only ever blocks entries. `null` in
+        // live mode / when the ladder is disabled. Entry regime = the same
+        // source the regime entry gate above uses (stamped, else the live
+        // detector), so L4's stop-out attribution matches what was gated.
+        const signalRegime =
+          (typeof signal.metadata?.regime === 'string' ? signal.metadata.regime : undefined) ??
+          signalProcessor!.getRegimeState(signal.symbol)?.regime;
+        const ladderEntry = tradingEngine!.getRiskEngineInstance()?.checkPaperKillLadderEntry({
+          strategy: signal.strategy,
+          regime: signalRegime,
+        });
+        if (ladderEntry && !ladderEntry.allowed) {
+          logger.warn('Signal blocked by paper kill ladder', {
+            signalId: signal.id,
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            level: ladderEntry.level,
+            reasonCode: ladderEntry.reasonCode,
+            reason: ladderEntry.reason,
+            regime: ladderEntry.regime,
+            until: ladderEntry.until ? new Date(ladderEntry.until).toISOString() : undefined,
+          });
+          recordSignalFiltered(logger, {
+            stage: 'kill_ladder',
+            reason: ladderEntry.reasonCode,
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            signalId: signal.id,
+            direction: signal.direction,
+            strength: signal.strength,
+            context: {
+              level: ladderEntry.level,
+              regime: ladderEntry.regime ?? signalRegime,
+              until: ladderEntry.until,
+            },
+          });
+          return routeRejected(routedExchange, 'kill_ladder', ladderEntry.reasonCode);
+        }
+
         // Use perps risk_per_trade for perpetual symbols, spot risk for others
         const isPerpsSymbol = signal.symbol.includes('-PERP-');
         const effectiveRiskPerTrade = isPerpsSymbol && guardrails.perps
@@ -2555,9 +2598,15 @@ app.post('/api/engine/start', async (req, res) => {
 
         // Apply regime-based position multiplier from signal metadata
         const rawMultiplier = signal.metadata?.positionMultiplier as number | undefined;
-        const positionMultiplier = (typeof rawMultiplier === 'number' && Number.isFinite(rawMultiplier) && rawMultiplier > 0)
+        const signalMultiplier = (typeof rawMultiplier === 'number' && Number.isFinite(rawMultiplier) && rawMultiplier > 0)
           ? rawMultiplier
           : 1.0;
+        // Paper kill ladder L1 / L2: cap the multiplier (min, not product) at
+        // 0.5 / 0.25 while a size-down rung is armed. Identity in live mode
+        // and whenever no rung is active.
+        const ladderSizing = tradingEngine!.getRiskEngineInstance()?.applyPaperKillLadderSizing(signalMultiplier)
+          ?? { multiplier: signalMultiplier, cap: 1, sizeLevel: 0 as const, capped: false };
+        const positionMultiplier = ladderSizing.multiplier;
         const computedSize = parseFloat((rawSize * positionMultiplier).toFixed(6));
         if (computedSize <= 0) {
           logger.warn('Position multiplier reduced size to zero, skipping signal', {
@@ -2608,6 +2657,10 @@ app.post('/api/engine/start', async (req, res) => {
           stopPrice,
           rawSize,
           positionMultiplier,
+          signalMultiplier,
+          killLadderLevel: ladderSizing.sizeLevel,
+          killLadderCap: ladderSizing.cap,
+          killLadderCapped: ladderSizing.capped,
           size: computedSize,
           orderType,
           executionPolicy: execution.policy,
@@ -2697,6 +2750,12 @@ app.post('/api/engine/start', async (req, res) => {
             notionalUsd: computedSize * entryPrice,
             executionPolicy: execution.policy,
             postOnly,
+            // Entry regime rides along to the position (PositionTracker copies
+            // it to `position.metadata.regime`) so the kill ladder's L4 can
+            // attribute a later stop-out to the regime the trade was opened in.
+            regime: signalRegime,
+            positionMultiplier,
+            killLadderLevel: ladderSizing.sizeLevel,
             // OrderManager honours metadata.noChase: a venue post-only rejection
             // is terminal (logged miss), never re-priced toward the market.
             noChase: execution.noChase,
@@ -4612,6 +4671,8 @@ app.get('/api/risk/status', (req, res) => {
       open: positions.length,
       max: (riskEngine as any).maxOpenPositionsLimit || 5,
     },
+    // Graduated paper kill ladder L1–L6 (paper only; `{ enabled: false }` otherwise).
+    paperKillLadder: riskEngine.getPaperKillLadderStatus(),
   });
 });
 

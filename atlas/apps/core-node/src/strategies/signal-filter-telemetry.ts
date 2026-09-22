@@ -87,7 +87,13 @@ export type SignalFilterStage =
   // position-aware sites: api/server signal:generated router (primary; the
   // verdict is persisted to `signals.reason` for the FE) and
   // backtest-engine.handleSignal. Paper-only by default — see ./regime-gate.ts.
-  | 'regime_gate';
+  | 'regime_gate'
+  // Added 2026-09-22 (Risk desk SoT, paper kill ladder) — router-side entry
+  // gate for L3 / L4. Reason slug is the ladder reason code:
+  // 'strategy_freeze' (strategy frozen for the session after N consecutive
+  // losses) or 'regime_pause' (strategy x entry regime paused for N hours
+  // after N stop-outs). Paper execution mode only; emitted by api/server.ts.
+  | 'kill_ladder';
 
 const signalFilteredCounter = new Counter({
   name: 'atlas_signal_filtered_total',
