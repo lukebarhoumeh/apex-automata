@@ -47,12 +47,26 @@ function printSummary(result: BacktestResult, feeTier: FeeTierLabel): void {
     console.log(`Fees: tier=${feeTier.name} → ${per}`);
   }
   console.log(`Long/Short entries: ${m.longEntries}/${m.shortEntries} (sell-exits=${m.sellSignalExits}, short-blocked=${m.shortBlocked})`);
+  // Live-parity ATR volatility floor/ceiling (guardrails.filters, router stage
+  // `atr_vol`). Since TF-ATR-FILTER-PARITY (2026-09-22) trend_follow entries are
+  // subject to it too, so a low-volatility window can legitimately reject
+  // every entry — the CI gate reads this line to tell "policy rejected the
+  // candidates" apart from "the funnel produced none".
+  const atrFilters = result.config.filters;
+  console.log(
+    atrFilters
+      ? `ATR volatility filter: min=${atrFilters.atrVolatilityMin ?? 'n/a'} max=${atrFilters.atrVolatilityMax ?? 'n/a'} rejects=${m.atrFilterRejects}`
+      : `ATR volatility filter: off rejects=${m.atrFilterRejects}`,
+  );
   console.log(`EV gate: mode=${m.evGate.mode} evaluated=${m.evGate.evaluated} rejected=${m.evGate.rejected} shadow-would-reject=${m.evGate.shadowWouldReject}`);
   console.log(`Regime gate: enabled=${result.regimeGate.enabled} minCompat=${result.regimeGate.minCompatibilityScore} minConf=${result.regimeGate.minRegimeConfidence}`);
-  // A6 regime-conditional gates (guardrails.regime_gates) — distinct from the
-  // RegimeFilter line above. Ships disabled; `--regime-conditional-gates` flips it for a run.
+  // A6 regime-conditional entry gates (guardrails.regime_gates) — distinct from
+  // the RegimeFilter line above. Paper-only in YAML (resolves disabled for
+  // backtests); `--regime-conditional-gates` forces it on for a run.
   const a6 = result.config.regimeConditionalGates;
-  console.log(`Regime-conditional gates (A6): enabled=${a6?.enabled ?? false} rules=${a6?.rules.length ?? 0}`);
+  console.log(
+    `Regime-conditional gates (A6): enabled=${a6?.enabled ?? false} paperOnly=${a6?.paperOnly ?? true} rules=${a6?.rules.length ?? 0}`,
+  );
   console.log(`Exit rules: ${describeExitRules(m.exitRules)}`);
   console.log(`Exits by reason: ${describeExitReasons(m.exitReasons)}`);
   console.log(`Total Return: ${m.returnPercent.toFixed(2)}%`);
@@ -191,10 +205,10 @@ async function main() {
     .option('regime-conditional-gates', {
       type: 'boolean',
       describe:
-        'A6: enable regime-conditional gates for THIS run (overrides ' +
-        'guardrails.regime_gates.enabled=false). The rules themselves come ' +
-        'from guardrails.yaml regime_gates.rules. Use to measure projected ' +
-        'impact without changing live/paper config.',
+        'A6: enable the regime-conditional ENTRY gates for THIS run (the YAML ' +
+        'block is paper_only, so backtests resolve it disabled). The rules ' +
+        'themselves come from guardrails.yaml regime_gates.rules. Use to ' +
+        'measure projected impact without changing live/paper config.',
       default: false,
     })
     .option('exit-parity', {

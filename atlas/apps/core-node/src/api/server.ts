@@ -12,7 +12,18 @@ import {
   buildPerSymbolDisabledStrategies,
   isSymbolStrategyDisabled,
 } from '../strategies/per-symbol-disable';
-import { buildRegimeGateConfig, evaluateRegimeGate } from '../strategies/regime-gate';
+import {
+  buildRegimeGateConfig,
+  classifySignalIntent,
+  evaluateRegimeGate,
+  REGIME_GATE_REASON_CODE,
+  REGIME_GATE_STAGE,
+} from '../strategies/regime-gate';
+import {
+  ATR_VOL_STAGE,
+  describeAtrVolatilityReject,
+  evaluateAtrVolatilityFilter,
+} from '../strategies/atr-volatility-filter';
 import { buildStrategyPolicy } from '../strategies/strategy-policy';
 import { resolvePersistedEntryPrice } from '../trading/position-entry-vwap';
 import { buildFillRow, FILLS_UPSERT_ON_CONFLICT, FILL_FEE_SIDE_COLUMNS, FillRowFillRef, FillRowOrderRef } from '../persistence/fill-row';
@@ -1768,10 +1779,26 @@ app.post('/api/engine/start', async (req, res) => {
     // single map. Passed to SignalProcessor for the live gate, and used by
     // the signal:generated defence-in-depth handler below.
     const perSymbolDisabledStrategies = buildPerSymbolDisabledStrategies(guardrails);
-    // A6 (2026-05-29): regime-conditional gates (disabled by default). Passed
-    // to SignalProcessor for the live gate; re-checked in the signal:generated
-    // defence-in-depth handler below.
-    const regimeConditionalGates = buildRegimeGateConfig(guardrails);
+    // A6 (2026-05-29) / TF-REGIME-GATE (2026-09-22): regime-conditional ENTRY
+    // gates, resolved for THIS session's execution mode. `paper_only: true`
+    // (the shipped default) makes the config inert in live — live routing is
+    // unchanged. Enforced in the signal:generated router below, after the
+    // canonical `signals` row is written and after the exit short-circuit, so
+    // exits pass and a blocked entry carries a persisted deny reason for the FE.
+    const regimeGateMode: 'paper' | 'live' = mode === 'live' ? 'live' : 'paper';
+    const regimeConditionalGates = buildRegimeGateConfig(guardrails, regimeGateMode);
+    if (regimeConditionalGates.enabled) {
+      logger.info('Regime entry gate ACTIVE for this session', {
+        mode: regimeGateMode,
+        paperOnly: regimeConditionalGates.paperOnly,
+        rules: regimeConditionalGates.rules,
+      });
+    } else if (guardrails.regime_gates?.enabled) {
+      logger.info('Regime entry gate configured but INERT for this session (paper_only scope)', {
+        mode: regimeGateMode,
+        paperOnly: regimeConditionalGates.paperOnly,
+      });
+    }
     // Momentum runtime constants live in guardrails.yaml's `momentum:` block
     // (or per-symbol overrides). Plugin configSchema in
     // strategies/plugins/builtin/momentum-strategy.ts is the source of
@@ -1825,7 +1852,6 @@ app.post('/api/engine/start', async (req, res) => {
       supabaseKey: env.SUPABASE_SERVICE_KEY || '',
       disabledStrategies,
       perSymbolDisabledStrategies,
-      regimeConditionalGates,
       strategies: {
         breakout: {
           enabled: !disabledStrategies.includes('breakout'),
@@ -2105,40 +2131,9 @@ app.post('/api/engine/start', async (req, res) => {
           return;
         }
 
-        // Defense-in-depth (A6 regime gate): SignalProcessor's regime_gate
-        // stage should have caught this already (disabled by default). Re-check
-        // at the final chokepoint, mirroring the per_symbol_disable defense
-        // above. Added 2026-05-29.
-        {
-          const gatedRegime =
-            typeof signal.metadata?.regime === 'string' ? signal.metadata.regime : undefined;
-          const regimeDecision = evaluateRegimeGate(regimeConditionalGates, {
-            strategy: signal.strategy,
-            symbol: signal.symbol,
-            regime: gatedRegime,
-          });
-          if (regimeDecision.blocked) {
-            logger.warn(
-              `SECURITY: regime-gated (${signal.symbol}/${signal.strategy}/${gatedRegime}) reached signal:generated handler — rejected`,
-              { signalId: signal.id, symbol: signal.symbol, strategy: signal.strategy, regime: gatedRegime },
-            );
-            recordSignalFiltered(logger, {
-              stage: 'regime_gate',
-              reason: 'router_defense_in_depth',
-              symbol: signal.symbol,
-              strategy: signal.strategy,
-              signalId: signal.id,
-              direction: signal.direction,
-              strength: signal.strength,
-              context: {
-                source: 'api_server',
-                regime: gatedRegime,
-                blockRegimes: regimeDecision.rule?.blockRegimes,
-              },
-            });
-            return;
-          }
-        }
+        // NB: the regime-conditional ENTRY gate is NOT a pre-persist check. It
+        // runs inside routeSignalToOrder below (after the exit short-circuit)
+        // so its verdict is written to the `signals` row for the FE.
 
         // Defense-in-depth (global): even if signal-processor.ts's disabled-
         // strategy filter were ever bypassed by a future bug or a new code
@@ -2341,6 +2336,63 @@ app.post('/api/engine/start', async (req, res) => {
           return engineRejectionVerdict(routedExchange, signal.symbol, 'exit_order_not_created');
         }
 
+        const openPositions = tradingEngine!.getOpenPositions();
+
+        // Regime-conditional ENTRY gate (A6 / TF-REGIME-GATE 2026-09-22,
+        // guardrails.regime_gates). Paper-only by config; the resolved config
+        // is inert in live. Runs AFTER the exit short-circuit above and is
+        // skipped for any signal that opposes an open position on the same
+        // symbol (exit / reversal), so it can never trap a position in a
+        // regime it dislikes. Runs BEFORE the arbitrator so a blocked entry
+        // never sets a direction lock or dedup window. The verdict is persisted
+        // as `signals.reason = "regime_gate: <why>"` — the FE's deny reason.
+        {
+          const openOnSymbol = openPositions.find(
+            (p) => p.symbol === signal.symbol && p.size > 0 && (p.side === 'long' || p.side === 'short'),
+          );
+          const intent = classifySignalIntent(signal.direction, openOnSymbol?.side);
+          const stampedRegime =
+            typeof signal.metadata?.regime === 'string' ? signal.metadata.regime : undefined;
+          const gateRegime = stampedRegime ?? signalProcessor!.getRegimeState(signal.symbol)?.regime;
+          const regimeDecision = evaluateRegimeGate(regimeConditionalGates, {
+            strategy: signal.strategy,
+            symbol: signal.symbol,
+            regime: gateRegime,
+            intent,
+          });
+          if (regimeDecision.blocked) {
+            logger.info('Signal rejected by regime entry gate', {
+              signalId: signal.id,
+              symbol: signal.symbol,
+              strategy: signal.strategy,
+              direction: signal.direction,
+              regime: gateRegime,
+              blockRegimes: regimeDecision.rule?.blockRegimes,
+              mode: regimeConditionalGates.mode,
+              reason: regimeDecision.reason,
+            });
+            recordSignalFiltered(logger, {
+              stage: REGIME_GATE_STAGE,
+              reason: REGIME_GATE_REASON_CODE,
+              symbol: signal.symbol,
+              strategy: signal.strategy,
+              signalId: signal.id,
+              direction: signal.direction,
+              strength: signal.strength,
+              context: {
+                source: 'api_server',
+                intent,
+                regime: gateRegime,
+                regimeSource: stampedRegime !== undefined ? 'signal_metadata' : 'regime_detector',
+                blockRegimes: regimeDecision.rule?.blockRegimes,
+                paperOnly: regimeConditionalGates.paperOnly,
+                mode: regimeConditionalGates.mode,
+              },
+            });
+            return routeRejected(routedExchange, REGIME_GATE_STAGE, regimeDecision.reason ?? REGIME_GATE_REASON_CODE);
+          }
+        }
+
         // Reversal-intent decoration (audit fix #2). The cross-venue
         // arbitrator blocks opposing-direction entries unless a signal
         // declares an explicit reversal thesis via
@@ -2352,7 +2404,6 @@ app.post('/api/engine/start', async (req, res) => {
         // indicators (RSI flips, EMA crossovers), so the flag is
         // semantically honest. The arbitrator's strength threshold still
         // gates weak reversals.
-        const openPositions = tradingEngine!.getOpenPositions();
         const REVERSAL_INTENT_STRATEGIES = new Set(['momentum', 'trend_follow']);
         if (REVERSAL_INTENT_STRATEGIES.has(signal.strategy)) {
           const desiredSide = signal.direction === 'buy' ? 'long' : 'short';
@@ -2408,26 +2459,39 @@ app.post('/api/engine/start', async (req, res) => {
           }
         }
 
-        // ATR volatility filter
+        // ATR volatility filter (guardrails.filters.atr_volatility_min/max).
+        // TF-ATR-FILTER-PARITY (2026-09-22): the ATR is resolved through the
+        // shared SoT (strategies/atr-volatility-filter.ts — `indicators.atr`,
+        // then trend_follow's legacy `metadata.atr`) so the 0.5% floor now
+        // applies to trend_follow entries too; the backtest mirror uses the
+        // same helper. A signal with no usable ATR still passes (unchanged),
+        // but the skip is logged instead of silent.
         const atrMin = guardrails.filters.atr_volatility_min;
         const atrMax = guardrails.filters.atr_volatility_max;
-        const atrValue = (signal.metadata?.indicators as Record<string, number> | undefined)?.atr;
-        if (typeof atrValue === 'number' && atrValue > 0) {
-          const atrPct = atrValue / entryPrice;
-          if (atrPct < atrMin || atrPct > atrMax) {
-            const reason = atrPct < atrMin ? 'atr_below_min' : 'atr_above_max';
-            recordSignalFiltered(logger, {
-              stage: 'atr_vol',
-              reason,
-              symbol: signal.symbol,
-              strategy: signal.strategy,
-              signalId: signal.id,
-              direction: signal.direction,
-              strength: signal.strength,
-              context: { atrPct, atrMin, atrMax },
-            });
-            return routeRejected(routedExchange, 'atr_vol', `${reason} (atrPct=${atrPct.toFixed(5)})`);
-          }
+        const atrVerdict = evaluateAtrVolatilityFilter({
+          metadata: signal.metadata,
+          price: entryPrice,
+          atrMin,
+          atrMax,
+        });
+        if (atrVerdict.outcome === 'no_atr') {
+          logger.debug('ATR volatility filter skipped — signal carries no usable ATR', {
+            signalId: signal.id,
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+          });
+        } else if (atrVerdict.outcome !== 'pass') {
+          recordSignalFiltered(logger, {
+            stage: ATR_VOL_STAGE,
+            reason: atrVerdict.outcome,
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            signalId: signal.id,
+            direction: signal.direction,
+            strength: signal.strength,
+            context: { atrPct: atrVerdict.atrPct, atrMin, atrMax, atrSource: atrVerdict.atrSource },
+          });
+          return routeRejected(routedExchange, ATR_VOL_STAGE, describeAtrVolatilityReject(atrVerdict));
         }
 
         // Funding bias guardrail — check if funding rate is excessive for perps symbols

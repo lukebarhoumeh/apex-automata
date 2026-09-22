@@ -10,7 +10,18 @@ import {
   PerSymbolDisabledStrategies,
   isSymbolStrategyDisabled,
 } from '../strategies/per-symbol-disable';
-import { RegimeGateConfig, evaluateRegimeGate } from '../strategies/regime-gate';
+import {
+  RegimeGateConfig,
+  classifySignalIntent,
+  evaluateRegimeGate,
+  REGIME_GATE_REASON_CODE,
+  REGIME_GATE_STAGE,
+} from '../strategies/regime-gate';
+import {
+  ATR_VOL_STAGE,
+  evaluateAtrVolatilityFilter,
+  resolveSignalAtr,
+} from '../strategies/atr-volatility-filter';
 import { recordSignalFiltered } from '../strategies/signal-filter-telemetry';
 import { computeRiskBasedSize } from '../trading/risk/position-sizing';
 import {
@@ -249,10 +260,10 @@ export interface BacktestConfig {
   realism?: BacktestRealismConfig;
   /**
    * Live pre-entry filters mirrored from `guardrails.filters` (api/server.ts
-   * routing stage `atr_vol`): an entry whose signal ATR% (`indicators.atr /
-   * price`) is below `atrVolatilityMin` or above `atrVolatilityMax` is
-   * rejected with the same telemetry reason as live. Absent = no filter
-   * (pre-E4 behaviour).
+   * routing stage `atr_vol`): an entry whose signal ATR% (signal ATR via
+   * `resolveSignalAtr` / price) is below `atrVolatilityMin` or above
+   * `atrVolatilityMax` is rejected with the same telemetry reason as live.
+   * Absent = no filter (pre-E4 behaviour).
    */
   filters?: {
     atrVolatilityMin?: number;
@@ -880,10 +891,8 @@ export class BacktestEngine extends EventEmitter {
       // gate at backtest-engine.handleSignal (defence-in-depth) and miss
       // the per-stage funnel telemetry the live path produces.
       perSymbolDisabledStrategies: this.config.perSymbolDisabledStrategies,
-      // A6 (2026-05-29) — forward the regime-conditional gate so the
-      // SignalProcessor's regime_gate stage fires in backtest with the same
-      // funnel telemetry the live path produces (disabled by default).
-      regimeConditionalGates: this.config.regimeConditionalGates,
+      // NB: the regime-conditional ENTRY gate is applied in handleSignal below
+      // (position-aware, exits exempt), not inside the SignalProcessor.
       enableArbiter: true,
       usePluginStrategies: true,
     } as any;
@@ -1080,22 +1089,27 @@ export class BacktestEngine extends EventEmitter {
       return;
     }
 
-    // A6 (2026-05-29) — regime-conditional gate defence-in-depth. The child
-    // SignalProcessor.processSignal already gates this (with funnel telemetry);
-    // re-check here mirroring the per_symbol_disable pattern so no path reaches
-    // the order pipeline ungated. Disabled by default.
+    // A6 (2026-05-29) / TF-REGIME-GATE (2026-09-22) — regime-conditional
+    // ENTRY gate. This is the backtest's only enforcement site (the child
+    // SignalProcessor is position-blind and does not gate). Mirrors the live
+    // router: a signal opposing the open position on this symbol is an exit /
+    // reversal and passes so the gate never traps a position; only new
+    // entries are blocked. Resolved disabled for backtests while
+    // `regime_gates.paper_only` is true — `--regime-conditional-gates` forces it.
     {
       const regime =
         typeof signal.metadata?.regime === 'string' ? signal.metadata.regime : undefined;
+      const openOnSymbol = this.positions.get(signal.symbol);
       const decision = evaluateRegimeGate(this.config.regimeConditionalGates, {
         strategy: signal.strategy,
         symbol: signal.symbol,
         regime,
+        intent: classifySignalIntent(signal.direction, openOnSymbol?.side),
       });
       if (decision.blocked) {
         recordSignalFiltered(this.logger, {
-          stage: 'regime_gate',
-          reason: 'regime_blocked',
+          stage: REGIME_GATE_STAGE,
+          reason: REGIME_GATE_REASON_CODE,
           symbol: signal.symbol,
           strategy: signal.strategy,
           signalId: signal.id,
@@ -1105,6 +1119,7 @@ export class BacktestEngine extends EventEmitter {
             source: 'backtest_engine',
             regime,
             blockRegimes: decision.rule?.blockRegimes,
+            deny: decision.reason,
           },
         });
         return;
@@ -1204,35 +1219,35 @@ export class BacktestEngine extends EventEmitter {
   }
 
   /**
-   * Live-parity ATR volatility filter. Mirrors api/server.ts: reads
-   * `signal.metadata.indicators.atr`, computes ATR% against the signal price
-   * and rejects outside `[atrVolatilityMin, atrVolatilityMax]`. A signal
+   * Live-parity ATR volatility filter. Same decision function as the
+   * api/server.ts `atr_vol` stage (`evaluateAtrVolatilityFilter`): the ATR is
+   * resolved through the shared SoT (`indicators.atr`, then trend_follow's
+   * legacy `metadata.atr`), ATR% is computed against the signal price and the
+   * entry is rejected outside `[atrVolatilityMin, atrVolatilityMax]`. A signal
    * without a usable ATR passes (same as live).
    */
   private passesAtrVolatilityFilter(signal: Signal): boolean {
     const atrMin = this.config.filters?.atrVolatilityMin;
     const atrMax = this.config.filters?.atrVolatilityMax;
-    const indicators = signal.metadata?.indicators as Record<string, unknown> | undefined;
-    const atrValue = indicators?.atr;
-    if (typeof atrValue !== 'number' || !(atrValue > 0) || !(signal.price > 0)) {
-      return true;
-    }
-    const atrPct = atrValue / signal.price;
-    const belowMin = typeof atrMin === 'number' && atrPct < atrMin;
-    const aboveMax = typeof atrMax === 'number' && atrPct > atrMax;
-    if (!belowMin && !aboveMax) {
+    const verdict = evaluateAtrVolatilityFilter({
+      metadata: signal.metadata,
+      price: signal.price,
+      atrMin,
+      atrMax,
+    });
+    if (verdict.outcome === 'no_atr' || verdict.outcome === 'pass') {
       return true;
     }
     this.atrFilterRejects += 1;
     recordSignalFiltered(this.logger, {
-      stage: 'atr_vol',
-      reason: belowMin ? 'atr_below_min' : 'atr_above_max',
+      stage: ATR_VOL_STAGE,
+      reason: verdict.outcome,
       symbol: signal.symbol,
       strategy: signal.strategy,
       signalId: signal.id,
       direction: signal.direction,
       strength: signal.strength,
-      context: { source: 'backtest_engine', atrPct, atrMin, atrMax },
+      context: { source: 'backtest_engine', atrPct: verdict.atrPct, atrMin, atrMax, atrSource: verdict.atrSource },
     });
     return false;
   }
@@ -1377,22 +1392,15 @@ export class BacktestEngine extends EventEmitter {
 
   /**
    * ATR the entry signal carried — the same value the strategy used for its
-   * stop/TP geometry. Builtin plugins disagree on where they stamp it:
-   * momentum/breakout/vwap_mr pass `indicators: { atr }` (→
-   * `metadata.indicators.atr`, what the live `atr_vol` filter reads), while
-   * trend_follow passes `metadata: { atr }` (→ `metadata.atr`, invisible to
-   * that filter — pre-existing, flagged, not changed here). Read both so the
-   * trail arms on every builtin strategy. Null when absent or not a positive
-   * finite number.
+   * stop/TP geometry. Resolved through the shared SoT (`resolveSignalAtr`:
+   * `metadata.indicators.atr`, then trend_follow's legacy `metadata.atr`) so
+   * the trail arms on every builtin strategy and agrees with the `atr_vol`
+   * filter. Since TF-ATR-FILTER-PARITY (2026-09-22) trend_follow stamps both
+   * paths; the fallback stays for signals persisted before that. Null when
+   * absent or not a positive finite number.
    */
   private resolveEntryAtr(signal: Signal): number | null {
-    const indicators = signal.metadata?.indicators as Record<string, unknown> | undefined;
-    for (const candidate of [indicators?.atr, signal.metadata?.atr]) {
-      if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0) {
-        return candidate;
-      }
-    }
-    return null;
+    return resolveSignalAtr(signal.metadata);
   }
 
   private resolveStopLoss(signal: Signal, override: number | undefined, fillPrice: number): number {

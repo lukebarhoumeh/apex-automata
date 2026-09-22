@@ -79,13 +79,14 @@ export type SignalFilterStage =
   // the live router adopts the same stage when TASK_012 lands so funnel
   // comparisons line up.
   | 'spot_short_blocked'
-  // Added 2026-05-29 (A6) — regime-conditional gate, narrower than the
-  // plugin-level regimeCompatibility gate. Reason slug 'regime_blocked'
-  // indicates the (strategy, regime[, venue, symbol]) tuple is policy-blocked
-  // via guardrails.regime_gates. Checked at three sites:
-  // signal-processor.processSignal (primary, after RegimeFilter),
-  // backtest-engine.handleSignal, and api/server signal:generated handler
-  // (defense in depth). Disabled by default — see ./regime-gate.ts.
+  // Added 2026-05-29 (A6); re-scoped 2026-09-22 (TF-REGIME-GATE) — regime-
+  // conditional ENTRY gate, narrower than the plugin-level regimeCompatibility
+  // gate. Reason slug 'regime_blocked' indicates a NEW ENTRY for the
+  // (strategy, regime[, venue, symbol]) tuple is policy-blocked via
+  // guardrails.regime_gates (exits / reversals are exempt). Checked at two
+  // position-aware sites: api/server signal:generated router (primary; the
+  // verdict is persisted to `signals.reason` for the FE) and
+  // backtest-engine.handleSignal. Paper-only by default — see ./regime-gate.ts.
   | 'regime_gate';
 
 const signalFilteredCounter = new Counter({

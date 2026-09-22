@@ -36,8 +36,9 @@ The window is the committed fixture window (`atlas/apps/core-node/fixtures/bars/
 
 1. The backtest CLI exits non-zero (a missing/short fixture is `DATA_UNAVAILABLE`, exit 2 — the loader is fail-closed since TASK_017 and never falls back to synthetic candles without `--allow-synthetic`), OR
 2. Stdout does not carry the `DATA: REAL` stamp, or carries `DATA: SYNTHETIC`, or either symbol did not load from the `fixture` source, OR
-3. The reported `Total Trades` count is < 5 over the 7-day window (structural smoke threshold; the committed fixtures produced 15 at the time of TASK_017), OR
-4. Any short entry was opened (spot is long-only by venue capability).
+3. The `ATR volatility filter:` line is missing or does not show the guardrails floor (`min=0.005`) — live/backtest parity requires the `atr_vol` stage to run with the desk-pinned floor, OR
+4. Entry candidates that reached the router — `Total Trades` **plus** the `atr_vol` `rejects=` count — number < 5 over the 7-day window (structural smoke threshold; the committed fixtures produced 15 trades at the time of TASK_017 and 7 by 2026-09-22). Since TF-ATR-FILTER-PARITY (2026-09-22) the 0.5% ATR floor also applies to `trend_follow`, and on this low-volatility 15m window it legitimately rejects every TF entry (ATR% ≈ 0.12–0.40%), so `Total Trades` alone would read 0 while the funnel is healthy; counting the floor's rejects keeps the smoke meaningful without weakening parity, OR
+5. Any short entry was opened (spot is long-only by venue capability).
 
 Wall-clock target: < 3 minutes per run (the backtest itself takes ~3 s; install dominates).
 

@@ -100,6 +100,10 @@ export const SCALAR_PINS: readonly ScalarPin[] = [
   { key: 'cfm.max_leverage', expected: 2 },
   { key: 'cfm.execution.order_type', expected: 'post_only' },
   { key: 'cfm.execution.no_chase', expected: true },
+  // TF-REGIME-GATE (2026-09-22): the regime entry gate is PAPER-ONLY. Live
+  // routing must stay untouched (CONFIRM_LIVE locked) — reaching live needs a
+  // two-file change, never a one-line YAML flip.
+  { key: 'regime_gates.paper_only', expected: true },
 ];
 
 /**
