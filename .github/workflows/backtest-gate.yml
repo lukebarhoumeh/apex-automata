@@ -152,12 +152,21 @@ jobs:
           done
           echo "Data stamp verified: REAL (fixtures)."
 
-      - name: Verify trade count >= 5
+      - name: Verify funnel (trades + ATR-floor rejects) >= 5, spot long-only
         # Structural smoke: a 7-day window across 2 spot products (long-only,
         # EV gate enforced at 4.5 bps) produced 15 trades on the committed
-        # fixtures at the time of TASK_017. Zero-or-near-zero trades almost
-        # always means a regression in the funnel (signal-arbiter,
-        # meta-filter, signal-processor, or the loader).
+        # fixtures at the time of TASK_017 (7 by 2026-09-22). Zero-or-near-
+        # zero entry CANDIDATES almost always means a regression in the funnel
+        # (signal-arbiter, meta-filter, signal-processor, or the loader).
+        #
+        # TF-ATR-FILTER-PARITY (2026-09-22): the live `atr_vol` floor
+        # (guardrails.filters.atr_volatility_min = 0.5%) now sees trend_follow's
+        # ATR, in the backtest too. On this 15m fixture window every TF entry
+        # carries ATR% ≈ 0.12–0.40%, so the floor legitimately rejects them all
+        # and `Total Trades` is 0 — that is the guardrail working, not a funnel
+        # regression. The gate therefore counts entry candidates that REACHED
+        # the router: trades placed + candidates the ATR floor rejected. Both
+        # are zero only when the pipeline stopped producing signals.
         run: |
           TRADES=$(grep -E '^Total Trades:' /tmp/backtest-stdout.log | tail -1 | awk '{print $3}')
           echo "Reported Total Trades: ${TRADES:-<not parsed>}"
@@ -165,8 +174,21 @@ jobs:
             echo "::error::Could not parse 'Total Trades:' from backtest stdout. CLI output format may have changed."
             exit 1
           fi
-          if [ "$TRADES" -lt 5 ]; then
-            echo "::error::Backtest produced $TRADES trades over the 7-day fixture window — expected >= 5."
+          ATR_LINE=$(grep -E '^ATR volatility filter:' /tmp/backtest-stdout.log | tail -1)
+          echo "${ATR_LINE:-ATR volatility filter: <not parsed>}"
+          if [ -z "$ATR_LINE" ]; then
+            echo "::error::Could not find 'ATR volatility filter:' in backtest stdout. CLI output format may have changed."
+            exit 1
+          fi
+          if ! echo "$ATR_LINE" | grep -qE '^ATR volatility filter: min=0\.005 '; then
+            echo "::error::Backtest did not run with the guardrails ATR floor (min=0.005) — live/backtest parity is broken. Line: $ATR_LINE"
+            exit 1
+          fi
+          ATR_REJECTS=$(echo "$ATR_LINE" | sed -E 's#.* rejects=([0-9]+).*#\1#')
+          CANDIDATES=$((TRADES + ATR_REJECTS))
+          echo "Entry candidates reaching the router: $CANDIDATES (trades=$TRADES, atr_vol rejects=$ATR_REJECTS)"
+          if [ "$CANDIDATES" -lt 5 ]; then
+            echo "::error::Backtest produced $CANDIDATES entry candidates (trades + ATR-floor rejects) over the 7-day fixture window — expected >= 5."
             echo "::error::This usually means the strategy pipeline regressed (signal-arbiter, meta-filter, or signal-processor)."
             exit 1
           fi
@@ -176,7 +198,7 @@ jobs:
             echo "::error::Spot backtest opened $SHORTS short positions — spot must be long-only (TASK_012/TASK_017 B2)."
             exit 1
           fi
-          echo "Backtest produced $TRADES trades, 0 shorts — gate PASSED."
+          echo "Backtest: $TRADES trades, $ATR_REJECTS ATR-floor rejects ($CANDIDATES candidates), 0 shorts — gate PASSED."
 
       - name: Upload backtest artefacts
         if: always()

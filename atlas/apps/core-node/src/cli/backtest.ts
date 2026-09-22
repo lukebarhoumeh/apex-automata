@@ -47,6 +47,17 @@ function printSummary(result: BacktestResult, feeTier: FeeTierLabel): void {
     console.log(`Fees: tier=${feeTier.name} → ${per}`);
   }
   console.log(`Long/Short entries: ${m.longEntries}/${m.shortEntries} (sell-exits=${m.sellSignalExits}, short-blocked=${m.shortBlocked})`);
+  // Live-parity ATR volatility floor/ceiling (guardrails.filters, router stage
+  // `atr_vol`). Since TF-ATR-FILTER-PARITY (2026-09-22) trend_follow entries are
+  // subject to it too, so a low-volatility window can legitimately reject
+  // every entry — the CI gate reads this line to tell "policy rejected the
+  // candidates" apart from "the funnel produced none".
+  const atrFilters = result.config.filters;
+  console.log(
+    atrFilters
+      ? `ATR volatility filter: min=${atrFilters.atrVolatilityMin ?? 'n/a'} max=${atrFilters.atrVolatilityMax ?? 'n/a'} rejects=${m.atrFilterRejects}`
+      : `ATR volatility filter: off rejects=${m.atrFilterRejects}`,
+  );
   console.log(`EV gate: mode=${m.evGate.mode} evaluated=${m.evGate.evaluated} rejected=${m.evGate.rejected} shadow-would-reject=${m.evGate.shadowWouldReject}`);
   console.log(`Regime gate: enabled=${result.regimeGate.enabled} minCompat=${result.regimeGate.minCompatibilityScore} minConf=${result.regimeGate.minRegimeConfidence}`);
   // A6 regime-conditional entry gates (guardrails.regime_gates) — distinct from
