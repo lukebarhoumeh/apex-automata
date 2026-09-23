@@ -20,6 +20,7 @@
     "backtest": "tsx src/cli/backtest.ts",
     "backtest:backfill": "tsx src/cli/backtest-backfill.ts",
     "backtest:e4": "tsx src/cli/backtest-e4.ts",
+    "research:h1": "tsx src/cli/research-apex-trend-v1.ts",
     "paper-test": "tsx src/cli/paper-test.ts",
     "api": "tsx src/api/server.ts",
     "diagnose": "tsx src/cli/diagnose.ts",
