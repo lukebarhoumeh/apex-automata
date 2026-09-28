@@ -5,8 +5,12 @@
  */
 
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import { TradingEngine, TradingEngineConfig, EngineState } from '../trading/trading-engine';
 import { Logger } from '../core/logger';
+import { buildFillRow } from '../persistence/fill-row';
+import type { SessionStamp } from '../persistence/session-stamp';
+import type { Fill } from '../exchanges/coinbase/types';
 
 // Mock dependencies
 vi.mock('../config/secrets');
@@ -476,6 +480,80 @@ describe('TradingEngine — FeeModel wiring (B5 engine-integration)', () => {
     // And explicitly NOT the spot tier (0.004) the pre-fix wiring used —
     // any value approaching 0.004 means a 8x over-charge regression.
     expect(fee / executed).toBeLessThan(0.001);
+  });
+});
+
+/**
+ * P3-B (2026-09-28): paper trade_id continuity across an in-session restart.
+ *
+ * server.ts's EngineSupervisor restart callback runs `engine.stop()` then
+ * `engine.start()` on the SAME engine and session (openTradingSession is not
+ * re-run, so the session stamp is unchanged). `start()` rebuilds the paper
+ * simulator via `initializePaperSimulator()`; pre-fix that instance's counter
+ * restarted at 0, so the restarted engine's first fill was `paper-<sameSess>-1`
+ * and upserted over the session's earlier fill #1 on `fills_user_trade_key`.
+ *
+ * A real `engine.start()` awaits mocked async paths that hang in this harness
+ * (see the lifecycle comments above), so the test drives the exact private init
+ * step `start()` runs for paper mode, with a real `stop()` in between.
+ */
+describe('TradingEngine — paper trade_id continuity across an in-session supervisor restart (P3-B)', () => {
+  const USER_ID = '00000000-0000-4000-8000-000000000001';
+  const session: SessionStamp = { sessionId: 'sess_1790091200890_9q7egp', executionMode: 'paper' };
+  let engine: TradingEngine;
+
+  beforeEach(() => {
+    vi.useRealTimers(); // the simulator awaits a setTimeout for latencyMs
+    vi.clearAllMocks();
+    engine = new TradingEngine(mockConfig, mockLogger);
+  });
+
+  afterEach(async () => {
+    try {
+      await engine.stop();
+    } catch {
+      // ignore stop errors in cleanup
+    }
+  });
+
+  /** Take one market fill from the engine's current simulator and build its fills row. */
+  async function oneFill() {
+    const sim = engine.getPaperSimulator();
+    expect(sim).not.toBeNull();
+    // Detach the engine's handleFill route (positionTracker is null in this harness).
+    sim!.removeAllListeners('fill');
+    const fills: Fill[] = [];
+    sim!.on('fill', (f: Fill) => fills.push(f));
+    sim!.updateMarketPrice('ETH-USD', 2000);
+    const clientOrderId = randomUUID();
+    await sim!.placeOrder({ product_id: 'ETH-USD', side: 'buy', type: 'market', size: '0.1', client_oid: clientOrderId });
+    expect(fills).toHaveLength(1);
+    return { sim: sim!, fill: fills[0], row: buildFillRow({ userId: USER_ID, order: { id: clientOrderId }, fill: fills[0], session }) };
+  }
+
+  it('stop() then the start()-path simulator rebuild: the next fill does not collide with the earlier one', async () => {
+    // Engine start #1 (paper): build the simulator exactly as start() does.
+    (engine as any).initializePaperSimulator();
+    const before = await oneFill();
+    expect(before.fill.trade_id).toBe(1);
+    expect(before.row.trade_id).toBe(`paper-${session.sessionId}-1`);
+
+    // Supervisor restart on the same engine + session: real stop(), then the
+    // paper-mode init step start() runs.
+    (engine as any).isRunning = true;
+    (engine as any).engineState = 'running';
+    await engine.stop('supervisor_restart: test');
+    expect(engine.getEngineState()).toBe('stopped');
+    (engine as any).initializePaperSimulator();
+
+    const after = await oneFill();
+    expect(after.sim).not.toBe(before.sim); // a genuinely fresh simulator instance
+
+    // Same user, same session_id → distinct upsert keys, sequence continues.
+    expect(after.row.session_id).toBe(before.row.session_id);
+    expect(after.row.trade_id).not.toBe(before.row.trade_id);
+    expect(after.fill.trade_id).toBe(2);
+    expect(after.row.trade_id).toBe(`paper-${session.sessionId}-2`);
   });
 });
 

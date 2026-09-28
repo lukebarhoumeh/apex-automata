@@ -66,6 +66,20 @@ export interface PaperTradingConfig {
    * or tick constraint (spot / INTX paper behaviour, unchanged).
    */
   contractSpecs?: Record<string, PaperContractSpec>;
+
+  /**
+   * Fill-sequence seed: the first fill this instance emits gets
+   * `trade_id = fillSequenceStart + 1`. Defaults to 0 (first fill is #1).
+   *
+   * TASK_014 P3-B (2026-09-28): `fills.trade_id` for paper is
+   * `paper-<sessionId>-<seq>` (persistence/fill-row.ts) and the writer upserts
+   * on `(user_id, trade_id)`. A supervisor restart rebuilds the simulator
+   * inside the SAME session, so a counter restarting at 0 made the restarted
+   * engine's fill #1 overwrite the session's earlier fill #1. TradingEngine
+   * seeds the replacement with the retired instance's `getFillSequence()` so
+   * numbering continues within the session.
+   */
+  fillSequenceStart?: number;
 }
 
 /** Structured reject codes for paper order validation (mapped to `paper_validation` by the engine). */
@@ -199,6 +213,12 @@ export class PaperTradingSimulator extends EventEmitter {
     };
     this.logger = logger;
     this.balances = new Map(config.initialBalances);
+
+    const seed = config.fillSequenceStart ?? 0;
+    if (!Number.isInteger(seed) || seed < 0) {
+      throw new Error(`PaperTradingSimulator: fillSequenceStart must be a non-negative integer (got ${String(seed)})`);
+    }
+    this.fillSequence = seed;
 
     if (!this.config.feeModel && this.config.makerFee === undefined && this.config.takerFee === undefined) {
       throw new Error(
@@ -1162,6 +1182,16 @@ export class PaperTradingSimulator extends EventEmitter {
       realizedPnL: this.realizedPnL,
       returnPercent
     };
+  }
+
+  /**
+   * Last fill sequence handed out (the `trade_id` of the most recent fill, or
+   * the seed when none has been emitted). TradingEngine reads this from a
+   * retired instance to seed its replacement across an in-session restart
+   * (`PaperTradingConfig.fillSequenceStart`).
+   */
+  public getFillSequence(): number {
+    return this.fillSequence;
   }
 
   /**

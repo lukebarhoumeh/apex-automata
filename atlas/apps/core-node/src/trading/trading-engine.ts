@@ -1398,6 +1398,14 @@ export class TradingEngine extends EventEmitter {
       contractSpecs[symbol] = { contractSize: spec.contract_size, priceIncrementUsd: spec.price_increment_usd };
     }
 
+    // TASK_014 P3-B: a supervisor restart (server.ts: stop() then start() on
+    // this same engine + session) rebuilds the simulator without re-opening
+    // the session. Paper `fills.trade_id` is `paper-<sessionId>-<seq>` and is
+    // upserted on (user_id, trade_id), so a counter restarting at 0 made the
+    // restarted engine's fill #1 overwrite the session's earlier fill #1.
+    // Continue the sequence from the retired instance instead.
+    const fillSequenceStart = this.paperSimulator?.getFillSequence() ?? 0;
+
     const config: PaperTradingConfig = {
       initialBalances: new Map([
         ['USD', this.guardrails.account.equity_usd],
@@ -1409,6 +1417,7 @@ export class TradingEngine extends EventEmitter {
       slippage: 0.001,  // 0.1%
       latencyMs: 100,   // 100ms simulated latency
       contractSpecs,
+      fillSequenceStart,
     };
 
     this.paperSimulator = new PaperTradingSimulator(config, this.logger);
@@ -1424,7 +1433,7 @@ export class TradingEngine extends EventEmitter {
       }
     });
     
-    this.logger.info('Paper trading simulator initialized');
+    this.logger.info('Paper trading simulator initialized', { fillSequenceStart });
   }
 
   private setupEventHandlers(): void {

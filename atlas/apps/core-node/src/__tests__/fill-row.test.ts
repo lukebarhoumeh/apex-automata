@@ -305,6 +305,68 @@ describe('resolveFillTradeId / buildFillRow — P3: paper trade_id is namespaced
     expect(b.row.trade_id).toBe(`paper-${paperSession.sessionId}-1`);
     expect(`${a.row.user_id}|${a.row.trade_id}`).not.toBe(`${b.row.user_id}|${b.row.trade_id}`);
   });
+
+  /**
+   * P3-B (2026-09-28): the same collision class INSIDE one session. The
+   * EngineSupervisor restart path (server.ts) runs `engine.stop()` then
+   * `engine.start()` on the same engine without re-opening the session, and
+   * `start()` builds a NEW PaperTradingSimulator whose counter starts at 0 — so
+   * the restarted engine's fill #1 became `paper-<sameSess>-1` and upserted over
+   * this session's earlier fill #1 on `fills_user_trade_key`.
+   *
+   * Fix: the sequence continues across simulator instances within a session —
+   * TradingEngine seeds the replacement simulator with the retired one's counter
+   * (`PaperTradingConfig.fillSequenceStart`, read back via `getFillSequence()`).
+   * The `paper-<sessionId>-<seq>` shape is unchanged, so existing rows and every
+   * reader (FE treats trade_id as opaque) stay valid.
+   */
+  it("supervisor restart inside ONE session: a fresh simulator's fill #1 gets a trade_id distinct from the session's earlier fill #1", async () => {
+    const logger: Logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const fees = new FeeModel({
+      coinbase: { spot: { maker_bps: 25, taker_bps: 40 }, perps_intx: { maker_bps: 0, taker_bps: 5 } },
+      hyperliquid: { perps: { maker_bps: -1.5, taker_bps: 4.5 } },
+    });
+    const buildSim = (fillSequenceStart?: number) =>
+      new PaperTradingSimulator(
+        {
+          initialBalances: new Map([['USD', 100_000], ['ETH', 0]]),
+          feeModel: fees,
+          venue: 'coinbase',
+          slippage: 0,
+          latencyMs: 0,
+          depthAware: false,
+          ...(fillSequenceStart !== undefined ? { fillSequenceStart } : {}),
+        },
+        logger,
+      );
+
+    const firstFillOf = async (sim: PaperTradingSimulator) => {
+      const fills: Fill[] = [];
+      sim.on('fill', (f: Fill) => fills.push(f));
+      sim.updateMarketQuote('ETH-USD', { bid: 1999, ask: 2001, last: 2000 });
+      const clientOrderId = randomUUID();
+      await sim.placeOrder({ product_id: 'ETH-USD', side: 'buy', type: 'market', size: '0.1', client_oid: clientOrderId } as OrderRequest);
+      expect(fills).toHaveLength(1);
+      return { fill: fills[0], row: buildFillRow({ userId: USER_ID, order: { id: clientOrderId }, fill: fills[0], session: paperSession }) };
+    };
+
+    // Engine start #1 of the session: one fill.
+    const before = await firstFillOf(buildSim());
+    expect(before.fill.trade_id).toBe(1);
+
+    // Supervisor restart: `start()` builds a replacement simulator for the SAME
+    // session. The engine hands it the retired simulator's last emitted sequence
+    // (what `getFillSequence()` returns) so numbering continues instead of
+    // restarting at 1.
+    const after = await firstFillOf(buildSim(Number(before.fill.trade_id)));
+
+    // Same user, same session → the two upsert keys must differ, or the restart's
+    // first fill overwrites the session's earlier fill #1 row.
+    expect(after.row.session_id).toBe(before.row.session_id);
+    expect(after.row.trade_id).not.toBe(before.row.trade_id);
+    expect(before.row.trade_id).toBe(`paper-${paperSession.sessionId}-1`);
+    expect(after.row.trade_id).toBe(`paper-${paperSession.sessionId}-2`);
+  });
 });
 
 describe('resolveFillExternalOrderId — priority order', () => {
