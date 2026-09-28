@@ -479,6 +479,32 @@ describe('Session Context', () => {
     expect(key1).not.toBe(key3);
   });
 
+  /**
+   * P3-B (2026-09-28): the key is documented as deterministic ("retry/spool
+   * replay doesn't create duplicates") but embedded `Date.now()` in its second
+   * group, so two calls a millisecond apart produced different keys — the test
+   * above was intermittent and a replay across a clock tick could never dedupe.
+   */
+  it('dedupe key is stable across a clock tick and keeps the UUID-like shape', async () => {
+    const { generateDedupeKey } = await import('../runtime/session-context');
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-28T12:00:00.000Z'));
+      const key1 = generateDedupeKey('user1', 'trade123', 1234567890);
+      vi.setSystemTime(new Date('2026-09-28T12:00:00.001Z'));
+      const key2 = generateDedupeKey('user1', 'trade123', 1234567890);
+      vi.setSystemTime(new Date('2026-09-28T13:00:00.000Z'));
+      const key3 = generateDedupeKey('user1', 'trade123', 1234567890);
+
+      expect(key1).toBe(key2);
+      expect(key1).toBe(key3);
+      expect(key1).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4000-8000-.{1,12}$/);
+      expect(generateDedupeKey('user1', 'trade456', 1234567890)).not.toBe(key1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('should format timestamps in UTC ISO', async () => {
     const { formatTimestamp } = await import('../runtime/session-context');
 
