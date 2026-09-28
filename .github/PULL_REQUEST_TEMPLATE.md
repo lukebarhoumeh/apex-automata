@@ -12,7 +12,8 @@ boxes - leave them unticked so reviewers can see what was considered.
 ## Test plan
 
 <!-- Bullet list of commands run + expected results.
-     Backend: `cd atlas/apps/core-node && pnpm test` -> 38 files / 529 tests.
+     Backend: `cd atlas/apps/core-node && ENCRYPTION_KEY=<64 hex> pnpm test` -> the
+     baseline in CLAUDE.md (90 files / 1479 tests as of 2026-09-28) or higher.
      Frontend: `pnpm lint && pnpm build`.
      Backtest changes: paste 1-line summary + a link to backtest_<ts>.json. -->
 
@@ -56,9 +57,9 @@ changes — do not merge until ticked.**
 
 ### Test + standards baseline
 
-- [ ] Backend tests still pass: `cd atlas/apps/core-node && pnpm test` is
-      **38 files / 529 tests** or higher (zero failures, zero skipped that
-      were previously passing).
+- [ ] Backend tests still pass: `cd atlas/apps/core-node && pnpm test` is at
+      the CLAUDE.md baseline (**90 files / 1479 tests** as of 2026-09-28) or
+      higher (zero failures, zero skipped that were previously passing).
 - [ ] Frontend lint + build clean: `pnpm lint && pnpm build`.
 - [ ] Conventional commit format on every commit (`feat:`, `fix:`,
       `docs:`, `chore:`, etc., with optional scope).
