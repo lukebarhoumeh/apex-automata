@@ -67,8 +67,13 @@ export const STRATEGIES_JSON_REPO_PATH = 'atlas/apps/core-node/config/strategies
 /** Only keys a non-canonical guardrails stub may contain. */
 const STUB_ALLOWED_KEYS = new Set(['DO_NOT_EDIT', 'canonical']);
 
-/** Directories never descended into when scanning for stray guardrails files. */
-const SCAN_SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'var', '.pnpm', 'coverage']);
+/**
+ * Directories never descended into when scanning for stray guardrails files.
+ * `.claude` holds Claude Code agent worktrees (`.claude/worktrees/<id>/` is a
+ * full checkout, guardrails.yaml included); scanning into it would report the
+ * canonical file of every parallel worktree as a "second editable copy".
+ */
+const SCAN_SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'var', '.pnpm', 'coverage', '.claude']);
 
 interface ScalarPin {
   key: string;
