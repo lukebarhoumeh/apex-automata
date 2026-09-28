@@ -28,7 +28,7 @@ pnpm install:all      # Install all dependencies (root + backend)
 ```bash
 pnpm api              # Express API + WebSocket server
 pnpm check:config     # Must print "config-drift: OK" before any commit
-pnpm test             # vitest run — 90 files / 1479 tests, all pass (~40s)
+pnpm test             # vitest run — 91 files / 1509 tests, all pass (~40s)
 pnpm exec vitest run <file>   # single file
 pnpm build            # rimraf dist && tsc (has pre-existing type errors; runtime uses tsx)
 pnpm exec tsx src/cli/backtest.ts --start-date <s> --end-date <e> --products BTC-USD --fixture-dir fixtures/bars/15m/<set>
@@ -89,7 +89,7 @@ The meta-filter is **rule-based** (cold-streak cooldown after 10 losses → 5 mi
 - **Regime gate** (`regime_gates` in guardrails, `src/strategies/regime-gate.ts`, enforced at the router): `paper_only: true` is a desk pin; NEW ENTRIES ONLY (exits/reversals and position-monitor exits are never gated); unknown regime never gated. Current rule: trend_follow blocks `[choppy]` only (weak_trend allowed since 2026-09-28, Luke decision 2026-09-23, so the soak takes trades; PF ~0.8 in weak_trend is known — purpose is soak observability, not edge). In the default `adx_primary` detector mode `choppy` is never emitted, so the rule is belt-and-braces. Blocked entries persist as `allowed=false`, reason `regime_gate: …`, funnel stage `regime_gate`. Backtests measure it with `--regime-conditional-gates` (NOT `--regime-gates on|off`, which is the unrelated RegimeFilter toggle).
 - **Graduated kill ladder L1–L6** (`src/trading/risk/paper-kill-ladder.ts`, guardrails `paper_kill_ladder`): L1 consec>=3 or dailyR<=-1 → size x0.5; L2 consec>=5 or dailyR<=-2 → x0.25; L3 4 consecutive losses in one strategy → strategy frozen for session; L4 trend_follow stopped out twice in weak_trend/choppy → paused 4h; L5 sleeve stub (disabled); L6 dailyR<=-4 or (consec>=12 and dailyR<=-2) → hard kill (`daily_stop` / `consecutive_losses`). Thresholds are desk pins. L1–L5 write `risk_events` rows and never latch the kill switch.
 - **Boot guard** (`src/trading/risk/paper-boot-guard.ts`, PR #81): a paper start REFUSES to boot while risk state is latched (`risk_metrics.kill_switch_active` or an open halt `risk_events` row) unless `RISK_CLEAR=YES`; `PAPER_RESET_RISK_STATE_ON_START` only acts together with `RISK_CLEAR=YES`, otherwise it is logged and ignored; boot never clears the halt row. NEVER set those env vars or clear `risk_events` / kill-switch rows without an explicit Risk / Luke OK.
-- **Desk pins** (`src/config/config-drift.ts`: SCALAR_PINS, LIST_PINS, TRADE_COOLDOWN_FLOOR_EXCLUSIVE, TREND_FOLLOW_PIN): trade_cooldown_min 15 (floor >5), min_ev_threshold 0, atr_volatility_min 0.005, fee books (spot 25/40 paper book; CFM 9.5/10 + $0.10/ct; never mixed), cfm max_leverage 2 / post_only / no_chase, regime_gates.paper_only, kill-ladder thresholds, disabled_strategies list, trend_follow stopAtr 2.5 / takeProfitAtr 6.0 on every symbol block, and the regime-gate FLOOR (`REGIME_GATE_RULE_PINS`): the trend_follow rule must exist and keep blocking choppy. Changing a pin = YAML + config-drift.ts in the SAME PR, called out loudly in the PR.
+- **Desk pins** (`src/config/config-drift.ts`: SCALAR_PINS, LIST_PINS, TRADE_COOLDOWN_FLOOR_EXCLUSIVE, TREND_FOLLOW_PIN): trade_cooldown_min 15 (floor >5), min_ev_threshold 0, atr_volatility_min 0.005, fee books (spot 25/40 paper book; CFM 9.5/10 + $0.10/ct; never mixed), cfm max_leverage 2 / post_only / no_chase, regime_gates.enabled + paper_only, kill-ladder thresholds, disabled_strategies list, trend_follow stopAtr 2.5 / takeProfitAtr 6.0 on every symbol block, and the regime-gate FLOOR (`REGIME_GATE_RULE_PINS`): the trend_follow rule must exist, stay unscoped (no `venues` / `symbols`) and keep blocking choppy. Changing a pin = YAML + config-drift.ts in the SAME PR, called out loudly in the PR.
 
 ## Desk hard rules
 - PAPER ONLY. Never set `EXECUTION_MODE=live`; `CONFIRM_LIVE` stays `NO`; never weaken a live-path gate. Every commit body carries a `live impact:` line ("none" or an exact explanation).
@@ -115,7 +115,7 @@ The meta-filter is **rule-based** (cold-streak cooldown after 10 losses → 5 mi
 - Do NOT change Logger or ConfigLoader patterns; do NOT create a second editable `guardrails.yaml` (check:config fails)
 
 ## Testing
-- Backend: `cd atlas/apps/core-node && ENCRYPTION_KEY=<64 hex> pnpm test` — **90 files / 1479 tests**, all pass (~40s, verified 2026-09-28). Rollup native binary gotcha → `AGENTS.md` item 1. Claude Code worktrees under `.claude/` are skipped by the config-drift scan.
+- Backend: `cd atlas/apps/core-node && ENCRYPTION_KEY=<64 hex> pnpm test` — **91 files / 1509 tests**, all pass (~40s, verified 2026-09-28). Rollup native binary gotcha → `AGENTS.md` item 1. Claude Code worktrees under `.claude/` are skipped by the config-drift scan.
 - `pnpm check:config` must print `config-drift: OK` in the same run.
 - Frontend: `pnpm exec vitest run` from root (Vitest + jsdom).
 - ZERO test failures allowed; any failure is a regression.
