@@ -253,7 +253,9 @@ export class PositionTracker extends EventEmitter {
     this.positions.clear();
     this.lots.clear();
 
-    const rows = (data ?? []) as HydratedPositionRow[];
+    // supabase-js types a dynamic column string as GenericStringError[]; the
+    // row shape is ours, so widen through unknown.
+    const rows = (data ?? []) as unknown as HydratedPositionRow[];
     const skippedForeignMode: Array<{ id: string; symbol: string; executionMode: string }> = [];
     let hydrated = 0;
     for (const row of rows) {
