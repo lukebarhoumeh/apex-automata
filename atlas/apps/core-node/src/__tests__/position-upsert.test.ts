@@ -30,6 +30,7 @@ import {
   type PositionsConflictTarget,
 } from '../persistence/position-upsert';
 import { resolvePositionWriteStamp } from '../persistence/position-session-restamp';
+import { PositionWriteSequencer, type PositionWriteOutcome } from '../persistence/position-write-sequencer';
 import { SessionColumnSupport } from '../persistence/session-stamp';
 import { PositionTracker, type Position, type PositionTrackerConfig } from '../trading/position-tracker';
 import type { Fill } from '../exchanges/coinbase';
@@ -55,6 +56,8 @@ const NO_ARBITER_42P10 = {
 };
 const RLS_DENIED = { code: '42501', message: 'new row violates row-level security policy for table "positions"' };
 const MISSING_SESSION_ID = { code: 'PGRST204', message: "Could not find the 'session_id' column of 'positions' in the schema cache" };
+/** Postgres connection_failure as PostgREST relays it when the upstream socket drops mid-request. */
+const CONNECTION_FAILURE_08006 = { code: '08006', message: 'connection failure: server closed the connection unexpectedly' };
 
 type Row = Record<string, unknown>;
 
@@ -457,5 +460,172 @@ describe('paper fill → positions row (live schema, session-stamped)', () => {
     expect([...table.rows.values()].every((r) => r.session_id === STAMP.sessionId && r.execution_mode === 'paper')).toBe(true);
     expect(table.calls.map((c) => c.onConflict)).toEqual(['user_id,symbol', 'id', 'id', 'id']);
     expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('an in-flight debounced update that resolves after the close cannot reopen the row', async () => {
+    vi.useFakeTimers();
+    try {
+      const logger = makeLogger();
+      const tracker = new PositionTracker(trackerConfig, asLogger(logger));
+      trackers.push(tracker);
+
+      const table = liveSchemaPositionsTable();
+      const conflictSupport = new PositionsConflictTargetSupport(resolvePositionsConflictTarget({}), { logger });
+      const sessionSupport = new SessionColumnSupport();
+
+      // The debounced update's HTTP round-trip is stalled until the test
+      // releases it — the closing fill lands inside that RTT.
+      let releaseUpdate: () => void = () => {};
+      const updateGate = new Promise<void>((resolve) => { releaseUpdate = resolve; });
+      let issued = 0;
+      const completed: number[] = [];
+      const upsert = async (payload: Row, onConflict: PositionsConflictTarget) => {
+        const call = ++issued;
+        if (call === 2) await updateGate; // call 1 = open, 2 = debounced update, 3 = close
+        const result = await table.upsert(payload, onConflict);
+        completed.push(call);
+        return result;
+      };
+
+      // Same composition as api/server.ts: snapshot the row synchronously, then
+      // queue the upsert behind every earlier write for this position id.
+      const sequencer = new PositionWriteSequencer({ logger });
+      const outcomes: PositionWriteOutcome[] = [];
+      const persist = async (position: Position) => {
+        const row = mapPositionRow(position);
+        const stamp = resolvePositionWriteStamp(position, STAMP);
+        outcomes.push(await sequencer.enqueue({
+          positionId: String(row.id),
+          symbol: position.symbol,
+          sessionId: stamp?.sessionId ?? null,
+          kind: row.closed_at ? 'close' : 'update',
+          write: () => upsertPositionRow({ row, stamp, sessionSupport, conflictSupport, upsert, logger }),
+        }));
+      };
+      const pending: Promise<void>[] = [];
+      tracker.on('position:opened', (p) => { pending.push(persist(p)); });
+      tracker.on('position:updated', (p) => { pending.push(persist(p)); });
+      tracker.on('position:closed', (p) => { pending.push(persist(p)); });
+
+      await tracker.processFill(
+        paperFill({ order_id: 'ord-entry', trade_id: 1, product_id: 'ETH-USD', side: 'buy', size: '0.05', price: '4321.5', fee: '0.11', created_at: '2026-09-21T17:41:02.000Z' }),
+        { strategy: 'momentum', signalId: 'sig-1', stopPrice: 4235.07, takeProfit: 4451.15 },
+      );
+      await Promise.all(pending);
+      const opened = tracker.getPosition('ETH-USD')!;
+      expect(table.rows.get(opened.id)).toMatchObject({ closed_at: null, qty_open: 0.05 });
+
+      // A ticker tick → 1 s debounce → 'position:updated' → the update's upsert is now in flight (stalled).
+      tracker.updateMarketPrice('ETH-USD', 4400);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(issued).toBe(2);
+      expect(completed).toEqual([1]);
+
+      // The closing fill lands within the update's RTT.
+      await tracker.processFill(
+        paperFill({ order_id: 'ord-exit', trade_id: 2, product_id: 'ETH-USD', side: 'sell', size: '0.05', price: '4451.15', fee: '0.11', created_at: '2026-09-21T18:02:11.000Z' }),
+        { tag: 'take_profit' },
+      );
+      expect(tracker.getPosition('ETH-USD')).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(0);
+      // The close is queued behind the in-flight update, not raced against it.
+      expect(issued).toBe(2);
+      expect(sequencer.hasCloseIssued(opened.id)).toBe(true);
+
+      // Now the stale update's round-trip resolves — the close goes out only after it.
+      releaseUpdate();
+      await Promise.all(pending);
+
+      // Two upserts on the same id are unordered on the wire; the row must end CLOSED regardless.
+      expect(outcomes.map((o) => [o.kind, o.status, o.attempts])).toEqual([['update', 'written', 1], ['update', 'written', 1], ['close', 'written', 1]]);
+      expect(issued).toBe(3);
+      expect(completed).toEqual([1, 2, 3]);
+      expect(table.rows.size).toBe(1);
+      expect(table.rows.get(opened.id)).toMatchObject({
+        id: opened.id,
+        qty_open: 0,
+        closed_at: '2026-09-21T18:02:11.000Z',
+        exit_price: 4451.15,
+        exit_reason: 'take_profit',
+        session_id: STAMP.sessionId,
+      });
+      // The close is the LAST write that completes for this id.
+      expect(completed[completed.length - 1]).toBe(3);
+      expect(logger.error).not.toHaveBeenCalled();
+      expect(logger.warn).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a closing fill whose first upsert fails transiently is retried until the row is closed', async () => {
+    const logger = makeLogger();
+    const tracker = new PositionTracker(trackerConfig, asLogger(logger));
+    trackers.push(tracker);
+
+    const table = liveSchemaPositionsTable();
+    const conflictSupport = new PositionsConflictTargetSupport(resolvePositionsConflictTarget({}), { logger });
+    const sessionSupport = new SessionColumnSupport();
+
+    // The FIRST close upsert dies on the wire (Postgres 08006 connection_failure); every later one succeeds.
+    let closeAttempts = 0;
+    const upsert = async (payload: Row, onConflict: PositionsConflictTarget) => {
+      if (payload.closed_at != null) {
+        closeAttempts++;
+        if (closeAttempts === 1) return { error: CONNECTION_FAILURE_08006 };
+      }
+      return table.upsert(payload, onConflict);
+    };
+
+    // Same composition as api/server.ts; the backoff sleep is injected so the
+    // schedule is asserted, not waited for.
+    const sleeps: number[] = [];
+    const sequencer = new PositionWriteSequencer({ logger, sleep: async (ms) => { sleeps.push(ms); } });
+    const outcomes: PositionWriteOutcome[] = [];
+    const persist = async (position: Position) => {
+      const row = mapPositionRow(position);
+      const stamp = resolvePositionWriteStamp(position, STAMP);
+      outcomes.push(await sequencer.enqueue({
+        positionId: String(row.id),
+        symbol: position.symbol,
+        sessionId: stamp?.sessionId ?? null,
+        kind: row.closed_at ? 'close' : 'update',
+        write: () => upsertPositionRow({ row, stamp, sessionSupport, conflictSupport, upsert, logger }),
+      }));
+    };
+    const pending: Promise<void>[] = [];
+    tracker.on('position:opened', (p) => { pending.push(persist(p)); });
+    tracker.on('position:closed', (p) => { pending.push(persist(p)); });
+
+    await tracker.processFill(
+      paperFill({ order_id: 'ord-entry', trade_id: 1, product_id: 'ETH-USD', side: 'buy', size: '0.05', price: '4321.5', fee: '0.11', created_at: '2026-09-21T17:41:02.000Z' }),
+      { strategy: 'momentum', signalId: 'sig-1', stopPrice: 4235.07, takeProfit: 4451.15 },
+    );
+    await Promise.all(pending);
+    const opened = tracker.getPosition('ETH-USD')!;
+
+    await tracker.processFill(
+      paperFill({ order_id: 'ord-exit', trade_id: 2, product_id: 'ETH-USD', side: 'sell', size: '0.05', price: '4451.15', fee: '0.11', created_at: '2026-09-21T18:02:11.000Z' }),
+      { tag: 'take_profit' },
+    );
+    // PositionTracker has already dropped the Position from memory: nothing upstream will ever re-assert closed_at.
+    expect(tracker.getPosition('ETH-USD')).toBeUndefined();
+    await Promise.all(pending);
+
+    expect(table.rows.get(opened.id)).toMatchObject({
+      id: opened.id,
+      qty_open: 0,
+      closed_at: '2026-09-21T18:02:11.000Z',
+      exit_reason: 'take_profit',
+      session_id: STAMP.sessionId,
+    });
+    expect(closeAttempts).toBe(2);
+    expect(outcomes.map((o) => [o.kind, o.status, o.attempts])).toEqual([['update', 'written', 1], ['close', 'written', 2]]);
+    expect(sleeps).toEqual([250]);
+    // One warn for the retried attempt, naming the position; no error — the row got closed.
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0][0]).toMatch(/close write failed; retrying/);
+    expect(logger.warn.mock.calls[0][1]).toMatchObject({ positionId: opened.id, symbol: 'ETH-USD', sessionId: STAMP.sessionId, attempt: 1, nextDelayMs: 250, code: '08006', transient: true });
+    expect(logger.error).not.toHaveBeenCalled();
   });
 });

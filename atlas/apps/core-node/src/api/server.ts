@@ -40,6 +40,7 @@ import {
   restampHydratedOpenPositions,
   type RestampOpenPositionsResult,
 } from '../persistence/position-session-restamp';
+import { PositionWriteSequencer } from '../persistence/position-write-sequencer';
 import { writeSignalRouteVerdict } from '../persistence/signal-route-verdict';
 import {
   resolveRoutedExchange,
@@ -372,6 +373,15 @@ const feeSideColumnSupport = new SessionColumnSupport();
 // persistence/position-upsert.ts.
 const positionsConflictSupport = new PositionsConflictTargetSupport(resolvePositionsConflictTarget(), { logger });
 logger.info('positions upsert conflict target', positionsConflictSupport.snapshot());
+
+// Per-position write ordering + close durability for `positions` rows (P3-A).
+// Writes for one position id are serialized, so a debounced ticker update whose
+// HTTP round-trip outlives the closing fill can no longer complete last and
+// reopen the row; and the CLOSE write is retried with bounded backoff, so one
+// transient failure no longer leaves the row open forever (PositionTracker has
+// already dropped the position from memory by then, so nothing else would ever
+// re-assert closed_at). See persistence/position-write-sequencer.ts.
+const positionWriteSequencer = new PositionWriteSequencer({ logger });
 
 // Session stamp for persisted rows. Set the moment the engine starts building
 // (so anything written during start-up already carries the id) and cleared when
@@ -5429,31 +5439,41 @@ async function syncPositionToSupabase(position: any) {
     // session's value survives its close, as before (TASK_014 P5). See
     // persistence/position-session-restamp.ts.
     const stamp = resolvePositionWriteStamp(position, currentSessionStamp());
-    const { error, onConflictTarget, conflictFellBack, stamped } = await upsertPositionRow({
-      row: mappedPosition,
-      stamp,
-      sessionSupport: sessionColumnSupport,
-      conflictSupport: positionsConflictSupport,
-      upsert: async (payload, onConflict) => {
-        const { error } = await supabase.from('positions').upsert(payload, { onConflict });
-        return { error };
+    //
+    // The row snapshot above is taken synchronously; the write itself is
+    // queued behind every earlier write for this position id and, for a
+    // close, retried with bounded backoff. Failures are logged by the
+    // sequencer (non-close: 'Failed to sync position to Supabase:' as before;
+    // close: one warn per retry, then an error naming the remediation).
+    await positionWriteSequencer.enqueue({
+      positionId: String(mappedPosition.id),
+      symbol: mappedPosition.symbol,
+      sessionId: stamp?.sessionId ?? null,
+      kind: closedAt ? 'close' : 'update',
+      write: async () => {
+        const { error, onConflictTarget, conflictFellBack, stamped } = await upsertPositionRow({
+          row: mappedPosition,
+          stamp,
+          sessionSupport: sessionColumnSupport,
+          conflictSupport: positionsConflictSupport,
+          upsert: async (payload, onConflict) => {
+            const { error } = await supabase.from('positions').upsert(payload, { onConflict });
+            return { error };
+          },
+          logger,
+        });
+        return {
+          error,
+          detail: {
+            onConflictTarget,
+            conflictFellBack,
+            stamped,
+            closedAt,
+            hint: describePositionUpsertError(error, onConflictTarget),
+          },
+        };
       },
-      logger,
     });
-
-    if (error) {
-      logger.error('Failed to sync position to Supabase:', {
-        error: error.message,
-        code: (error as any).code,
-        onConflictTarget,
-        conflictFellBack,
-        stamped,
-        positionId: mappedPosition.id,
-        symbol: mappedPosition.symbol,
-        closedAt,
-        hint: describePositionUpsertError(error, onConflictTarget),
-      });
-    }
   } catch (error) {
     logger.error('Error syncing position:', error);
   }
