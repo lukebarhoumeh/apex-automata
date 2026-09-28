@@ -24,6 +24,8 @@ import {
   findGuardrailsFiles,
   formatViolations,
   isPointerStub,
+  REGIME_GATE_RULE_PINS,
+  SCALAR_PINS,
   STRATEGIES_JSON_REPO_PATH,
   type DriftViolation,
   type DriftViolationCode,
@@ -433,6 +435,109 @@ describe('checkConfigDrift() fixtures', () => {
       ['perps_symbols.ETH-PERP-INTX.disabled_strategies', 'perps_symbols.BTC-PERP-INTX.disabled_strategies'],
       ['pin_list_missing_entry', 'pin_list_missing_entry']
     );
+  });
+
+  describe('regime-gate FLOOR pin (TF-REGIME-GATE 2026-09-28: loosen, never remove)', () => {
+    test('the floor is exactly: trend_follow rule must exist and must block choppy', () => {
+      expect(REGIME_GATE_RULE_PINS).toEqual([{ strategy: 'trend_follow', mustBlock: ['choppy'] }]);
+      // paper_only stays a scalar pin so the loosened gate can never reach live in a one-file edit.
+      expect(SCALAR_PINS).toContainEqual({ key: 'regime_gates.paper_only', expected: true });
+    });
+
+    test('the canonical YAML satisfies the floor with block_regimes: [choppy] only', () => {
+      const doc = YAML.parse(realCanonicalYaml);
+      const tf = doc.regime_gates.rules.find((r: { strategy: string }) => r.strategy === 'trend_follow');
+      expect(doc.regime_gates.enabled).toBe(true);
+      expect(doc.regime_gates.paper_only).toBe(true);
+      expect(tf.block_regimes).toEqual(['choppy']);
+      expect(checkConfigDrift(makeRepo()).violations).toEqual([]);
+    });
+
+    test('tightening the rule (adding weak_trend back) is NOT a violation — the pin is a floor', () => {
+      const { violations } = checkConfigDrift(
+        makeRepo({
+          mutateCanonical: (doc) => {
+            doc.regime_gates.rules[0].block_regimes = ['weak_trend', 'choppy'];
+          },
+        })
+      );
+      expect(violations).toEqual([]);
+    });
+
+    test('dropping choppy from the trend_follow rule breaches the floor', () => {
+      const { violations } = checkConfigDrift(
+        makeRepo({
+          mutateCanonical: (doc) => {
+            doc.regime_gates.rules[0].block_regimes = [];
+          },
+        })
+      );
+      expect(codes(violations)).toEqual(['regime_gate_rule_missing']);
+      expect(violations[0].key).toBe('regime_gates.rules.trend_follow.block_regimes');
+      expect(violations[0].message).toMatch(/must include "choppy"/);
+      expect(violations[0].message).toMatch(/loosened but never removed/);
+    });
+
+    test('swapping choppy for another regime also breaches the floor', () => {
+      const { violations } = checkConfigDrift(
+        makeRepo({
+          mutateCanonical: (doc) => {
+            doc.regime_gates.rules[0].block_regimes = ['ranging'];
+          },
+        })
+      );
+      expect(codes(violations)).toEqual(['regime_gate_rule_missing']);
+      expect(violations[0].message).toMatch(/currently \["ranging"\]/);
+    });
+
+    test('removing the trend_follow rule breaches the floor', () => {
+      const { violations } = checkConfigDrift(
+        makeRepo({
+          mutateCanonical: (doc) => {
+            doc.regime_gates.rules = [];
+          },
+        })
+      );
+      expect(codes(violations)).toEqual(['regime_gate_rule_missing']);
+      expect(violations[0].key).toBe('regime_gates.rules');
+      expect(violations[0].message).toMatch(/no "trend_follow" rule/);
+    });
+
+    test('retargeting the rule at another strategy breaches the floor (trend_follow rule is gone)', () => {
+      const { violations } = checkConfigDrift(
+        makeRepo({
+          mutateCanonical: (doc) => {
+            doc.regime_gates.rules[0].strategy = 'momentum';
+          },
+        })
+      );
+      expect(codes(violations)).toEqual(['regime_gate_rule_missing']);
+      expect(violations[0].message).toMatch(/currently \["momentum"\]/);
+    });
+
+    test('deleting the whole regime_gates block breaches the floor AND the paper_only pin', () => {
+      const { violations } = checkConfigDrift(
+        makeRepo({
+          mutateCanonical: (doc) => {
+            delete doc.regime_gates;
+          },
+        })
+      );
+      expect(codes(violations)).toEqual(['pin_mismatch', 'regime_gate_rule_missing']);
+      expect(violations.map((v) => v.key)).toEqual(['regime_gates.paper_only', 'regime_gates.rules']);
+    });
+
+    test('flipping paper_only toward live is still caught by the scalar pin', () => {
+      const { violations } = checkConfigDrift(
+        makeRepo({
+          mutateCanonical: (doc) => {
+            doc.regime_gates.paper_only = false;
+          },
+        })
+      );
+      expect(codes(violations)).toEqual(['pin_mismatch']);
+      expect(violations[0].key).toBe('regime_gates.paper_only');
+    });
   });
 
   test('formatViolations renders code, file, key and message', () => {

@@ -17,6 +17,9 @@
  *   4. A desk-pinned value in the canonical file has drifted. Pins are the
  *      2026-09-10 desk approvals; changing one is a two-file change (YAML +
  *      this list) on purpose.
+ *   5. The paper regime entry gate has been loosened past its floor
+ *      (`REGIME_GATE_RULE_PINS`, TF-REGIME-GATE 2026-09-28): the trend_follow
+ *      rule must exist and must still block `choppy`.
  *
  * Pure: no logging, no process.exit — the CLI wrapper in
  * `src/cli/check-config-drift.ts` and the vitest suite both consume the
@@ -39,6 +42,7 @@ export type DriftViolationCode =
   | 'pin_mismatch'
   | 'pin_floor_breached'
   | 'pin_list_missing_entry'
+  | 'regime_gate_rule_missing'
   | 'cfm_symbol_strategy_enabled'
   | 'cfm_symbol_proxy_missing';
 
@@ -131,6 +135,29 @@ export const LIST_PINS: ReadonlyArray<{ key: string; mustInclude: readonly strin
 
 /** trade_cooldown_min may be raised, never dropped to the fee-churn zone. */
 export const TRADE_COOLDOWN_FLOOR_EXCLUSIVE = 5;
+
+/** One regime-gate FLOOR pin: the rule for `strategy` must exist and block every regime in `mustBlock`. */
+export interface RegimeGateRulePin {
+  strategy: string;
+  mustBlock: readonly string[];
+}
+
+/**
+ * TF-REGIME-GATE floor pins (2026-09-28, Luke decision 2026-09-23).
+ *
+ * The paper regime entry gate for trend_follow was LOOSENED from
+ * `[weak_trend, choppy]` to `[choppy]` so the paper soak takes trades in
+ * weak_trend (observability, not edge — the kill ladder is the loss brake).
+ * This pin is the FLOOR under that loosening: the trend_follow rule must still
+ * exist under `regime_gates.rules` and must still block `choppy`, so a further
+ * one-line YAML edit cannot silently turn "loosened" into "removed". Extra
+ * blocked regimes are allowed (tightening never trips it); dropping the rule,
+ * dropping `choppy`, or deleting the `regime_gates` block does.
+ * `regime_gates.paper_only` stays pinned in SCALAR_PINS (live inert).
+ */
+export const REGIME_GATE_RULE_PINS: readonly RegimeGateRulePin[] = [
+  { strategy: 'trend_follow', mustBlock: ['choppy'] },
+];
 
 /** trend_follow stop / take-profit pin applied to every symbol block. */
 export const TREND_FOLLOW_PIN = { stopAtr: 2.5, takeProfitAtr: 6.0 } as const;
@@ -340,6 +367,38 @@ function checkPins(guardrails: GuardrailConfig, out: DriftViolation[]): void {
           file,
           key: pin.key,
           message: `${pin.key} must include "${entry}" (currently ${JSON.stringify(actual ?? null)})`,
+        });
+      }
+    }
+  }
+
+  // Regime-gate FLOOR (TF-REGIME-GATE 2026-09-28): rule present + still blocks
+  // its floor regimes. Reported once per missing rule / per missing regime.
+  const gateRules = guardrails.regime_gates?.rules ?? [];
+  for (const pin of REGIME_GATE_RULE_PINS) {
+    const rule = gateRules.find((r) => r.strategy === pin.strategy);
+    if (!rule) {
+      out.push({
+        code: 'regime_gate_rule_missing',
+        file,
+        key: 'regime_gates.rules',
+        message:
+          `regime_gates.rules has no "${pin.strategy}" rule (currently ${JSON.stringify(gateRules.map((r) => r.strategy))}). ` +
+          `The paper regime gate may be loosened but never removed: keep a ${pin.strategy} rule that blocks ` +
+          `${pin.mustBlock.map((r) => `"${r}"`).join(', ')} (floor pin REGIME_GATE_RULE_PINS).`,
+      });
+      continue;
+    }
+    for (const regime of pin.mustBlock) {
+      if (!(rule.block_regimes as readonly string[]).includes(regime)) {
+        out.push({
+          code: 'regime_gate_rule_missing',
+          file,
+          key: `regime_gates.rules.${pin.strategy}.block_regimes`,
+          message:
+            `regime_gates.rules[${pin.strategy}].block_regimes must include "${regime}" ` +
+            `(currently ${JSON.stringify(rule.block_regimes)}). Floor pin REGIME_GATE_RULE_PINS: ` +
+            'the paper regime gate may be loosened but never removed.',
         });
       }
     }

@@ -512,9 +512,51 @@ paper_kill_ladder:
     consecutive_losses: 12
     consecutive_losses_daily_r: -2.0
 
-# A6 (2026-05-29) / TF-REGIME-GATE (2026-09-22) — Regime-conditional ENTRY
-# gates. ENABLED FOR PAPER ONLY.
+# A6 (2026-05-29) / TF-REGIME-GATE (2026-09-22, loosened 2026-09-28) —
+# Regime-conditional ENTRY gates. ENABLED FOR PAPER ONLY.
 # ---------------------------------------------------------------------------
+# History:
+#   - 2026-09-22 (TF-REGIME-GATE): shipped ENABLED, paper_only, with the
+#     trend_follow rule `block_regimes: [weak_trend, choppy]` (A6 evidence,
+#     see the empirical-basis paragraph below).
+#   - 2026-09-28 (desk decision, Luke 2026-09-23): LOOSENED to
+#     `block_regimes: [choppy]`. With weak_trend blocked the stack was safe and
+#     honest but did not trade: the last paper session ended flat with 0
+#     orders and all 50 signals rejected at the router with
+#     `regime_gate: trend_follow new entry blocked: regime=weak_trend`.
+#     trend_follow is the only active strategy and weak_trend is the regime
+#     the market has been in, so the gate silenced the whole book.
+#
+# Why (2026-09-28): the purpose of the current paper run is an OBSERVABLE
+# paper soak — fills, persistence, the kill ladder and the UI under real
+# trades — NOT proving edge. We already KNOW trend_follow in weak_trend is
+# ~PF 0.78 (90d) / 0.80 (12m) before fees (docs/research/
+# 2026-05-29_a6-regime-conditional-gates.md §4.1); the soak is expected to
+# bleed slowly and that is accepted. The loss brakes that remain in force:
+#   - paper_kill_ladder L1/L2: size-down caps (0.5 / 0.25) on 3 / 5
+#     consecutive losses or dailyR <= -1 / -2;
+#   - paper_kill_ladder L4: trend_follow paused 4h in weak_trend / choppy
+#     after 2 stop-outs in that regime (regime stamped at entry);
+#   - paper_kill_ladder L6: hard kill on dailyR <= -4 (or consec >= 12 with
+#     dailyR <= -2), plus the unchanged drawdown / weekly / rapid-loss halts;
+#   - the plugin-level regimeCompatibility refusal (trend_follow never emits
+#     in ranging / choppy at signal generation);
+#   - the RegimeFilter (counter-trend + low-compatibility rejects).
+# `choppy` stays in the rule as belt-and-braces: in the RegimeDetector's
+# default `adx_primary` mode `choppy` is never emitted (ADX >= 40 strong,
+# >= 20 weak, else ranging; `choppy` only appears in multi_factor mode or the
+# insufficient-data neutral state, which the plugin already refuses), so this
+# router gate is effectively inert for trend_follow in paper unless the
+# detector runs multi_factor. Keeping the rule keeps the wiring, the funnel
+# stage and the FE deny reason exercised, and it is FLOOR-pinned:
+# `pnpm check:config` (config-drift.ts REGIME_GATE_RULE_PINS) fails if the
+# trend_follow rule is removed or stops blocking `choppy`, so "loosened" can
+# never silently become "removed". Rollback = `block_regimes: [weak_trend,
+# choppy]` (one line; the floor pin allows tightening).
+# LIVE IS INERT: `paper_only: true` is pinned; a live session resolves the
+# gate disabled (regime-gate.ts buildRegimeGateConfig), so this loosening
+# changes nothing on the live path.
+#
 # Scope (TF-REGIME-GATE, desk 2026-09-22):
 #   - `paper_only: true` (schema default true) — the gate is INERT when the
 #     engine starts with EXECUTION_MODE=live: live behaviour is byte-for-byte
@@ -531,7 +573,7 @@ paper_kill_ladder:
 #   - Enforced at the ROUTER stage (api/server.ts `signal:generated`, after the
 #     canonical `signals` row is written), so a blocked entry is persisted as
 #     `allowed = false` with
-#       reason = "regime_gate: trend_follow new entry blocked: regime=weak_trend (paper-only regime gate blocks weak_trend|choppy)"
+#       reason = "regime_gate: trend_follow new entry blocked: regime=choppy (paper-only regime gate blocks choppy)"
 #     and renders REJECTED with that note in the FE signal stream. Funnel:
 #     stage `regime_gate`, reason `regime_blocked` (atlas_signal_filtered_total).
 #
@@ -551,6 +593,8 @@ paper_kill_ladder:
 # positive edge in strong_trend (PF 1.41, 12m, n=16). Blocking weak_trend keeps
 # only the strong_trend edge. CAVEAT: strong_trend is rare, so this nearly
 # silences trend_follow entries in paper — see the doc's §"projected impact".
+# That caveat is exactly what the 2026-09-28 loosening trades away on purpose
+# (observability over edge); the weak_trend bleed numbers above still stand.
 # Momentum is intentionally NOT gated here: its regime edge is NOT stationary
 # (strong_trend PF 3.73 over 90d vs 0.46 over 12m), so a momentum regime gate
 # would overfit to one window.
@@ -559,7 +603,10 @@ regime_gates:
   paper_only: true
   rules:
     - strategy: trend_follow
-      block_regimes: [weak_trend, choppy]
+      # 2026-09-28: weak_trend removed (paper soak observability, Luke
+      # 2026-09-23). Floor-pinned: must keep `choppy`. Rollback:
+      # block_regimes: [weak_trend, choppy]
+      block_regimes: [choppy]
 
 compliance:
   tax_method: FIFO
