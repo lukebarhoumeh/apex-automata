@@ -536,9 +536,10 @@ paper_kill_ladder:
 # Why (2026-09-28): the purpose of the current paper run is an OBSERVABLE
 # paper soak — fills, persistence, the kill ladder and the UI under real
 # trades — NOT proving edge. We already KNOW trend_follow in weak_trend is
-# ~PF 0.78 (90d) / 0.80 (12m) before fees (docs/research/
-# 2026-05-29_a6-regime-conditional-gates.md §4.1); the soak is expected to
-# bleed slowly and that is accepted. The loss brakes that remain in force:
+# ~PF 0.78 (90d) / 0.80 (12m) net of that study's simulated HL 4.5 bps fee
+# (docs/research/2026-05-29_a6-regime-conditional-gates.md §4.1; worse under
+# the 25/40 bps paper book); the soak is expected to bleed slowly and that is
+# accepted. The loss brakes that remain in force:
 #   - paper_kill_ladder L1/L2: size-down caps (0.5 / 0.25) on 3 / 5
 #     consecutive losses or dailyR <= -1 / -2;
 #   - paper_kill_ladder L4: trend_follow paused 4h in weak_trend / choppy
@@ -555,10 +556,12 @@ paper_kill_ladder:
 # router gate is effectively inert for trend_follow in paper unless the
 # detector runs multi_factor. Keeping the rule keeps the wiring, the funnel
 # stage and the FE deny reason exercised, and it is FLOOR-pinned:
-# `pnpm check:config` (config-drift.ts REGIME_GATE_RULE_PINS) fails if the
-# trend_follow rule is removed or stops blocking `choppy`, so "loosened" can
-# never silently become "removed". Rollback = `block_regimes: [weak_trend,
-# choppy]` (one line; the floor pin allows tightening).
+# `pnpm check:config` (config-drift.ts REGIME_GATE_RULE_PINS + SCALAR_PINS)
+# fails if the trend_follow rule is removed, scoped down with `venues` /
+# `symbols`, or stops blocking `choppy`, and if `enabled` or `paper_only`
+# leaves `true` — so "loosened" can never silently become "removed".
+# Rollback = `block_regimes: [weak_trend, choppy]` (one line; the floor pin
+# allows tightening).
 # LIVE IS INERT: `paper_only: true` is pinned; a live session resolves the
 # gate disabled (regime-gate.ts buildRegimeGateConfig), so this loosening
 # changes nothing on the live path.

@@ -19,7 +19,9 @@
  *      this list) on purpose.
  *   5. The paper regime entry gate has been loosened past its floor
  *      (`REGIME_GATE_RULE_PINS`, TF-REGIME-GATE 2026-09-28): the trend_follow
- *      rule must exist and must still block `choppy`.
+ *      rule must exist, must not be scoped down with `venues` / `symbols`, and
+ *      must still block `choppy`; `regime_gates.enabled` and `paper_only`
+ *      stay pinned `true` (SCALAR_PINS).
  *
  * Pure: no logging, no process.exit — the CLI wrapper in
  * `src/cli/check-config-drift.ts` and the vitest suite both consume the
@@ -43,6 +45,7 @@ export type DriftViolationCode =
   | 'pin_floor_breached'
   | 'pin_list_missing_entry'
   | 'regime_gate_rule_missing'
+  | 'regime_gate_rule_scoped'
   | 'cfm_symbol_strategy_enabled'
   | 'cfm_symbol_proxy_missing';
 
@@ -113,6 +116,10 @@ export const SCALAR_PINS: readonly ScalarPin[] = [
   // routing must stay untouched (CONFIRM_LIVE locked) — reaching live needs a
   // two-file change, never a one-line YAML flip.
   { key: 'regime_gates.paper_only', expected: true },
+  // TF-REGIME-GATE (2026-09-28 loosening): `enabled` is pinned as well. With the
+  // rule loosened to [choppy], `enabled: false` would be the one-line edit that
+  // removes the paper gate entirely while REGIME_GATE_RULE_PINS still passes.
+  { key: 'regime_gates.enabled', expected: true },
   // Graduated paper kill ladder (Risk desk SoT 2026-09-22). The `enabled`
   // flags are deliberately NOT pinned (feature flags); the rung thresholds are.
   { key: 'paper_kill_ladder.l1_size_down.consecutive_losses', expected: 3 },
@@ -157,11 +164,14 @@ export interface RegimeGateRulePin {
  * `[weak_trend, choppy]` to `[choppy]` so the paper soak takes trades in
  * weak_trend (observability, not edge — the kill ladder is the loss brake).
  * This pin is the FLOOR under that loosening: the trend_follow rule must still
- * exist under `regime_gates.rules` and must still block `choppy`, so a further
- * one-line YAML edit cannot silently turn "loosened" into "removed". Extra
- * blocked regimes are allowed (tightening never trips it); dropping the rule,
- * dropping `choppy`, or deleting the `regime_gates` block does.
- * `regime_gates.paper_only` stays pinned in SCALAR_PINS (live inert).
+ * exist under `regime_gates.rules`, must apply to every venue and symbol (no
+ * `venues` / `symbols` scope — scoping it to `[PERP]` would ungate every spot
+ * entry), and must still block `choppy`, so a further one-line YAML edit
+ * cannot silently turn "loosened" into "removed". Extra blocked regimes are
+ * allowed (tightening never trips it); dropping the rule, scoping it, dropping
+ * `choppy`, or deleting the `regime_gates` block does. `regime_gates.enabled`
+ * and `regime_gates.paper_only` stay pinned in SCALAR_PINS (the other two
+ * one-line removals; live inert).
  */
 export const REGIME_GATE_RULE_PINS: readonly RegimeGateRulePin[] = [
   { strategy: 'trend_follow', mustBlock: ['choppy'] },
@@ -396,6 +406,17 @@ function checkPins(guardrails: GuardrailConfig, out: DriftViolation[]): void {
           `${pin.mustBlock.map((r) => `"${r}"`).join(', ')} (floor pin REGIME_GATE_RULE_PINS).`,
       });
       continue;
+    }
+    if ((rule.venues && rule.venues.length > 0) || (rule.symbols && rule.symbols.length > 0)) {
+      out.push({
+        code: 'regime_gate_rule_scoped',
+        file,
+        key: `regime_gates.rules.${pin.strategy}`,
+        message:
+          `regime_gates.rules[${pin.strategy}] is scoped (venues=${JSON.stringify(rule.venues ?? null)}, ` +
+          `symbols=${JSON.stringify(rule.symbols ?? null)}). The floor rule must apply to every venue and symbol: ` +
+          'scoping it down is another way of removing the paper regime gate (floor pin REGIME_GATE_RULE_PINS).',
+      });
     }
     for (const regime of pin.mustBlock) {
       if (!(rule.block_regimes as readonly string[]).includes(regime)) {

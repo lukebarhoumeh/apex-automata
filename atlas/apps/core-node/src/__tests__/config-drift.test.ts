@@ -457,6 +457,45 @@ describe('checkConfigDrift() fixtures', () => {
       expect(REGIME_GATE_RULE_PINS).toEqual([{ strategy: 'trend_follow', mustBlock: ['choppy'] }]);
       // paper_only stays a scalar pin so the loosened gate can never reach live in a one-file edit.
       expect(SCALAR_PINS).toContainEqual({ key: 'regime_gates.paper_only', expected: true });
+      // enabled is pinned too: `enabled: false` is the other one-line removal of the paper gate.
+      expect(SCALAR_PINS).toContainEqual({ key: 'regime_gates.enabled', expected: true });
+    });
+
+    test('disabling the gate (`enabled: false`) is caught by the scalar pin', () => {
+      const { violations } = checkConfigDrift(
+        makeRepo({
+          mutateCanonical: (doc) => {
+            doc.regime_gates.enabled = false;
+          },
+        })
+      );
+      expect(codes(violations)).toEqual(['pin_mismatch']);
+      expect(violations[0].key).toBe('regime_gates.enabled');
+    });
+
+    test('scoping the trend_follow rule to PERP venues breaches the floor (spot entries would be ungated)', () => {
+      const { violations } = checkConfigDrift(
+        makeRepo({
+          mutateCanonical: (doc) => {
+            doc.regime_gates.rules[0].venues = ['PERP'];
+          },
+        })
+      );
+      expect(codes(violations)).toEqual(['regime_gate_rule_scoped']);
+      expect(violations[0].key).toBe('regime_gates.rules.trend_follow');
+      expect(violations[0].message).toMatch(/venues=\["PERP"\]/);
+    });
+
+    test('scoping the trend_follow rule to a symbol list breaches the floor', () => {
+      const { violations } = checkConfigDrift(
+        makeRepo({
+          mutateCanonical: (doc) => {
+            doc.regime_gates.rules[0].symbols = ['BTC-USD'];
+          },
+        })
+      );
+      expect(codes(violations)).toEqual(['regime_gate_rule_scoped']);
+      expect(violations[0].message).toMatch(/symbols=\["BTC-USD"\]/);
     });
 
     test('the canonical YAML satisfies the floor with block_regimes: [choppy] only', () => {
@@ -538,8 +577,8 @@ describe('checkConfigDrift() fixtures', () => {
           },
         })
       );
-      expect(codes(violations)).toEqual(['pin_mismatch', 'regime_gate_rule_missing']);
-      expect(violations.map((v) => v.key)).toEqual(['regime_gates.paper_only', 'regime_gates.rules']);
+      expect(codes(violations)).toEqual(['pin_mismatch', 'pin_mismatch', 'regime_gate_rule_missing']);
+      expect(violations.map((v) => v.key)).toEqual(['regime_gates.paper_only', 'regime_gates.enabled', 'regime_gates.rules']);
     });
 
     test('flipping paper_only toward live is still caught by the scalar pin', () => {
