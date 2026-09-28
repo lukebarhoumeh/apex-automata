@@ -90,7 +90,15 @@ export interface RestampOpenPositionsResult {
   restamped: number;
   /** Open rows that already carried the active stamp. */
   alreadyCurrent: number;
+  /**
+   * Open rows whose non-null `execution_mode` is NOT the active session's.
+   * Never restamped: paper and live share one Supabase project and a row of
+   * the other mode must never be re-labelled onto this session.
+   */
+  foreign: number;
   rows: RestampedRow[];
+  /** The foreign-mode rows, with the stamp they keep. */
+  foreignRows: RestampedRow[];
   error: PostgrestErrorLike | null;
 }
 
@@ -178,7 +186,9 @@ export async function restampHydratedOpenPositions(params: {
     hydrated: refs.length,
     restamped: 0,
     alreadyCurrent: 0,
+    foreign: 0,
     rows: [],
+    foreignRows: [],
     error: null,
   };
 
@@ -234,6 +244,7 @@ export async function restampHydratedOpenPositions(params: {
 
   const symbolById = new Map(refs.map((ref) => [ref.id, ref.symbol]));
   const stale: RestampedRow[] = [];
+  const foreign: RestampedRow[] = [];
   let alreadyCurrent = 0;
   for (const row of readResult.data ?? []) {
     if (!symbolById.has(row.id)) continue;
@@ -243,20 +254,43 @@ export async function restampHydratedOpenPositions(params: {
       alreadyCurrent++;
       continue;
     }
-    stale.push({
+    const ref: RestampedRow = {
       id: row.id,
       symbol: symbolById.get(row.id) ?? row.symbol ?? '',
       fromSessionId: sessionId,
       fromExecutionMode: executionMode,
+    };
+    if (executionMode !== null && executionMode !== stamp.executionMode) {
+      // A row of the OTHER mode: never adopt or re-label it. Only NULL
+      // (legacy, unstamped) and same-mode rows are ever moved.
+      foreign.push(ref);
+      continue;
+    }
+    stale.push(ref);
+  }
+  base.foreign = foreign.length;
+  base.foreignRows = foreign;
+
+  if (foreign.length > 0) {
+    logger?.warn('positions: hydrated open rows carry another execution_mode — left on their own session (never restamped across modes)', {
+      sessionId: stamp.sessionId,
+      executionMode: stamp.executionMode,
+      foreign: foreign.length,
+      ids: foreign.map((row) => row.id),
+      symbols: foreign.map((row) => row.symbol),
+      foreignModes: [...new Set(foreign.map((row) => row.fromExecutionMode ?? 'null'))],
+      fromSessionIds: [...new Set(foreign.map((row) => row.fromSessionId ?? 'null'))],
     });
   }
 
   if (stale.length === 0) {
-    logger?.info('positions: hydrated open positions already carry the active session_id', {
-      sessionId: stamp.sessionId,
-      hydrated: refs.length,
-      alreadyCurrent,
-    });
+    if (foreign.length === 0) {
+      logger?.info('positions: hydrated open positions already carry the active session_id', {
+        sessionId: stamp.sessionId,
+        hydrated: refs.length,
+        alreadyCurrent,
+      });
+    }
     return { ...base, alreadyCurrent };
   }
 
@@ -288,6 +322,7 @@ export async function restampHydratedOpenPositions(params: {
     hydrated: refs.length,
     restamped: rows.length,
     alreadyCurrent,
+    foreign: foreign.length,
     symbols: rows.map((row) => row.symbol),
     fromSessionIds: [...new Set(rows.map((row) => row.fromSessionId ?? 'null'))],
   });

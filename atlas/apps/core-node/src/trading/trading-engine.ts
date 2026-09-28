@@ -1346,7 +1346,10 @@ export class TradingEngine extends EventEmitter {
     this.logger.info('Startup state hydration: starting', { userId });
 
     const results = await Promise.allSettled([
-      this.positionTracker.hydrateOpenPositions(userId),
+      // Mode-scoped: a paper engine never adopts a live open row and a live
+      // engine never adopts a paper one (shared Supabase project). NULL-stamped
+      // legacy rows and pre-20260911 schemas hydrate exactly as before.
+      this.positionTracker.hydrateOpenPositions(userId, { executionMode: this.config.mode }),
       this.orderManager.hydrateOpenOrders(userId, {
         supabaseUrl: this.config.supabase.url,
         supabaseKey: this.config.supabase.serviceKey,

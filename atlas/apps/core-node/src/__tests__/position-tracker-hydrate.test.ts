@@ -20,16 +20,24 @@ const mockLogger = {
 };
 
 // Each test sets this to control what supabase.from('positions').select(...).eq(...).is(...) returns.
-let nextQueryResult: { data: any[] | null; error: { message: string } | null } = { data: [], error: null };
+type QueryResult = { data: any[] | null; error: { message: string; code?: string } | null };
+let nextQueryResult: QueryResult = { data: [], error: null };
+// Optional FIFO of per-call results (schema-tolerance tests); falls back to nextQueryResult when drained.
+let queuedQueryResults: QueryResult[] = [];
+// Column lists passed to select(), in call order.
+let selectCalls: string[] = [];
 
 vi.mock('@supabase/supabase-js', () => ({
   createClient: () => ({
     from: () => ({
-      select: () => ({
-        eq: () => ({
-          is: () => Promise.resolve(nextQueryResult),
-        }),
-      }),
+      select: (columns: string) => {
+        selectCalls.push(columns);
+        return {
+          eq: () => ({
+            is: () => Promise.resolve(queuedQueryResults.length > 0 ? queuedQueryResults.shift() : nextQueryResult),
+          }),
+        };
+      },
       insert: () => Promise.resolve({ error: null }),
       upsert: () => Promise.resolve({ error: null }),
     }),
@@ -53,6 +61,8 @@ describe('PositionTracker.hydrateOpenPositions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     nextQueryResult = { data: [], error: null };
+    queuedQueryResults = [];
+    selectCalls = [];
     tracker = new PositionTracker(baseConfig, mockLogger as any);
   });
 
@@ -140,5 +150,76 @@ describe('PositionTracker.hydrateOpenPositions', () => {
   test('throws when Supabase returns an error so the engine can branch on failure', async () => {
     nextQueryResult = { data: null, error: { message: 'fetch failed' } };
     await expect(tracker.hydrateOpenPositions('user-abc')).rejects.toThrow(/positions hydrate query failed/);
+  });
+
+  // ── execution_mode isolation (paper and live share one Supabase project) ──
+
+  const LIVE_ROW_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const modeRows = () => [
+    { id: 'p-1', symbol: 'ETH-USD', side: 'long', qty_open: 0.5, entry_price: 3000, opened_at: '2026-09-27T12:00:00.000Z', execution_mode: 'paper' },
+    { id: LIVE_ROW_ID, symbol: 'BTC-USD', side: 'long', qty_open: 0.01, entry_price: 110_000, opened_at: '2026-09-27T12:05:00.000Z', execution_mode: 'live' },
+    // Legacy row written before migration 20260911170000: execution_mode never stamped.
+    { id: 'n-1', symbol: 'SOL-USD', side: 'short', qty_open: 5, entry_price: 150, opened_at: '2026-09-27T12:10:00.000Z', execution_mode: null },
+  ];
+
+  test('paper hydrate adopts paper and legacy (NULL) rows only — a live row is skipped and reported', async () => {
+    nextQueryResult = { data: modeRows(), error: null };
+
+    const count = await tracker.hydrateOpenPositions('user-abc', { executionMode: 'paper' });
+
+    expect(count).toBe(2);
+    expect(tracker.getPosition('ETH-USD')).toBeDefined();
+    expect(tracker.getPosition('SOL-USD')).toBeDefined();
+    expect(tracker.getPosition('BTC-USD')).toBeUndefined();
+
+    // The skipped row is surfaced (count + ids), never silently dropped.
+    const skipWarn = mockLogger.warn.mock.calls.find(([msg]) => /execution_mode/.test(String(msg)));
+    expect(skipWarn).toBeDefined();
+    expect(skipWarn![1]).toMatchObject({ executionMode: 'paper', skipped: 1, ids: [LIVE_ROW_ID], symbols: ['BTC-USD'] });
+    // The query itself asked for the column so the decision is made on the row, not by guessing.
+    expect(selectCalls[0]).toMatch(/execution_mode/);
+  });
+
+  test('live hydrate is symmetric: paper rows are never adopted by a live start (NULL still hydrates)', async () => {
+    nextQueryResult = { data: modeRows(), error: null };
+
+    const count = await tracker.hydrateOpenPositions('user-abc', { executionMode: 'live' });
+
+    expect(count).toBe(2);
+    expect(tracker.getPosition('BTC-USD')).toBeDefined();
+    expect(tracker.getPosition('SOL-USD')).toBeDefined();
+    expect(tracker.getPosition('ETH-USD')).toBeUndefined();
+    const skipWarn = mockLogger.warn.mock.calls.find(([msg]) => /execution_mode/.test(String(msg)));
+    expect(skipWarn![1]).toMatchObject({ executionMode: 'live', skipped: 1, ids: ['p-1'] });
+  });
+
+  test('no active mode given: every open row hydrates (legacy callers unchanged)', async () => {
+    nextQueryResult = { data: modeRows(), error: null };
+    const count = await tracker.hydrateOpenPositions('user-abc');
+    expect(count).toBe(3);
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+  });
+
+  test('pre-20260911 schema: 42703 on execution_mode retries the legacy select once and hydrates every row', async () => {
+    queuedQueryResults = [
+      { data: null, error: { code: '42703', message: 'column positions.execution_mode does not exist' } },
+      { data: modeRows().map(({ execution_mode: _m, ...row }) => row), error: null },
+    ];
+
+    const count = await tracker.hydrateOpenPositions('user-abc', { executionMode: 'paper' });
+
+    expect(count).toBe(3);
+    expect(selectCalls).toHaveLength(2);
+    expect(selectCalls[0]).toMatch(/execution_mode/);
+    expect(selectCalls[1]).not.toMatch(/execution_mode/);
+    // Warned once about the missing column; no "skipped" warning since nothing was skipped.
+    expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+    expect(mockLogger.warn.mock.calls[0][0]).toMatch(/20260911170000/);
+  });
+
+  test('an unrelated error on the stamped select still throws (no silent legacy retry)', async () => {
+    queuedQueryResults = [{ data: null, error: { code: '42501', message: 'permission denied for table positions' } }];
+    await expect(tracker.hydrateOpenPositions('user-abc', { executionMode: 'paper' })).rejects.toThrow(/positions hydrate query failed/);
+    expect(selectCalls).toHaveLength(1);
   });
 });

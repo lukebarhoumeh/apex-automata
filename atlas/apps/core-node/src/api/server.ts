@@ -467,7 +467,9 @@ async function restampHydratedPositionsForSession(stamp: SessionStamp): Promise<
       hydrated: hydrated.length,
       restamped: 0,
       alreadyCurrent: 0,
+      foreign: 0,
       rows: [],
+      foreignRows: [],
       error: { message: err instanceof Error ? err.message : String(err) },
     };
   }
@@ -2971,6 +2973,8 @@ app.post('/api/engine/start', async (req, res) => {
             hydrated: lastHydrateRestamp.hydrated,
             restamped: lastHydrateRestamp.restamped,
             alreadyCurrent: lastHydrateRestamp.alreadyCurrent,
+            // Open rows of the OTHER execution_mode found among the hydrated set — never restamped.
+            foreign: lastHydrateRestamp.foreign,
             symbols: lastHydrateRestamp.rows.map((row) => row.symbol),
             fromSessionIds: [...new Set(lastHydrateRestamp.rows.map((row) => row.fromSessionId ?? null))],
           }

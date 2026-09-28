@@ -162,6 +162,49 @@ describe('PositionTracker debounce (D10)', () => {
     expect(updates[1].marketPrice).toBe(51_014);
   });
 
+  test('a fill that changes size (partial close / scale-in) emits position:updated immediately; only mark-price ticks are debounced', async () => {
+    const updates: Position[] = [];
+    tracker.on('position:updated', (p: Position) => updates.push(p));
+
+    // Open 0.10 — first trade emits 'position:opened', not 'updated'.
+    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '50000', size: '0.10', fee: '0' }) as any);
+    expect(updates.length).toBe(0);
+
+    // A mark-price tick schedules a debounced update (pending, not yet emitted).
+    tracker.updateMarketPrice('BTC-USD', 50_200);
+    expect(updates.length).toBe(0);
+
+    // Partial close 0.05 mid-window. The positions row MUST be written now:
+    // the fill row already landed synchronously (order:filled) and a process
+    // kill inside the 1 s debounce window would otherwise leave qty_open /
+    // realized_pnl_usd stale, and the next start hydrates the PRE-fill size.
+    await tracker.processFill(makeFill({ trade_id: 2, side: 'sell', price: '50100', size: '0.05', fee: '0' }) as any);
+    expect(updates.length).toBe(1);
+    expect(updates[0].symbol).toBe('BTC-USD');
+    expect(updates[0].size).toBeCloseTo(0.05, 10);
+    expect(updates[0].trades.length).toBe(2);
+
+    // The pending tick-driven update was folded into the immediate emit: the
+    // original debounce window expiring must NOT double-write a stale snapshot.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(updates.length).toBe(1);
+
+    // Scale-in 0.05 → size back to 0.10, again emitted synchronously.
+    await tracker.processFill(makeFill({ trade_id: 3, side: 'buy', price: '50050', size: '0.05', fee: '0' }) as any);
+    expect(updates.length).toBe(2);
+    expect(updates[1].size).toBeCloseTo(0.10, 10);
+    expect(updates[1].trades.length).toBe(3);
+
+    // Ticks are still debounced: < 1000 ms → nothing; ≥ 1000 ms → exactly one tail emit.
+    for (let i = 0; i < 5; i++) tracker.updateMarketPrice('BTC-USD', 50_300 + i);
+    expect(updates.length).toBe(2);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(updates.length).toBe(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(updates.length).toBe(3);
+    expect(updates[2].marketPrice).toBe(50_304);
+  });
+
   test('multiple symbols debounce independently', async () => {
     const updates: Position[] = [];
     tracker.on('position:updated', (p: Position) => updates.push(p));
