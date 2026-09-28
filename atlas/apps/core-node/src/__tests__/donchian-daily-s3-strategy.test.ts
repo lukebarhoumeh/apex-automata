@@ -216,6 +216,20 @@ describe('DonchianDailyS3Strategy — the rule on synthetic daily candles', () =
     expect(fired.map((b) => [b.i, b.signals[0].direction])).toEqual([[30, 'buy'], [32, 'sell']]);
   });
 
+  it('the prior-10 window includes the PREVIOUS bar (right edge): a close above the previous bar but below the older bars does not exit', () => {
+    // Entry at bar 30 (101). Bar 31 (fill bar, not checked) dips to 95, which
+    // is now the prior-10 LOW for bar 32. Bar 32 closes 96: above 95 → NO exit
+    // (an implementation that also excluded the previous bar would see low 99.5
+    // and exit here). Bar 33 closes 94 < 95 → exit, with donchianLow = 95.
+    const closes = [...flatBase(30), 101, 95, 96, 94];
+    const candles = dailyFromCloses(closes);
+    const bars = replay(s, candles, 21);
+    const fired = bars.filter((b) => b.signals.length > 0);
+    expect(fired.map((b) => [b.i, b.signals[0].direction])).toEqual([[30, 'buy'], [33, 'sell']]);
+    expect(bars.find((b) => b.i === 32)!.signals).toHaveLength(0);
+    expect(fired[1].signals[0].metadata.indicators.donchianLow).toBe(95);
+  });
+
   it('re-enters only on a later completed bar after an exit, never the same bar', () => {
     // Entry at 101 (bar 30); bars 31..: keep IN, then undercut to exit, then a
     // fresh breakout above the new prior-20 high.

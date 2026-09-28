@@ -51,6 +51,15 @@
  *     Consequence: the fee-adjusted EV gate sees a huge reward and effectively
  *     default-allows every entry of this strategy; it is not a meaningful
  *     filter here.
+ *   - The live-parity ATR volatility CEILING (`filters.atr_volatility_max`,
+ *     0.05 — a 15m-bar pin) is applied by the router and the BacktestEngine to
+ *     every flat-book entry, and daily ATR% on BTC/ETH/SOL is routinely 5–9 %,
+ *     so a large share of the rule's entries are rejected downstream (harness
+ *     run on fixtures/bars/1d 2024-09-01..2026-08-31: 41 rule entries, 27
+ *     filled, 14 rejected `atr_above_max`). The plugin does not see the
+ *     rejection and flips IN anyway (see KNOWN LIMITATIONS). Read a harness
+ *     report's `ATR volatility filter: … rejects=N` line next to `Total
+ *     Trades`: the trade count is the rule AFTER the ceiling, not the rule.
  *
  * DATA SOURCE (decided per call, see `resolveDailySeries`):
  *
@@ -73,10 +82,21 @@
  *     wired into `mtfCandles.d1` (follow-up). The feed must present COMPLETED
  *     daily bars only; the plugin evaluates the last element of the series as
  *     the just-closed bar.
+ *   - Rule state is decoupled from the book. The IN/OUT machine mirrors
+ *     `sim_brk`, not the engine: after an entry the engine REJECTED (ATR
+ *     ceiling, EV gate, sizing, exposure cap) or a position the software stop
+ *     CLOSED, the plugin stays IN — it suppresses every later 20-day breakout
+ *     until its own 10-day-low exit fires, and that exit then arrives as an
+ *     orphan `sell` into a flat book (dropped at the router / counted under
+ *     `atr_vol` or `short-blocked` in the harness). `sim_brk` re-arms
+ *     immediately after a stop, so stop-sensitivity parity is broken too.
+ *     Follow-up before any paper A/B: give the plugin a per-symbol position
+ *     hint on MarketContext (populated by the router and the BacktestEngine)
+ *     and reconcile state at the top of generateSignals (IN only while long).
  *   - Rule state lives in memory. On process restart every symbol is OUT: the
  *     plugin will not emit the rule exit for a position it does not remember
  *     (the router's exit path still handles PositionMonitor stops for real
- *     open positions). Follow-up: hydrate IN/OUT from open positions at boot.
+ *     open positions). Same follow-up: hydrate IN/OUT from open positions.
  *   - The ATR is computed in-plugin from the daily series
  *     (`ValidatedIndicators.ATR`), not from `context.indicators.atr`, which is
  *     1m-based in the paper runtime; `requiredIndicators` is therefore empty.

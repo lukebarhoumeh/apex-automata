@@ -133,9 +133,10 @@ async function main() {
     .option('include-disabled', {
       type: 'array',
       describe:
-        'Strategy ids to lift from THIS RUN\'S copy of the guardrails kill lists (global disabled_strategies + ' +
-        'per-symbol disabled_strategies). Only the listed ids are lifted; guardrails.yaml, paper and live are ' +
-        'untouched. E.g. --strategy donchian_daily_s3 --include-disabled donchian_daily_s3 (card PAPER-S3-DONCHIAN-v0, HOLD).',
+        'Strategy ids (space- or comma-separated) to lift from THIS RUN\'S copy of the guardrails kill lists ' +
+        '(global disabled_strategies + per-symbol disabled_strategies). Only the listed ids are lifted; ' +
+        'guardrails.yaml, paper and live are untouched. ' +
+        'E.g. --strategy donchian_daily_s3 --include-disabled donchian_daily_s3 (card PAPER-S3-DONCHIAN-v0, HOLD).',
       default: [],
     })
     .option('commission', {
@@ -278,7 +279,11 @@ async function main() {
   // live/paper config. Wired through buildBacktestConfig() (below).
   const forceRegimeConditionalGates = Boolean(argv.regimeConditionalGates);
   const exitParity = String(argv.exitParity) === 'on';
-  const includeDisabled = (argv.includeDisabled as unknown[]).map((v) => String(v));
+  // yargs array option: accept both `--include-disabled a b` and `--include-disabled a,b`.
+  const includeDisabled = (argv.includeDisabled as unknown[])
+    .flatMap((v) => String(v).split(','))
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
 
   logger.info('Starting backtest', {
     startDate: argv.startDate,

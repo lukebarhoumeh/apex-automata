@@ -19,6 +19,23 @@ export interface HydrateOpenPositionsOptions {
   executionMode?: ExecutionMode;
 }
 
+/** Columns `hydrateOpenPositions` selects from `positions` (loosely typed: PostgREST returns numerics as strings). */
+interface HydratedPositionRow {
+  id: string;
+  symbol: string;
+  side?: string | null;
+  qty_open?: number | string | null;
+  entry_price?: number | string | null;
+  opened_at?: string | null;
+  stop_price_at_entry?: number | string | null;
+  take_profit_price?: number | string | null;
+  strategy?: string | null;
+  realized_pnl_usd?: number | string | null;
+  exit_reason?: string | null;
+  /** Present only when the caller asked for a mode filter and the column exists. */
+  execution_mode?: string | null;
+}
+
 export interface PositionTrackerConfig {
   supabaseUrl: string;
   supabaseKey: string;
@@ -236,7 +253,7 @@ export class PositionTracker extends EventEmitter {
     this.positions.clear();
     this.lots.clear();
 
-    const rows = (data ?? []) as Array<Record<string, any>>;
+    const rows = (data ?? []) as HydratedPositionRow[];
     const skippedForeignMode: Array<{ id: string; symbol: string; executionMode: string }> = [];
     let hydrated = 0;
     for (const row of rows) {
