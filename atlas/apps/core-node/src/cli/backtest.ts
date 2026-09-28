@@ -46,6 +46,11 @@ function printSummary(result: BacktestResult, feeTier: FeeTierLabel): void {
     const per = Object.entries(result.fees.perVenue).map(([v, b]) => `${v} maker=${b.makerBps}/taker=${b.takerBps} bps`).join('; ');
     console.log(`Fees: tier=${feeTier.name} → ${per}`);
   }
+  console.log(`Active strategies: ${(m.activeStrategies ?? []).join(', ') || '(none)'}`);
+  // `--include-disabled`: killed ids lifted for THIS RUN ONLY (paper/live untouched).
+  console.log(
+    `Force-enabled (this run only, --include-disabled): ${(result.config.forceEnabledStrategies ?? []).join(', ') || '(none)'}`,
+  );
   console.log(`Long/Short entries: ${m.longEntries}/${m.shortEntries} (sell-exits=${m.sellSignalExits}, short-blocked=${m.shortBlocked})`);
   // Live-parity ATR volatility floor/ceiling (guardrails.filters, router stage
   // `atr_vol`). Since TF-ATR-FILTER-PARITY (2026-09-22) trend_follow entries are
@@ -120,8 +125,18 @@ async function main() {
     })
     .option('strategy', {
       type: 'string',
-      describe: 'Strategy to test (breakout, vwap, momentum, trend_follow, all). disabled_strategies in guardrails.yaml override this.',
+      describe:
+        'Strategy to test (breakout, vwap, momentum, trend_follow, donchian_daily_s3, all). ' +
+        'disabled_strategies in guardrails.yaml override this — a killed id runs nothing unless --include-disabled lifts it.',
       default: 'all',
+    })
+    .option('include-disabled', {
+      type: 'array',
+      describe:
+        'Strategy ids to lift from THIS RUN\'S copy of the guardrails kill lists (global disabled_strategies + ' +
+        'per-symbol disabled_strategies). Only the listed ids are lifted; guardrails.yaml, paper and live are ' +
+        'untouched. E.g. --strategy donchian_daily_s3 --include-disabled donchian_daily_s3 (card PAPER-S3-DONCHIAN-v0, HOLD).',
+      default: [],
     })
     .option('commission', {
       type: 'number',
@@ -263,12 +278,14 @@ async function main() {
   // live/paper config. Wired through buildBacktestConfig() (below).
   const forceRegimeConditionalGates = Boolean(argv.regimeConditionalGates);
   const exitParity = String(argv.exitParity) === 'on';
+  const includeDisabled = (argv.includeDisabled as unknown[]).map((v) => String(v));
 
   logger.info('Starting backtest', {
     startDate: argv.startDate,
     endDate: argv.endDate,
     products: argv.products,
     strategy: argv.strategy,
+    includeDisabled,
     feeRouting: argv.commission !== undefined ? 'flat-override' : 'per-symbol-feeModel',
     commissionOverride: argv.commission,
     feeTier,
@@ -321,9 +338,19 @@ async function main() {
       forceRegimeConditionalGates,
       slippageRate: argv.slippage !== undefined ? Number(argv.slippage) : undefined,
       applyExitParity: exitParity,
+      includeDisabled,
     },
     guardrails,
   );
+  if (includeDisabled.length > 0) {
+    const lifted = backtestConfig.forceEnabledStrategies ?? [];
+    const noop = includeDisabled.filter((id) => !lifted.includes(id));
+    const banner =
+      `DISABLED strategy force-enabled for this backtest run only — paper/live untouched: ${lifted.join(', ') || '(none)'}` +
+      (noop.length > 0 ? ` (not on any kill list, no-op: ${noop.join(', ')})` : '');
+    logger.warn(banner, { includeDisabled, forceEnabled: lifted, noop });
+    console.warn(`WARNING: ${banner}`);
+  }
 
   const dataOptions = {
     allowSynthetic,

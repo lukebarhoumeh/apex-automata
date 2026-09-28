@@ -126,9 +126,12 @@ export const SCALAR_PINS: readonly ScalarPin[] = [
 /**
  * Lists that must contain every listed entry (extra entries are allowed).
  * `momentum` joined the global shelf on 2026-09-11 (E2-MOM-ISO KILL).
+ * `donchian_daily_s3` (card PAPER-S3-DONCHIAN-v0, research verdict HOLD) was
+ * pinned OFF on registration (2026-09-28): the plugin is infra for a later
+ * paper A/B, not a GO. Lifting it is a desk decision and a two-file change.
  */
 export const LIST_PINS: ReadonlyArray<{ key: string; mustInclude: readonly string[] }> = [
-  { key: 'disabled_strategies', mustInclude: ['vwap_mr', 'breakout', 'momentum'] },
+  { key: 'disabled_strategies', mustInclude: ['vwap_mr', 'breakout', 'momentum', 'donchian_daily_s3'] },
   { key: 'perps_symbols.ETH-PERP-INTX.disabled_strategies', mustInclude: ['momentum'] },
   { key: 'perps_symbols.BTC-PERP-INTX.disabled_strategies', mustInclude: ['momentum'] },
 ];

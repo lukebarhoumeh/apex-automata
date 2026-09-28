@@ -269,6 +269,7 @@ Risk per trade: ${((account.riskPerTrade ?? 0.005) * 100).toFixed(3)}% of CURREN
 Max position exposure: ${((account.maxPositionExposurePct ?? 0.30) * 100).toFixed(1)}% of equity
 Active strategies: ${(metrics.activeStrategies ?? []).join(', ') || '(none)'}
 Disabled strategies: ${(config.disabledStrategies ?? []).join(', ') || '(none)'}
+Force-enabled for THIS RUN ONLY (--include-disabled; paper/live untouched): ${(config.forceEnabledStrategies ?? []).join(', ') || '(none)'}
 
 Long/Short Split:
 -----------------

@@ -11,21 +11,28 @@ import { BreakoutStrategy } from './breakout-strategy';
 import { VWAPMeanReversionStrategy } from './vwap-mr-strategy';
 import { MomentumStrategy } from './momentum-strategy';
 import { TrendFollowStrategy } from './trend-follow-strategy';
+import { DonchianDailyS3Strategy } from './donchian-daily-s3-strategy';
 
 // Export individual strategies
 export { BreakoutStrategy } from './breakout-strategy';
 export { VWAPMeanReversionStrategy } from './vwap-mr-strategy';
 export { MomentumStrategy } from './momentum-strategy';
 export { TrendFollowStrategy } from './trend-follow-strategy';
+export { DonchianDailyS3Strategy } from './donchian-daily-s3-strategy';
 
 /**
  * Registry of all built-in strategies.
+ *
+ * `donchian_daily_s3` (card PAPER-S3-DONCHIAN-v0) is registered here so the
+ * config-drift checks pin it, but it ships in `guardrails.disabled_strategies`
+ * (HOLD, default OFF, not a GO) — the StrategyRegistry never registers it.
  */
 export const BUILTIN_STRATEGIES = {
   breakout: BreakoutStrategy,
   vwap_mr: VWAPMeanReversionStrategy,
   momentum: MomentumStrategy,
   trend_follow: TrendFollowStrategy,
+  donchian_daily_s3: DonchianDailyS3Strategy,
 } as const;
 
 /**

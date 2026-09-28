@@ -201,6 +201,14 @@ export interface BacktestConfig {
     momentum: BacktestStrategyToggle;
     /** Optional. When omitted, trend_follow runs with plugin defaults. */
     trendFollow?: BacktestStrategyToggle;
+    /**
+     * Optional. `donchian_daily_s3` (card PAPER-S3-DONCHIAN-v0, HOLD) is
+     * opt-in: when omitted OR `enabled: false` the plugin is disabled at the
+     * registry even if it is not on the kill list, so older callers never
+     * run it by accident. It only trades when this toggle is on AND the id
+     * is absent from `disabledStrategies` (`--include-disabled`).
+     */
+    donchianDailyS3?: BacktestStrategyToggle;
   };
   risk: {
     /**
@@ -237,6 +245,12 @@ export interface BacktestConfig {
   };
   /** Strategies disabled by Phase-3 verdict. Skipped before signal entry. */
   disabledStrategies?: string[];
+  /**
+   * Informational (`--include-disabled`): killed strategy ids that were
+   * lifted from `disabledStrategies` for THIS RUN ONLY. The engine logs a
+   * warning banner and the reports print the list; paper/live never read it.
+   */
+  forceEnabledStrategies?: string[];
   /**
    * Per-(symbol, strategy) disable map. Strictly additive vs the global
    * `disabledStrategies` list — a signal is rejected if either matches.
@@ -934,6 +948,34 @@ export class BacktestEngine extends EventEmitter {
       } else {
         this.signalProcessor.enableStrategy('trend_follow');
       }
+    }
+
+    // PAPER-S3-DONCHIAN-v0 (2026-09-28): opt-in toggle. Omitted or false →
+    // disabled at the registry (never runs by accident); true → enabled, but
+    // only effective when the id is not on the kill list (`disable()` /
+    // `enable()` are no-ops on an unregistered plugin).
+    const donchianToggle = this.config.signals.donchianDailyS3;
+    if (!this.disabledStrategies.has('donchian_daily_s3')) {
+      if (donchianToggle?.enabled) {
+        if (donchianToggle.parameters && Object.keys(donchianToggle.parameters).length > 0) {
+          this.signalProcessor.updateStrategyConfig('donchian_daily_s3', { ...donchianToggle.parameters });
+        }
+        this.signalProcessor.enableStrategy('donchian_daily_s3');
+      } else {
+        this.signalProcessor.disableStrategy('donchian_daily_s3');
+      }
+    }
+
+    if (this.config.forceEnabledStrategies && this.config.forceEnabledStrategies.length > 0) {
+      this.logger.warn(
+        `DISABLED strategy force-enabled for this backtest run only — paper/live untouched: ` +
+          this.config.forceEnabledStrategies.join(', '),
+        {
+          forceEnabledStrategies: this.config.forceEnabledStrategies,
+          remainingDisabled: Array.from(this.disabledStrategies),
+          source: '--include-disabled',
+        },
+      );
     }
 
     if (this.config.perSymbolOverrides) {

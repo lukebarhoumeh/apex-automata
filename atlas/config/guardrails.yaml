@@ -65,6 +65,12 @@ disabled_strategies:
   - vwap_mr
   - breakout
   - momentum
+  # donchian_daily_s3: card PAPER-S3-DONCHIAN-v0 — research verdict HOLD
+  # (docs/research/2026-09-22_s3-donchian-breakout-replication.md: pooled
+  # full-sample passes the desk bar, recency and per-product FAIL). Plugin
+  # shipped as infra for a later paper A/B; DEFAULT OFF, NOT a GO. Removing
+  # this line is a desk decision and a two-file change (config-drift LIST_PINS).
+  - donchian_daily_s3
 
 # Backtest realism model. Read by atlas/apps/core-node/src/backtesting/backtest-engine.ts
 # to make backtest P&L comparable to paper/live behaviour. These knobs are
@@ -368,7 +374,7 @@ cfm_symbols:
     spot_proxy: BTC-USD
     max_notional_usd: 2000
     max_daily_loss_usd: 100
-    disabled_strategies: [trend_follow, momentum, vwap_mr, breakout]
+    disabled_strategies: [trend_follow, momentum, vwap_mr, breakout, donchian_daily_s3]
 
 execution:
   order_type: marketable_limit

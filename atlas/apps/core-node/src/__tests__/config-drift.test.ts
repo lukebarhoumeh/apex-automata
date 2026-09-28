@@ -183,6 +183,8 @@ describe('checkConfigDrift() on the real repository', () => {
       trend_follow: { enabled: true },
       vwap_mr: { enabled: false },
       breakout: { enabled: false },
+      // PAPER-S3-DONCHIAN-v0 (2026-09-28): registered, HOLD, default OFF.
+      donchian_daily_s3: { enabled: false },
     });
   });
 });
@@ -413,16 +415,29 @@ describe('checkConfigDrift() fixtures', () => {
     );
 
     pinCase(
-      'global disabled_strategies must keep vwap_mr, breakout and momentum (extras allowed); the strategies.json mirror follows',
+      'global disabled_strategies must keep vwap_mr, breakout, momentum and donchian_daily_s3 (extras allowed); the strategies.json mirror follows',
       (doc) => { doc.disabled_strategies = ['vwap_mr', 'something_else']; },
-      ['strategies.momentum.enabled', 'strategies.breakout.enabled', 'disabled_strategies', 'disabled_strategies'],
-      ['strategies_json_enabled_conflict', 'strategies_json_enabled_conflict', 'pin_list_missing_entry', 'pin_list_missing_entry']
+      [
+        'strategies.momentum.enabled', 'strategies.breakout.enabled', 'strategies.donchian_daily_s3.enabled',
+        'disabled_strategies', 'disabled_strategies', 'disabled_strategies',
+      ],
+      [
+        'strategies_json_enabled_conflict', 'strategies_json_enabled_conflict', 'strategies_json_enabled_conflict',
+        'pin_list_missing_entry', 'pin_list_missing_entry', 'pin_list_missing_entry',
+      ]
     );
 
     pinCase(
       'dropping only momentum from the global shelf (E2-MOM-ISO KILL) is caught',
-      (doc) => { doc.disabled_strategies = ['vwap_mr', 'breakout']; },
+      (doc) => { doc.disabled_strategies = ['vwap_mr', 'breakout', 'donchian_daily_s3']; },
       ['strategies.momentum.enabled', 'disabled_strategies'],
+      ['strategies_json_enabled_conflict', 'pin_list_missing_entry']
+    );
+
+    pinCase(
+      'dropping only donchian_daily_s3 from the global shelf (PAPER-S3-DONCHIAN-v0 HOLD) is caught',
+      (doc) => { doc.disabled_strategies = ['vwap_mr', 'breakout', 'momentum']; },
+      ['strategies.donchian_daily_s3.enabled', 'disabled_strategies'],
       ['strategies_json_enabled_conflict', 'pin_list_missing_entry']
     );
 

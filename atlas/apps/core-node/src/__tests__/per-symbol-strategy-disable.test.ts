@@ -191,8 +191,8 @@ describe('guardrails.yaml — disabled_strategies state (F4 follow-up §8)', () 
     expect(guardrails.per_symbol?.['SOL-USD']?.disabled_strategies).toBeUndefined();
   });
 
-  it('global disabled_strategies contains the Phase-3 kills plus momentum (E2-MOM-ISO KILL)', () => {
-    expect(new Set(guardrails.disabled_strategies)).toEqual(new Set(['vwap_mr', 'breakout', 'momentum']));
+  it('global disabled_strategies contains the Phase-3 kills plus momentum (E2-MOM-ISO KILL) plus donchian_daily_s3 (PAPER-S3-DONCHIAN-v0 HOLD)', () => {
+    expect(new Set(guardrails.disabled_strategies)).toEqual(new Set(['vwap_mr', 'breakout', 'momentum', 'donchian_daily_s3']));
   });
 
   it('buildPerSymbolDisabledStrategies(guardrails) flattens to the two perp symbols plus the CFM paper symbol (every builtin off — NOT strategy GO)', () => {
@@ -202,7 +202,9 @@ describe('guardrails.yaml — disabled_strategies state (F4 follow-up §8)', () 
       // Card SH-QMAKER-CFM-PAPER-v0 (2026-09-21): the CFM venue is wired for
       // paper infra only; all built-in strategies stay disabled on it until a
       // card strategy is authorised (pinned by `pnpm check:config`).
-      'BIP-20DEC30-CDE': ['trend_follow', 'momentum', 'vwap_mr', 'breakout'],
+      // donchian_daily_s3 (PAPER-S3-DONCHIAN-v0, 2026-09-28) joins the list as
+      // a built-in the moment it is registered — HOLD, not a GO.
+      'BIP-20DEC30-CDE': ['trend_follow', 'momentum', 'vwap_mr', 'breakout', 'donchian_daily_s3'],
     });
   });
 });
