@@ -1,6 +1,6 @@
 # Apex Automata (AtlasBot v2) — Claude Code Context
 
-State as of the 2026-09-28 handoff PR (base c9bfae1, PR #81). Where a sibling task of that handoff is referenced (P1 regime-gate rule, P2 Donchian S3), this file describes the TARGET state, not a merged one.
+State as of the 2026-09-28 handoff PR (base c9bfae1 / PR #81, plus that PR's regime-gate loosening, `donchian_daily_s3` plugin and persistence fixes).
 
 ## What This Is
 Algorithmic crypto trading system: React frontend + Node.js trading runtime + Supabase persistence. **Currently PAPER ONLY** on Coinbase spot market data. Live paths exist but are locked (`CONFIRM_LIVE=NO`) and every change must leave them byte-for-byte unchanged.
@@ -28,7 +28,7 @@ pnpm install:all      # Install all dependencies (root + backend)
 ```bash
 pnpm api              # Express API + WebSocket server
 pnpm check:config     # Must print "config-drift: OK" before any commit
-pnpm test             # vitest run — 89 files / 1440 tests, all pass (~35-40s)
+pnpm test             # vitest run — 90 files / 1479 tests, all pass (~40s)
 pnpm exec vitest run <file>   # single file
 pnpm build            # rimraf dist && tsc (has pre-existing type errors; runtime uses tsx)
 pnpm exec tsx src/cli/backtest.ts --start-date <s> --end-date <e> --products BTC-USD --fixture-dir fixtures/bars/15m/<set>
@@ -79,17 +79,17 @@ Controlled by `atlas/config/guardrails.yaml` `disabled_strategies` (pinned by `p
 - **trend_follow** (EMA crossover + MTF alignment, `plugins/builtin/trend-follow-strategy.ts`) — the ONLY active strategy, heavily gated: EMA12/EMA15 cross + price on the correct side + regime agreement + plugin `regimeCompatibility` (refuses ranging/choppy) + router regime gate + EV gate + 15-min cooldown. Silence for hours in weak/ranging markets is by design. stopAtr 2.5 / takeProfitAtr 6.0 pinned on every symbol block.
 - **momentum** (RSI/MACD) — RETIRED: E2-MOM-ISO KILL, 2026-09-11 (PR #55). In `disabled_strategies`; parameter blocks stay as a one-line undo.
 - **vwap_mr, breakout** — killed per Phase 3 backtest verdict (March 2026).
-- **donchian_daily_s3** — target state after the handoff's P2 task: card PAPER-S3-DONCHIAN-v0, daily Donchian in20/out10 long-only, research verdict HOLD (`docs/research/2026-09-22_s3-donchian-breakout-replication.md`), default OFF in `disabled_strategies`, backtest-only via `--strategy donchian_daily_s3 --include-disabled donchian_daily_s3 --bar-minutes 1440 --fixture-dir fixtures/bars/1d`.
-Killed plugin files stay as `@deprecated` reference (DO NOT delete). Signals from disabled strategies are still written to `signals` with `allowed: false` for audit; they never reach order routing (`api/server.ts` re-checks at `signal:generated`).
+- **donchian_daily_s3** (`plugins/builtin/donchian-daily-s3-strategy.ts`, card PAPER-S3-DONCHIAN-v0) — daily Donchian in20/out10 long-only, research verdict HOLD (`docs/research/2026-09-22_s3-donchian-breakout-replication.md`), default OFF in `disabled_strategies` (desk pin), backtest-only via `--strategy donchian_daily_s3 --include-disabled donchian_daily_s3 --bar-minutes 1440 --fixture-dir fixtures/bars/1d`. The paper runtime has no daily-candle feed yet, so even if enabled it would refuse to emit (follow-up).
+Killed plugin files stay as `@deprecated` reference (DO NOT delete). Disabled strategies are never registered (`StrategyRegistry.register` skips them), so they generate no signals; the router re-checks `disabled_strategies` at `signal:generated` as defence in depth.
 
 ## Meta-filter
 The meta-filter is **rule-based** (cold-streak cooldown after 10 losses → 5 min pause, time-of-day filter for lo-liq 04–07 UTC / preferred 13–17 UTC, plus optional ATR/strength/volume gates). There is **no ML model** in this codebase — `signals.meta_prob` is always NULL. The `/model` page renders rule-based meta-filter state today (cold-streak, time-of-day, recent decisions); any ML-style metrics displayed there (ROC AUC, SHAP, calibration) are placeholder mocks and the on-page banner says so. Treat ML as a future workstream, not a current feature.
 
 ## Paper safety rails (all PAPER ONLY — live never reads these)
-- **Regime gate** (`regime_gates` in guardrails, `src/strategies/regime-gate.ts`, enforced at the router): `paper_only: true` is a desk pin; NEW ENTRIES ONLY (exits/reversals and position-monitor exits are never gated); unknown regime never gated. Target rule after P1: trend_follow blocks `[choppy]` only (weak_trend allowed since 2026-09-28 so the soak takes trades; PF ~0.8 in weak_trend is known — purpose is soak observability). In the default `adx_primary` detector mode `choppy` is never emitted, so the rule is belt-and-braces. Blocked entries persist as `allowed=false`, reason `regime_gate: …`, funnel stage `regime_gate`. Backtests measure it with `--regime-conditional-gates` (NOT `--regime-gates on|off`, which is the unrelated RegimeFilter toggle).
+- **Regime gate** (`regime_gates` in guardrails, `src/strategies/regime-gate.ts`, enforced at the router): `paper_only: true` is a desk pin; NEW ENTRIES ONLY (exits/reversals and position-monitor exits are never gated); unknown regime never gated. Current rule: trend_follow blocks `[choppy]` only (weak_trend allowed since 2026-09-28, Luke decision 2026-09-23, so the soak takes trades; PF ~0.8 in weak_trend is known — purpose is soak observability, not edge). In the default `adx_primary` detector mode `choppy` is never emitted, so the rule is belt-and-braces. Blocked entries persist as `allowed=false`, reason `regime_gate: …`, funnel stage `regime_gate`. Backtests measure it with `--regime-conditional-gates` (NOT `--regime-gates on|off`, which is the unrelated RegimeFilter toggle).
 - **Graduated kill ladder L1–L6** (`src/trading/risk/paper-kill-ladder.ts`, guardrails `paper_kill_ladder`): L1 consec>=3 or dailyR<=-1 → size x0.5; L2 consec>=5 or dailyR<=-2 → x0.25; L3 4 consecutive losses in one strategy → strategy frozen for session; L4 trend_follow stopped out twice in weak_trend/choppy → paused 4h; L5 sleeve stub (disabled); L6 dailyR<=-4 or (consec>=12 and dailyR<=-2) → hard kill (`daily_stop` / `consecutive_losses`). Thresholds are desk pins. L1–L5 write `risk_events` rows and never latch the kill switch.
 - **Boot guard** (`src/trading/risk/paper-boot-guard.ts`, PR #81): a paper start REFUSES to boot while risk state is latched (`risk_metrics.kill_switch_active` or an open halt `risk_events` row) unless `RISK_CLEAR=YES`; `PAPER_RESET_RISK_STATE_ON_START` only acts together with `RISK_CLEAR=YES`, otherwise it is logged and ignored; boot never clears the halt row. NEVER set those env vars or clear `risk_events` / kill-switch rows without an explicit Risk / Luke OK.
-- **Desk pins** (`src/config/config-drift.ts`: SCALAR_PINS, LIST_PINS, TRADE_COOLDOWN_FLOOR_EXCLUSIVE, TREND_FOLLOW_PIN): trade_cooldown_min 15 (floor >5), min_ev_threshold 0, atr_volatility_min 0.005, fee books (spot 25/40 paper book; CFM 9.5/10 + $0.10/ct; never mixed), cfm max_leverage 2 / post_only / no_chase, regime_gates.paper_only, kill-ladder thresholds, disabled_strategies list, trend_follow stopAtr 2.5 / takeProfitAtr 6.0 on every symbol block, plus (after P1) the trend_follow regime-gate rule must keep blocking choppy. Changing a pin = YAML + config-drift.ts in the SAME PR, called out loudly in the PR.
+- **Desk pins** (`src/config/config-drift.ts`: SCALAR_PINS, LIST_PINS, TRADE_COOLDOWN_FLOOR_EXCLUSIVE, TREND_FOLLOW_PIN): trade_cooldown_min 15 (floor >5), min_ev_threshold 0, atr_volatility_min 0.005, fee books (spot 25/40 paper book; CFM 9.5/10 + $0.10/ct; never mixed), cfm max_leverage 2 / post_only / no_chase, regime_gates.paper_only, kill-ladder thresholds, disabled_strategies list, trend_follow stopAtr 2.5 / takeProfitAtr 6.0 on every symbol block, and the regime-gate FLOOR (`REGIME_GATE_RULE_PINS`): the trend_follow rule must exist and keep blocking choppy. Changing a pin = YAML + config-drift.ts in the SAME PR, called out loudly in the PR.
 
 ## Desk hard rules
 - PAPER ONLY. Never set `EXECUTION_MODE=live`; `CONFIRM_LIVE` stays `NO`; never weaken a live-path gate. Every commit body carries a `live impact:` line ("none" or an exact explanation).
@@ -115,7 +115,7 @@ The meta-filter is **rule-based** (cold-streak cooldown after 10 losses → 5 mi
 - Do NOT change Logger or ConfigLoader patterns; do NOT create a second editable `guardrails.yaml` (check:config fails)
 
 ## Testing
-- Backend: `cd atlas/apps/core-node && ENCRYPTION_KEY=<64 hex> pnpm test` — **89 files / 1440 tests**, all pass (~35-40s, verified 2026-09-28). Rollup native binary gotcha → `AGENTS.md` item 1.
+- Backend: `cd atlas/apps/core-node && ENCRYPTION_KEY=<64 hex> pnpm test` — **90 files / 1479 tests**, all pass (~40s, verified 2026-09-28). Rollup native binary gotcha → `AGENTS.md` item 1. Claude Code worktrees under `.claude/` are skipped by the config-drift scan.
 - `pnpm check:config` must print `config-drift: OK` in the same run.
 - Frontend: `pnpm exec vitest run` from root (Vitest + jsdom).
 - ZERO test failures allowed; any failure is a regression.
