@@ -88,7 +88,10 @@ function regime(r: MarketRegime = 'ranging'): RegimeState {
   } as unknown as RegimeState;
 }
 
-function ctx(candles: OHLCV[], opts: { symbol?: string; d1?: OHLCV[]; regime?: MarketRegime } = {}): MarketContext {
+function ctx(
+  candles: OHLCV[],
+  opts: { symbol?: string; d1?: OHLCV[]; regime?: MarketRegime; openPosition?: MarketContext['openPosition'] } = {},
+): MarketContext {
   const latestCandle = candles[candles.length - 1];
   const previousCandle = candles[candles.length - 2] ?? latestCandle;
   return {
@@ -101,8 +104,12 @@ function ctx(candles: OHLCV[], opts: { symbol?: string; d1?: OHLCV[]; regime?: M
     latestCandle,
     previousCandle,
     regime: regime(opts.regime),
+    ...(opts.openPosition !== undefined ? { openPosition: opts.openPosition } : {}),
   };
 }
+
+const FLAT_BOOK = { side: 'flat' as const, size: 0 };
+const LONG_BOOK = { side: 'long' as const, size: 0.25, entryPrice: 101 };
 
 /**
  * 30 flat closes at 100 (with tiny wiggle so ATR > 0 and max/min are exact),
@@ -274,6 +281,104 @@ describe('DonchianDailyS3Strategy — the rule on synthetic daily candles', () =
     const closes = [...flatBase(30), 100.01];
     expect(strict.generateSignals(ctx(dailyFromCloses(closes)))).toHaveLength(0);
     expect(strict.getSymbolState('BTC-USD').state).toBe('OUT');
+  });
+});
+
+describe('DonchianDailyS3Strategy — book reconcile via context.openPosition', () => {
+  it('hint flat while IN → OUT: a rejected / stopped-out entry re-arms and the next breakout enters again (never an orphan sell)', () => {
+    const s = new DonchianDailyS3Strategy();
+    // bar 30: 101 breaks the prior-20 high (100) → entry; book still flat (a
+    // pending fill is not a position yet — the plugin flips IN by itself).
+    // bar 31: 95 — the engine rejected or the stop closed the trade → flat →
+    //   reconcile IN→OUT; 95 < prior-10 low but NO sell may be emitted.
+    // bar 32: 96 — OUT, below the prior-20 high (101) → nothing.
+    // bar 33: 102 > 101 → a fresh entry (HEAD stays IN here and suppresses it).
+    // bar 34: 60 — book flat again → OUT, no orphan sell.
+    const candles = dailyFromCloses([...flatBase(30), 101, 95, 96, 102, 60]);
+    const at = (i: number, openPosition: MarketContext['openPosition']) =>
+      s.generateSignals(ctx(candles.slice(0, i + 1), { openPosition }));
+
+    const entry = at(30, FLAT_BOOK);
+    expect(entry.map((x) => x.direction)).toEqual(['buy']);
+    expect(s.getSymbolState('BTC-USD').state).toBe('IN');
+
+    expect(at(31, FLAT_BOOK)).toHaveLength(0);
+    const afterReconcile = s.getSymbolState('BTC-USD');
+    expect(afterReconcile.state).toBe('OUT');
+    expect(afterReconcile.lastBarTime).toBe(candles[31].time);
+    expect(afterReconcile.lastReconcile).toEqual(
+      expect.objectContaining({ from: 'IN', to: 'OUT', barTime: candles[31].time }),
+    );
+
+    expect(at(32, FLAT_BOOK)).toHaveLength(0);
+    const reentry = at(33, FLAT_BOOK);
+    expect(reentry.map((x) => x.direction)).toEqual(['buy']);
+    expect(reentry[0].metadata.indicators.donchianHigh).toBe(101);
+    expect(s.getSymbolState('BTC-USD').state).toBe('IN');
+
+    expect(at(34, FLAT_BOOK)).toHaveLength(0);
+    expect(s.getSymbolState('BTC-USD').state).toBe('OUT');
+  });
+
+  it('hint short (not long) while IN is treated like flat: OUT, no sell', () => {
+    const s = new DonchianDailyS3Strategy();
+    const candles = dailyFromCloses([...flatBase(30), 101, 90]);
+    expect(s.generateSignals(ctx(candles.slice(0, 31), { openPosition: FLAT_BOOK }))).toHaveLength(1);
+    expect(s.generateSignals(ctx(candles, { openPosition: { side: 'short', size: 1 } }))).toHaveLength(0);
+    expect(s.getSymbolState('BTC-USD').state).toBe('OUT');
+  });
+
+  it('hint long while OUT → IN with the exit rule armed from this bar (restart / unknown entry bar)', () => {
+    // Fresh plugin (OUT) told the book is long on a bar that closes below the
+    // prior-10 low → the rule exit fires on this very bar.
+    const s = new DonchianDailyS3Strategy();
+    const candles = dailyFromCloses([...flatBase(30), 98]);
+    const sigs = s.generateSignals(ctx(candles, { openPosition: LONG_BOOK }));
+    expect(sigs.map((x) => [x.direction, x.metadata.intent])).toEqual([['sell', 'exit']]);
+    expect(sigs[0].metadata.indicators.donchianLow).toBe(99.5);
+    expect(sigs[0].metadata.entrySignalBarTime).toBeNull();
+    expect(s.getSymbolState('BTC-USD').state).toBe('OUT');
+    expect(s.getSymbolState('BTC-USD').lastReconcile).toEqual(
+      expect.objectContaining({ from: 'OUT', to: 'IN', barTime: candles[30].time }),
+    );
+
+    // Same, but the bar is a breakout: already long → NO second buy, state IN,
+    // exit check armed (barsSinceEntrySignal = 2).
+    const s2 = new DonchianDailyS3Strategy();
+    expect(s2.generateSignals(ctx(dailyFromCloses([...flatBase(30), 101]), { openPosition: LONG_BOOK }))).toHaveLength(0);
+    const st = s2.getSymbolState('BTC-USD');
+    expect(st.state).toBe('IN');
+    expect(st.barsSinceEntrySignal).toBe(2);
+    expect(st.entrySignalBarTime).toBeNull();
+  });
+
+  it('hint long while IN (normal fill bar) changes nothing: the fill bar is still not exit-checked', () => {
+    const s = new DonchianDailyS3Strategy();
+    const candles = dailyFromCloses([...flatBase(30), 101, 50, 49]);
+    expect(s.generateSignals(ctx(candles.slice(0, 31), { openPosition: FLAT_BOOK }))).toHaveLength(1);
+    // Fill bar: the engine filled at open, so the book is long. sim_brk mechanics: no exit check yet.
+    expect(s.generateSignals(ctx(candles.slice(0, 32), { openPosition: LONG_BOOK }))).toHaveLength(0);
+    expect(s.getSymbolState('BTC-USD').barsSinceEntrySignal).toBe(1);
+    expect(s.getSymbolState('BTC-USD').lastReconcile).toBeNull();
+    // Bar after: exit.
+    expect(s.generateSignals(ctx(candles, { openPosition: LONG_BOOK })).map((x) => x.direction)).toEqual(['sell']);
+  });
+
+  it('undefined hint → today\'s behaviour: the machine stays IN and suppresses the later breakout', () => {
+    const s = new DonchianDailyS3Strategy();
+    const candles = dailyFromCloses([...flatBase(30), 101, 95, 96, 102]);
+    const bars = replay(s, candles, 21);
+    expect(bars.filter((b) => b.signals.length > 0).map((b) => [b.i, b.signals[0].direction])).toEqual([[30, 'buy']]);
+    expect(s.getSymbolState('BTC-USD').state).toBe('IN');
+    expect(s.getSymbolState('BTC-USD').lastReconcile).toBeNull();
+  });
+
+  it('the same-bar dedupe runs BEFORE the reconcile: a repeated evaluation of one bar never flips state', () => {
+    const s = new DonchianDailyS3Strategy();
+    const candles = dailyFromCloses([...flatBase(30), 101]);
+    expect(s.generateSignals(ctx(candles, { openPosition: FLAT_BOOK }))).toHaveLength(1);
+    expect(s.generateSignals(ctx(candles, { openPosition: FLAT_BOOK }))).toHaveLength(0);
+    expect(s.getSymbolState('BTC-USD').state).toBe('IN');
   });
 });
 
@@ -507,5 +612,36 @@ describe('backtest harness hook — --include-disabled (config + engine level)',
       expect(trade.strategy).toBe('donchian_daily_s3');
       expect(trade.side).toBe('BUY');
     }
+  });
+
+  it('engine: after a synthetic stop-out the plugin re-enters on the next breakout (book hint wired by BacktestEngine)', async () => {
+    // 60 flat days at 100 (ATR ≈ 2.5), breakout 103 (entry signal; software
+    // stop 103 − 3×ATR ≈ 95.5), fill next bar at open ≈ 103 — that bar
+    // crashes to 90 (low 89.1) → stop_loss on the fill bar. Three days at 95
+    // sit ABOVE the prior-10 low (now 90), so the rule's own exit never fires;
+    // without the book hint the plugin stays IN and the 105 breakout (prior-20
+    // high 103) is suppressed. With the hint: flat → OUT → second entry at 105.
+    const closes = [...flatBase(60, 100), 103, 90, 95, 95, 95, 105, 106, 106, 106, 106];
+    const candles = dailyFromCloses(closes, Date.UTC(2025, 0, 1));
+    const engine = new BacktestEngine(buildBacktestConfig({ ...base, includeDisabled: ['donchian_daily_s3'] }, guardrails), mockLogger);
+    await engine.loadHistoricalData(async () => candles);
+    const result = await engine.run();
+
+    expect(result.metrics.activeStrategies).toEqual(['donchian_daily_s3']);
+    expect(result.metrics.exitReasons.stop_loss).toBe(1);
+    expect(result.metrics.longEntries).toBe(2);
+    expect(result.metrics.shortEntries).toBe(0);
+    expect(result.trades).toHaveLength(2);
+    expect(result.trades[0].exitReason).toBe('stop_loss');
+    expect(result.trades[1].exitReason).toBe('end_of_data');
+    // The re-entry filled on the bar after the 105 close (next-bar-open fill).
+    expect(result.trades[1].timestamp.getTime()).toBe(candles[66].time);
+
+    // The plugin's own state agrees with the book at the end of the run.
+    const plugin = engine.getSignalProcessor()?.getStrategy('donchian_daily_s3') as DonchianDailyS3Strategy;
+    expect(plugin.getSymbolState('BTC-USD').state).toBe('IN');
+    expect(plugin.getSymbolState('BTC-USD').lastReconcile).toEqual(
+      expect.objectContaining({ from: 'IN', to: 'OUT', barTime: candles[61].time }),
+    );
   });
 });

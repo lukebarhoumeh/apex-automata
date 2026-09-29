@@ -1993,6 +1993,22 @@ app.post('/api/engine/start', async (req, res) => {
       logger.info('Disabled strategies from guardrails:', { disabledStrategies });
     }
 
+    // Read-only book hint for plugins (MarketContext.openPosition, 2026-09-29).
+    // Same accessor the router's exit short-circuit and regime gate use
+    // (`tradingEngine.getOpenPositions()`); nothing here routes or sizes. An
+    // engine that is gone (stop/restart race) answers "unknown" (undefined),
+    // never "flat", so a plugin cannot mistake a torn-down engine for a closed
+    // position. Mode-agnostic: paper and live get the same visibility.
+    signalProcessor.setOpenPositionProvider((symbol: string) => {
+      const engine = tradingEngine;
+      if (!engine) return undefined;
+      const open = engine
+        .getOpenPositions()
+        .find((p) => p.symbol === symbol && p.size > 0 && (p.side === 'long' || p.side === 'short'));
+      if (!open) return { side: 'flat', size: 0 };
+      return { side: open.side, size: open.size, entryPrice: open.averagePrice };
+    });
+
     // Set up data loader from exchange for historical data
     // Uses Coinbase public REST endpoint (no auth required) for fast warmup
     signalProcessor.setDataLoader(async (symbol: string, limit: number) => {

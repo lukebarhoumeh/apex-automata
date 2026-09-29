@@ -20,6 +20,7 @@ import {
   PerSymbolOverrides,
 } from './types';
 import { MarketRegime } from '../regime-detector';
+import type { Logger } from '../../core/logger';
 
 export abstract class BaseStrategy implements StrategyPlugin {
   // ============ Metadata (must be overridden) ============
@@ -40,7 +41,18 @@ export abstract class BaseStrategy implements StrategyPlugin {
   
   // Per-symbol parameter overrides (e.g., BTC-USD gets different ATR multiplier than SOL-USD)
   protected perSymbolOverrides: PerSymbolOverrides = {};
-  
+
+  /**
+   * Optional logger, injected by `StrategyRegistry.register` (plugins are
+   * constructed without one). Null until registered — guard every use.
+   */
+  protected logger: Logger | null = null;
+
+  /** Inject the host logger (called by the StrategyRegistry on registration). */
+  public setLogger(logger: Logger): void {
+    this.logger = logger;
+  }
+
   // Statistics
   protected stats = {
     signalsGenerated: 0,

@@ -913,6 +913,21 @@ export class BacktestEngine extends EventEmitter {
 
     this.signalProcessor = new SignalProcessor(signalConfig, this.logger);
 
+    // Book hint for plugins (MarketContext.openPosition, 2026-09-29): the
+    // engine's own positions map, read at signal time. `processTimeSteps`
+    // fills the pending entry (step 1) and runs the stop/TP checks (step 3)
+    // BEFORE the bar reaches the SignalProcessor (step 4), so on the fill bar
+    // the hint already says `long` and on a stop-out bar it already says
+    // `flat`. Lets donchian_daily_s3 re-arm after a stop or a rejected entry
+    // instead of staying IN until its own 10-day-low exit (orphan sell).
+    this.signalProcessor.setOpenPositionProvider((symbol: string) => {
+      const open = this.positions.get(symbol);
+      if (!open || open.size <= 0) {
+        return { side: 'flat', size: 0 };
+      }
+      return { side: open.side, size: open.size, entryPrice: open.entryPrice };
+    });
+
     // Strategy selector toggles (E4 harness, 2026-09-10). `BaseStrategy.enabled`
     // defaults to true and the constructor config's `enabled: false` never
     // flips it, so before this only trend_follow (below) honoured its
