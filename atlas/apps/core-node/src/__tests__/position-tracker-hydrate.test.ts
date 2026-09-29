@@ -222,4 +222,91 @@ describe('PositionTracker.hydrateOpenPositions', () => {
     await expect(tracker.hydrateOpenPositions('user-abc', { executionMode: 'paper' })).rejects.toThrow(/positions hydrate query failed/);
     expect(selectCalls).toHaveLength(1);
   });
+
+  // ── Finding 6 (2026-09-28 persistence verification §2): a hydrated position
+  // has `trades = []`, so its FIRST fill in the new session used to satisfy the
+  // old `trades.length === 1` "just opened" test and re-emit `position:opened`
+  // (TradeAnalytics.recordEntry then overwrote the trade_log entry's price /
+  // size / time and "opened" was counted twice). "Opened" must mean "did not
+  // exist before this fill".
+
+  const makeFill = (overrides: Record<string, unknown>) => ({
+    trade_id: 1,
+    product_id: 'ETH-USD',
+    order_id: 'order-1',
+    user_id: 'u',
+    profile_id: 'p',
+    liquidity: 'T',
+    price: '3000',
+    size: '0.25',
+    fee: '0',
+    created_at: '2026-09-28T15:00:00.000Z',
+    side: 'buy',
+    settled: true,
+    usd_volume: '0',
+    ...overrides,
+  });
+
+  const hydrateOneEthLong = async () => {
+    nextQueryResult = {
+      data: [
+        { id: '22222222-2222-4222-8222-222222222222', symbol: 'ETH-USD', side: 'long', qty_open: 0.5, entry_price: 3000, opened_at: '2026-09-27T12:00:00.000Z' },
+      ],
+      error: null,
+    };
+    await tracker.hydrateOpenPositions('user-abc', { executionMode: 'paper' });
+    const opened: string[] = [];
+    const updated: string[] = [];
+    const closed: string[] = [];
+    tracker.on('position:opened', (p) => opened.push(p.id));
+    tracker.on('position:updated', (p) => updated.push(p.id));
+    tracker.on('position:closed', (p) => closed.push(p.id));
+    return { opened, updated, closed };
+  };
+
+  test('hydrated position: first scale-in fill emits position:updated, never position:opened again', async () => {
+    const events = await hydrateOneEthLong();
+
+    await tracker.processFill(makeFill({ trade_id: 1, order_id: 'order-scale-in', side: 'buy', size: '0.25', price: '3100' }) as any);
+
+    expect(events.opened).toEqual([]);
+    expect(events.updated).toEqual(['22222222-2222-4222-8222-222222222222']);
+    expect(events.closed).toEqual([]);
+    expect(tracker.getPosition('ETH-USD')!.size).toBeCloseTo(0.75, 10);
+  });
+
+  test('hydrated position: first partial-close fill emits position:updated, never position:opened', async () => {
+    const events = await hydrateOneEthLong();
+
+    await tracker.processFill(makeFill({ trade_id: 2, order_id: 'order-partial', side: 'sell', size: '0.25', price: '3100' }) as any);
+
+    expect(events.opened).toEqual([]);
+    expect(events.updated).toEqual(['22222222-2222-4222-8222-222222222222']);
+    expect(events.closed).toEqual([]);
+    expect(tracker.getPosition('ETH-USD')!.size).toBeCloseTo(0.25, 10);
+  });
+
+  test('hydrated position: a full close still emits position:closed (and only that)', async () => {
+    const events = await hydrateOneEthLong();
+
+    await tracker.processFill(makeFill({ trade_id: 3, order_id: 'order-exit', side: 'sell', size: '0.5', price: '3100' }) as any);
+
+    expect(events.opened).toEqual([]);
+    expect(events.updated).toEqual([]);
+    expect(events.closed).toEqual(['22222222-2222-4222-8222-222222222222']);
+    expect(tracker.getPosition('ETH-USD')).toBeUndefined();
+  });
+
+  test('a genuinely new position still emits position:opened exactly once', async () => {
+    const opened: string[] = [];
+    const updated: string[] = [];
+    tracker.on('position:opened', (p) => opened.push(p.symbol));
+    tracker.on('position:updated', (p) => updated.push(p.symbol));
+
+    await tracker.processFill(makeFill({ trade_id: 1, product_id: 'SOL-USD', side: 'buy', size: '5', price: '150' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 2, product_id: 'SOL-USD', order_id: 'order-2', side: 'buy', size: '5', price: '151' }) as any);
+
+    expect(opened).toEqual(['SOL-USD']);
+    expect(updated).toEqual(['SOL-USD']);
+  });
 });

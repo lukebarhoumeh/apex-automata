@@ -407,6 +407,12 @@ export class PositionTracker extends EventEmitter {
     };
 
     let position = this.positions.get(symbol);
+    // "Opened" means the position did not exist before this fill. Deciding it
+    // by `trades.length === 1` was wrong for a HYDRATED position (`trades = []`
+    // at hydrate): its first same-direction / partial fill in the new session
+    // re-emitted 'position:opened', TradeAnalytics.recordEntry overwrote the
+    // trade_log entry and "opened" was counted twice (finding 6, 2026-09-28).
+    const existedBeforeFill = position !== undefined;
 
     if (!position) {
       // Create new position
@@ -488,7 +494,7 @@ export class PositionTracker extends EventEmitter {
       // Remove closed positions so a new trade creates a fresh position (new id/openTime)
       this.positions.delete(symbol);
       this.lots.delete(symbol);
-    } else if (position.trades.length === 1) {
+    } else if (!existedBeforeFill) {
       this.emit('position:opened', position);
     } else {
       // Size-changing fill (partial close / scale-in): persist NOW, not at the
