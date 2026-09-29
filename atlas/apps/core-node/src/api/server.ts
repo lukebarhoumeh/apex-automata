@@ -41,6 +41,7 @@ import {
   type RestampOpenPositionsResult,
 } from '../persistence/position-session-restamp';
 import { PositionWriteSequencer } from '../persistence/position-write-sequencer';
+import { resolvePositionStrategy, resolveStrategyName } from '../persistence/strategy-name';
 import { writeSignalRouteVerdict } from '../persistence/signal-route-verdict';
 import {
   resolveRoutedExchange,
@@ -383,6 +384,11 @@ logger.info('positions upsert conflict target', positionsConflictSupport.snapsho
 // already dropped the position from memory by then, so nothing else would ever
 // re-assert closed_at). See persistence/position-write-sequencer.ts.
 const positionWriteSequencer = new PositionWriteSequencer({ logger });
+
+// Position ids whose unknown strategy label has already been warned about
+// (finding 7): the positions row is rewritten on every debounced ticker update,
+// so the "persisting as system" audit line is emitted once per position.
+const positionStrategyWarned = new Set<string>();
 
 // Session stamp for persisted rows. Set the moment the engine starts building
 // (so anything written during start-up already carries the id) and cleared when
@@ -5359,37 +5365,22 @@ async function syncOrderToSupabase(order: any, stampAtEvent?: SessionStamp | nul
   };
 
   const normalizeStrategy = (strategy?: string) => {
-    const candidate = (strategy || '').toLowerCase();
-    // Must stay in sync with public.strategy_name enum in Supabase.
-    // Last confirmed 2026-04-27: breakout, vwap_mr, obi_scalper, momentum,
-    // trend_follow, system. Any addition here needs a matching ALTER TYPE
-    // migration.
-    const validStrategies = [
-      'breakout',
-      'vwap_mr',
-      'obi_scalper',
-      'momentum',
-      'trend_follow',
-      'system',
-    ];
-    if (validStrategies.includes(candidate)) {
-      return candidate;
+    // Shared mapping onto the public.strategy_name enum (persistence/strategy-name.ts;
+    // positions use the same one — finding 7). DO NOT default to a real strategy —
+    // that mislabeled every momentum / trend_follow order as "breakout" for months.
+    // `breakout` is in `disabled_strategies` and tagging flatten/exit orders with it
+    // pollutes the audit trail with synthetic activity for a strategy that's
+    // supposed to be silent. `system` is the dedicated neutral tag for engine-
+    // originated orders (flatten, exit, close-all). Anything still hitting the
+    // fallback is a genuine unknown worth auditing (empty included, as before).
+    const resolved = resolveStrategyName(strategy);
+    if (resolved.empty || resolved.unknown) {
+      logger.warn('Unknown strategy tagged on order — falling back to system', {
+        received: strategy,
+        orderId: order.id,
+      });
     }
-    if (candidate === 'vwapmeanreversion') {
-      return 'vwap_mr';
-    }
-    // DO NOT default to a real strategy — that mislabeled every momentum /
-    // trend_follow order as "breakout" for months. `breakout` is in
-    // `disabled_strategies` and tagging flatten/exit orders with it pollutes
-    // the audit trail with synthetic activity for a strategy that's supposed
-    // to be silent. `system` is the dedicated neutral tag for engine-
-    // originated orders (flatten, exit, close-all). Anything still hitting
-    // this fallback is a genuine unknown worth auditing.
-    logger.warn('Unknown strategy tagged on order — falling back to system', {
-      received: strategy,
-      orderId: order.id,
-    });
-    return 'system';
+    return resolved.value;
   };
 
   const sizeValue = Number(order.size ?? order.quantity ?? 0);
@@ -5560,11 +5551,26 @@ async function syncPositionToSupabase(position: any) {
     const defaultStop = side === 'long' ? entryPrice * 0.98 : entryPrice * 1.02;
     const defaultTakeProfit = side === 'long' ? entryPrice * 1.03 : entryPrice * 0.97;
 
+    // Same strategy_name enum mapping as orders (finding 7): a context-less
+    // position is `system`, never `breakout` (killed); an id the enum does not
+    // know (e.g. donchian_daily_s3 today) is `system` too, so the write — and
+    // above all the CLOSE write — can never fail on 22P02. Warned once per
+    // position id (the debounced ticker update rewrites this row every second).
+    const strategyResolved = resolvePositionStrategy(position);
+    if (strategyResolved.unknown && !positionStrategyWarned.has(String(position.id))) {
+      positionStrategyWarned.add(String(position.id));
+      logger.warn('Unknown strategy tagged on position — persisting as system', {
+        received: strategyResolved.received,
+        positionId: position.id,
+        symbol,
+      });
+    }
+
     const mappedPosition = {
       id: position.id, // must be UUID-compatible
       user_id: USER_ID,
       symbol,
-      strategy: (position.strategy || 'breakout') as any,
+      strategy: strategyResolved.value as any,
       side,
       qty_open: Math.abs(Number(position.size || 0)),
       entry_price: entryPrice,
