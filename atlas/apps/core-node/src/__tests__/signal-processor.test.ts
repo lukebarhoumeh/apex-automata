@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach, vi } from 'vitest';
 import { SignalProcessor, SignalProcessorConfig } from '../strategies/signal-processor';
 import { OHLCV } from '../indicators/technical';
 import type { MarketContext, StrategyPlugin } from '../strategies/plugins/types';
+import type { Logger } from '../core/logger';
 
 // Mock logger
 const mockLogger = {
@@ -10,6 +11,8 @@ const mockLogger = {
   error: vi.fn(),
   debug: vi.fn(),
 };
+// The processor only calls the four methods above; widen once instead of `as any` per call site.
+const testLogger = mockLogger as unknown as Logger;
 
 // Mock Supabase client
 vi.mock('@supabase/supabase-js', () => ({
@@ -56,7 +59,7 @@ describe('SignalProcessor', () => {
   };
 
   beforeEach(() => {
-    signalProcessor = new SignalProcessor(config, mockLogger as any);
+    signalProcessor = new SignalProcessor(config, testLogger);
   });
 
   describe('Candle Management', () => {
@@ -190,7 +193,7 @@ describe('SignalProcessor', () => {
     }
 
     test('without a provider plugins see openPosition === undefined (unknown book)', () => {
-      const sp = new SignalProcessor({ ...config, disabledStrategies: [] }, mockLogger as any);
+      const sp = new SignalProcessor({ ...config, disabledStrategies: [] }, testLogger);
       const seen: Array<MarketContext['openPosition']> = [];
       expect(sp.registerStrategy(probePlugin(seen))).toBe(true);
       feed(sp, 'BTC-USD', 0, 60);
@@ -199,7 +202,7 @@ describe('SignalProcessor', () => {
     });
 
     test('with a provider the per-symbol hint is passed through verbatim; clearing the provider restores undefined', () => {
-      const sp = new SignalProcessor({ ...config, disabledStrategies: [] }, mockLogger as any);
+      const sp = new SignalProcessor({ ...config, disabledStrategies: [] }, testLogger);
       const seen: Array<MarketContext['openPosition']> = [];
       sp.registerStrategy(probePlugin(seen));
       const asked: string[] = [];
