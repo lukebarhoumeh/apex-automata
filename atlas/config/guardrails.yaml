@@ -617,6 +617,32 @@ regime_gates:
       # block_regimes: [weak_trend, choppy]
       block_regimes: [choppy]
 
+# Handoff P5 (2026-09-29) — PAPER session hard stop: engine-side scheduled
+# self-stop BACKSTOP. PAPER ONLY.
+# ---------------------------------------------------------------------------
+# The paper soak on LukePC is ended by an EXTERNAL automation at 10:18pm CT
+# (POST /api/engine/stop, then the processes are killed). That automation
+# STAYS PRIMARY. On 2026-09-22 it failed and the session ran on overnight, so
+# the desk asked for an engine-side backstop: while a PAPER session is
+# running, the API server arms a timer for the next `local_time` in
+# `timezone` (DST-safe via Intl, no fixed UTC offsets) and, if the session is
+# still up when it fires, runs the SAME stop path as POST /api/engine/stop —
+# engine.stop(reason) with compliance.flatten_on_shutdown, the
+# trading_sessions row closed, supervisor set to stopped — and logs at WARN
+# "PAPER hard stop fired (engine-side backstop)" with the fire time and the
+# session id. Any stop (manual or hard) disarms the timer; the next paper
+# start re-arms it. `GET /api/status` exposes `paperHardStop.nextFireAtIso`.
+#
+# LIVE IS INERT: the scheduler is only constructed for paper sessions and
+# refuses to arm for any other mode; the live stop path is untouched.
+# Not a desk pin (pnpm check:config does not read this block); an absent
+# block behaves as `enabled: false`.
+paper_session_hard_stop:
+  enabled: true
+  local_time: "22:30"      # HH:MM, 24h, wall clock in `timezone`
+  timezone: "America/Chicago"
+  reason: "paper_hard_stop_22_30_ct"
+
 compliance:
   tax_method: FIFO
   export_frequency_days: 7

@@ -149,6 +149,61 @@ describe('buildStatusPayload', () => {
     expect(payload.killSwitch).toBe(tripped);
   });
 
+  it('paperHardStop (handoff P5) rides along for a running PAPER session, is null when stopped, and NEVER for live', () => {
+    const snapshot = {
+      enabled: true,
+      nextFireAtIso: '2026-09-30T03:30:00.000Z',
+      nextFireAtMs: Date.parse('2026-09-30T03:30:00.000Z'),
+      timezone: 'America/Chicago',
+      localTime: '22:30',
+      reason: 'paper_hard_stop_22_30_ct',
+    };
+    const paper = buildStatusPayload({
+      runtime: runtime({ sessionId: SESSION_ID, sessionStartedAt: STARTED_AT, sessionMode: 'paper' }),
+      supervisor: supervisor(),
+      engine: { running: true, mode: 'paper', engineState: 'running', activeSymbols: [] },
+      pnl: pnl(SESSION_ID, STARTED_AT),
+      liveAccount: null,
+      paperHardStop: snapshot,
+      now: NOW,
+    });
+    expect(paper.paperHardStop).toEqual(snapshot);
+    expect(STATUS_PAYLOAD_REQUIRED_KEYS).toContain('paperHardStop');
+
+    const stopped = buildStatusPayload({
+      runtime: runtime(),
+      supervisor: supervisor({ engineDesiredState: 'stopped' }),
+      engine: { running: false, mode: null, engineState: 'stopped', activeSymbols: [] },
+      pnl: null,
+      liveAccount: null,
+      paperHardStop: snapshot,
+      now: NOW,
+    });
+    expect(stopped).toHaveProperty('paperHardStop', null);
+
+    // Callers that predate the field still get the key (null).
+    const legacy = buildStatusPayload({
+      runtime: runtime({ sessionId: SESSION_ID, sessionStartedAt: STARTED_AT, sessionMode: 'paper' }),
+      supervisor: supervisor(),
+      engine: { running: true, mode: 'paper', engineState: 'running', activeSymbols: [] },
+      pnl: pnl(SESSION_ID, STARTED_AT),
+      liveAccount: null,
+      now: NOW,
+    });
+    expect(legacy).toHaveProperty('paperHardStop', null);
+
+    const live = buildStatusPayload({
+      runtime: runtime({ sessionId: SESSION_ID, sessionStartedAt: STARTED_AT, sessionMode: 'live' }),
+      supervisor: supervisor(),
+      engine: { running: true, mode: 'live', engineState: 'running', activeSymbols: [] },
+      pnl: null,
+      liveAccount: { equityUsd: 1 },
+      paperHardStop: snapshot,
+      now: NOW,
+    });
+    expect(live.paperHardStop).toBeNull();
+  });
+
   it('pause/resume-style emits (same builder, paused toggled) keep the session window identical', () => {
     const base = { sessionId: SESSION_ID, sessionStartedAt: STARTED_AT, sessionMode: 'paper' as const, sessionInitialEquity: 10_000 };
     const engine = { running: true, mode: 'paper' as const, engineState: 'running' as const, activeSymbols: ['ETH-USD'] };

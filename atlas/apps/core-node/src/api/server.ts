@@ -72,7 +72,8 @@ import path from 'path';
 import { loadAndValidateEnv } from '../core/env';
 import client from 'prom-client';
 import { OHLCV } from '../indicators/technical';
-import { loadGuardrails, resolveLiveConfig, resolveCfmConfig } from '../config/loadGuardrails';
+import { loadGuardrails, resolveLiveConfig, resolveCfmConfig, resolvePaperSessionHardStopConfig } from '../config/loadGuardrails';
+import { PaperHardStopScheduler, type PaperHardStopFireContext } from '../runtime/paper-hard-stop';
 import { FeeModel } from '../core/fee-model';
 import { CfmGuard, CfmFlattenRequiredEvent, CfmLeverageSnapshot } from '../trading/cfm/cfm-guard';
 import { OrderOpsThrottle } from '../trading/execution/order-ops-throttle';
@@ -686,6 +687,11 @@ async function closeTradingSession(params: {
 // Trading engine instance
 let tradingEngine: TradingEngine | null = null;
 let signalProcessor: SignalProcessor | null = null;
+// Handoff P5 — PAPER ONLY engine-side 22:30 CT self-stop backstop
+// (runtime/paper-hard-stop.ts). Constructed and armed only when a PAPER
+// session starts; disarmed and dropped on every stop path. Never exists for
+// a live session, so the live stop path is untouched.
+let paperHardStop: PaperHardStopScheduler | null = null;
 // Coherence layer: per-symbol direction lock + cross-venue netting + intra-window dedup.
 // Long-lived module-level singleton; reset() is called on engine stop.
 const signalArbitrator = new SignalArbitrator(logger);
@@ -1092,6 +1098,8 @@ function buildStatusCore(supervisorState = supervisor.getState()): StatusPayload
     },
     pnl: buildPnLSnapshot(),
     liveAccount: isEngineRunning && mode === 'live' ? buildLiveAccountBlock() : null,
+    // Paper-only hard-stop backstop (handoff P5): next fire time for the desk / FE.
+    paperHardStop: paperHardStop ? paperHardStop.snapshot() : null,
   });
 }
 
@@ -2924,7 +2932,14 @@ app.post('/api/engine/start', async (req, res) => {
       mode: mode as 'paper' | 'live',
       initialEquity: liveAccountSummary ? liveAccountSummary.equityUsd : engineGuardrails.account.equity_usd,
     });
-    
+
+    // Handoff P5 — PAPER ONLY engine-side self-stop backstop (22:30 America/Chicago
+    // per guardrails `paper_session_hard_stop`). The external 10:18pm CT automation
+    // stays primary; this catches the night it does not run. Never built for live.
+    if (mode === 'paper') {
+      armPaperHardStop(sessionId);
+    }
+
     // Load historical data for warmup (don't await - do in background)
     const activeSymbols = tradingEngine.getActiveSymbols();
     logger.info(`Starting warmup for ${activeSymbols.length} symbols`);
@@ -3002,6 +3017,7 @@ app.post('/api/engine/start', async (req, res) => {
 
     // Clean up partially-initialized state so next start attempt works
     try {
+      disarmPaperHardStop('start_failed');
       if (perpsRiskMonitor) {
         perpsRiskMonitor.stop();
         perpsRiskMonitor.removeAllListeners();
@@ -3262,6 +3278,71 @@ async function runLivePreflight(input: {
   return { ok: true, warnings, checks: report.checks, account: report.account, truth };
 }
 
+/**
+ * The ONE engine stop path, shared by `POST /api/engine/stop` and the paper
+ * hard-stop backstop (handoff P5). Tears the running engine down
+ * (`engine.stop(reason)` — flatten_on_shutdown applies inside), releases the
+ * venue adapters, marks the supervisor stopped and closes the
+ * `trading_sessions` row. The caller owns `engineOperationInProgress` and the
+ * `tradingEngine !== null` precondition. Body is the former route body,
+ * byte-for-byte in behaviour for the route's `api_request` / `api_stop_request`
+ * reasons (live included).
+ *
+ * @param reasons `engineStopReason` goes to `TradingEngine.stop()`; `supervisorReason`
+ *   to `EngineSupervisor.setActualState('stopped', …)`.
+ */
+async function stopTradingEngineShared(reasons: { engineStopReason: string; supervisorReason: string }): Promise<void> {
+  const engine = tradingEngine;
+  if (!engine) {
+    throw new Error('stopTradingEngineShared: trading engine not running');
+  }
+
+  // Any stop (manual, signal or hard stop) disarms the paper backstop first so a
+  // stop that is already under way can never be followed by a second fire.
+  disarmPaperHardStop(reasons.engineStopReason);
+
+  // Update supervisor state first
+  supervisor.setDesiredState('stopped');
+
+  // Snapshot final equity + closed-trade count BEFORE tearing the engine down
+  // so we can stamp them on the trading_sessions row. `totalEquityUsd` is the
+  // equity SoT (the old code read a non-existent `.equity` and always wrote
+  // final_equity = initial_equity).
+  const snapshot = buildPnLSnapshot();
+  const finalEquity: number | null = snapshot?.totalEquityUsd ?? null;
+  const finalStats = engine.getSessionStats();
+
+  await engine.stop(reasons.engineStopReason);
+  if (perpsRiskMonitor) {
+    perpsRiskMonitor.stop();
+    perpsRiskMonitor.removeAllListeners();
+  }
+  if (exchangeRegistry) {
+    try {
+      await exchangeRegistry.shutdown();
+    } catch (regErr) {
+      logger.warn('Error tearing down ExchangeRegistry on stop:', regErr);
+    }
+  }
+  tradingEngine = null;
+  signalProcessor = null;
+  perpsRiskMonitor = null;
+  perpsAdapter = null;
+  exchangeRegistry = null;
+  hyperliquidAdapter = null;
+  activeSpotToPerpsMap = new Map();
+  stopCfmGuard();
+
+  // Update supervisor actual state
+  supervisor.setActualState('stopped', reasons.supervisorReason);
+
+  // Update metrics
+  engineRunningGauge.set(0);
+
+  // Close the trading_sessions row (best-effort, does not block response)
+  await closeTradingSession({ finalEquity, totalTrades: finalStats?.totalTrades ?? null });
+}
+
 // Stop trading engine
 app.post('/api/engine/stop', async (req, res) => {
   if (engineOperationInProgress) {
@@ -3273,46 +3354,7 @@ app.post('/api/engine/stop', async (req, res) => {
       return res.status(400).json({ error: 'Trading engine not running' });
     }
 
-    // Update supervisor state first
-    supervisor.setDesiredState('stopped');
-
-    // Snapshot final equity + closed-trade count BEFORE tearing the engine down
-    // so we can stamp them on the trading_sessions row. `totalEquityUsd` is the
-    // equity SoT (the old code read a non-existent `.equity` and always wrote
-    // final_equity = initial_equity).
-    const snapshot = buildPnLSnapshot();
-    const finalEquity: number | null = snapshot?.totalEquityUsd ?? null;
-    const finalStats = tradingEngine.getSessionStats();
-
-    await tradingEngine.stop('api_request');
-    if (perpsRiskMonitor) {
-      perpsRiskMonitor.stop();
-      perpsRiskMonitor.removeAllListeners();
-    }
-    if (exchangeRegistry) {
-      try {
-        await exchangeRegistry.shutdown();
-      } catch (regErr) {
-        logger.warn('Error tearing down ExchangeRegistry on stop:', regErr);
-      }
-    }
-    tradingEngine = null;
-    signalProcessor = null;
-    perpsRiskMonitor = null;
-    perpsAdapter = null;
-    exchangeRegistry = null;
-    hyperliquidAdapter = null;
-    activeSpotToPerpsMap = new Map();
-    stopCfmGuard();
-
-    // Update supervisor actual state
-    supervisor.setActualState('stopped', 'api_stop_request');
-
-    // Update metrics
-    engineRunningGauge.set(0);
-
-    // Close the trading_sessions row (best-effort, does not block response)
-    await closeTradingSession({ finalEquity, totalTrades: finalStats?.totalTrades ?? null });
+    await stopTradingEngineShared({ engineStopReason: 'api_request', supervisorReason: 'api_stop_request' });
 
     res.json({ success: true, message: 'Trading engine stopped' });
 
@@ -3323,6 +3365,115 @@ app.post('/api/engine/stop', async (req, res) => {
     engineOperationInProgress = false;
   }
 });
+
+// ── Handoff P5 — PAPER session hard stop (engine-side backstop) ──────────────
+//
+// Arms `runtime/paper-hard-stop.ts` for the next `paper_session_hard_stop.local_time`
+// in `.timezone` (desk: 22:30 America/Chicago). When it fires and a paper
+// engine is still running, the SAME stop path as POST /api/engine/stop runs
+// with the YAML `reason`. The external 10:18pm CT automation stays primary.
+// PAPER ONLY: only called from the paper branch of /api/engine/start, and the
+// scheduler itself refuses to arm for any other mode.
+
+/** Hard-stop retry cadence while another engine operation holds the lock. */
+const PAPER_HARD_STOP_BUSY_RETRY_MS = 10_000;
+const PAPER_HARD_STOP_BUSY_MAX_ATTEMPTS = 6;
+
+function armPaperHardStop(sessionId: string): void {
+  const config = resolvePaperSessionHardStopConfig(guardrails);
+  disarmPaperHardStop('rearm');
+  const scheduler = new PaperHardStopScheduler({
+    mode: 'paper',
+    config,
+    logger,
+    onFire: (ctx) => runPaperHardStop(ctx, sessionId, 1),
+  });
+  paperHardStop = scheduler;
+  if (!scheduler.arm()) {
+    // Disabled in YAML (or refused): keep the snapshot visible on /api/status but hold no timer.
+    logger.info('PAPER hard stop backstop not armed', { sessionId, enabled: config.enabled, localTime: config.local_time, timezone: config.timezone });
+  }
+}
+
+function disarmPaperHardStop(cause: string): void {
+  if (!paperHardStop) return;
+  const wasArmed = paperHardStop.isArmed();
+  paperHardStop.disarm();
+  paperHardStop = null;
+  if (wasArmed) {
+    logger.info('PAPER hard stop backstop disarmed', { cause });
+  }
+}
+
+/**
+ * Timer callback: stop the paper engine through the shared stop path. Retries a
+ * bounded number of times when another engine operation holds the lock; never
+ * throws into the timer (the scheduler logs anything that escapes).
+ */
+async function runPaperHardStop(ctx: PaperHardStopFireContext, sessionId: string, attempt: number): Promise<void> {
+  const firedAtIso = new Date(ctx.firedAtMs).toISOString();
+  if (!tradingEngine) {
+    logger.info('PAPER hard stop fired but no engine is running — nothing to stop', { sessionId, firedAt: firedAtIso });
+    disarmPaperHardStop('no_engine');
+    return;
+  }
+  const runningMode = tradingEngine.getConfig().mode;
+  if (runningMode !== 'paper') {
+    // Belt-and-braces: the scheduler is only ever built for paper; never stop a live engine from here.
+    logger.error('PAPER hard stop fired while the running engine is not paper — REFUSING to act', { sessionId, mode: runningMode });
+    disarmPaperHardStop('mode_mismatch');
+    return;
+  }
+  if (engineOperationInProgress) {
+    if (attempt >= PAPER_HARD_STOP_BUSY_MAX_ATTEMPTS) {
+      logger.error('PAPER hard stop could not acquire the engine lock — giving up for today', {
+        sessionId,
+        attempts: attempt,
+        firedAt: firedAtIso,
+      });
+      return;
+    }
+    logger.warn('PAPER hard stop fired while an engine operation is in progress — retrying', {
+      sessionId,
+      attempt,
+      retryInMs: PAPER_HARD_STOP_BUSY_RETRY_MS,
+    });
+    setTimeout(() => {
+      void runPaperHardStop(ctx, sessionId, attempt + 1);
+    }, PAPER_HARD_STOP_BUSY_RETRY_MS).unref();
+    return;
+  }
+
+  engineOperationInProgress = true;
+  try {
+    logger.warn('PAPER hard stop fired (engine-side backstop)', {
+      sessionId: runtimeState.sessionId ?? sessionId,
+      firedAt: firedAtIso,
+      scheduledFor: new Date(ctx.scheduledForMs).toISOString(),
+      localTime: ctx.localTime,
+      timezone: ctx.timezone,
+      reason: ctx.reason,
+      flattenOnShutdown: guardrails.compliance.flatten_on_shutdown,
+      note: 'external 10:18pm CT stop did not end this session; engine-side backstop is stopping it',
+    });
+    await stopTradingEngineShared({ engineStopReason: ctx.reason, supervisorReason: 'paper_hard_stop' });
+    // Same shape every other emitter uses, so the UI sees engineRunning=false immediately
+    // (the engine's own `engine:state_changed` → `EngineStateChanged` already went out).
+    broadcast({ type: 'StatusUpdate', payload: buildStatusCore() });
+    logger.warn('PAPER hard stop complete — paper session stopped by the engine-side backstop', {
+      sessionId,
+      reason: ctx.reason,
+    });
+  } catch (error) {
+    logger.error('PAPER hard stop failed to stop the trading engine', {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  } finally {
+    engineOperationInProgress = false;
+  }
+}
 
 // Emergency kill switch
 app.post('/api/engine/kill', async (req, res) => {
@@ -5755,7 +5906,10 @@ async function gracefulShutdown(signal: string) {
 
     // Stop supervisor first
     supervisor.stop();
-    
+
+    // The process is going away: never let the paper backstop fire mid-shutdown.
+    disarmPaperHardStop(`${signal}_shutdown`);
+
     // Stop perps risk monitor
     if (perpsRiskMonitor) {
       perpsRiskMonitor.stop();

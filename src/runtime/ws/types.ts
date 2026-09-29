@@ -78,6 +78,18 @@ export interface StatusPayload {
   warmupComplete?: boolean;
   candlesBuffered?: Record<string, number>;
   pnl?: Record<string, unknown> | null;
+  /**
+   * Handoff P5 — PAPER ONLY engine-side self-stop backstop (22:30 America/Chicago).
+   * Present (non-null) only while a paper session is running; always null for live.
+   */
+  paperHardStop?: {
+    enabled: boolean;
+    nextFireAtIso: string | null;
+    nextFireAtMs: number | null;
+    timezone: string;
+    localTime: string;
+    reason: string;
+  } | null;
   lastMarketDataAt?: number;
   lastEngineHeartbeatAt?: number;
   timestamp?: number;

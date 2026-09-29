@@ -22,6 +22,7 @@
 import type { EngineState } from '../trading/trading-engine';
 import type { EngineState as SupervisorEngineState } from '../runtime/engine-supervisor';
 import type { ExecutionMode } from '../runtime/session-context';
+import type { PaperHardStopSnapshot } from '../runtime/paper-hard-stop';
 import type { PnlSnapshot } from './pnl-snapshot';
 
 export interface StatusKillSwitch {
@@ -82,6 +83,13 @@ export interface StatusPayloadInputs {
   pnl: PnlSnapshot | null;
   /** Live only (TASK_011); `null` in paper / when stopped. */
   liveAccount: Record<string, unknown> | null;
+  /**
+   * Paper-only engine-side 22:30 CT self-stop backstop (handoff P5). The
+   * scheduler's snapshot while a paper session is running; `null` when no
+   * scheduler exists (stopped, or a live session). Optional for callers that
+   * predate the field.
+   */
+  paperHardStop?: PaperHardStopSnapshot | null;
   now?: number;
 }
 
@@ -114,6 +122,12 @@ export interface StatusPayload {
   /** Canonical PnL / equity snapshot; `null` while the engine is not running. ALWAYS present. */
   pnl: PnlSnapshot | null;
   liveAccount: Record<string, unknown> | null;
+  /**
+   * Paper-only hard-stop backstop state: `{ enabled, nextFireAtIso, nextFireAtMs,
+   * timezone, localTime, reason }` while a paper session is running, `null`
+   * otherwise (and ALWAYS `null` for live). ALWAYS present as a key.
+   */
+  paperHardStop: PaperHardStopSnapshot | null;
   activeSymbols: string[];
   warmupComplete: boolean;
   candlesBuffered: Record<string, number>;
@@ -136,6 +150,7 @@ export const STATUS_PAYLOAD_REQUIRED_KEYS = [
   'sessionStartedAt',
   'session',
   'pnl',
+  'paperHardStop',
   'engineState',
   'timestamp',
 ] as const satisfies readonly (keyof StatusPayload)[];
@@ -172,6 +187,8 @@ export function buildStatusPayload(inputs: StatusPayloadInputs): StatusPayload {
     risk: runtime.risk,
     pnl,
     liveAccount: engine.running && engine.mode === 'live' ? inputs.liveAccount : null,
+    // Paper only: never surface (or arm) a hard stop for a live session.
+    paperHardStop: engine.running && engine.mode === 'paper' ? (inputs.paperHardStop ?? null) : null,
     activeSymbols: engine.activeSymbols,
     warmupComplete: runtime.warmupComplete ?? false,
     candlesBuffered: runtime.candlesBuffered ?? {},
