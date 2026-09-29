@@ -13,7 +13,7 @@ boxes - leave them unticked so reviewers can see what was considered.
 
 <!-- Bullet list of commands run + expected results.
      Backend: `cd atlas/apps/core-node && ENCRYPTION_KEY=<64 hex> pnpm test` -> the
-     baseline in CLAUDE.md (91 files / 1509 tests as of 2026-09-28) or higher.
+     baseline in CLAUDE.md (95 files / 1574 tests as of 2026-09-29) or higher.
      Frontend: `pnpm lint && pnpm build`.
      Backtest changes: paste 1-line summary + a link to backtest_<ts>.json. -->
 
@@ -58,7 +58,7 @@ changes — do not merge until ticked.**
 ### Test + standards baseline
 
 - [ ] Backend tests still pass: `cd atlas/apps/core-node && pnpm test` is at
-      the CLAUDE.md baseline (**91 files / 1509 tests** as of 2026-09-28) or
+      the CLAUDE.md baseline (**95 files / 1574 tests** as of 2026-09-29) or
       higher (zero failures, zero skipped that were previously passing).
 - [ ] Frontend lint + build clean: `pnpm lint && pnpm build`.
 - [ ] Conventional commit format on every commit (`feat:`, `fix:`,
