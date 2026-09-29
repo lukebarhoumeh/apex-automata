@@ -21,8 +21,8 @@
  * (`persistence/signal-row.ts`, which used to write `signal.strategy` raw).
  *
  * `donchian_daily_s3` (plugin PAPER-S3-DONCHIAN-v0, default OFF) is an enum
- * value since migration 20260929120000_add_donchian_daily_s3_to_strategy_name_enum.sql
- * (STAGED, applied separately) and passes through. Because the runtime is
+ * value since migration 20260929203106_add_donchian_daily_s3_to_strategy_name_enum.sql
+ * (applied to project gdrdaajvutmewgxbjurk on 2026-09-29) and passes through. Because the runtime is
  * deployed independently of that apply, the value is written schema-tolerantly:
  * a database that does not have the label yet answers 22P02, and
  * `persistence/strategy-enum-fallback.ts` retries that one write as `system`,
@@ -37,7 +37,7 @@
  * Values of `public.strategy_name`. Last confirmed against the migrations on
  * 2026-09-29: 20251013054024 (breakout, vwap_mr, obi_scalper), 20251016192352
  * (momentum), 20260303175729 (trend_follow), 20260427161412 (system),
- * 20260929120000 (donchian_daily_s3 — STAGED; see the 22P02 fallback above).
+ * 20260929203106 (donchian_daily_s3 — applied 2026-09-29; see the 22P02 fallback above).
  * Any addition here needs a matching ALTER TYPE. Declaration order = enum order.
  */
 export const STRATEGY_NAME_ENUM_VALUES = [

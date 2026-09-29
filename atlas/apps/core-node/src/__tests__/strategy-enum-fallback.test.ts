@@ -3,7 +3,7 @@
  *
  * The runtime is deployed independently of Supabase migrations. Since
  * `donchian_daily_s3` joined `STRATEGY_NAME_ENUM_VALUES` (migration
- * 20260929120000, staged), a runtime that normalises the id onto itself would
+ * 20260929203106, applied 2026-09-29), a runtime that normalises the id onto itself would
  * fail every orders / positions / signals write for it with
  *
  *     22P02  invalid input value for enum strategy_name: "donchian_daily_s3"

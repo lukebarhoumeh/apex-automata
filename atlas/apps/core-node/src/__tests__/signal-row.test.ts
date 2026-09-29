@@ -9,7 +9,7 @@
  *   - `strategy` goes through the shared `resolveStrategyName` mapping
  *     (enum pass-through, alias, `system` fallback), exactly like orders and
  *     positions;
- *   - `donchian_daily_s3` (enum value since 20260929120000) survives;
+ *   - `donchian_daily_s3` (enum value since 20260929203106) survives;
  *   - the resolution is returned so the caller can warn on an unknown id;
  *   - every other column keeps the shape the pre-extraction inline writer
  *     produced (id only when a v4 uuid, side mapping, score / confidence
@@ -35,7 +35,7 @@ const baseSignal = () => ({
 });
 
 describe('buildSignalRow — strategy_name normalisation', () => {
-  it('a donchian_daily_s3 signal keeps its id (enum value since 20260929120000)', () => {
+  it('a donchian_daily_s3 signal keeps its id (enum value since 20260929203106)', () => {
     const { row, strategy } = buildSignalRow({ userId: USER_ID, signal: { ...baseSignal(), strategy: 'donchian_daily_s3' }, now: NOW });
     expect(row.strategy).toBe('donchian_daily_s3');
     expect(strategy).toEqual({ value: 'donchian_daily_s3', empty: false, unknown: false, received: 'donchian_daily_s3' });

@@ -6,7 +6,7 @@
  * The runtime is deployed independently of Supabase migrations (staged in the
  * repo, applied by the Database Engineer with Trading Master go). Since
  * `donchian_daily_s3` joined `STRATEGY_NAME_ENUM_VALUES` (migration
- * 20260929120000_add_donchian_daily_s3_to_strategy_name_enum.sql), a runtime
+ * 20260929203106_add_donchian_daily_s3_to_strategy_name_enum.sql), a runtime
  * that normalises the id onto itself would fail every orders / positions /
  * signals write for it on a database that has not applied the migration yet:
  *
@@ -38,7 +38,7 @@ import type { PostgrestErrorLike } from '../core/postgrest-errors';
 import { STRATEGY_NAME_FALLBACK } from './strategy-name';
 
 /** Migration that adds the newest enum value; named in the warn log. */
-export const STRATEGY_ENUM_MIGRATION_HINT = '20260929120000_add_donchian_daily_s3_to_strategy_name_enum.sql';
+export const STRATEGY_ENUM_MIGRATION_HINT = '20260929203106_add_donchian_daily_s3_to_strategy_name_enum.sql';
 
 /** Default time a value stays remembered as "not in the enum" before re-probing. */
 export const DEFAULT_STRATEGY_ENUM_REPROBE_MS = 5 * 60_000;

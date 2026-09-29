@@ -12,7 +12,7 @@
  *   - empty / non-string → `system`, flagged `empty` (not an audit event);
  *   - unknown ids → `system`, flagged `unknown` (worth an audit log line);
  *   - `donchian_daily_s3` IS an enum value since migration
- *     20260929120000_add_donchian_daily_s3_to_strategy_name_enum.sql (staged
+ *     20260929203106_add_donchian_daily_s3_to_strategy_name_enum.sql (applied
  *     2026-09-29) and survives normalisation; a database that has not applied
  *     the migration yet is handled at write time by
  *     persistence/strategy-enum-fallback.ts (22P02 → `system`, warned once);
@@ -60,7 +60,7 @@ describe('resolveStrategyName — strategy_name enum normalisation', () => {
     expect(resolved).toEqual({ value: 'system', empty: false, unknown: true, received: 'this_is_a_made_up_strategy' });
   });
 
-  it('donchian_daily_s3 is an enum value (migration 20260929120000) and survives normalisation', () => {
+  it('donchian_daily_s3 is an enum value (migration 20260929203106) and survives normalisation', () => {
     const resolved = resolveStrategyName('donchian_daily_s3');
     expect(resolved).toEqual({ value: 'donchian_daily_s3', empty: false, unknown: false, received: 'donchian_daily_s3' });
     // Guard: the list and the ALTER TYPE migration move together. A database
@@ -98,7 +98,7 @@ describe('resolvePositionStrategy — positions.strategy for a tracker Position'
     expect(resolvePositionStrategy({ strategy: 'trend_follow' })).toMatchObject({ value: 'trend_follow', unknown: false, empty: false });
   });
 
-  it('a donchian_daily_s3 position keeps its label (enum value since 20260929120000)', () => {
+  it('a donchian_daily_s3 position keeps its label (enum value since 20260929203106)', () => {
     expect(resolvePositionStrategy({ strategy: 'donchian_daily_s3' })).toMatchObject({ value: 'donchian_daily_s3', unknown: false, empty: false });
   });
 

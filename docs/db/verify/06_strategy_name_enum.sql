@@ -1,7 +1,7 @@
 -- docs/db/verify/06_strategy_name_enum.sql
 -- Read-only verification for
---   20260929120000_add_donchian_daily_s3_to_strategy_name_enum.sql
---   (placeholder version — renamed to the apply-time version after the MCP apply)
+--   20260929203106_add_donchian_daily_s3_to_strategy_name_enum.sql
+--   (APPLIED 2026-09-29 via MCP; the recorded apply-time version is the file name — pass = t on prod)
 -- Run as postgres or any role that can read pg_enum (SQL editor shows only the
 -- final summary row; psql shows all).
 -- Documentation only — never copy into supabase/migrations/.

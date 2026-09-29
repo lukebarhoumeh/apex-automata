@@ -401,7 +401,7 @@ const positionStrategyWarned = new Set<string>();
 // Process-lifetime memory of which strategy_name enum labels the deployed
 // database accepts (persistence/strategy-enum-fallback.ts). Shared by the
 // orders / positions / signals writers so a label the enum lacks (e.g.
-// donchian_daily_s3 before migration 20260929120000 is applied) is retried
+// donchian_daily_s3 before migration 20260929203106 is applied) is retried
 // once as `system`, warned once, and remembered — with a re-probe window.
 const strategyEnumSupport = new StrategyEnumValueSupport();
 
