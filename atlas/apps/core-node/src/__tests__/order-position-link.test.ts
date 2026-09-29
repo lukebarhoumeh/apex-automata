@@ -136,6 +136,54 @@ describe('OrderPositionLinker.link', () => {
   });
 });
 
+describe('OrderPositionLinker.linkCounts (round 3, task G: /api/status persistence block)', () => {
+  const POS_2 = 'aaaaaaaa-0000-4000-8000-000000000002';
+
+  it('starts at zero, counts confirmed links cumulatively, and tracks ids awaiting retry as pending', async () => {
+    let returnAll = false;
+    const { linker } = makeLinker((_p, ids) => ({ data: returnAll ? ids.map((id) => ({ id })) : [], error: null }));
+    expect(linker.linkCounts()).toEqual({ linked: 0, pending: 0, failed: 0, disabled: false });
+
+    // Order row not persisted yet → pending, retried on the next write.
+    await linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }] });
+    expect(linker.linkCounts()).toEqual({ linked: 0, pending: 1, failed: 0, disabled: false });
+
+    returnAll = true;
+    await linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }, { clientOrderId: 'o-scale' }] });
+    expect(linker.linkCounts()).toEqual({ linked: 2, pending: 0, failed: 0, disabled: false });
+
+    // A second position: its pending set is counted alongside the first.
+    returnAll = false;
+    await linker.link({ id: POS_2, symbol: 'SOL-USD', trades: [{ clientOrderId: 'o-2a' }, { clientOrderId: 'o-2b' }] });
+    expect(linker.linkCounts()).toEqual({ linked: 2, pending: 2, failed: 0, disabled: false });
+  });
+
+  it('a failed UPDATE on an open position is pending (retried), and ids still unlinked when the position closes are failed', async () => {
+    let fail = true;
+    const { linker } = makeLinker((_p, ids) => (fail ? { data: null, error: { code: '08006', message: 'connection failure' } } : { data: [], error: null }));
+
+    await linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }] });
+    expect(linker.linkCounts()).toEqual({ linked: 0, pending: 1, failed: 0, disabled: false });
+
+    // Close write: UPDATE answers but RETURNING confirms nothing — the position is
+    // forgotten, so those ids will never be retried: they are failed, not pending.
+    fail = false;
+    await linker.link({ id: POS, symbol: 'ETH-USD', closedAt: new Date(), trades: [{ clientOrderId: 'o-entry' }, { clientOrderId: 'o-exit' }] });
+    expect(linker.linkCounts()).toEqual({ linked: 0, pending: 0, failed: 2, disabled: false });
+
+    // Close write whose link UPDATE errors: same — terminal for that position.
+    fail = true;
+    await linker.link({ id: POS_2, symbol: 'SOL-USD', closedAt: new Date(), trades: [{ clientOrderId: 'o-2a' }] });
+    expect(linker.linkCounts()).toEqual({ linked: 0, pending: 0, failed: 3, disabled: false });
+  });
+
+  it('a missing position_id column reports disabled and clears pending (nothing will ever be retried)', async () => {
+    const { linker } = makeLinker(() => ({ data: null, error: { code: 'PGRST204', message: "Could not find the 'position_id' column of 'orders' in the schema cache" } }));
+    await linker.link({ id: POS, trades: [{ clientOrderId: 'o-entry' }] });
+    expect(linker.linkCounts()).toEqual({ linked: 0, pending: 0, failed: 0, disabled: true });
+  });
+});
+
 describe('PositionTracker threads FillContext.clientOrderId onto Trade', () => {
   const config: PositionTrackerConfig = {
     supabaseUrl: 'http://localhost:54321',

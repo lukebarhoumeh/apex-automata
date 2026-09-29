@@ -291,3 +291,65 @@ describe('PositionWriteSequencer — close durability', () => {
     expect(ok).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('PositionWriteSequencer — close-write failure counter (round 3, task G: /api/status persistence block)', () => {
+  const AT = Date.parse('2026-09-29T21:00:00.000Z');
+
+  it('starts at zero with no last failure', () => {
+    expect(new PositionWriteSequencer().closeWriteFailures()).toEqual({ count: 0, last: null });
+  });
+
+  it('increments once per TERMINAL close failure and remembers the last one (id, symbol, session, attempts, code, error, at)', async () => {
+    const sequencer = new PositionWriteSequencer({ logger: makeLogger(), sleep: async () => {}, now: () => AT });
+    const failing = vi.fn(async (): Promise<PositionWriteAttempt> => ({ error: CONNECTION_FAILURE }));
+
+    await sequencer.enqueue(request(ID_A, 'close', failing));
+    expect(sequencer.closeWriteFailures()).toEqual({
+      count: 1,
+      last: {
+        positionId: ID_A,
+        symbol: 'ETH-USD',
+        sessionId: SESSION,
+        at: AT,
+        attempts: DEFAULT_CLOSE_RETRY_DELAYS_MS.length + 1,
+        code: '08006',
+        error: CONNECTION_FAILURE.message,
+      },
+    });
+
+    // Retries inside one close are NOT counted separately — one terminal failure, one increment.
+    expect(failing).toHaveBeenCalledTimes(DEFAULT_CLOSE_RETRY_DELAYS_MS.length + 1);
+
+    const rlsFailing = vi.fn(async (): Promise<PositionWriteAttempt> => ({ error: RLS_DENIED }));
+    await sequencer.enqueue(request(ID_B, 'close', rlsFailing, 'SOL-USD'));
+    expect(sequencer.closeWriteFailures()).toMatchObject({
+      count: 2,
+      last: { positionId: ID_B, symbol: 'SOL-USD', attempts: NON_TRANSIENT_MAX_ATTEMPTS, code: '42501', error: RLS_DENIED.message },
+    });
+  });
+
+  it('a close that succeeds after retry, a failed NON-close write and a dropped write never count', async () => {
+    const sequencer = new PositionWriteSequencer({ logger: makeLogger(), sleep: async () => {} });
+    const recovering = vi
+      .fn<[], Promise<PositionWriteAttempt>>()
+      .mockResolvedValueOnce({ error: CONNECTION_FAILURE })
+      .mockResolvedValueOnce({ error: null });
+    await expect(sequencer.enqueue(request(ID_A, 'close', recovering))).resolves.toMatchObject({ status: 'written', attempts: 2 });
+
+    const failingUpdate = vi.fn(async (): Promise<PositionWriteAttempt> => ({ error: CONNECTION_FAILURE }));
+    await expect(sequencer.enqueue(request(ID_B, 'update', failingUpdate))).resolves.toMatchObject({ status: 'failed' });
+
+    // Enqueued after the close for ID_A → dropped, never executed.
+    await expect(sequencer.enqueue(request(ID_A, 'update', failingUpdate))).resolves.toMatchObject({ status: 'dropped' });
+
+    expect(sequencer.closeWriteFailures()).toEqual({ count: 0, last: null });
+  });
+
+  it('a thrown close write (fetch failure) that exhausts the schedule is counted with its message and no code', async () => {
+    const sequencer = new PositionWriteSequencer({ logger: makeLogger(), sleep: async () => {} });
+    const thrower = vi.fn(async (): Promise<PositionWriteAttempt> => { throw new TypeError('fetch failed'); });
+    await sequencer.enqueue(request(ID_A, 'close', thrower));
+    expect(sequencer.closeWriteFailures()).toMatchObject({ count: 1, last: { positionId: ID_A, code: null, error: 'fetch failed' } });
+    expect(typeof sequencer.closeWriteFailures().last?.at).toBe('number');
+  });
+});

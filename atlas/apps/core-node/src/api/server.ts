@@ -45,7 +45,12 @@ import { OrderPositionLinker } from '../persistence/order-position-link';
 import { resolvePositionStrategy, resolveStrategyName } from '../persistence/strategy-name';
 import { StrategyEnumValueSupport, writeWithStrategyEnumFallback } from '../persistence/strategy-enum-fallback';
 import { buildSignalRow } from '../persistence/signal-row';
-import { classifyReconcileRows, selectRowsForDestructiveReconcile, type ReconcileOpenRow } from '../persistence/session-reconcile';
+import {
+  classifyReconcileRows,
+  selectRowsForDestructiveReconcile,
+  type ReconcileClassification,
+  type ReconcileOpenRow,
+} from '../persistence/session-reconcile';
 import { writeSignalRouteVerdict } from '../persistence/signal-route-verdict';
 import {
   resolveRoutedExchange,
@@ -71,7 +76,7 @@ import {
 } from './session-scope';
 import { buildStrategySessionStats, StrategySessionStats } from './strategy-session-stats';
 import { buildPnlSnapshotPayload, PnlSnapshot } from './pnl-snapshot';
-import { buildStatusPayload, StatusPayload } from './status-payload';
+import { buildPersistenceBlock, buildStatusPayload, StatusPayload } from './status-payload';
 import { createClient } from '@supabase/supabase-js';
 import path from 'path';
 import { loadAndValidateEnv } from '../core/env';
@@ -411,6 +416,11 @@ let activeSessionStamp: SessionStamp | null = null;
 // the engine agree on session_id without a SQL round-trip.
 let lastHydrateRestamp: RestampOpenPositionsResult | null = null;
 
+// Outcome of the most recent observational session reconcile (openTradingSession),
+// surfaced on /api/status `persistence.reconcile` alongside the restamp above
+// (round 3, task G). Cleared with the session; null with STARTUP_RECONCILE=false.
+let lastSessionReconcile: (ReconcileClassification & { at: number }) | null = null;
+
 const DEFAULT_LIVE_CONFIRM_PHRASE = 'ENABLE LIVE';
 
 // Supabase client
@@ -653,6 +663,7 @@ async function openTradingSession(params: {
         executionMode: params.mode,
         modeColumnPresent: reconcileModeColumnPresent,
       });
+      lastSessionReconcile = { ...reconcile, at: Date.now() };
 
       logger.info('Session reconcile (observational)', {
         sessionId,
@@ -734,6 +745,7 @@ async function closeTradingSession(params: {
   // Stamp clears even when no runtimeState session was opened (start failed early).
   activeSessionStamp = null;
   lastHydrateRestamp = null;
+  lastSessionReconcile = null;
   if (!sessionId) return;
 
   const endedAt = Date.now();
@@ -1198,6 +1210,20 @@ function buildStatusCore(supervisorState = supervisor.getState()): StatusPayload
     liveAccount: isEngineRunning && mode === 'live' ? buildLiveAccountBlock() : null,
     // Paper-only hard-stop backstop (handoff P5): next fire time for the desk / FE.
     paperHardStop: paperHardStop ? paperHardStop.snapshot() : null,
+    // Persistence health (round 3, task G): last start's hydrate restamp +
+    // observational reconcile, terminal close-write failures and the
+    // orders.position_id link counters — the same object on REST and every WS
+    // StatusUpdate. Built only while running; the builder nulls it otherwise.
+    persistence: isEngineRunning
+      ? buildPersistenceBlock({
+          sessionId: runtimeState.sessionId,
+          executionMode: runtimeState.sessionMode,
+          hydrateRestamp: lastHydrateRestamp,
+          reconcile: lastSessionReconcile,
+          closeWriteFailures: positionWriteSequencer.closeWriteFailures(),
+          orderLinks: orderPositionLinker.linkCounts(),
+        })
+      : null,
   });
 }
 

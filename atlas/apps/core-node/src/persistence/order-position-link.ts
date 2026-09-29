@@ -69,8 +69,27 @@ export function pendingOrderLinks(position: LinkablePosition, alreadyLinked: Rea
   return [...out];
 }
 
+/**
+ * Link counters for `/api/status` `persistence.orderLinks` (round 3, task G).
+ * `linked` = order ids RETURNING confirmed since process start; `pending` =
+ * ids attempted on a still-open position and not confirmed yet (order row not
+ * persisted, or the UPDATE failed) — retried on that position's next write;
+ * `failed` = ids still unlinked when their position closed (the linker forgets
+ * the position, so nothing retries them); `disabled` mirrors `disabled`.
+ */
+export interface OrderLinkCounts {
+  linked: number;
+  pending: number;
+  failed: number;
+  disabled: boolean;
+}
+
 export class OrderPositionLinker {
   private readonly linked = new Map<string, Set<string>>();
+  /** Attempted-but-unconfirmed ids per OPEN position (diagnostic mirror of what the next write retries). */
+  private readonly pending = new Map<string, Set<string>>();
+  private linkedTotal = 0;
+  private failedTotal = 0;
   private columnMissing = false;
 
   constructor(private readonly options: OrderPositionLinkerOptions) {}
@@ -92,7 +111,10 @@ export class OrderPositionLinker {
     const known = this.linked.get(positionId) ?? new Set<string>();
     const attempted = pendingOrderLinks(position, known);
     if (attempted.length === 0) {
-      if (position.closedAt) this.linked.delete(positionId);
+      if (position.closedAt) {
+        this.linked.delete(positionId);
+        this.pending.delete(positionId);
+      }
       return base;
     }
 
@@ -107,6 +129,8 @@ export class OrderPositionLinker {
     if (error) {
       if (isMissingColumnError(error, 'position_id')) {
         this.columnMissing = true;
+        // Nothing will ever be retried: the counters report `disabled`, not a pending backlog.
+        this.pending.clear();
         this.options.logger?.warn('orders: position_id column missing — fills ↔ positions stay joinable by symbol + time only (migration 20251216000002)', {
           code: error.code,
           message: error.message,
@@ -120,6 +144,13 @@ export class OrderPositionLinker {
         code: error.code,
         message: error.message,
       });
+      if (position.closedAt) {
+        // The close is the last write for this position: these ids stay unlinked.
+        this.failedTotal += attempted.length;
+        this.pending.delete(positionId);
+      } else {
+        this.pending.set(positionId, new Set(attempted));
+      }
       return { ...base, attempted, error };
     }
 
@@ -127,8 +158,11 @@ export class OrderPositionLinker {
     const linked = attempted.filter((id) => returned.has(id));
     const missing = attempted.filter((id) => !returned.has(id));
     for (const id of linked) known.add(id);
+    this.linkedTotal += linked.length;
     if (position.closedAt) {
       this.linked.delete(positionId);
+      this.pending.delete(positionId);
+      this.failedTotal += missing.length;
       if (missing.length > 0) {
         this.options.logger?.warn('orders: position closed with orders still unlinked (order rows not persisted at link time)', {
           positionId,
@@ -139,7 +173,10 @@ export class OrderPositionLinker {
     } else {
       this.linked.set(positionId, known);
       if (missing.length > 0) {
+        this.pending.set(positionId, new Set(missing));
         this.options.logger?.debug('orders: position_id link deferred — order row not persisted yet', { positionId, orderIds: missing });
+      } else {
+        this.pending.delete(positionId);
       }
     }
     return { ...base, attempted, linked, missing };
@@ -148,5 +185,12 @@ export class OrderPositionLinker {
   /** Current memory (for diagnostics and tests). */
   public snapshot(): { positions: number; disabled: boolean } {
     return { positions: this.linked.size, disabled: this.columnMissing };
+  }
+
+  /** Cumulative link counters for `/api/status` `persistence.orderLinks`. */
+  public linkCounts(): OrderLinkCounts {
+    let pending = 0;
+    for (const ids of this.pending.values()) pending += ids.size;
+    return { linked: this.linkedTotal, pending, failed: this.failedTotal, disabled: this.columnMissing };
   }
 }

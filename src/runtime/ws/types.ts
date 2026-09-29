@@ -90,6 +90,55 @@ export interface StatusPayload {
     localTime: string;
     reason: string;
   } | null;
+  /**
+   * Round 3 (task G) — persistence health for the soak desk. Present (non-null)
+   * only while an engine is running; identical on REST and every WS StatusUpdate.
+   * Counts are numbers; `closeWriteFailures` / `orderLinks` accumulate since the
+   * backend process started, `hydrateRestamp` / `reconcile` are the last start's.
+   */
+  persistence?: {
+    sessionId: string | null;
+    executionMode: 'paper' | 'live' | null;
+    hydrateRestamp: {
+      outcome: 'restamped' | 'noop' | 'skipped_columns_missing' | 'skipped_mode' | 'error';
+      hydrated: number;
+      restamped: number;
+      alreadyCurrent: number;
+      foreign: number;
+      symbols: string[];
+      fromSessionIds: Array<string | null>;
+      error: string | null;
+    } | null;
+    reconcile: {
+      at: number;
+      modeScoped: boolean;
+      dbOpenCount: number;
+      engineOpenCount: number;
+      inDbNotEngine: string[];
+      inEngineNotDb: string[];
+      foreignModeOpen: number;
+      foreignModeSymbols: string[];
+      note: string;
+    } | null;
+    closeWriteFailures: {
+      count: number;
+      last: {
+        positionId: string;
+        symbol: string;
+        sessionId: string | null;
+        at: number;
+        attempts: number;
+        code: string | null;
+        error: string;
+      } | null;
+    };
+    orderLinks: {
+      linked: number;
+      pending: number;
+      failed: number;
+      disabled: boolean;
+    };
+  } | null;
   lastMarketDataAt?: number;
   lastEngineHeartbeatAt?: number;
   timestamp?: number;

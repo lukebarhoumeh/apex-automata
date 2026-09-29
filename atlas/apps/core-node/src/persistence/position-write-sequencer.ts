@@ -148,6 +148,8 @@ export interface PositionWriteSequencerOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Bound on the closed-id memory. Default `DEFAULT_MAX_REMEMBERED_CLOSES`. */
   maxRememberedCloses?: number;
+  /** Clock for the failure record's `at` (epoch ms). Injected for tests. Default `Date.now`. */
+  now?: () => number;
 }
 
 export interface PositionWriteSequencerSnapshot {
@@ -155,6 +157,29 @@ export interface PositionWriteSequencerSnapshot {
   pendingIds: number;
   /** Position ids for which a close write has been issued (bounded memory). */
   rememberedCloses: number;
+}
+
+/** One TERMINAL close-write failure (the schedule was exhausted; the row is left open). */
+export interface PositionCloseWriteFailure {
+  positionId: string;
+  symbol: string;
+  sessionId: string | null;
+  /** Epoch ms the final attempt failed. */
+  at: number;
+  attempts: number;
+  code: string | null;
+  error: string;
+}
+
+/**
+ * Close-write failure counter for `/api/status` (round 3, task G). `count` is
+ * the number of close writes that exhausted their schedule since the process
+ * started (retries inside one close are not counted separately); `last` is the
+ * most recent one. Diagnostics only — nothing reads it back into a decision.
+ */
+export interface PositionCloseWriteFailures {
+  count: number;
+  last: PositionCloseWriteFailure | null;
 }
 
 /**
@@ -174,12 +199,16 @@ export class PositionWriteSequencer {
   private readonly closeRetryDelaysMs: ReadonlyArray<number>;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly maxRememberedCloses: number;
+  private readonly now: () => number;
+  private closeFailureCount = 0;
+  private lastCloseFailure: PositionCloseWriteFailure | null = null;
 
   constructor(options: PositionWriteSequencerOptions = {}) {
     this.logger = options.logger;
     this.closeRetryDelaysMs = options.closeRetryDelaysMs ?? DEFAULT_CLOSE_RETRY_DELAYS_MS;
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.maxRememberedCloses = options.maxRememberedCloses ?? DEFAULT_MAX_REMEMBERED_CLOSES;
+    this.now = options.now ?? Date.now;
   }
 
   /**
@@ -223,6 +252,11 @@ export class PositionWriteSequencer {
   /** Current state (for `/api/status`-style diagnostics and tests). */
   public snapshot(): PositionWriteSequencerSnapshot {
     return { pendingIds: this.tails.size, rememberedCloses: this.closedIds.size };
+  }
+
+  /** Terminal close-write failures since process start (for `/api/status` `persistence.closeWriteFailures`). */
+  public closeWriteFailures(): PositionCloseWriteFailures {
+    return { count: this.closeFailureCount, last: this.lastCloseFailure ? { ...this.lastCloseFailure } : null };
   }
 
   private rememberClose(positionId: string): void {
@@ -299,6 +333,18 @@ export class PositionWriteSequencer {
     }
 
     if (kind === 'close') {
+      // Counted once per exhausted schedule, right where the remediation is logged,
+      // so /api/status and the log line can never disagree.
+      this.closeFailureCount++;
+      this.lastCloseFailure = {
+        positionId,
+        symbol,
+        sessionId,
+        at: this.now(),
+        attempts,
+        code: typeof lastError?.code === 'string' ? lastError.code : null,
+        error: lastError?.message ?? 'unknown error',
+      };
       this.logger?.error(`positions: close write failed after ${attempts} attempt(s) — ${CLOSE_WRITE_REMEDIATION}`, {
         positionId,
         symbol,
