@@ -1,0 +1,48 @@
+-- =============================================================================
+-- Add 'donchian_daily_s3' to public.strategy_name (2026-09-29).
+-- =============================================================================
+-- Why: the runtime persists every strategy label on orders.strategy,
+-- positions.strategy and signals.strategy through the Postgres enum
+-- public.strategy_name. The donchian_daily_s3 plugin (card
+-- PAPER-S3-DONCHIAN-v0, research verdict HOLD, default OFF in
+-- guardrails.yaml disabled_strategies — a desk pin) has no enum value, so
+-- today its orders / positions rows are normalised to 'system'
+-- (atlas/apps/core-node/src/persistence/strategy-name.ts) and a raw
+-- signals.strategy write would fail with 22P02 the day the plugin is ever
+-- enabled (docs/db/DESK_QUERIES_2026-09-29.md, round-2 Task B finding).
+-- Staging the value now means the plugin's rows are attributed to the
+-- plugin, not to 'system', from the first paper trade it ever takes.
+--
+-- What this does: appends ONE label to the enum. Existing labels (breakout,
+-- vwap_mr, obi_scalper, momentum, trend_follow, system) keep their order and
+-- OIDs; existing rows are untouched; no default, check or column changes.
+--
+-- This ENABLES NOTHING. donchian_daily_s3 stays on every kill list
+-- (guardrails.yaml disabled_strategies, pinned by `pnpm check:config`); the
+-- paper runtime also has no daily-candle feed for it yet.
+--
+-- Scope fence (docs/db/EXTERNAL_CONSUMERS.md): touches ONLY the type
+-- public.strategy_name. No table, RLS, grant, view, function or
+-- exposed-schema change; nothing under agentic_* / cb_* / equity.*.
+--
+-- Idempotent: ADD VALUE IF NOT EXISTS — re-running is a no-op (NOTICE only).
+--
+-- Transaction note: ALTER TYPE ... ADD VALUE cannot run inside a transaction
+-- block together with statements that USE the new value (Postgres refuses
+-- with 55P04 "unsafe use of new value"). This file is therefore that single
+-- statement and nothing else — do NOT append INSERT / UPDATE / backfill
+-- statements referencing 'donchian_daily_s3' to it; put them in a later
+-- migration.
+--
+-- Rollback: Postgres cannot drop a value from an enum (there is no ALTER TYPE
+-- ... DROP VALUE). Reverting means recreating the type without the label and
+-- rewriting the three columns, which is not worth it for an unused label;
+-- the intended "rollback" is simply to never write the value (the runtime
+-- would go back to normalising it to 'system').
+--
+-- Apply-time note: the repo file name is a PLACEHOLDER version. The MCP
+-- apply records the apply-time version — rename this file to the version
+-- `list_migrations` reports afterwards (see 20260929005509_* precedent),
+-- otherwise Supabase Preview branches refuse to run.
+
+ALTER TYPE public.strategy_name ADD VALUE IF NOT EXISTS 'donchian_daily_s3';
