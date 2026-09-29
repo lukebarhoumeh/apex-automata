@@ -1723,6 +1723,8 @@ export class TradingEngine extends EventEmitter {
       takeProfit,
       tag: managedOrder?.metadata?.tag,
       regime: typeof managedOrder?.metadata?.regime === 'string' ? managedOrder.metadata.regime : undefined,
+      // orders.id (client UUID) so persistence can write orders.position_id by primary key.
+      clientOrderId: managedOrder?.id,
     });
     
     // Update risk engine metrics

@@ -11,6 +11,7 @@
  */
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import { PositionTracker, PositionTrackerConfig } from '../trading/position-tracker';
+import type { Fill } from '../exchanges/coinbase';
 
 const mockLogger = {
   info: vi.fn(),
@@ -230,7 +231,7 @@ describe('PositionTracker.hydrateOpenPositions', () => {
   // size / time and "opened" was counted twice). "Opened" must mean "did not
   // exist before this fill".
 
-  const makeFill = (overrides: Record<string, unknown>) => ({
+  const makeFill = (overrides: Partial<Fill>): Fill => ({
     trade_id: 1,
     product_id: 'ETH-USD',
     order_id: 'order-1',
@@ -267,7 +268,7 @@ describe('PositionTracker.hydrateOpenPositions', () => {
   test('hydrated position: first scale-in fill emits position:updated, never position:opened again', async () => {
     const events = await hydrateOneEthLong();
 
-    await tracker.processFill(makeFill({ trade_id: 1, order_id: 'order-scale-in', side: 'buy', size: '0.25', price: '3100' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 1, order_id: 'order-scale-in', side: 'buy', size: '0.25', price: '3100' }));
 
     expect(events.opened).toEqual([]);
     expect(events.updated).toEqual(['22222222-2222-4222-8222-222222222222']);
@@ -278,7 +279,7 @@ describe('PositionTracker.hydrateOpenPositions', () => {
   test('hydrated position: first partial-close fill emits position:updated, never position:opened', async () => {
     const events = await hydrateOneEthLong();
 
-    await tracker.processFill(makeFill({ trade_id: 2, order_id: 'order-partial', side: 'sell', size: '0.25', price: '3100' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 2, order_id: 'order-partial', side: 'sell', size: '0.25', price: '3100' }));
 
     expect(events.opened).toEqual([]);
     expect(events.updated).toEqual(['22222222-2222-4222-8222-222222222222']);
@@ -289,7 +290,7 @@ describe('PositionTracker.hydrateOpenPositions', () => {
   test('hydrated position: a full close still emits position:closed (and only that)', async () => {
     const events = await hydrateOneEthLong();
 
-    await tracker.processFill(makeFill({ trade_id: 3, order_id: 'order-exit', side: 'sell', size: '0.5', price: '3100' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 3, order_id: 'order-exit', side: 'sell', size: '0.5', price: '3100' }));
 
     expect(events.opened).toEqual([]);
     expect(events.updated).toEqual([]);
@@ -303,8 +304,8 @@ describe('PositionTracker.hydrateOpenPositions', () => {
     tracker.on('position:opened', (p) => opened.push(p.symbol));
     tracker.on('position:updated', (p) => updated.push(p.symbol));
 
-    await tracker.processFill(makeFill({ trade_id: 1, product_id: 'SOL-USD', side: 'buy', size: '5', price: '150' }) as any);
-    await tracker.processFill(makeFill({ trade_id: 2, product_id: 'SOL-USD', order_id: 'order-2', side: 'buy', size: '5', price: '151' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 1, product_id: 'SOL-USD', side: 'buy', size: '5', price: '150' }));
+    await tracker.processFill(makeFill({ trade_id: 2, product_id: 'SOL-USD', order_id: 'order-2', side: 'buy', size: '5', price: '151' }));
 
     expect(opened).toEqual(['SOL-USD']);
     expect(updated).toEqual(['SOL-USD']);

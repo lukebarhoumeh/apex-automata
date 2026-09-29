@@ -77,7 +77,14 @@ export interface Position {
 
 export interface Trade {
   id: string;
+  /** Exchange order id as carried on the fill (`fill.order_id`; equals the client id in paper). */
   orderId: string;
+  /**
+   * Engine-side client UUID of the order (`ManagedOrder.id` = `orders.id`) when the
+   * fill was matched to a managed order. Lets persistence link `orders.position_id`
+   * by primary key without guessing from the exchange id (live: not a UUID).
+   */
+  clientOrderId?: string;
   side: 'buy' | 'sell';
   size: number;
   price: number;
@@ -94,6 +101,8 @@ export interface FillContext {
   tag?: string;
   /** Market regime stamped on the entry signal; kept on `Position.metadata.regime` for exit attribution. */
   regime?: string;
+  /** `ManagedOrder.id` (= `orders.id`) of the order this fill belongs to, when known. */
+  clientOrderId?: string;
 }
 
 export interface PositionTrackerEvents {
@@ -399,6 +408,9 @@ export class PositionTracker extends EventEmitter {
     const trade: Trade = {
       id: fill.trade_id.toString(),
       orderId: fill.order_id,
+      ...(typeof context?.clientOrderId === 'string' && context.clientOrderId.length > 0
+        ? { clientOrderId: context.clientOrderId }
+        : {}),
       side,
       size,
       price,

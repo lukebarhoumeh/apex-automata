@@ -40,7 +40,8 @@ import {
   restampHydratedOpenPositions,
   type RestampOpenPositionsResult,
 } from '../persistence/position-session-restamp';
-import { PositionWriteSequencer } from '../persistence/position-write-sequencer';
+import { PositionWriteSequencer, type PositionWriteOutcome } from '../persistence/position-write-sequencer';
+import { OrderPositionLinker } from '../persistence/order-position-link';
 import { resolvePositionStrategy, resolveStrategyName } from '../persistence/strategy-name';
 import { classifyReconcileRows, type ReconcileOpenRow } from '../persistence/session-reconcile';
 import { writeSignalRouteVerdict } from '../persistence/signal-route-verdict';
@@ -409,6 +410,24 @@ const supabase = createClient(
   env.SUPABASE_URL || '',
   env.SUPABASE_SERVICE_KEY || ''
 );
+
+// orders.position_id linkage (column since migration 20251216000002, never
+// written before 2026-09-29): after a CONFIRMED positions write, the orders of
+// that position's not-yet-linked trades are updated by primary key, scoped to
+// USER_ID; RETURNING tells the linker which ids landed so an order row that is
+// not persisted yet is retried on the next write. See persistence/order-position-link.ts.
+const orderPositionLinker = new OrderPositionLinker({
+  update: async (positionId, orderIds) => {
+    const { data, error } = await supabase
+      .from('orders')
+      .update({ position_id: positionId })
+      .eq('user_id', USER_ID)
+      .in('id', orderIds)
+      .select('id');
+    return { data, error };
+  },
+  logger,
+});
 
 /**
  * Mint the identity of a trading session: the `trading_sessions.session_id`
@@ -1791,7 +1810,13 @@ app.post('/api/engine/start', async (req, res) => {
     tradingEngine.on('position:update', async (position) => {
       try {
         broadcast({ type: 'PositionUpdate', payload: position });
-        await syncPositionToSupabase(position);
+        const positionWrite = await syncPositionToSupabase(position);
+        // orders.position_id: link this snapshot's not-yet-linked orders once the
+        // positions row is confirmed written (FK). A dropped stale update or a
+        // failed write links nothing; the next write for the position retries.
+        if (positionWrite?.status === 'written') {
+          await orderPositionLinker.link(position);
+        }
 
         // Record outcome for ML training when position is closed.
         //
@@ -5528,7 +5553,7 @@ function mapExitReason(reason?: string): string | null {
   return 'manual_exit'; // fallback
 }
 
-async function syncPositionToSupabase(position: any) {
+async function syncPositionToSupabase(position: any): Promise<PositionWriteOutcome | null> {
   try {
     const symbol = position.symbol || position.product;
     const side = position.side as 'long' | 'short' | 'flat' | undefined;
@@ -5553,7 +5578,7 @@ async function syncPositionToSupabase(position: any) {
         entryPrice,
         closedAt: position.closedAt ?? null,
       });
-      return;
+      return null;
     }
 
     const openedAt = position.openTime instanceof Date
@@ -5624,7 +5649,9 @@ async function syncPositionToSupabase(position: any) {
     // close, retried with bounded backoff. Failures are logged by the
     // sequencer (non-close: 'Failed to sync position to Supabase:' as before;
     // close: one warn per retry, then an error naming the remediation).
-    await positionWriteSequencer.enqueue({
+    // The outcome is returned so the caller can link orders.position_id only
+    // once the row is confirmed written (FK to positions.id).
+    return await positionWriteSequencer.enqueue({
       positionId: String(mappedPosition.id),
       symbol: mappedPosition.symbol,
       sessionId: stamp?.sessionId ?? null,
@@ -5655,6 +5682,7 @@ async function syncPositionToSupabase(position: any) {
     });
   } catch (error) {
     logger.error('Error syncing position:', error);
+    return null;
   }
 }
 
