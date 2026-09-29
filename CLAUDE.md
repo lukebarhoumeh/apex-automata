@@ -45,7 +45,7 @@ pnpm start            # node start.cjs — frontend + backend
 ```
 Root (/)              → React + Vite + shadcn/ui frontend
 atlas/apps/core-node/ → Node.js trading runtime (Express API + engine)
-supabase/             → PostgreSQL migrations (73) + 4 Edge Functions
+supabase/             → PostgreSQL migrations (74 files incl. reconciliation stubs) + 4 Edge Functions
 deploy/               → Docker + Kubernetes + Prometheus/Grafana
 ```
 **Runtime flow**: Coinbase WS → ticker → candles → SignalProcessor → router gates in `api/server.ts` `signal:generated` (disabled-strategy, per-symbol, time, atr_vol, regime_gate, ev_gate) → RiskEngine (kill ladder, halts) → OrderManager → PositionTracker → Supabase sync → UI via WebSocket + Supabase Realtime.
