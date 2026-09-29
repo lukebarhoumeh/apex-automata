@@ -270,6 +270,7 @@ Max position exposure: ${((account.maxPositionExposurePct ?? 0.30) * 100).toFixe
 Active strategies: ${(metrics.activeStrategies ?? []).join(', ') || '(none)'}
 Disabled strategies: ${(config.disabledStrategies ?? []).join(', ') || '(none)'}
 Force-enabled for THIS RUN ONLY (--include-disabled; paper/live untouched): ${(config.forceEnabledStrategies ?? []).join(', ') || '(none)'}
+Meta-filter: ${describeMetaFilter(config)}
 
 Long/Short Split:
 -----------------
@@ -463,6 +464,17 @@ export function describeExitRules(rules: ExitRuleState | undefined): string {
  */
 export function describeExitReasons(exitReasons: Partial<Record<BacktestExitReason, number>> | undefined): string {
   return BACKTEST_EXIT_REASONS.map((reason) => `${reason}=${exitReasons?.[reason] ?? 0}`).join(', ');
+}
+
+/**
+ * Rule-based MetaFilter state for a run (`--meta-filter on|off`, 2026-09-29).
+ * Shared by the CLI summary and the text report so the two can't disagree;
+ * `OFF` names the flag because it is run-scoped and never live behaviour.
+ */
+export function describeMetaFilter(config: Pick<BacktestConfig, 'metaFilter'>): string {
+  return config.metaFilter === false
+    ? 'OFF (this run only, --meta-filter off)'
+    : 'ON (rule-based MetaFilter, live parity)';
 }
 
 function describeProvenance(p: DataProvenance): string {

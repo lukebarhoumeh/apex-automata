@@ -194,6 +194,17 @@ export interface BacktestConfig {
    * report prints the state either way.
    */
   regimeGates?: boolean;
+  /**
+   * Rule-based MetaFilter toggle (`--meta-filter on|off`, 2026-09-29).
+   * Default (absent / true): the SignalProcessor's MetaFilter runs exactly
+   * as live (cold-streak cooldown, time-of-day, quality-score threshold).
+   * `false` disables it for THIS RUN ONLY via `setMetaFilterEnabled(false)`
+   * so a strategy's rule P&L can be measured without the position-blind
+   * cold-streak pause; the engine logs a warn banner and the reports print
+   * the state. Trade outcomes are still recorded (EV-gate observed win rate
+   * unchanged). Backtest-only: paper/live never read this key.
+   */
+  metaFilter?: boolean;
   products: string[];
   signals: {
     breakout: BacktestStrategyToggle;
@@ -1000,6 +1011,18 @@ export class BacktestEngine extends EventEmitter {
 
     if (this.config.regimeGates === false) {
       this.signalProcessor.setRegimeFilterEnabled(false);
+    }
+
+    // `--meta-filter off` (2026-09-29): run-scoped. Same mechanism the live
+    // admin endpoint uses (`setMetaFilterEnabled`), applied only to THIS
+    // engine's SignalProcessor — guardrails.yaml, paper and live untouched.
+    if (this.config.metaFilter === false) {
+      this.signalProcessor.setMetaFilterEnabled(false);
+      this.logger.warn(
+        'Rule-based MetaFilter DISABLED for this backtest run only — paper/live untouched ' +
+          '(cold-streak cooldown, time-of-day and quality-score gates are off; outcomes still recorded)',
+        { source: '--meta-filter off', metaFilter: false },
+      );
     }
 
     // Snapshot the active strategy set AFTER the disabled filter so the

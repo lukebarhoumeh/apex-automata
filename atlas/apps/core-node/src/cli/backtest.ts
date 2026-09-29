@@ -11,6 +11,7 @@ import {
   FeeTierLabel,
   describeExitReasons,
   describeExitRules,
+  describeMetaFilter,
 } from '../backtesting/backtest-runner';
 import { BacktestResult, EvGateMode } from '../backtesting/backtest-engine';
 import { isDataUnavailableError } from '../backtesting/data-loader';
@@ -72,6 +73,8 @@ function printSummary(result: BacktestResult, feeTier: FeeTierLabel): void {
   console.log(
     `Regime-conditional gates (A6): enabled=${a6?.enabled ?? false} paperOnly=${a6?.paperOnly ?? true} rules=${a6?.rules.length ?? 0}`,
   );
+  // `--meta-filter off`: rule-based MetaFilter disabled for THIS RUN ONLY (paper/live untouched).
+  console.log(`Meta-filter: ${describeMetaFilter(result.config)}`);
   console.log(`Exit rules: ${describeExitRules(m.exitRules)}`);
   console.log(`Exits by reason: ${describeExitReasons(m.exitReasons)}`);
   console.log(`Total Return: ${m.returnPercent.toFixed(2)}%`);
@@ -227,6 +230,17 @@ async function main() {
         'measure projected impact without changing live/paper config.',
       default: false,
     })
+    .option('meta-filter', {
+      type: 'string',
+      choices: ['on', 'off'],
+      default: 'on',
+      describe:
+        'Rule-based MetaFilter inside the SignalProcessor (cold-streak cooldown: 10 consecutive ' +
+        'losses → 5 min pause; time-of-day; quality-score threshold). Default on = live parity. ' +
+        'off disables it for THIS RUN ONLY — guardrails.yaml, paper and live are untouched — so a ' +
+        'strategy\'s rule P&L can be measured without the position-blind cold-streak pause. ' +
+        'Trade outcomes are still recorded (EV gate unchanged).',
+    })
     .option('exit-parity', {
       type: 'string',
       choices: ['on', 'off'],
@@ -279,6 +293,9 @@ async function main() {
   // live/paper config. Wired through buildBacktestConfig() (below).
   const forceRegimeConditionalGates = Boolean(argv.regimeConditionalGates);
   const exitParity = String(argv.exitParity) === 'on';
+  // `--meta-filter off` (2026-09-29): run-scoped MetaFilter disable. Only
+  // `false` is forwarded (see buildBacktestConfig) so `on` is byte-identical.
+  const metaFilterOn = String(argv.metaFilter) !== 'off';
   // yargs array option: accept both `--include-disabled a b` and `--include-disabled a,b`.
   const includeDisabled = (argv.includeDisabled as unknown[])
     .flatMap((v) => String(v).split(','))
@@ -298,6 +315,7 @@ async function main() {
     evGateMode,
     regimeGates: argv.regimeGates,
     regimeConditionalGates: forceRegimeConditionalGates ? 'forced-on' : 'guardrails',
+    metaFilter: metaFilterOn ? 'on' : 'off (this run only)',
     exitParity,
     barMinutes,
     allowSynthetic,
@@ -344,9 +362,17 @@ async function main() {
       slippageRate: argv.slippage !== undefined ? Number(argv.slippage) : undefined,
       applyExitParity: exitParity,
       includeDisabled,
+      metaFilter: metaFilterOn,
     },
     guardrails,
   );
+  if (!metaFilterOn) {
+    const banner =
+      'Rule-based MetaFilter DISABLED for this backtest run only (--meta-filter off) — ' +
+      'guardrails.yaml, paper and live untouched; cold-streak / time-of-day / quality-score gates are off.';
+    logger.warn(banner, { metaFilter: false, source: '--meta-filter off' });
+    console.warn(`WARNING: ${banner}`);
+  }
   if (includeDisabled.length > 0) {
     const lifted = backtestConfig.forceEnabledStrategies ?? [];
     const noop = includeDisabled.filter((id) => !lifted.includes(id));

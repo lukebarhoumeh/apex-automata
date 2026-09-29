@@ -214,6 +214,15 @@ export interface BacktestConfigInput {
    * runs nothing (today's semantics). See `stripDisabledForRun`.
    */
   includeDisabled?: string[];
+  /**
+   * `--meta-filter on|off` (2026-09-29): rule-based MetaFilter toggle for
+   * THIS RUN ONLY. Default / true → today's behaviour (no key is written, so
+   * the config is byte-identical); false → `BacktestConfig.metaFilter: false`
+   * and the engine disables the SignalProcessor's MetaFilter for the run.
+   * Same isolation as `includeDisabled`: guardrails.yaml, paper and live are
+   * untouched.
+   */
+  metaFilter?: boolean;
 }
 
 /**
@@ -248,6 +257,9 @@ export function buildBacktestConfig(input: BacktestConfigInput, guardrails: Guar
       minEvThreshold: guardrails.risk.min_ev_threshold,
     },
     regimeGates: input.regimeGates,
+    // `--meta-filter off` → run-scoped MetaFilter disable. Key only present
+    // when off so the default config stays byte-identical.
+    ...(input.metaFilter === false ? { metaFilter: false } : {}),
     products: input.products,
     // Strategy parameters mirror atlas/config/guardrails.yaml. trend_follow
     // is wired here too — defect #1: prior backtests silently dropped it.
