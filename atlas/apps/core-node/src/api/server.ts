@@ -43,7 +43,7 @@ import {
 import { PositionWriteSequencer, type PositionWriteOutcome } from '../persistence/position-write-sequencer';
 import { OrderPositionLinker } from '../persistence/order-position-link';
 import { resolvePositionStrategy, resolveStrategyName } from '../persistence/strategy-name';
-import { classifyReconcileRows, type ReconcileOpenRow } from '../persistence/session-reconcile';
+import { classifyReconcileRows, selectRowsForDestructiveReconcile, type ReconcileOpenRow } from '../persistence/session-reconcile';
 import { writeSignalRouteVerdict } from '../persistence/signal-route-verdict';
 import {
   resolveRoutedExchange,
@@ -542,7 +542,8 @@ async function openTradingSession(params: {
   //      drift; this pass is observational only.
   //
   // Feature flag STARTUP_RECONCILE=false reverts to the destructive
-  // behavior so this can be rolled back without a deploy.
+  // behavior so this can be rolled back without a deploy — scoped to this
+  // session's execution_mode since round 3 (see the branch below).
   const reconcileEnvVal = (process.env.STARTUP_RECONCILE ?? 'true').toLowerCase();
   const reconcileMode = reconcileEnvVal === 'false' || reconcileEnvVal === '0' ? 'destructive' : 'observational';
   try {
@@ -573,19 +574,65 @@ async function openTradingSession(params: {
       logger.warn('Session reconcile: could not read open positions (non-fatal)', { error: openErr.message });
     } else if (reconcileMode === 'destructive') {
       // Legacy behavior, only reachable when STARTUP_RECONCILE is explicitly disabled.
-      const { error: orphanErr, count } = await supabase
-        .from('positions')
-        .update({
-          closed_at: new Date(startedAt).toISOString(),
-          exit_reason: 'session_end',
-          realized_pnl_usd: 0,
-        }, { count: 'exact' })
-        .eq('user_id', USER_ID)
-        .is('closed_at', null);
-      if (orphanErr) {
-        logger.warn('Legacy orphan-zero cleanup failed (non-fatal)', { error: orphanErr.message });
-      } else if ((count ?? 0) > 0) {
-        logger.warn('Legacy orphan-zero cleanup closed positions (STARTUP_RECONCILE=false)', { count: count ?? 0 });
+      //
+      // Mode-scoped since round 3 (2026-09-29): paper and live share one Supabase
+      // project + USER_ID, so the orphan-zero UPDATE may only touch rows whose
+      // execution_mode equals THIS session's mode. Legacy NULL-mode rows are
+      // touched for a PAPER session only, never for live. Without the
+      // execution_mode column the update is SKIPPED entirely (error-level log)
+      // rather than run unscoped — an unscoped update is the defect. The rows
+      // are targeted by primary key from the read above, never by a blanket
+      // `closed_at IS NULL` filter. See persistence/session-reconcile.ts.
+      const selection = selectRowsForDestructiveReconcile(
+        (dbOpenRows ?? []) as unknown as ReconcileOpenRow[],
+        params.mode,
+        reconcileModeColumnPresent,
+      );
+      if (selection.skipped) {
+        logger.error('Legacy orphan-zero cleanup SKIPPED — execution_mode column missing, refusing to run the update unscoped (STARTUP_RECONCILE=false)', {
+          sessionId,
+          executionMode: params.mode,
+          skipReason: selection.skipReason,
+          openRows: (dbOpenRows ?? []).length,
+        });
+      } else {
+        if (selection.skippedForeignMode > 0 || selection.skippedNullModeForLive > 0 || selection.droppedNoId > 0) {
+          logger.warn('Legacy orphan-zero cleanup left open rows outside this execution_mode untouched (STARTUP_RECONCILE=false)', {
+            sessionId,
+            executionMode: params.mode,
+            skippedForeignMode: selection.skippedForeignMode,
+            skippedForeignModeSymbols: selection.skippedForeignModeSymbols,
+            skippedNullModeForLive: selection.skippedNullModeForLive,
+            droppedNoId: selection.droppedNoId,
+          });
+        }
+        if (selection.ids.length > 0) {
+          const { error: orphanErr, count } = await supabase
+            .from('positions')
+            .update({
+              closed_at: new Date(startedAt).toISOString(),
+              exit_reason: 'session_end',
+              realized_pnl_usd: 0,
+            }, { count: 'exact' })
+            .eq('user_id', USER_ID)
+            .in('id', selection.ids)
+            .is('closed_at', null);
+          if (orphanErr) {
+            logger.warn('Legacy orphan-zero cleanup failed (non-fatal)', {
+              error: orphanErr.message,
+              executionMode: params.mode,
+              targeted: selection.ids.length,
+              skippedForeignMode: selection.skippedForeignMode,
+            });
+          } else if ((count ?? 0) > 0) {
+            logger.warn('Legacy orphan-zero cleanup closed positions (STARTUP_RECONCILE=false)', {
+              count: count ?? 0,
+              executionMode: params.mode,
+              skippedForeignMode: selection.skippedForeignMode,
+              skippedNullModeForLive: selection.skippedNullModeForLive,
+            });
+          }
+        }
       }
     } else {
       // Observational reconcile — log only. Classification (same-mode + NULL

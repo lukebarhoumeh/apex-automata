@@ -15,6 +15,7 @@ import {
   classifyReconcileRows,
   RECONCILE_NOTE_ALIGNED,
   RECONCILE_NOTE_DRIFT,
+  selectRowsForDestructiveReconcile,
 } from '../persistence/session-reconcile';
 
 const rows = () => [
@@ -120,5 +121,79 @@ describe('classifyReconcileRows — execution_mode scoping', () => {
     expect(result.dbOpenCount).toBe(1);
     expect(result.inDbNotEngine).toEqual([]);
     expect(result.note).toBe(RECONCILE_NOTE_ALIGNED);
+  });
+});
+
+/**
+ * Legacy destructive reconcile (`STARTUP_RECONCILE=false`), round-3 Task E.
+ *
+ * Defect pinned here: the orphan-zero UPDATE ran on every `closed_at IS NULL`
+ * row for the user with no execution_mode filter, so a paper start with the
+ * env set would zero a LIVE open row (paper and live share one Supabase
+ * project + USER_ID). The selection must be mode-scoped like hydrate:
+ *   - rows stamped with the session's mode are in scope;
+ *   - legacy NULL-mode rows are in scope for a PAPER session only, never live;
+ *   - rows stamped with another mode are skipped (`skippedForeignMode`);
+ *   - without the execution_mode column the update is skipped entirely.
+ */
+describe('selectRowsForDestructiveReconcile — execution_mode scoping', () => {
+  it('paper start never selects a live row (the defect); legacy NULL rows are in scope', () => {
+    const selection = selectRowsForDestructiveReconcile(rows(), 'paper', true);
+
+    expect(selection.skipped).toBe(false);
+    expect(selection.ids).toEqual(['p-1', 'n-1']);
+    expect(selection.ids).not.toContain('l-1');
+    expect(selection.skippedForeignMode).toBe(1);
+    expect(selection.skippedForeignModeSymbols).toEqual(['BTC-USD']);
+    expect(selection.skippedNullModeForLive).toBe(0);
+  });
+
+  it('live start selects only rows stamped live — never a paper row, never a NULL-mode legacy row', () => {
+    const selection = selectRowsForDestructiveReconcile(rows(), 'live', true);
+
+    expect(selection.skipped).toBe(false);
+    expect(selection.ids).toEqual(['l-1']);
+    expect(selection.skippedForeignMode).toBe(1);
+    expect(selection.skippedForeignModeSymbols).toEqual(['ETH-USD']);
+    expect(selection.skippedNullModeForLive).toBe(1);
+  });
+
+  it('execution_mode column missing: the destructive update is skipped entirely, nothing is selected', () => {
+    const legacyRows = rows().map(({ execution_mode: _m, ...row }) => row);
+    const selection = selectRowsForDestructiveReconcile(legacyRows, 'paper', false);
+
+    expect(selection.skipped).toBe(true);
+    expect(selection.skipReason).toBe('execution_mode_column_missing');
+    expect(selection.ids).toEqual([]);
+    expect(selection.skippedForeignMode).toBe(0);
+  });
+
+  it('rows without an id cannot be targeted and are dropped, not zeroed by a blanket filter', () => {
+    const selection = selectRowsForDestructiveReconcile(
+      [
+        { id: 'p-1', symbol: 'ETH-USD', execution_mode: 'paper' },
+        { id: null, symbol: 'SOL-USD', execution_mode: 'paper' },
+        { symbol: 'XRP-USD', execution_mode: 'paper' },
+      ],
+      'paper',
+      true,
+    );
+
+    expect(selection.ids).toEqual(['p-1']);
+    expect(selection.droppedNoId).toBe(2);
+  });
+
+  it('empty input selects nothing and skips nothing', () => {
+    const selection = selectRowsForDestructiveReconcile([], 'paper', true);
+
+    expect(selection).toEqual({
+      ids: [],
+      skipped: false,
+      skipReason: null,
+      skippedForeignMode: 0,
+      skippedForeignModeSymbols: [],
+      skippedNullModeForLive: 0,
+      droppedNoId: 0,
+    });
   });
 });

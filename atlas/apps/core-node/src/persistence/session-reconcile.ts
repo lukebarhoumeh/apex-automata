@@ -18,6 +18,10 @@
  *     20260911170000, `modeColumnPresent = false`), every row is in scope —
  *     exactly the pre-P3-C behaviour, and exactly what hydrate does then.
  *
+ * The legacy destructive path (`STARTUP_RECONCILE=false`) selects its rows
+ * through `selectRowsForDestructiveReconcile` below, with the same mode rule
+ * (NULL-mode rows for paper only; no column → skip the update entirely).
+ *
  * Pure and Supabase-free (the read is the caller's) so the classification can
  * be unit tested without a database.
  */
@@ -108,4 +112,88 @@ export function classifyReconcileRows(params: {
     modeScoped,
     note: inDbNotEngine.length === 0 && inEngineNotDb.length === 0 ? RECONCILE_NOTE_ALIGNED : RECONCILE_NOTE_DRIFT,
   };
+}
+
+/**
+ * Row selection for the LEGACY DESTRUCTIVE reconcile (`STARTUP_RECONCILE=false`
+ * / `0`): the orphan-zero UPDATE that force-closes open rows the engine does
+ * not hold (`exit_reason='session_end'`, `realized_pnl_usd=0`).
+ *
+ * Until round 3 (2026-09-29) that UPDATE had NO execution_mode filter — every
+ * `closed_at IS NULL` row for the user — so a paper start with the env set
+ * would have zeroed a LIVE open row (one Supabase project + USER_ID for both
+ * modes). The rule now:
+ *
+ *   - rows stamped with the session's own `execution_mode` are selected;
+ *   - legacy NULL-mode rows (written before migration 20260911170000) are
+ *     selected for a PAPER session only — NEVER for live, because an
+ *     unstamped row cannot be proven not to be a live position;
+ *   - rows stamped with another mode are skipped (`skippedForeignMode`);
+ *   - when the caller could not read the column (`columnPresent = false`)
+ *     NOTHING is selected and `skipped = true`: the caller must log an
+ *     error-level line and not run the update at all — an unscoped update is
+ *     exactly the defect, so skipping is the safe fallback;
+ *   - rows without an `id` are dropped (`droppedNoId`), because the update is
+ *     targeted by primary key and never by a blanket `closed_at IS NULL`
+ *     filter again.
+ */
+export type DestructiveReconcileSkipReason = 'execution_mode_column_missing';
+
+export interface DestructiveReconcileSelection {
+  /** Primary keys the caller may orphan-zero (same-mode rows; NULL-mode rows for paper only). */
+  ids: string[];
+  /** True when the update must NOT run at all (see `skipReason`). */
+  skipped: boolean;
+  skipReason: DestructiveReconcileSkipReason | null;
+  /** Open rows stamped with another execution_mode — left untouched. */
+  skippedForeignMode: number;
+  skippedForeignModeSymbols: string[];
+  /** Legacy NULL-mode rows left untouched because the session is live. */
+  skippedNullModeForLive: number;
+  /** Rows the read returned without an id — cannot be targeted, left untouched. */
+  droppedNoId: number;
+}
+
+export function selectRowsForDestructiveReconcile(
+  rows: ReadonlyArray<ReconcileOpenRow>,
+  executionMode: ExecutionMode,
+  columnPresent: boolean,
+): DestructiveReconcileSelection {
+  const selection: DestructiveReconcileSelection = {
+    ids: [],
+    skipped: false,
+    skipReason: null,
+    skippedForeignMode: 0,
+    skippedForeignModeSymbols: [],
+    skippedNullModeForLive: 0,
+    droppedNoId: 0,
+  };
+
+  if (!columnPresent) {
+    selection.skipped = true;
+    selection.skipReason = 'execution_mode_column_missing';
+    return selection;
+  }
+
+  const foreignSymbols = new Set<string>();
+  for (const row of rows) {
+    if (!row) continue;
+    const rowMode = row.execution_mode ?? null;
+    if (rowMode !== null && rowMode !== executionMode) {
+      selection.skippedForeignMode++;
+      if (typeof row.symbol === 'string') foreignSymbols.add(row.symbol);
+      continue;
+    }
+    if (rowMode === null && executionMode !== 'paper') {
+      selection.skippedNullModeForLive++;
+      continue;
+    }
+    if (typeof row.id !== 'string' || row.id.length === 0) {
+      selection.droppedNoId++;
+      continue;
+    }
+    selection.ids.push(row.id);
+  }
+  selection.skippedForeignModeSymbols = [...foreignSymbols];
+  return selection;
 }

@@ -155,6 +155,17 @@ const ts = formatTimestamp(); // "2025-02-03T12:00:00.000Z"
 const day = getRiskDay(ctx); // "2025-02-03"
 ```
 
+## Start-up session reconcile (`STARTUP_RECONCILE`)
+
+`openTradingSession` (`api/server.ts`) reads every `positions` row with `closed_at IS NULL` for the user and reconciles it against the engine's post-hydrate open set. Two paths, selected by the env var (default `true`):
+
+| `STARTUP_RECONCILE` | Path | What it does |
+|---------------------|------|--------------|
+| `true` (default) | observational | Log-only. `persistence/session-reconcile.ts` `classifyReconcileRows`: same-mode + legacy NULL-mode rows are the DB open set; rows stamped with the other `execution_mode` are reported as `foreignModeOpen`, never as drift. |
+| `false` / `0` | legacy destructive | Skips hydrate (`trading-engine.ts`) and orphan-zeroes open rows (`exit_reason='session_end'`, `realized_pnl_usd=0`). **Mode-scoped since 2026-09-29** (`selectRowsForDestructiveReconcile`): the UPDATE is targeted by `id` and may only touch rows whose `execution_mode` equals the session's mode. Legacy NULL-mode rows are touched for a PAPER session only, never for live. Rows of the other mode are skipped and logged (`skippedForeignMode`, `skippedForeignModeSymbols`, `skippedNullModeForLive`). If the `execution_mode` column is missing (schema before migration `20260911170000`) the update is **skipped entirely** with an error-level log rather than run unscoped. |
+
+Paper and live share one Supabase project and `USER_ID`, scoped only by `execution_mode` columns — before the scoping a paper start with `STARTUP_RECONCILE=false` would have zeroed a LIVE open row. Hydrate + restamp (PR #74/#81/#82) supersede the destructive path; leave the env var at its default.
+
 ## Idempotent Writes
 
 Unique constraints enable safe retries:
