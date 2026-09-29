@@ -43,6 +43,8 @@ import {
 import { PositionWriteSequencer, type PositionWriteOutcome } from '../persistence/position-write-sequencer';
 import { OrderPositionLinker } from '../persistence/order-position-link';
 import { resolvePositionStrategy, resolveStrategyName } from '../persistence/strategy-name';
+import { StrategyEnumValueSupport, writeWithStrategyEnumFallback } from '../persistence/strategy-enum-fallback';
+import { buildSignalRow } from '../persistence/signal-row';
 import { classifyReconcileRows, selectRowsForDestructiveReconcile, type ReconcileOpenRow } from '../persistence/session-reconcile';
 import { writeSignalRouteVerdict } from '../persistence/signal-route-verdict';
 import {
@@ -391,6 +393,12 @@ const positionWriteSequencer = new PositionWriteSequencer({ logger });
 // (finding 7): the positions row is rewritten on every debounced ticker update,
 // so the "persisting as system" audit line is emitted once per position.
 const positionStrategyWarned = new Set<string>();
+// Process-lifetime memory of which strategy_name enum labels the deployed
+// database accepts (persistence/strategy-enum-fallback.ts). Shared by the
+// orders / positions / signals writers so a label the enum lacks (e.g.
+// donchian_daily_s3 before migration 20260929120000 is applied) is retried
+// once as `system`, warned once, and remembered — with a re-probe window.
+const strategyEnumSupport = new StrategyEnumValueSupport();
 
 // Session stamp for persisted rows. Set the moment the engine starts building
 // (so anything written during start-up already carries the id) and cleared when
@@ -5525,7 +5533,17 @@ async function syncOrderToSupabase(order: any, stampAtEvent?: SessionStamp | nul
       stamp,
       support: sessionColumnSupport,
       write: async (payload) => {
-        const { error } = await supabase.from('orders').upsert(payload);
+        // Innermost: strategy_name enum fallback (22P02 → system, once per process).
+        const { error } = await writeWithStrategyEnumFallback({
+          table: 'orders',
+          row: payload,
+          support: strategyEnumSupport,
+          logger,
+          write: async (shape) => {
+            const { error } = await supabase.from('orders').upsert(shape);
+            return { error };
+          },
+        });
         return { error };
       },
       logger,
@@ -5726,7 +5744,19 @@ async function syncPositionToSupabase(position: any): Promise<PositionWriteOutco
           sessionSupport: sessionColumnSupport,
           conflictSupport: positionsConflictSupport,
           upsert: async (payload, onConflict) => {
-            const { error } = await supabase.from('positions').upsert(payload, { onConflict });
+            // Innermost: strategy_name enum fallback (22P02 → system, once per
+            // process) so a label the deployed enum lacks can never fail the
+            // CLOSE write (finding 3 class) — the sequencer then sees success.
+            const { error } = await writeWithStrategyEnumFallback({
+              table: 'positions',
+              row: payload,
+              support: strategyEnumSupport,
+              logger,
+              write: async (shape) => {
+                const { error } = await supabase.from('positions').upsert(shape, { onConflict });
+                return { error };
+              },
+            });
             return { error };
           },
           logger,
@@ -5751,44 +5781,38 @@ async function syncPositionToSupabase(position: any): Promise<PositionWriteOutco
 
 async function syncSignalToSupabase(signal: any) {
   try {
-    const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    const maybeId = (typeof signal.id === 'string' && uuidV4.test(signal.id)) ? signal.id : undefined;
+    // Row shape lives in persistence/signal-row.ts. `strategy` goes through the
+    // same strategy_name enum mapping as orders / positions (finding 7 open
+    // item closed 2026-09-29): an id the enum does not know is persisted as
+    // `system` and warned, instead of failing the INSERT with 22P02 and losing
+    // the funnel's root row.
+    const { row, strategy: strategyResolved } = buildSignalRow({ userId: USER_ID, signal });
+    if (strategyResolved.empty || strategyResolved.unknown) {
+      logger.warn('Unknown strategy tagged on signal — persisting as system', {
+        received: strategyResolved.received,
+        signalId: signal.id,
+        symbol: signal.symbol,
+      });
+    }
 
-    const decidedAt = signal.timestamp instanceof Date
-      ? signal.timestamp.toISOString()
-      : new Date(signal.timestamp ?? Date.now()).toISOString();
-
-    const direction = (signal.direction || signal.side) as string | undefined;
-    const side = direction === 'buy'
-      ? 'long'
-      : direction === 'sell'
-        ? 'short'
-        : (signal.side === 'long' || signal.side === 'short' ? signal.side : null);
-
-    const row = {
-      ...(maybeId ? { id: maybeId } : {}),
-      user_id: USER_ID,
-      symbol: signal.symbol,
-      strategy: signal.strategy, // strategy_name enum
-      decided_at: decidedAt,
-      side, // position_side enum
-      score: signal.strength || signal.score || 0,
-      confidence: signal.confidence || signal.strength || 0,
-      meta_prob: signal.metaLabel || signal.metaProb || null,
-      features: signal.metadata || signal.features || {},
-      allowed: signal.allowed !== false, // Default to true if signal was generated
-      reason: signal.reason || (signal.metadata && signal.metadata.reason) || null,
-      created_at: new Date().toISOString()
-    };
-
-    // TASK_014 P5: session stamp with schema-tolerant fallback (session-stamp.ts).
+    // TASK_014 P5: session stamp with schema-tolerant fallback (session-stamp.ts),
+    // composed over the strategy_name enum fallback (strategy-enum-fallback.ts).
     const { error } = await writeWithSessionStamp({
       table: 'signals',
-      row,
+      row: row as unknown as Record<string, unknown>,
       stamp: currentSessionStamp(),
       support: sessionColumnSupport,
       write: async (payload) => {
-        const { error } = await supabase.from('signals').insert(payload);
+        const { error } = await writeWithStrategyEnumFallback({
+          table: 'signals',
+          row: payload,
+          support: strategyEnumSupport,
+          logger,
+          write: async (shape) => {
+            const { error } = await supabase.from('signals').insert(shape);
+            return { error };
+          },
+        });
         return { error };
       },
       logger,

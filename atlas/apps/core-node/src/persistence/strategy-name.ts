@@ -16,19 +16,29 @@
  *     killed strategy, so every context-less position polluted its audit
  *     trail (finding 7, docs/research/2026-09-28_paper-persistence-verification.md §2).
  *
- * `donchian_daily_s3` (plugin PAPER-S3-DONCHIAN-v0, default OFF) is NOT in the
- * enum today and is therefore persisted as `system` too. Adding it needs an
- * `ALTER TYPE strategy_name ADD VALUE` migration — a separate desk decision;
- * when it lands, add the id to `STRATEGY_NAME_ENUM_VALUES` in the same PR.
+ * All three writers use it: orders (`normalizeStrategy`), positions
+ * (`resolvePositionStrategy`) and — since 2026-09-29 — signals
+ * (`persistence/signal-row.ts`, which used to write `signal.strategy` raw).
+ *
+ * `donchian_daily_s3` (plugin PAPER-S3-DONCHIAN-v0, default OFF) is an enum
+ * value since migration 20260929120000_add_donchian_daily_s3_to_strategy_name_enum.sql
+ * (STAGED, applied separately) and passes through. Because the runtime is
+ * deployed independently of that apply, the value is written schema-tolerantly:
+ * a database that does not have the label yet answers 22P02, and
+ * `persistence/strategy-enum-fallback.ts` retries that one write as `system`,
+ * warns once per process and remembers the value as missing (with a re-probe
+ * window). The list here and the ALTER TYPE migration move together — never
+ * add an id without its migration, never drop one to dodge a 22P02.
  *
  * Pure: the caller decides whether a fallback is worth a log line.
  */
 
 /**
- * Values of `public.strategy_name` as deployed. Last confirmed against the
- * migrations on 2026-09-29: 20251013054024 (breakout, vwap_mr, obi_scalper),
- * 20251016192352 (momentum), 20260303175729 (trend_follow),
- * 20260427161412 (system). Any addition here needs a matching ALTER TYPE.
+ * Values of `public.strategy_name`. Last confirmed against the migrations on
+ * 2026-09-29: 20251013054024 (breakout, vwap_mr, obi_scalper), 20251016192352
+ * (momentum), 20260303175729 (trend_follow), 20260427161412 (system),
+ * 20260929120000 (donchian_daily_s3 — STAGED; see the 22P02 fallback above).
+ * Any addition here needs a matching ALTER TYPE. Declaration order = enum order.
  */
 export const STRATEGY_NAME_ENUM_VALUES = [
   'breakout',
@@ -37,6 +47,7 @@ export const STRATEGY_NAME_ENUM_VALUES = [
   'momentum',
   'trend_follow',
   'system',
+  'donchian_daily_s3',
 ] as const;
 
 export type StrategyNameEnum = (typeof STRATEGY_NAME_ENUM_VALUES)[number];

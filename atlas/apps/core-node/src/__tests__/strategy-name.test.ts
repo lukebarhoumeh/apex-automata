@@ -11,8 +11,11 @@
  *   - the legacy display name VWAPMeanReversion → vwap_mr;
  *   - empty / non-string → `system`, flagged `empty` (not an audit event);
  *   - unknown ids → `system`, flagged `unknown` (worth an audit log line);
- *   - `donchian_daily_s3` is NOT in the enum today → `system` (enum migration
- *     is a separate desk decision);
+ *   - `donchian_daily_s3` IS an enum value since migration
+ *     20260929120000_add_donchian_daily_s3_to_strategy_name_enum.sql (staged
+ *     2026-09-29) and survives normalisation; a database that has not applied
+ *     the migration yet is handled at write time by
+ *     persistence/strategy-enum-fallback.ts (22P02 → `system`, warned once);
  *   - the fallback is never a real strategy, in particular never `breakout`.
  */
 import { describe, expect, it } from 'vitest';
@@ -57,12 +60,14 @@ describe('resolveStrategyName — strategy_name enum normalisation', () => {
     expect(resolved).toEqual({ value: 'system', empty: false, unknown: true, received: 'this_is_a_made_up_strategy' });
   });
 
-  it('donchian_daily_s3 is not in the enum today → system (enum migration is a separate desk decision)', () => {
+  it('donchian_daily_s3 is an enum value (migration 20260929120000) and survives normalisation', () => {
     const resolved = resolveStrategyName('donchian_daily_s3');
-    expect(resolved.value).toBe('system');
-    expect(resolved.unknown).toBe(true);
-    // Guard: if someone adds it to the enum list, this test must be revisited together with the ALTER TYPE migration.
-    expect(STRATEGY_NAME_ENUM_VALUES).not.toContain('donchian_daily_s3' as never);
+    expect(resolved).toEqual({ value: 'donchian_daily_s3', empty: false, unknown: false, received: 'donchian_daily_s3' });
+    // Guard: the list and the ALTER TYPE migration move together. A database
+    // that has not applied the migration yet is covered by the 22P02 write
+    // fallback (strategy-enum-fallback.test.ts), never by dropping the id here.
+    expect(STRATEGY_NAME_ENUM_VALUES).toContain('donchian_daily_s3');
+    expect(STRATEGY_NAME_ENUM_VALUES[STRATEGY_NAME_ENUM_VALUES.length - 1]).toBe('donchian_daily_s3');
   });
 
   it('the fallback is the neutral system tag — never a killed or real strategy', () => {
@@ -93,8 +98,12 @@ describe('resolvePositionStrategy — positions.strategy for a tracker Position'
     expect(resolvePositionStrategy({ strategy: 'trend_follow' })).toMatchObject({ value: 'trend_follow', unknown: false, empty: false });
   });
 
-  it('an unknown / not-yet-in-enum label on a position becomes system and is flagged for the audit log', () => {
-    expect(resolvePositionStrategy({ strategy: 'donchian_daily_s3' })).toMatchObject({ value: 'system', unknown: true });
+  it('a donchian_daily_s3 position keeps its label (enum value since 20260929120000)', () => {
+    expect(resolvePositionStrategy({ strategy: 'donchian_daily_s3' })).toMatchObject({ value: 'donchian_daily_s3', unknown: false, empty: false });
+  });
+
+  it('an unknown label on a position becomes system and is flagged for the audit log', () => {
     expect(resolvePositionStrategy({ strategy: 'Trend Following (display name)' })).toMatchObject({ value: 'system', unknown: true });
+    expect(resolvePositionStrategy({ strategy: 'donchian_daily_s4' })).toMatchObject({ value: 'system', unknown: true });
   });
 });
