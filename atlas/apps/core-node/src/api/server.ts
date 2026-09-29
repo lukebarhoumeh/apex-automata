@@ -42,6 +42,7 @@ import {
 } from '../persistence/position-session-restamp';
 import { PositionWriteSequencer } from '../persistence/position-write-sequencer';
 import { resolvePositionStrategy, resolveStrategyName } from '../persistence/strategy-name';
+import { classifyReconcileRows, type ReconcileOpenRow } from '../persistence/session-reconcile';
 import { writeSignalRouteVerdict } from '../persistence/signal-route-verdict';
 import {
   resolveRoutedExchange,
@@ -526,11 +527,28 @@ async function openTradingSession(params: {
   const reconcileEnvVal = (process.env.STARTUP_RECONCILE ?? 'true').toLowerCase();
   const reconcileMode = reconcileEnvVal === 'false' || reconcileEnvVal === '0' ? 'destructive' : 'observational';
   try {
-    const { data: dbOpenRows, error: openErr } = await supabase
-      .from('positions')
-      .select('id, symbol, side, qty_open, opened_at')
-      .eq('user_id', USER_ID)
-      .is('closed_at', null);
+    // Scoped by execution_mode the same way hydrate is (P3-C): a paper start
+    // does not adopt a live open row, so that row must not be reported as
+    // drift — it is classified as `foreignModeOpen` instead. Schema-tolerant:
+    // without the column (migration 20260911170000 pending) fall back to the
+    // legacy select once and classify every row, exactly as before.
+    const reconcileBaseColumns = 'id, symbol, side, qty_open, opened_at';
+    const readOpenRows = (columns: string) =>
+      supabase
+        .from('positions')
+        .select(columns)
+        .eq('user_id', USER_ID)
+        .is('closed_at', null);
+    let reconcileModeColumnPresent = true;
+    let { data: dbOpenRows, error: openErr } = await readOpenRows(`${reconcileBaseColumns}, execution_mode`);
+    if (openErr && isMissingColumnError(openErr, 'execution_mode')) {
+      logger.warn('Session reconcile: execution_mode column missing — classifying every open row until migration 20260911170000 is applied', {
+        code: openErr.code,
+        message: openErr.message,
+      });
+      reconcileModeColumnPresent = false;
+      ({ data: dbOpenRows, error: openErr } = await readOpenRows(reconcileBaseColumns));
+    }
 
     if (openErr) {
       logger.warn('Session reconcile: could not read open positions (non-fatal)', { error: openErr.message });
@@ -551,29 +569,29 @@ async function openTradingSession(params: {
         logger.warn('Legacy orphan-zero cleanup closed positions (STARTUP_RECONCILE=false)', { count: count ?? 0 });
       }
     } else {
-      // Observational reconcile — log only.
-      const dbSymbols = new Set((dbOpenRows ?? []).map((r: any) => r.symbol));
+      // Observational reconcile — log only. Classification (same-mode + NULL
+      // rows vs engine; foreign-mode rows reported separately) lives in
+      // persistence/session-reconcile.ts.
       const enginePositions = tradingEngine?.getOpenPositions?.() ?? [];
-      const engineSymbols = new Set(enginePositions.map((p: any) => p.symbol));
-
-      const inDbNotEngine: string[] = [];
-      for (const s of dbSymbols) {
-        if (!engineSymbols.has(s)) inDbNotEngine.push(s);
-      }
-      const inEngineNotDb: string[] = [];
-      for (const s of engineSymbols) {
-        if (!dbSymbols.has(s)) inEngineNotDb.push(s);
-      }
+      const reconcile = classifyReconcileRows({
+        rows: (dbOpenRows ?? []) as unknown as ReconcileOpenRow[],
+        engineSymbols: enginePositions.map((p: any) => p.symbol),
+        executionMode: params.mode,
+        modeColumnPresent: reconcileModeColumnPresent,
+      });
 
       logger.info('Session reconcile (observational)', {
         sessionId,
-        dbOpenCount: dbSymbols.size,
-        engineOpenCount: engineSymbols.size,
-        inDbNotEngine,
-        inEngineNotDb,
-        note: inDbNotEngine.length === 0 && inEngineNotDb.length === 0
-          ? 'state aligned'
-          : 'mismatch — exchange reconciler + next ticker/fill will repair drift',
+        executionMode: params.mode,
+        modeScoped: reconcile.modeScoped,
+        dbOpenCount: reconcile.dbOpenCount,
+        engineOpenCount: reconcile.engineOpenCount,
+        inDbNotEngine: reconcile.inDbNotEngine,
+        inEngineNotDb: reconcile.inEngineNotDb,
+        foreignModeOpen: reconcile.foreignModeOpen,
+        foreignModeSymbols: reconcile.foreignModeSymbols,
+        foreignModes: reconcile.foreignModes,
+        note: reconcile.note,
       });
     }
   } catch (err) {
