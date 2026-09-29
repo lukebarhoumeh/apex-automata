@@ -47,6 +47,16 @@ export interface RuntimeEventEnvelope<
 // ============ Payload Interfaces ============
 
 /** Status payload from /api/status or WS StatusUpdate */
+/** `/api/status → paperHardStop` snapshot (PaperHardStopScheduler.snapshot() on the backend). */
+export interface PaperHardStopStatus {
+  enabled: boolean;
+  nextFireAtIso: string | null;
+  nextFireAtMs: number | null;
+  timezone: string;
+  localTime: string;
+  reason: string;
+}
+
 export interface StatusPayload {
   engineRunning: boolean;
   mode: 'paper' | 'live' | null;
@@ -82,14 +92,7 @@ export interface StatusPayload {
    * Handoff P5 — PAPER ONLY engine-side self-stop backstop (22:30 America/Chicago).
    * Present (non-null) only while a paper session is running; always null for live.
    */
-  paperHardStop?: {
-    enabled: boolean;
-    nextFireAtIso: string | null;
-    nextFireAtMs: number | null;
-    timezone: string;
-    localTime: string;
-    reason: string;
-  } | null;
+  paperHardStop?: PaperHardStopStatus | null;
   /**
    * Round 3 (task G) — persistence health for the soak desk. Present (non-null)
    * only while an engine is running; identical on REST and every WS StatusUpdate.

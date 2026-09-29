@@ -7,6 +7,7 @@
  */
 
 import type { RuntimeConnectivity } from '@/runtime/connectivity/types';
+import type { PaperHardStopStatus } from '@/runtime/ws/types';
 import { deriveTradingUiState, type RuntimeStatusPayload } from './deriveTradingUiState';
 
 export type EnginePillTone = 'up' | 'live' | 'warn' | 'down' | 'muted';
@@ -21,6 +22,68 @@ export interface EnginePill {
 export interface EnginePillStatus extends RuntimeStatusPayload {
   sessionId?: string | null;
   engineState?: string;
+  /** PAPER ONLY 22:30 CT hard stop; null for live/stopped, absent on old backends. */
+  paperHardStop?: PaperHardStopStatus | null;
+}
+
+// ============ Paper hard-stop chip (handoff P5) ============
+
+export type HardStopChipTone = 'info' | 'warn';
+
+export interface HardStopChip {
+  /** e.g. "Hard stop 22:30 CT" */
+  label: string;
+  /** Short countdown for the chip body, e.g. "3h 12m", "<1m", "now". */
+  remaining: string;
+  /** e.g. "fires in 3h 12m (2026-09-30T03:30:00.000Z)" */
+  detail: string;
+  tone: HardStopChipTone;
+  /** Hover text: timezone + local time + the ISO fire instant. */
+  title: string;
+}
+
+/** Below this much time left the chip turns to `warn`. */
+export const HARD_STOP_WARN_MS = 30 * 60_000;
+
+/** Desk-facing zone abbreviations; anything else falls back to the IANA name. */
+const ZONE_ABBREVIATIONS: Readonly<Record<string, string>> = {
+  'America/Chicago': 'CT',
+};
+
+function formatRemaining(remainingMs: number): string {
+  if (remainingMs <= 0) return 'now';
+  const totalMinutes = Math.floor(remainingMs / 60_000);
+  if (totalMinutes < 1) return '<1m';
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+}
+
+/**
+ * Pure derivation of the paper hard-stop chip from `/api/status → paperHardStop`.
+ * Returns null whenever there is nothing honest to show: no status yet, field
+ * null (live or stopped) or absent (old backend), scheduler not armed, or an
+ * unparseable fire time. `nowMs` is injected so the caller owns the clock.
+ */
+export function deriveHardStopChip(
+  status: Pick<EnginePillStatus, 'paperHardStop'> | null | undefined,
+  nowMs: number,
+): HardStopChip | null {
+  const hardStop = status?.paperHardStop;
+  if (!hardStop || !hardStop.enabled || !hardStop.nextFireAtIso) return null;
+  const fireAtMs = Date.parse(hardStop.nextFireAtIso);
+  if (!Number.isFinite(fireAtMs)) return null;
+
+  const remainingMs = fireAtMs - nowMs;
+  const remaining = formatRemaining(remainingMs);
+  const zone = ZONE_ABBREVIATIONS[hardStop.timezone] ?? hardStop.timezone;
+  return {
+    label: `Hard stop ${hardStop.localTime} ${zone}`,
+    remaining,
+    detail: remainingMs <= 0 ? `firing now (${hardStop.nextFireAtIso})` : `fires in ${remaining} (${hardStop.nextFireAtIso})`,
+    tone: remainingMs < HARD_STOP_WARN_MS ? 'warn' : 'info',
+    title: `Paper session hard stop at ${hardStop.localTime} ${hardStop.timezone} — stops the engine through the shared stop path. Next fire: ${hardStop.nextFireAtIso}`,
+  };
 }
 
 export function deriveEnginePill(

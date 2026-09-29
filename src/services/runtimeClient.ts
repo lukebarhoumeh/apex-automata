@@ -1,6 +1,8 @@
 // Runtime Client - Direct connection to Atlas Node.js backend
 // API Reference: https://github.com/atlasbot/core-node
 
+import type { PaperHardStopStatus } from '@/runtime/ws/types';
+
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || 'http://localhost:3001';
 
 // ============= Types =============
@@ -42,6 +44,12 @@ export interface RuntimeStatus {
   timestamp?: number;
   /** PnL snapshot from PositionTracker/RiskEngine; null when the engine is stopped. */
   pnl?: RuntimePnlSnapshot | null;
+  /**
+   * PAPER ONLY 22:30 America/Chicago engine-side hard stop (handoff P5).
+   * Non-null only while a paper session is armed; null for live/stopped and
+   * absent on backends that predate it.
+   */
+  paperHardStop?: PaperHardStopStatus | null;
   /** Exchange WebSocket health; null when no exchange adapter is attached. */
   ws?: {
     connected: boolean;
