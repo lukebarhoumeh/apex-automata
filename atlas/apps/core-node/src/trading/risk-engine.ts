@@ -142,9 +142,10 @@ export interface RiskEngineConfig {
    * fail-closed live semantics. Default `paper` — behaviour unchanged.
    *
    * Also scopes persisted risk state (TASK_014 P5): every boot-time restore
-   * (`risk_metrics`, `daily_equity`, `account_metrics`, `risk_events`) is
-   * filtered to rows of this mode and every matching persist is stamped
-   * with it, so paper state never bleeds into live or vice versa.
+   * (`risk_metrics`, `daily_equity`, `risk_events`) is filtered to rows of
+   * this mode and every matching persist is stamped with it, so paper state
+   * never bleeds into live or vice versa. `account_metrics` is never read
+   * here: its `total_equity` is open-position value, not equity.
    */
   executionMode?: 'paper' | 'live';
   /**
@@ -854,7 +855,7 @@ export class RiskEngine extends EventEmitter {
           this.metrics.maxDrawdown = 0;
           this.metrics.consecutiveLosses = 0;
           this.metrics.dailyPnL = 0;
-          // Without this, the 7-day-ago account_metrics load below pulls a
+          // Without this, the 7-day daily_equity window load below pulls a
           // stale equity (e.g. $50k from a prior session) while currentEquity
           // is the new paper $10k, and the weekly-loss check trips immediately.
           // For an ephemeral paper restart there's no meaningful "weekly"
@@ -891,72 +892,20 @@ export class RiskEngine extends EventEmitter {
         }
       }
 
-      // Load account metrics for today to get weekly tracking. Skip when
-      // ignorePersistedKillSwitch is set — the reset block above already
-      // anchored the weekly tracker to current equity for a clean session.
-      // `account_metrics.execution_mode` already exists on prod (Sprint-9 DB
-      // handoff #2 stamps + backfilled it), so both reads are mode-scoped.
+      // Weekly-loss anchor. Skip when ignorePersistedKillSwitch is set — the
+      // reset block above already anchored the weekly tracker to current
+      // equity for a clean session. Otherwise loadDailyStartEquity() has
+      // already set weeklyStartEquity = today's daily_equity.start_equity;
+      // widen that to the earliest start-of-day anchor within the last 7
+      // days so a losing week is measured from where it began, not from
+      // this morning. NEVER read account_metrics.total_equity for this: the
+      // upsert_account_metrics() RPC writes open-position market value there
+      // (0.00 when flat), so anchoring on it made weeklyLoss negative and the
+      // weekly_stop halt inert (docs/db/DESK_QUERIES_2026-09-29.md §4.1).
       if (!this.config.ignorePersistedKillSwitch) {
-        const loadTodayMetrics = (scoped: boolean) => {
-          let query = this.supabase
-            .from('account_metrics')
-            .select('*')
-            .eq('date', todayStr)
-            .limit(1);
-          if (this.userId) {
-            query = query.eq('user_id', this.userId);
-          }
-          if (scoped) {
-            query = query.eq('execution_mode', this.modeScope.mode);
-          }
-          return query.maybeSingle();
-        };
-
-        const { data: accountMetrics, error: accountError } = await this.modeScope.query(
-          'account_metrics',
-          'select',
-          () => loadTodayMetrics(true),
-          () => loadTodayMetrics(false),
-        );
-
-        if (accountError && !['PGRST116', 'PGRST205', '42P01'].includes(accountError.code)) {
-          this.logger.warn('Failed to load account metrics state:', accountError);
-        } else if (accountMetrics) {
-          // Calculate weekly start from 7 days ago
-          const weekStart = new Date();
-          weekStart.setDate(weekStart.getDate() - 7);
-          weekStart.setHours(0, 0, 0, 0);
-          const weekStartDate = weekStart.toISOString().split('T')[0];
-
-          const loadWeekStartEquity = (scoped: boolean) => {
-            let query = this.supabase
-              .from('account_metrics')
-              .select('total_equity')
-              .eq('date', weekStartDate)
-              .limit(1);
-            if (this.userId) {
-              query = query.eq('user_id', this.userId);
-            }
-            if (scoped) {
-              query = query.eq('execution_mode', this.modeScope.mode);
-            }
-            return query.maybeSingle();
-          };
-
-          const { data: weekStartMetrics } = await this.modeScope.query(
-            'account_metrics',
-            'select',
-            () => loadWeekStartEquity(true),
-            () => loadWeekStartEquity(false),
-          );
-
-          if (weekStartMetrics) {
-            this.weeklyStartEquity = weekStartMetrics.total_equity;
-            this.logger.debug('Restored weekly start equity:', this.weeklyStartEquity);
-          }
-        }
+        await this.loadWeeklyStartEquity(todayStr);
       }
-      
+
     } catch (error) {
       this.logger.error('Error loading risk state:', error);
       // Don't throw - use initialized defaults
@@ -1100,6 +1049,77 @@ export class RiskEngine extends EventEmitter {
     this.dailyHighEquity = this.dailyStartEquity;
     this.weeklyStartEquity = this.dailyStartEquity;
     this.weeklyStartTimestamp = Date.now();
+  }
+
+  /**
+   * Widen the weekly-loss anchor to the EARLIEST `daily_equity.start_equity`
+   * within the last 7 days for `(user_id, execution_mode)`.
+   *
+   * Runs after `loadDailyStartEquity()` (which already anchored the week on
+   * today's row), so on any failure — no user, missing table/column, no row,
+   * non-positive value — the daily anchor simply stands. Never touches
+   * `weeklyStartTimestamp`; the rolling 7-day reset in
+   * `enforceLossGuardrails` is unchanged. `daily_equity.start_equity` is the
+   * only persisted equity mark the runtime writes; `account_metrics.total_equity`
+   * is open-position value and must never be read as equity.
+   */
+  private async loadWeeklyStartEquity(todayStr: string): Promise<void> {
+    if (!this.userId) {
+      return;
+    }
+    const userId = this.userId;
+    const weekStartDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    const loadEarliestStartEquity = (scoped: boolean) => {
+      let query = this.supabase
+        .from('daily_equity')
+        .select('start_equity, date')
+        .eq('user_id', userId)
+        .gte('date', weekStartDate)
+        .lte('date', todayStr)
+        .order('date', { ascending: true })
+        .limit(1);
+      if (scoped) {
+        query = query.eq('execution_mode', this.modeScope.mode);
+      }
+      return query.maybeSingle();
+    };
+
+    try {
+      const { data, error } = await this.modeScope.query(
+        'daily_equity',
+        'select',
+        () => loadEarliestStartEquity(true),
+        () => loadEarliestStartEquity(false),
+      );
+
+      if (error) {
+        if (!['PGRST116', 'PGRST205', '42P01'].includes(error.code)) {
+          this.logger.warn('Failed to load weekly start equity from daily_equity (keeping daily anchor):', error);
+        }
+        return;
+      }
+      if (!data || data.start_equity === undefined || data.start_equity === null) {
+        return;
+      }
+
+      const startEquity = Number(data.start_equity);
+      if (!Number.isFinite(startEquity) || startEquity <= 0) {
+        this.logger.warn('Ignoring non-positive daily_equity.start_equity for weekly anchor (keeping daily anchor)', {
+          date: data.date,
+          start_equity: data.start_equity,
+        });
+        return;
+      }
+
+      this.weeklyStartEquity = startEquity;
+      this.logger.debug('Restored weekly start equity from daily_equity', {
+        date: data.date,
+        weeklyStartEquity: this.weeklyStartEquity,
+      });
+    } catch (err) {
+      this.logger.warn('Error loading weekly start equity (keeping daily anchor):', err);
+    }
   }
 
   /**

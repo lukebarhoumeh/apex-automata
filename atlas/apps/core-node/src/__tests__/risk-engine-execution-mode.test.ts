@@ -26,6 +26,7 @@ import { RiskEngine, RiskEngineConfig } from '../trading/risk-engine';
 import { RiskStateMachine } from '../trading/risk-state';
 import { PositionTracker, PositionTrackerConfig } from '../trading/position-tracker';
 import { GuardrailConfig } from '../config/loadGuardrails';
+import type { Logger } from '../core/logger';
 
 interface RecordedCall {
   table: string;
@@ -114,6 +115,7 @@ const mockLogger = {
   error: vi.fn(),
   debug: vi.fn(),
 };
+const typedLogger = mockLogger as unknown as Logger;
 
 const guardrails = {
   disabled_strategies: [],
@@ -302,11 +304,12 @@ function hasModeFilter(call: RecordedCall): unknown | undefined {
 }
 
 /**
- * Table-store responder: applies every recorded `eq` filter to `rows`
- * (so the execution_mode filter really hides the other mode's rows), sorts
- * newest `updated_at` first, and honours `.maybeSingle()` vs list reads.
- * In `legacy` mode any reference to execution_mode fails like a database
- * without the column would.
+ * Table-store responder: applies every recorded `eq` / `gte` / `lte` filter
+ * to `rows` (so the execution_mode filter really hides the other mode's rows
+ * and a date range really narrows them), sorts by the recorded `.order()`
+ * (newest `updated_at` first when none was given), and honours
+ * `.maybeSingle()` vs list reads. In `legacy` mode any reference to
+ * execution_mode fails like a database without the column would.
  */
 function tableSelect(rows: Row[], opts: { legacy?: boolean } = {}): Responder {
   return (call) => {
@@ -314,9 +317,21 @@ function tableSelect(rows: Row[], opts: { legacy?: boolean } = {}): Responder {
       return { error: missingModeColumnError(call.table) };
     }
     const matches = rows.filter((row) =>
-      call.filters.every(([method, column, value]) => method !== 'eq' || row[column as string] === value)
+      call.filters.every(([method, column, value]) => {
+        const cell = row[column as string];
+        if (method === 'eq') return cell === value;
+        if (method === 'gte') return String(cell) >= String(value);
+        if (method === 'lte') return String(cell) <= String(value);
+        return true;
+      })
     );
-    matches.sort((a, b) => String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')));
+    const order = call.filters.find(([method]) => method === 'order');
+    const orderColumn = order ? String(order[1]) : 'updated_at';
+    const ascending = order ? Boolean((order[2] as { ascending?: boolean } | undefined)?.ascending) : false;
+    matches.sort((a, b) => {
+      const cmp = String(a[orderColumn] ?? '').localeCompare(String(b[orderColumn] ?? ''));
+      return ascending ? cmp : -cmp;
+    });
     return { data: call.single ? (matches[0] ?? null) : matches };
   };
 }
@@ -544,23 +559,98 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
     });
   });
 
-  describe('account_metrics weekly anchor', () => {
-    test('both account_metrics reads are scoped to the session mode', async () => {
-      harness.respond('risk_metrics.select', tableSelect([liveCleanRow()]));
+  /**
+   * Weekly-loss anchor (docs/db/DESK_QUERIES_2026-09-29.md §4.1).
+   *
+   * `account_metrics.total_equity` is open-position market value written by
+   * the `upsert_account_metrics()` RPC (0.00 when flat), NOT equity. The
+   * boot-time restore used to overwrite `weeklyStartEquity` with the 7-day-old
+   * value of that column whenever such a row existed, so
+   * `weeklyLoss = weeklyStartEquity - currentEquity` went negative and the
+   * `weekly_stop` halt could never trip. The only honest persisted anchor is
+   * `daily_equity.start_equity`; the weekly anchor must come from the
+   * earliest such row within the last 7 days for (user_id, execution_mode).
+   */
+  describe('weekly loss anchor (daily_equity, never account_metrics)', () => {
+    const weeklyStartEquityOf = (riskEngine: RiskEngine): number =>
+      (riskEngine as unknown as { weeklyStartEquity: number }).weeklyStartEquity;
+    const daysAgoDate = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString().split('T')[0];
+
+    test('a 7-day-old account_metrics row (position value 0) never becomes the weekly anchor', async () => {
+      harness.respond('risk_metrics.select', tableSelect([{ ...paperHaltedRow(), kill_switch_active: false, consecutive_losses: 0 }]));
+      harness.respond('daily_equity.select', tableSelect([
+        { user_id: USER_ID, date: todayDate(), [MODE_COLUMN]: 'paper', start_equity: 10000 },
+      ]));
+      // Flat book on both days: the RPC wrote 0.00 "total_equity".
       harness.respond('account_metrics.select', tableSelect([
-        { user_id: USER_ID, date: todayDate(), [MODE_COLUMN]: 'live', total_equity: 990 },
-        { user_id: USER_ID, date: todayDate(), [MODE_COLUMN]: 'paper', total_equity: 10500 },
+        { user_id: USER_ID, date: todayDate(), [MODE_COLUMN]: 'paper', total_equity: 0 },
+        { user_id: USER_ID, date: daysAgoDate(7), [MODE_COLUMN]: 'paper', total_equity: 0 },
       ]));
 
       engine = await waitForLoaders(
-        new RiskEngine(liveConfig(), mockLogger as any, positionTracker)
+        new RiskEngine({ ...baseConfig, executionMode: 'paper' }, typedLogger, positionTracker)
       );
 
-      const reads = harness.callsFor('account_metrics', 'select');
-      expect(reads.length).toBeGreaterThanOrEqual(1);
+      expect(weeklyStartEquityOf(engine)).toBe(10000);
+      expect(harness.callsFor('account_metrics', 'select')).toHaveLength(0);
+    });
+
+    test('anchors on the EARLIEST daily_equity.start_equity within the last 7 days, scoped to the session mode', async () => {
+      harness.respond('risk_metrics.select', tableSelect([liveCleanRow()]));
+      harness.respond('daily_equity.select', tableSelect([
+        { user_id: USER_ID, date: todayDate(), [MODE_COLUMN]: 'live', start_equity: 950 },
+        { user_id: USER_ID, date: daysAgoDate(3), [MODE_COLUMN]: 'live', start_equity: 980 },
+        { user_id: USER_ID, date: daysAgoDate(6), [MODE_COLUMN]: 'live', start_equity: 1020 },
+        // Outside the window and the other mode: both must be ignored.
+        { user_id: USER_ID, date: daysAgoDate(9), [MODE_COLUMN]: 'live', start_equity: 1100 },
+        { user_id: USER_ID, date: daysAgoDate(6), [MODE_COLUMN]: 'paper', start_equity: 10200 },
+      ]));
+
+      engine = await waitForLoaders(
+        new RiskEngine(liveConfig(), typedLogger, positionTracker)
+      );
+
+      expect((engine as unknown as { dailyStartEquity: number }).dailyStartEquity).toBe(950);
+      expect(weeklyStartEquityOf(engine)).toBe(1020);
+      const reads = harness.callsFor('daily_equity', 'select');
+      // Today's anchor read plus the 7-day window read, both mode-scoped.
+      expect(reads.length).toBeGreaterThanOrEqual(2);
       for (const read of reads) {
         expect(hasModeFilter(read)).toBe('live');
       }
+      const windowRead = reads.find((c) => c.filters.some(([method]) => method === 'gte'));
+      expect(windowRead).toBeDefined();
+      expect(windowRead!.filters).toEqual(
+        expect.arrayContaining([
+          ['eq', 'user_id', USER_ID],
+          ['gte', 'date', daysAgoDate(7)],
+          ['order', 'date', { ascending: true }],
+        ])
+      );
+      expect(harness.callsFor('account_metrics', 'select')).toHaveLength(0);
+    });
+
+    test('keeps the daily anchor when the window read fails (missing table) or returns nothing', async () => {
+      harness.respond('risk_metrics.select', tableSelect([liveCleanRow()]));
+      let windowReads = 0;
+      harness.respond('daily_equity.select', (call) => {
+        if (call.filters.some(([method]) => method === 'gte')) {
+          windowReads += 1;
+          return { error: { code: '42P01', message: 'relation "daily_equity" does not exist' } };
+        }
+        return tableSelect([
+          { user_id: USER_ID, date: todayDate(), [MODE_COLUMN]: 'live', start_equity: 1250 },
+        ])(call);
+      });
+
+      engine = await waitForLoaders(
+        new RiskEngine(liveConfig(), typedLogger, positionTracker)
+      );
+
+      expect(windowReads).toBe(1);
+      expect(weeklyStartEquityOf(engine)).toBe(1250);
+      expect(mockLogger.error).not.toHaveBeenCalled();
+      expect(harness.callsFor('account_metrics', 'select')).toHaveLength(0);
     });
   });
 
