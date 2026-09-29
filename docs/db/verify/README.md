@@ -16,6 +16,7 @@ Trading Master go; see the handoff doc.
 | `02_execution_mode_backfill.sql` | #2 (`20260910180200`) | immediately after #2 | `null_execution_mode_account_metrics = 0`, `null_execution_mode_trading_sessions = 0`, `pass = t` |
 | `03_quarantine_agentic_heartbeats.sql` | #3 (`20260910180300`) | after #3 (writers already retargeted) | `in_equity_only = t`, `policies_present = t`, `anon_no_access = t`, `row_count` ≈ 43 (informational), `pass = t` |
 | `04_repair_strategy_filter_analysis.sql` | #4 (`20260910180400`) | after #4 | `view_exists = t`, `security_invoker = t`, `fixed_definition = t`, `anon_select = f`, `pass = t` |
+| `05_desk_status_views.sql` | 2026-09-29 desk-status set (`20260929005509`, `20260929005512`, `20260929005514`, `20260929010733`) — APPLIED 2026-09-29 via MCP, see `docs/db/DESK_QUERIES_2026-09-29.md` | any time after 2026-09-29 | `views_invoker = 2`, `view_grant_rows = 4`, `anon_grants = 0`, `generated_cols = 11`, `dup_indexes_left = 0`, `initplan_policies = 2`, `heartbeats_view_ok = 1`, `pass = t`; the two "desk monitor" statements in §4 return rows instead of `42703` |
 
 ## How to run
 
