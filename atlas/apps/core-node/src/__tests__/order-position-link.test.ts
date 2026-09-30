@@ -305,6 +305,107 @@ describe('OrderPositionLinker close-time UPDATE failure (review finding 6)', () 
   });
 });
 
+describe('OrderPositionLinker overlapping link() calls for one position (round-2 repair)', () => {
+  const CONNECTION_FAILURE = { code: '08006', message: 'connection failure' };
+  const mkLogger = () => ({ warn: vi.fn(), error: vi.fn(), debug: vi.fn() });
+  const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  /**
+   * An UPDATE whose calls that carry `o-exit` (the close) succeed at once, while
+   * the earlier open-position UPDATE stays in flight until the test fails it —
+   * the api/server.ts `position:update` listener is not awaited by the emitter,
+   * so the close's link can be called while the open's UPDATE is pending.
+   */
+  function overlappingLinker(log: ReturnType<typeof mkLogger>) {
+    const calls: Array<{ positionId: string; orderIds: string[] }> = [];
+    let failOpen: (() => void) | null = null;
+    const linker = new OrderPositionLinker({
+      update: (positionId, orderIds) => {
+        calls.push({ positionId, orderIds });
+        if (orderIds.includes('o-exit')) return Promise.resolve({ data: orderIds.map((id) => ({ id })), error: null });
+        return new Promise((resolve) => {
+          failOpen = () => resolve({ data: null, error: CONNECTION_FAILURE });
+        });
+      },
+      logger: log,
+      now: () => 0,
+    });
+    return { linker, calls, failOpen: () => failOpen?.() };
+  }
+  const backoffSize = (linker: OrderPositionLinker) => (linker as unknown as { backoff: Map<string, unknown> }).backoff.size;
+
+  it('a failing open link that overlaps the close link (shared mutable Position, as the tracker emits) is not booked as a close failure', async () => {
+    const log = mkLogger();
+    const { linker, calls, failOpen } = overlappingLinker(log);
+
+    // PositionTracker emits the SAME mutable object for open / update / close.
+    const position: { id: string; symbol: string; closedAt?: Date; trades: Array<{ clientOrderId: string }> } = {
+      id: POS,
+      symbol: 'ETH-USD',
+      trades: [{ clientOrderId: 'o-entry' }],
+    };
+    const openLink = linker.link(position);
+    await flush();
+    // The close fill lands while the open's UPDATE is still in flight.
+    position.closedAt = new Date();
+    position.trades.push({ clientOrderId: 'o-exit' });
+    const closeLink = linker.link(position);
+    await flush();
+    failOpen();
+    const [open, close] = await Promise.all([openLink, closeLink]);
+
+    expect(open.error).toMatchObject({ code: '08006' });
+    expect(close.linked).toEqual(['o-entry', 'o-exit']);
+    // The close runs after the open settled (serialised per position) and links both.
+    expect(calls.map((c) => c.orderIds)).toEqual([['o-entry'], ['o-entry', 'o-exit']]);
+    expect(linker.linkCounts()).toEqual({ linked: 2, pending: 0, failed: 0, disabled: false });
+    expect(linker.snapshot()).toEqual({ positions: 0, disabled: false });
+    expect(backoffSize(linker)).toBe(0);
+    expect(log.error.mock.calls.some((c) => /still unlinked/.test(String(c[0])))).toBe(false);
+  });
+
+  it('the same overlap with separate snapshots leaks no pending / backoff entry for the closed position', async () => {
+    const log = mkLogger();
+    const { linker, failOpen } = overlappingLinker(log);
+
+    const openLink = linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }] });
+    await flush();
+    const closeLink = linker.link({ id: POS, symbol: 'ETH-USD', closedAt: new Date(), trades: [{ clientOrderId: 'o-entry' }, { clientOrderId: 'o-exit' }] });
+    await flush();
+    failOpen();
+    await Promise.all([openLink, closeLink]);
+
+    expect(linker.linkCounts()).toEqual({ linked: 2, pending: 0, failed: 0, disabled: false });
+    expect(linker.snapshot()).toEqual({ positions: 0, disabled: false });
+    expect(backoffSize(linker)).toBe(0);
+  });
+
+  it('once a position closed, a later link for it is a no-op (no second UPDATE, no double count, no new entry)', async () => {
+    const { linker, calls } = makeLinker(undefined, { logger: mkLogger() });
+    const closed = { id: POS, symbol: 'ETH-USD', closedAt: new Date(), trades: [{ clientOrderId: 'o-entry' }, { clientOrderId: 'o-exit' }] };
+
+    expect((await linker.link(closed)).linked).toEqual(['o-entry', 'o-exit']);
+    // e.g. two queued links for one shared object that both see closedAt set.
+    expect((await linker.link(closed)).attempted).toEqual([]);
+    expect((await linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }] })).attempted).toEqual([]);
+    expect(calls).toHaveLength(1);
+    expect(linker.linkCounts()).toEqual({ linked: 2, pending: 0, failed: 0, disabled: false });
+    expect(linker.snapshot()).toEqual({ positions: 0, disabled: false });
+  });
+
+  it('an order id added inside the backoff window is counted as pending without an UPDATE', async () => {
+    let now = 0;
+    const { linker, calls } = makeLinker(() => ({ data: null, error: CONNECTION_FAILURE }), { now: () => now, logger: mkLogger() });
+
+    await linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }] }); // t=0 fails → next at 1 s
+    now = 500;
+    const scaled = await linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }, { clientOrderId: 'o-scale' }] });
+    expect(scaled).toMatchObject({ attempted: [], backedOff: true });
+    expect(calls).toHaveLength(1);
+    expect(linker.linkCounts()).toEqual({ linked: 0, pending: 2, failed: 0, disabled: false });
+  });
+});
+
 describe('createSupabaseOrderLinkUpdate (review finding 8a: the production UPDATE chain)', () => {
   const USER_ID = 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f';
 

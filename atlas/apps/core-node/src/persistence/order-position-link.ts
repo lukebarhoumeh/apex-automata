@@ -29,7 +29,11 @@
  * error every `ORDER_LINK_ERROR_LOG_EVERY` failures so it never goes silent.
  * A failed close-time UPDATE is terminal (finding 6): the tracker has already
  * forgotten the position, so the linker forgets it too, logs the still-unlinked
- * ids at error and counts them as `failed`. A missing `position_id` column
+ * ids at error and counts them as `failed`. `link()` captures the close state
+ * and order ids synchronously and runs one call per position at a time, in call
+ * order, so an in-flight open link can never be booked as (or land after) the
+ * close; once the close link ran, later links for that position are no-ops
+ * (round-2 repair, 2026-09-30). A missing `position_id` column
  * (42703 / PGRST204) disables the linker for the process after one warn. Only
  * trades with a `clientOrderId` are linked (paper always has one; a live fill
  * that was not matched to a managed order carries only the exchange id).
@@ -138,7 +142,8 @@ export function pendingOrderLinks(position: LinkablePosition, alreadyLinked: Rea
  * Link counters for `/api/status` `persistence.orderLinks` (round 3, task G).
  * `linked` = order ids RETURNING confirmed since process start; `pending` =
  * ids attempted on a still-open position and not confirmed yet (order row not
- * persisted, or the UPDATE failed) — retried on that position's next write
+ * persisted, or the UPDATE failed), plus ids that arrived while its failure
+ * backoff runs (not sent yet) — retried on that position's next write
  * (after the failure backoff when the UPDATE failed);
  * `failed` = ids still unlinked when their position closed (the linker forgets
  * the position, so nothing retries them); `disabled` mirrors `disabled`.
@@ -150,12 +155,27 @@ export interface OrderLinkCounts {
   disabled: boolean;
 }
 
+/** Most recently closed position ids remembered so a late link for one is a no-op (bounded). */
+export const ORDER_LINK_CLOSED_MEMORY = 1_000;
+
+/** What one `link()` call captured synchronously, before any await (the tracker mutates its Position in place). */
+interface LinkRequest {
+  positionId: string;
+  symbol?: string;
+  closing: boolean;
+  orderIds: string[];
+}
+
 export class OrderPositionLinker {
   private readonly linked = new Map<string, Set<string>>();
   /** Attempted-but-unconfirmed ids per OPEN position (diagnostic mirror of what the next write retries). */
   private readonly pending = new Map<string, Set<string>>();
   /** Failure backoff per OPEN position: consecutive failed UPDATEs and the earliest next attempt (epoch ms). */
   private readonly backoff = new Map<string, { failures: number; nextRetryAt: number }>();
+  /** Tail of the per-position link chain: link() calls for one position run one at a time, in call order. */
+  private readonly chains = new Map<string, Promise<unknown>>();
+  /** Positions whose close link already ran (insertion-ordered, capped at ORDER_LINK_CLOSED_MEMORY). */
+  private readonly closed = new Set<string>();
   private linkedTotal = 0;
   private failedTotal = 0;
   private columnMissing = false;
@@ -170,23 +190,55 @@ export class OrderPositionLinker {
   /**
    * Link the not-yet-linked orders of `position` to it. Call only after the
    * positions write for this snapshot succeeded. Never throws.
+   *
+   * The position's close state and order ids are captured NOW: PositionTracker
+   * emits one mutable object for open / update / close, and the server's
+   * `position:update` listener is not awaited, so a close fill can land while
+   * an earlier link's UPDATE is in flight. Calls for one position are then
+   * serialised (like PositionWriteSequencer), so an open link's result can
+   * never land after the close link has forgotten the position; once the close
+   * link ran, later links for that position are no-ops.
    */
-  public async link(position: LinkablePosition): Promise<OrderPositionLinkResult> {
-    const positionId = String(position.id);
+  public link(position: LinkablePosition): Promise<OrderPositionLinkResult> {
+    const request: LinkRequest = {
+      positionId: String(position.id),
+      symbol: position.symbol,
+      closing: Boolean(position.closedAt),
+      orderIds: pendingOrderLinks(position),
+    };
+    const previous = this.chains.get(request.positionId) ?? Promise.resolve();
+    const run = previous.then(() => this.linkNow(request));
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.chains.set(request.positionId, tail);
+    void tail.then(() => {
+      if (this.chains.get(request.positionId) === tail) this.chains.delete(request.positionId);
+    });
+    return run;
+  }
+
+  private async linkNow(request: LinkRequest): Promise<OrderPositionLinkResult> {
+    const { positionId, symbol, closing } = request;
     const base: OrderPositionLinkResult = { attempted: [], linked: [], missing: [], error: null, disabled: this.columnMissing, backedOff: false };
-    if (this.columnMissing) return base;
+    if (this.columnMissing || this.closed.has(positionId)) return base;
 
     const known = this.linked.get(positionId) ?? new Set<string>();
-    const attempted = pendingOrderLinks(position, known);
+    const attempted = request.orderIds.filter((id) => !known.has(id));
     if (attempted.length === 0) {
-      if (position.closedAt) this.forget(positionId);
+      if (closing) this.forget(positionId);
       return base;
     }
 
     // The failure backoff applies to OPEN positions only: the close is the
-    // last write for the position, so it always attempts.
+    // last write for the position, so it always attempts. Ids that are waiting
+    // out the backoff are still reported as pending.
     const retry = this.backoff.get(positionId);
-    if (!position.closedAt && retry && this.now() < retry.nextRetryAt) {
+    if (!closing && retry && this.now() < retry.nextRetryAt) {
+      const waiting = this.pending.get(positionId) ?? new Set<string>();
+      for (const id of attempted) waiting.add(id);
+      this.pending.set(positionId, waiting);
       return { ...base, backedOff: true };
     }
 
@@ -210,14 +262,14 @@ export class OrderPositionLinker {
         });
         return { ...base, attempted, disabled: true };
       }
-      if (position.closedAt) {
+      if (closing) {
         // The close is the last write for this position and the tracker has
         // already forgotten it: nothing will retry, so these ids stay unlinked.
         this.forget(positionId);
         this.failedTotal += attempted.length;
         this.options.logger?.error('orders: position closed with orders still unlinked (link write failed)', {
           positionId,
-          symbol: position.symbol,
+          symbol,
           orderIds: attempted,
           code: error.code,
           message: error.message,
@@ -228,7 +280,7 @@ export class OrderPositionLinker {
       const nextRetryInMs = orderLinkRetryDelayMs(failures);
       this.backoff.set(positionId, { failures, nextRetryAt: this.now() + nextRetryInMs });
       this.pending.set(positionId, new Set(attempted));
-      const meta = { positionId, symbol: position.symbol, orderIds: attempted, code: error.code, message: error.message, failures, nextRetryInMs };
+      const meta = { positionId, symbol, orderIds: attempted, code: error.code, message: error.message, failures, nextRetryInMs };
       const message = 'orders: position_id link write failed (will retry on the next write for this position)';
       if (failures === 1 || failures % ORDER_LINK_ERROR_LOG_EVERY === 0) this.options.logger?.error(message, meta);
       else this.options.logger?.debug(message, meta);
@@ -243,13 +295,13 @@ export class OrderPositionLinker {
     const missing = attempted.filter((id) => !returned.has(id));
     for (const id of linked) known.add(id);
     this.linkedTotal += linked.length;
-    if (position.closedAt) {
+    if (closing) {
       this.forget(positionId);
       this.failedTotal += missing.length;
       if (missing.length > 0) {
         this.options.logger?.warn('orders: position closed with orders still unlinked (order rows not persisted at link time)', {
           positionId,
-          symbol: position.symbol,
+          symbol,
           orderIds: missing,
         });
       }
@@ -265,11 +317,16 @@ export class OrderPositionLinker {
     return { ...base, attempted, linked, missing };
   }
 
-  /** Drop every per-position entry (the position closed). */
+  /** Drop every per-position entry and remember the id as closed (the position closed). */
   private forget(positionId: string): void {
     this.linked.delete(positionId);
     this.pending.delete(positionId);
     this.backoff.delete(positionId);
+    this.closed.add(positionId);
+    if (this.closed.size > ORDER_LINK_CLOSED_MEMORY) {
+      const oldest = this.closed.values().next().value;
+      if (oldest !== undefined) this.closed.delete(oldest);
+    }
   }
 
   private now(): number {

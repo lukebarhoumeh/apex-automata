@@ -434,7 +434,9 @@ const supabase = createClient(
 // written before 2026-09-29): after a CONFIRMED positions write, the orders of
 // that position's not-yet-linked trades are updated by primary key, scoped to
 // USER_ID; RETURNING tells the linker which ids landed so an order row that is
-// not persisted yet is retried on the next write. See persistence/order-position-link.ts.
+// not persisted yet is retried on the next write (a FAILED UPDATE only after its
+// per-position failure backoff; the close write always attempts). See
+// persistence/order-position-link.ts.
 const orderPositionLinker = new OrderPositionLinker({
   update: createSupabaseOrderLinkUpdate(supabase, USER_ID),
   logger,
@@ -1887,7 +1889,8 @@ app.post('/api/engine/start', async (req, res) => {
         const positionWrite = await syncPositionToSupabase(position);
         // orders.position_id: link this snapshot's not-yet-linked orders once the
         // positions row is confirmed written (FK). A dropped stale update or a
-        // failed write links nothing; the next write for the position retries.
+        // failed write links nothing; the next write for the position retries
+        // (after the linker's failure backoff if the link UPDATE itself failed).
         await linkOrdersAfterPositionWrite(positionWrite, position, orderPositionLinker);
 
         // Record outcome for ML training when position is closed.
