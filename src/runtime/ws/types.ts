@@ -47,6 +47,16 @@ export interface RuntimeEventEnvelope<
 // ============ Payload Interfaces ============
 
 /** Status payload from /api/status or WS StatusUpdate */
+/** `/api/status → paperHardStop` snapshot (PaperHardStopScheduler.snapshot() on the backend). */
+export interface PaperHardStopStatus {
+  enabled: boolean;
+  nextFireAtIso: string | null;
+  nextFireAtMs: number | null;
+  timezone: string;
+  localTime: string;
+  reason: string;
+}
+
 export interface StatusPayload {
   engineRunning: boolean;
   mode: 'paper' | 'live' | null;
@@ -78,6 +88,60 @@ export interface StatusPayload {
   warmupComplete?: boolean;
   candlesBuffered?: Record<string, number>;
   pnl?: Record<string, unknown> | null;
+  /**
+   * Handoff P5 — PAPER ONLY engine-side self-stop backstop (22:30 America/Chicago).
+   * Present (non-null) only while a paper session is running; always null for live.
+   */
+  paperHardStop?: PaperHardStopStatus | null;
+  /**
+   * Round 3 (task G) — persistence health for the soak desk. Present (non-null)
+   * only while an engine is running; identical on REST and every WS StatusUpdate.
+   * Counts are numbers; `closeWriteFailures` / `orderLinks` accumulate since the
+   * backend process started, `hydrateRestamp` / `reconcile` are the last start's.
+   */
+  persistence?: {
+    sessionId: string | null;
+    executionMode: 'paper' | 'live' | null;
+    hydrateRestamp: {
+      outcome: 'restamped' | 'noop' | 'skipped_columns_missing' | 'skipped_mode' | 'error';
+      hydrated: number;
+      restamped: number;
+      alreadyCurrent: number;
+      foreign: number;
+      symbols: string[];
+      fromSessionIds: Array<string | null>;
+      error: string | null;
+    } | null;
+    reconcile: {
+      at: number;
+      modeScoped: boolean;
+      dbOpenCount: number;
+      engineOpenCount: number;
+      inDbNotEngine: string[];
+      inEngineNotDb: string[];
+      foreignModeOpen: number;
+      foreignModeSymbols: string[];
+      note: string;
+    } | null;
+    closeWriteFailures: {
+      count: number;
+      last: {
+        positionId: string;
+        symbol: string;
+        sessionId: string | null;
+        at: number;
+        attempts: number;
+        code: string | null;
+        error: string;
+      } | null;
+    };
+    orderLinks: {
+      linked: number;
+      pending: number;
+      failed: number;
+      disabled: boolean;
+    };
+  } | null;
   lastMarketDataAt?: number;
   lastEngineHeartbeatAt?: number;
   timestamp?: number;

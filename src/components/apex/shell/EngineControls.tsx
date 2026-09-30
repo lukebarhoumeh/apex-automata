@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { Play, Square, Power, Loader2 } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -5,8 +6,19 @@ import { runtimeClient } from "@/services/runtimeClient";
 import { useActiveSession } from "@/runtime/session";
 import { useConnectivity } from "@/runtime/connectivity";
 import { useRuntimeStatus } from "@/hooks/useRuntimeStatus";
-import { deriveEnginePill, type EnginePillTone } from "@/runtime/state/deriveEnginePill";
+import { deriveEnginePill, deriveHardStopChip, type EnginePillTone } from "@/runtime/state/deriveEnginePill";
+import { Pill } from "@/components/apex/Pill";
 import { cn } from "@/lib/utils";
+
+/** Coarse clock for the hard-stop countdown (minute granularity is all it shows). */
+function useNow(intervalMs: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), intervalMs);
+    return () => window.clearInterval(id);
+  }, [intervalMs]);
+  return now;
+}
 
 const API_URL = import.meta.env.VITE_RUNTIME_API_URL || "http://localhost:3001";
 
@@ -30,6 +42,9 @@ export function EngineControls() {
   const connectivity = useConnectivity();
   const pill = deriveEnginePill(status, connectivity);
   const pillClasses = PILL_CLASSES[pill.tone];
+  const now = useNow(15_000);
+  // PAPER ONLY: null (nothing rendered) for live, stopped, or a backend without the hard stop.
+  const hardStop = deriveHardStopChip(status, now);
   const queryClient = useQueryClient();
 
   const bumpStatus = () => {
@@ -79,6 +94,15 @@ export function EngineControls() {
         <span className={cn("inline-block h-1.5 w-1.5 rounded-full", pillClasses.dot)} />
         {pill.label}
       </div>
+
+      {/* Paper hard-stop countdown — derived from /api/status → paperHardStop, absent for live */}
+      {hardStop && (
+        <span className="inline-flex" data-testid="hard-stop-pill" title={hardStop.title}>
+          <Pill tone={hardStop.tone} dot className="text-[10px]">
+            {hardStop.label} · {hardStop.remaining}
+          </Pill>
+        </span>
+      )}
 
       {/* Start / Stop */}
       {engineRunning ? (

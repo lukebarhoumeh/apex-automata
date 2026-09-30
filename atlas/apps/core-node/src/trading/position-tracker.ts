@@ -3,6 +3,38 @@ import { Logger } from '../core/logger';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { Fill } from '../exchanges/coinbase';
 import { v4 as uuidv4 } from 'uuid';
+import { isMissingColumnError } from '../core/postgrest-errors';
+import type { ExecutionMode } from '../runtime/session-context';
+
+/** Options for `PositionTracker.hydrateOpenPositions`. */
+export interface HydrateOpenPositionsOptions {
+  /**
+   * Execution mode of the session doing the hydrate. When given, open rows
+   * whose non-null `execution_mode` differs are NOT adopted (paper and live
+   * share one Supabase project; a live position must never be managed by a
+   * paper engine or vice versa). Rows with `execution_mode` NULL (written
+   * before migration 20260911170000) always hydrate. Omitted → every open
+   * row hydrates (legacy behaviour).
+   */
+  executionMode?: ExecutionMode;
+}
+
+/** Columns `hydrateOpenPositions` selects from `positions` (loosely typed: PostgREST returns numerics as strings). */
+interface HydratedPositionRow {
+  id: string;
+  symbol: string;
+  side?: string | null;
+  qty_open?: number | string | null;
+  entry_price?: number | string | null;
+  opened_at?: string | null;
+  stop_price_at_entry?: number | string | null;
+  take_profit_price?: number | string | null;
+  strategy?: string | null;
+  realized_pnl_usd?: number | string | null;
+  exit_reason?: string | null;
+  /** Present only when the caller asked for a mode filter and the column exists. */
+  execution_mode?: string | null;
+}
 
 export interface PositionTrackerConfig {
   supabaseUrl: string;
@@ -45,7 +77,14 @@ export interface Position {
 
 export interface Trade {
   id: string;
+  /** Exchange order id as carried on the fill (`fill.order_id`; equals the client id in paper). */
   orderId: string;
+  /**
+   * Engine-side client UUID of the order (`ManagedOrder.id` = `orders.id`) when the
+   * fill was matched to a managed order. Lets persistence link `orders.position_id`
+   * by primary key without guessing from the exchange id (live: not a UUID).
+   */
+  clientOrderId?: string;
   side: 'buy' | 'sell';
   size: number;
   price: number;
@@ -62,6 +101,8 @@ export interface FillContext {
   tag?: string;
   /** Market regime stamped on the entry signal; kept on `Position.metadata.regime` for exit attribution. */
   regime?: string;
+  /** `ManagedOrder.id` (= `orders.id`) of the order this fill belongs to, when known. */
+  clientOrderId?: string;
 }
 
 export interface PositionTrackerEvents {
@@ -124,8 +165,13 @@ export class PositionTracker extends EventEmitter {
   // ~5–10× without changing what consumers eventually see.
   //
   // Contract:
-  //  - 'position:updated' is debounced per symbol, max 1 emission per
-  //    `updateDebounceMs`. The LATEST state emits at the tail edge.
+  //  - 'position:updated' driven by MARK-PRICE TICKS is debounced per symbol,
+  //    max 1 emission per `updateDebounceMs`. The LATEST state emits at the
+  //    tail edge.
+  //  - 'position:updated' driven by a SIZE-CHANGING FILL (partial close,
+  //    scale-in) bypasses the debounce and cancels any pending tick update:
+  //    the fill row is already persisted, so the positions row must not lag
+  //    it across a crash window.
   //  - 'position:opened' and 'position:closed' bypass the debounce — they
   //    are lifecycle transitions UI / persistence must see immediately.
   //  - On close, any pending intermediate update for that symbol is
@@ -166,18 +212,46 @@ export class PositionTracker extends EventEmitter {
    * - Does NOT touch the rows. Moving them onto the session that now manages
    *   them (`positions.session_id`, paper only) is the API server's job once
    *   the session is open — see persistence/position-session-restamp.ts.
+   * - Mode isolation: with `options.executionMode` set, rows stamped with the
+   *   OTHER mode are skipped (count + ids logged at warn) so a paper start
+   *   never adopts a live position and a live start never adopts a paper one.
+   *   NULL-stamped legacy rows still hydrate. Schema-tolerant: a schema
+   *   without `execution_mode` (migration 20260911170000 pending) falls back
+   *   to the legacy select and hydrates every row, as before.
    */
-  public async hydrateOpenPositions(userId: string): Promise<number> {
+  public async hydrateOpenPositions(userId: string, options: HydrateOpenPositionsOptions = {}): Promise<number> {
     if (!userId) {
       this.logger.warn('hydrateOpenPositions called with empty userId — skipping');
       return 0;
     }
 
-    const { data, error } = await this.supabase
-      .from('positions')
-      .select('id, symbol, side, qty_open, entry_price, opened_at, stop_price_at_entry, take_profit_price, strategy, realized_pnl_usd, exit_reason')
-      .eq('user_id', userId)
-      .is('closed_at', null);
+    const activeMode: ExecutionMode | null = options.executionMode ?? null;
+    const baseColumns = 'id, symbol, side, qty_open, entry_price, opened_at, stop_price_at_entry, take_profit_price, strategy, realized_pnl_usd, exit_reason';
+    const runQuery = (columns: string) =>
+      this.supabase
+        .from('positions')
+        .select(columns)
+        .eq('user_id', userId)
+        .is('closed_at', null);
+
+    // Only ask for execution_mode when a mode filter is wanted, so callers
+    // without one keep the exact legacy query.
+    let modeColumnPresent = activeMode !== null;
+    let { data, error } = await runQuery(modeColumnPresent ? `${baseColumns}, execution_mode` : baseColumns);
+
+    if (error && modeColumnPresent && isMissingColumnError(error, 'execution_mode')) {
+      // Pre-20260911 schema: no execution_mode column. Retry the legacy shape
+      // once; without the column there is nothing to filter on, so every open
+      // row hydrates exactly as before this filter existed.
+      this.logger.warn('positions: execution_mode column missing — hydrating every open row until migration 20260911170000 is applied', {
+        userId,
+        executionMode: activeMode,
+        code: error.code,
+        message: error.message,
+      });
+      modeColumnPresent = false;
+      ({ data, error } = await runQuery(baseColumns));
+    }
 
     if (error) {
       // Bubble up so engine's allSettled treats this as a rejected branch.
@@ -188,9 +262,20 @@ export class PositionTracker extends EventEmitter {
     this.positions.clear();
     this.lots.clear();
 
+    // supabase-js types a dynamic column string as GenericStringError[]; the
+    // row shape is ours, so widen through unknown.
+    const rows = (data ?? []) as unknown as HydratedPositionRow[];
+    const skippedForeignMode: Array<{ id: string; symbol: string; executionMode: string }> = [];
     let hydrated = 0;
-    for (const row of data ?? []) {
+    for (const row of rows) {
       try {
+        if (activeMode !== null && modeColumnPresent) {
+          const rowMode = row.execution_mode ?? null;
+          if (rowMode !== null && rowMode !== activeMode) {
+            skippedForeignMode.push({ id: row.id, symbol: row.symbol, executionMode: String(rowMode) });
+            continue;
+          }
+        }
         const size = Number(row.qty_open ?? 0);
         const avgPrice = Number(row.entry_price ?? 0);
         if (!Number.isFinite(size) || size <= 0 || !Number.isFinite(avgPrice) || avgPrice <= 0) {
@@ -246,10 +331,25 @@ export class PositionTracker extends EventEmitter {
       }
     }
 
+    if (skippedForeignMode.length > 0) {
+      // Never silent: the desk must be able to see that a row of the other
+      // mode is open in the shared project and was deliberately left alone.
+      this.logger.warn('positions: open rows stamped with another execution_mode were NOT hydrated (cross-mode isolation)', {
+        userId,
+        executionMode: activeMode,
+        skipped: skippedForeignMode.length,
+        ids: skippedForeignMode.map((row) => row.id),
+        symbols: skippedForeignMode.map((row) => row.symbol),
+        foreignModes: [...new Set(skippedForeignMode.map((row) => row.executionMode))],
+      });
+    }
+
     this.logger.info('PositionTracker hydrated open positions', {
       userId,
-      rowsReturned: data?.length ?? 0,
+      executionMode: activeMode,
+      rowsReturned: rows.length,
       hydrated,
+      skippedForeignMode: skippedForeignMode.length,
       symbols: Array.from(this.positions.keys()),
     });
 
@@ -308,6 +408,9 @@ export class PositionTracker extends EventEmitter {
     const trade: Trade = {
       id: fill.trade_id.toString(),
       orderId: fill.order_id,
+      ...(typeof context?.clientOrderId === 'string' && context.clientOrderId.length > 0
+        ? { clientOrderId: context.clientOrderId }
+        : {}),
       side,
       size,
       price,
@@ -316,6 +419,12 @@ export class PositionTracker extends EventEmitter {
     };
 
     let position = this.positions.get(symbol);
+    // "Opened" means the position did not exist before this fill. Deciding it
+    // by `trades.length === 1` was wrong for a HYDRATED position (`trades = []`
+    // at hydrate): its first same-direction / partial fill in the new session
+    // re-emitted 'position:opened', TradeAnalytics.recordEntry overwrote the
+    // trade_log entry and "opened" was counted twice (finding 6, 2026-09-28).
+    const existedBeforeFill = position !== undefined;
 
     if (!position) {
       // Create new position
@@ -397,10 +506,19 @@ export class PositionTracker extends EventEmitter {
       // Remove closed positions so a new trade creates a fresh position (new id/openTime)
       this.positions.delete(symbol);
       this.lots.delete(symbol);
-    } else if (position.trades.length === 1) {
+    } else if (!existedBeforeFill) {
       this.emit('position:opened', position);
     } else {
-      this.schedulePositionUpdate(position);
+      // Size-changing fill (partial close / scale-in): persist NOW, not at the
+      // tail of the 1 s debounce. The fill row already landed synchronously
+      // (order:filled); a process kill inside the debounce window would leave
+      // positions.qty_open / realized_pnl_usd at the PRE-fill values and the
+      // next start would hydrate the wrong size (hydrate reads only
+      // `positions`, never replays fills). Any pending tick-driven update is
+      // folded into this emit so the expiring timer cannot double-write a
+      // stale snapshot afterwards. Mark-price ticks stay debounced.
+      this.cancelPendingPositionUpdate(symbol);
+      this.emit('position:updated', position);
     }
   }
 

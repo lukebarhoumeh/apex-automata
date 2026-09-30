@@ -1,0 +1,31 @@
+-- =============================================================================
+-- RECONCILIATION STUB — version 20260921185202
+-- (name: fills_fee_side)
+-- =============================================================================
+-- This file is intentionally a no-op. It exists ONLY so that the local
+-- supabase/migrations/ manifest matches `supabase_migrations.schema_migrations`
+-- on the linked project, which records this version as applied on 2026-09-21
+-- 18:52:02 UTC (MCP apply-time re-stamp of `20260921180000_fills_fee_side.sql`).
+-- Without a file here, Supabase Preview refuses to run ("Remote migration
+-- versions not found in local migrations directory").
+--
+-- What it is: a DUPLICATE APPLY STAMP of 20260921180000, exactly like
+-- 20260910213833 is for 20260910205000 and 20260911172937 is for
+-- 20260911170000. Remote history holds BOTH stamps.
+--
+-- Source of truth for this DDL stays `20260921180000_fills_fee_side.sql`. DO
+-- NOT copy the SQL here. On prod the runner skips this version (already
+-- recorded); on a fresh chain it sorts after 180000 and is a no-op. Version
+-- stamp MUST stay 20260921185202; do not rename.
+--
+-- Found 2026-09-29 while reconciling the desk-status migrations
+-- (docs/db/DESK_QUERIES_2026-09-29.md §5). The five remaining remote-only
+-- versions (20260923210349 agentic_control_kill_latch, 20260924161650
+-- cb_live_intents_lease_state, 20260924171619 cb_live_executor_fence_snapshot,
+-- 20260925021711 cb_live_004_privileges_halt_clear, 20260928183106
+-- cb_live_005_shadow_sleeve) belong to the co-hosted equity workflow
+-- (docs/db/EXTERNAL_CONSUMERS.md) and are deliberately NOT stubbed from the
+-- Apex side.
+-- =============================================================================
+
+SELECT 1;

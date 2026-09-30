@@ -197,6 +197,26 @@ limit 200;
 3. Check whether the failing table is one we recently migrated. If yes, audit its RLS in `supabase/migrations/` — likely a policy was dropped without a replacement.
 4. After D5 lands (`(SELECT auth.uid())` rewrite), this query is also the regression test — any new row here means D5 broke a policy.
 
+## Query 5 — Who is erroring? (MCP `query_logs`, ClickHouse dialect)
+
+**Intent:** when Query 1 is non-empty, attribute the errors before touching the schema. On 2026-09-28 all 142 Postgres errors were an external Supabase-MCP poller guessing column names (`42703`), not the runtime — see `docs/db/DESK_QUERIES_2026-09-29.md`.
+
+**Where it runs:** the Supabase MCP `query_logs` tool (unified `logs` stream, ClickHouse SQL). It does **not** run in Studio (Logflare/BigQuery dialect) or in the SQL editor.
+
+```sql
+select log_attributes['parsed.sql_state_code']            as code,
+       event_message,
+       log_attributes['parsed.query']                     as q,   -- statement + MCP trailer (-- source / -- user)
+       timestamp
+from logs
+where source = 'postgres_logs'
+  and log_attributes['parsed.error_severity'] = 'ERROR'
+order by timestamp desc
+limit 40
+```
+
+**Reading it:** `q` ending in `-- source: POST /mcp` / `-- user: oauth:<id>` is an MCP client (a desk agent), `parsed.application_name = PostgREST` is the runtime or the frontend. Group by `event_message` to see whether it is one repeating shape. Note `event_message ilike '%ERROR%'` returns nothing — severity lives in `parsed.error_severity`.
+
 ## Saved-query checklist (post-merge)
 
 Apply once in Supabase Studio (project `gdrdaajvutmewgxbjurk`):

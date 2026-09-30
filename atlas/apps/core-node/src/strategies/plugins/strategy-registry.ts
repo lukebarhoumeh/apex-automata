@@ -95,6 +95,13 @@ export class StrategyRegistry extends EventEmitter {
       return false;
     }
 
+    // Hand the host logger to plugins that accept one (BaseStrategy.setLogger);
+    // plugins are constructed logger-less by `createBuiltinStrategies`.
+    const maybeLoggable = plugin as StrategyPlugin & { setLogger?: (logger: Logger) => void };
+    if (typeof maybeLoggable.setLogger === 'function') {
+      maybeLoggable.setLogger(this.logger);
+    }
+
     // Initialize if needed
     if (plugin.initialize) {
       plugin.initialize().catch(err => {

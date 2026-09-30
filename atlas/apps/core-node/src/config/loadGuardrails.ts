@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
 import { z } from 'zod';
+import { HARD_STOP_LOCAL_TIME_PATTERN } from '../runtime/paper-hard-stop';
 
 // Per-strategy parameter overrides (e.g., different ATR multiplier for BTC vs SOL)
 const StrategyOverridesSchema = z.record(
@@ -363,6 +364,52 @@ export function resolvePaperKillLadderConfig(guardrails: { paper_kill_ladder?: P
   return guardrails.paper_kill_ladder ?? (PaperKillLadderSchema.parse({}) as PaperKillLadderConfig);
 }
 
+// ---------------------------------------------------------------------------
+// Paper session hard stop (handoff P5, 2026-09-29) — engine-side scheduled
+// self-stop backstop for PAPER sessions. Absent block => disabled (the runtime
+// behaves exactly as before). NOT a desk pin. See runtime/paper-hard-stop.ts.
+// ---------------------------------------------------------------------------
+const PaperSessionHardStopSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    /** `HH:MM` 24h wall clock in `timezone`. */
+    local_time: z
+      .string()
+      .regex(HARD_STOP_LOCAL_TIME_PATTERN, 'paper_session_hard_stop.local_time must be HH:MM (24h)')
+      .default('22:30'),
+    /** IANA zone; validated by constructing an Intl.DateTimeFormat. */
+    timezone: z
+      .string()
+      .min(1)
+      .refine(
+        (tz) => {
+          try {
+            new Intl.DateTimeFormat('en-US', { timeZone: tz });
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        { message: 'paper_session_hard_stop.timezone must be a valid IANA time zone' },
+      )
+      .default('America/Chicago'),
+    /** Stop reason handed to engine.stop() and stamped on the log line. */
+    reason: z.string().min(1).default('paper_hard_stop_22_30_ct'),
+  })
+  .optional();
+
+export type PaperSessionHardStopConfig = NonNullable<z.infer<typeof PaperSessionHardStopSchema>>;
+
+/**
+ * Effective paper hard-stop config: the parsed block, or the disabled defaults
+ * when the block is absent (pre-P5 YAML keeps today's behaviour).
+ */
+export function resolvePaperSessionHardStopConfig(guardrails: {
+  paper_session_hard_stop?: PaperSessionHardStopConfig;
+}): PaperSessionHardStopConfig {
+  return guardrails.paper_session_hard_stop ?? (PaperSessionHardStopSchema.parse({}) as PaperSessionHardStopConfig);
+}
+
 export const GuardrailsSchema = z.object({
   disabled_strategies: z.array(z.string()).optional().default([]),
   momentum: MomentumConfigSchema.optional(),
@@ -469,6 +516,9 @@ export const GuardrailsSchema = z.object({
   // A6 (2026-05-29) / TF-REGIME-GATE (2026-09-22) — regime-conditional entry
   // gates. Paper-only by default (`paper_only`), see RegimeGatesSchema.
   regime_gates: RegimeGatesSchema,
+  // Handoff P5 (2026-09-29) — engine-side 22:30 CT self-stop backstop for
+  // PAPER sessions. Optional; absent = disabled. See `resolvePaperSessionHardStopConfig()`.
+  paper_session_hard_stop: PaperSessionHardStopSchema,
   compliance: z.object({
     tax_method: z.string(),
     export_frequency_days: z.number().int().positive(),

@@ -40,6 +40,17 @@ import {
   restampHydratedOpenPositions,
   type RestampOpenPositionsResult,
 } from '../persistence/position-session-restamp';
+import { PositionWriteSequencer, type PositionWriteOutcome } from '../persistence/position-write-sequencer';
+import { OrderPositionLinker } from '../persistence/order-position-link';
+import { resolvePositionStrategy, resolveStrategyName } from '../persistence/strategy-name';
+import { StrategyEnumValueSupport, writeWithStrategyEnumFallback } from '../persistence/strategy-enum-fallback';
+import { buildSignalRow } from '../persistence/signal-row';
+import {
+  classifyReconcileRows,
+  selectRowsForDestructiveReconcile,
+  type ReconcileClassification,
+  type ReconcileOpenRow,
+} from '../persistence/session-reconcile';
 import { writeSignalRouteVerdict } from '../persistence/signal-route-verdict';
 import {
   resolveRoutedExchange,
@@ -65,13 +76,14 @@ import {
 } from './session-scope';
 import { buildStrategySessionStats, StrategySessionStats } from './strategy-session-stats';
 import { buildPnlSnapshotPayload, PnlSnapshot } from './pnl-snapshot';
-import { buildStatusPayload, StatusPayload } from './status-payload';
+import { buildPersistenceBlock, buildStatusPayload, StatusPayload } from './status-payload';
 import { createClient } from '@supabase/supabase-js';
 import path from 'path';
 import { loadAndValidateEnv } from '../core/env';
 import client from 'prom-client';
 import { OHLCV } from '../indicators/technical';
-import { loadGuardrails, resolveLiveConfig, resolveCfmConfig } from '../config/loadGuardrails';
+import { loadGuardrails, resolveLiveConfig, resolveCfmConfig, resolvePaperSessionHardStopConfig } from '../config/loadGuardrails';
+import { PaperHardStopScheduler, type PaperHardStopFireContext } from '../runtime/paper-hard-stop';
 import { FeeModel } from '../core/fee-model';
 import { CfmGuard, CfmFlattenRequiredEvent, CfmLeverageSnapshot } from '../trading/cfm/cfm-guard';
 import { OrderOpsThrottle } from '../trading/execution/order-ops-throttle';
@@ -373,6 +385,26 @@ const feeSideColumnSupport = new SessionColumnSupport();
 const positionsConflictSupport = new PositionsConflictTargetSupport(resolvePositionsConflictTarget(), { logger });
 logger.info('positions upsert conflict target', positionsConflictSupport.snapshot());
 
+// Per-position write ordering + close durability for `positions` rows (P3-A).
+// Writes for one position id are serialized, so a debounced ticker update whose
+// HTTP round-trip outlives the closing fill can no longer complete last and
+// reopen the row; and the CLOSE write is retried with bounded backoff, so one
+// transient failure no longer leaves the row open forever (PositionTracker has
+// already dropped the position from memory by then, so nothing else would ever
+// re-assert closed_at). See persistence/position-write-sequencer.ts.
+const positionWriteSequencer = new PositionWriteSequencer({ logger });
+
+// Position ids whose unknown strategy label has already been warned about
+// (finding 7): the positions row is rewritten on every debounced ticker update,
+// so the "persisting as system" audit line is emitted once per position.
+const positionStrategyWarned = new Set<string>();
+// Process-lifetime memory of which strategy_name enum labels the deployed
+// database accepts (persistence/strategy-enum-fallback.ts). Shared by the
+// orders / positions / signals writers so a label the enum lacks (e.g.
+// donchian_daily_s3 before migration 20260929203106 is applied) is retried
+// once as `system`, warned once, and remembered — with a re-probe window.
+const strategyEnumSupport = new StrategyEnumValueSupport();
+
 // Session stamp for persisted rows. Set the moment the engine starts building
 // (so anything written during start-up already carries the id) and cleared when
 // the session closes. `runtimeState.session*` (what /api/status reports) is only
@@ -384,6 +416,11 @@ let activeSessionStamp: SessionStamp | null = null;
 // the engine agree on session_id without a SQL round-trip.
 let lastHydrateRestamp: RestampOpenPositionsResult | null = null;
 
+// Outcome of the most recent observational session reconcile (openTradingSession),
+// surfaced on /api/status `persistence.reconcile` alongside the restamp above
+// (round 3, task G). Cleared with the session; null with STARTUP_RECONCILE=false.
+let lastSessionReconcile: (ReconcileClassification & { at: number }) | null = null;
+
 const DEFAULT_LIVE_CONFIRM_PHRASE = 'ENABLE LIVE';
 
 // Supabase client
@@ -391,6 +428,24 @@ const supabase = createClient(
   env.SUPABASE_URL || '',
   env.SUPABASE_SERVICE_KEY || ''
 );
+
+// orders.position_id linkage (column since migration 20251216000002, never
+// written before 2026-09-29): after a CONFIRMED positions write, the orders of
+// that position's not-yet-linked trades are updated by primary key, scoped to
+// USER_ID; RETURNING tells the linker which ids landed so an order row that is
+// not persisted yet is retried on the next write. See persistence/order-position-link.ts.
+const orderPositionLinker = new OrderPositionLinker({
+  update: async (positionId, orderIds) => {
+    const { data, error } = await supabase
+      .from('orders')
+      .update({ position_id: positionId })
+      .eq('user_id', USER_ID)
+      .in('id', orderIds)
+      .select('id');
+    return { data, error };
+  },
+  logger,
+});
 
 /**
  * Mint the identity of a trading session: the `trading_sessions.session_id`
@@ -457,7 +512,9 @@ async function restampHydratedPositionsForSession(stamp: SessionStamp): Promise<
       hydrated: hydrated.length,
       restamped: 0,
       alreadyCurrent: 0,
+      foreign: 0,
       rows: [],
+      foreignRows: [],
       error: { message: err instanceof Error ? err.message : String(err) },
     };
   }
@@ -503,58 +560,123 @@ async function openTradingSession(params: {
   //      drift; this pass is observational only.
   //
   // Feature flag STARTUP_RECONCILE=false reverts to the destructive
-  // behavior so this can be rolled back without a deploy.
+  // behavior so this can be rolled back without a deploy — scoped to this
+  // session's execution_mode since round 3 (see the branch below).
   const reconcileEnvVal = (process.env.STARTUP_RECONCILE ?? 'true').toLowerCase();
   const reconcileMode = reconcileEnvVal === 'false' || reconcileEnvVal === '0' ? 'destructive' : 'observational';
   try {
-    const { data: dbOpenRows, error: openErr } = await supabase
-      .from('positions')
-      .select('id, symbol, side, qty_open, opened_at')
-      .eq('user_id', USER_ID)
-      .is('closed_at', null);
+    // Scoped by execution_mode the same way hydrate is (P3-C): a paper start
+    // does not adopt a live open row, so that row must not be reported as
+    // drift — it is classified as `foreignModeOpen` instead. Schema-tolerant:
+    // without the column (migration 20260911170000 pending) fall back to the
+    // legacy select once and classify every row, exactly as before.
+    const reconcileBaseColumns = 'id, symbol, side, qty_open, opened_at';
+    const readOpenRows = (columns: string) =>
+      supabase
+        .from('positions')
+        .select(columns)
+        .eq('user_id', USER_ID)
+        .is('closed_at', null);
+    let reconcileModeColumnPresent = true;
+    let { data: dbOpenRows, error: openErr } = await readOpenRows(`${reconcileBaseColumns}, execution_mode`);
+    if (openErr && isMissingColumnError(openErr, 'execution_mode')) {
+      logger.warn('Session reconcile: execution_mode column missing — classifying every open row until migration 20260911170000 is applied', {
+        code: openErr.code,
+        message: openErr.message,
+      });
+      reconcileModeColumnPresent = false;
+      ({ data: dbOpenRows, error: openErr } = await readOpenRows(reconcileBaseColumns));
+    }
 
     if (openErr) {
       logger.warn('Session reconcile: could not read open positions (non-fatal)', { error: openErr.message });
     } else if (reconcileMode === 'destructive') {
       // Legacy behavior, only reachable when STARTUP_RECONCILE is explicitly disabled.
-      const { error: orphanErr, count } = await supabase
-        .from('positions')
-        .update({
-          closed_at: new Date(startedAt).toISOString(),
-          exit_reason: 'session_end',
-          realized_pnl_usd: 0,
-        }, { count: 'exact' })
-        .eq('user_id', USER_ID)
-        .is('closed_at', null);
-      if (orphanErr) {
-        logger.warn('Legacy orphan-zero cleanup failed (non-fatal)', { error: orphanErr.message });
-      } else if ((count ?? 0) > 0) {
-        logger.warn('Legacy orphan-zero cleanup closed positions (STARTUP_RECONCILE=false)', { count: count ?? 0 });
+      //
+      // Mode-scoped since round 3 (2026-09-29): paper and live share one Supabase
+      // project + USER_ID, so the orphan-zero UPDATE may only touch rows whose
+      // execution_mode equals THIS session's mode. Legacy NULL-mode rows are
+      // touched for a PAPER session only, never for live. Without the
+      // execution_mode column the update is SKIPPED entirely (error-level log)
+      // rather than run unscoped — an unscoped update is the defect. The rows
+      // are targeted by primary key from the read above, never by a blanket
+      // `closed_at IS NULL` filter. See persistence/session-reconcile.ts.
+      const selection = selectRowsForDestructiveReconcile(
+        (dbOpenRows ?? []) as unknown as ReconcileOpenRow[],
+        params.mode,
+        reconcileModeColumnPresent,
+      );
+      if (selection.skipped) {
+        logger.error('Legacy orphan-zero cleanup SKIPPED — execution_mode column missing, refusing to run the update unscoped (STARTUP_RECONCILE=false)', {
+          sessionId,
+          executionMode: params.mode,
+          skipReason: selection.skipReason,
+          openRows: (dbOpenRows ?? []).length,
+        });
+      } else {
+        if (selection.skippedForeignMode > 0 || selection.skippedNullModeForLive > 0 || selection.droppedNoId > 0) {
+          logger.warn('Legacy orphan-zero cleanup left open rows outside this execution_mode untouched (STARTUP_RECONCILE=false)', {
+            sessionId,
+            executionMode: params.mode,
+            skippedForeignMode: selection.skippedForeignMode,
+            skippedForeignModeSymbols: selection.skippedForeignModeSymbols,
+            skippedNullModeForLive: selection.skippedNullModeForLive,
+            droppedNoId: selection.droppedNoId,
+          });
+        }
+        if (selection.ids.length > 0) {
+          const { error: orphanErr, count } = await supabase
+            .from('positions')
+            .update({
+              closed_at: new Date(startedAt).toISOString(),
+              exit_reason: 'session_end',
+              realized_pnl_usd: 0,
+            }, { count: 'exact' })
+            .eq('user_id', USER_ID)
+            .in('id', selection.ids)
+            .is('closed_at', null);
+          if (orphanErr) {
+            logger.warn('Legacy orphan-zero cleanup failed (non-fatal)', {
+              error: orphanErr.message,
+              executionMode: params.mode,
+              targeted: selection.ids.length,
+              skippedForeignMode: selection.skippedForeignMode,
+            });
+          } else if ((count ?? 0) > 0) {
+            logger.warn('Legacy orphan-zero cleanup closed positions (STARTUP_RECONCILE=false)', {
+              count: count ?? 0,
+              executionMode: params.mode,
+              skippedForeignMode: selection.skippedForeignMode,
+              skippedNullModeForLive: selection.skippedNullModeForLive,
+            });
+          }
+        }
       }
     } else {
-      // Observational reconcile — log only.
-      const dbSymbols = new Set((dbOpenRows ?? []).map((r: any) => r.symbol));
+      // Observational reconcile — log only. Classification (same-mode + NULL
+      // rows vs engine; foreign-mode rows reported separately) lives in
+      // persistence/session-reconcile.ts.
       const enginePositions = tradingEngine?.getOpenPositions?.() ?? [];
-      const engineSymbols = new Set(enginePositions.map((p: any) => p.symbol));
-
-      const inDbNotEngine: string[] = [];
-      for (const s of dbSymbols) {
-        if (!engineSymbols.has(s)) inDbNotEngine.push(s);
-      }
-      const inEngineNotDb: string[] = [];
-      for (const s of engineSymbols) {
-        if (!dbSymbols.has(s)) inEngineNotDb.push(s);
-      }
+      const reconcile = classifyReconcileRows({
+        rows: (dbOpenRows ?? []) as unknown as ReconcileOpenRow[],
+        engineSymbols: enginePositions.map((p: any) => p.symbol),
+        executionMode: params.mode,
+        modeColumnPresent: reconcileModeColumnPresent,
+      });
+      lastSessionReconcile = { ...reconcile, at: Date.now() };
 
       logger.info('Session reconcile (observational)', {
         sessionId,
-        dbOpenCount: dbSymbols.size,
-        engineOpenCount: engineSymbols.size,
-        inDbNotEngine,
-        inEngineNotDb,
-        note: inDbNotEngine.length === 0 && inEngineNotDb.length === 0
-          ? 'state aligned'
-          : 'mismatch — exchange reconciler + next ticker/fill will repair drift',
+        executionMode: params.mode,
+        modeScoped: reconcile.modeScoped,
+        dbOpenCount: reconcile.dbOpenCount,
+        engineOpenCount: reconcile.engineOpenCount,
+        inDbNotEngine: reconcile.inDbNotEngine,
+        inEngineNotDb: reconcile.inEngineNotDb,
+        foreignModeOpen: reconcile.foreignModeOpen,
+        foreignModeSymbols: reconcile.foreignModeSymbols,
+        foreignModes: reconcile.foreignModes,
+        note: reconcile.note,
       });
     }
   } catch (err) {
@@ -623,6 +745,7 @@ async function closeTradingSession(params: {
   // Stamp clears even when no runtimeState session was opened (start failed early).
   activeSessionStamp = null;
   lastHydrateRestamp = null;
+  lastSessionReconcile = null;
   if (!sessionId) return;
 
   const endedAt = Date.now();
@@ -674,6 +797,11 @@ async function closeTradingSession(params: {
 // Trading engine instance
 let tradingEngine: TradingEngine | null = null;
 let signalProcessor: SignalProcessor | null = null;
+// Handoff P5 — PAPER ONLY engine-side 22:30 CT self-stop backstop
+// (runtime/paper-hard-stop.ts). Constructed and armed only when a PAPER
+// session starts; disarmed and dropped on every stop path. Never exists for
+// a live session, so the live stop path is untouched.
+let paperHardStop: PaperHardStopScheduler | null = null;
 // Coherence layer: per-symbol direction lock + cross-venue netting + intra-window dedup.
 // Long-lived module-level singleton; reset() is called on engine stop.
 const signalArbitrator = new SignalArbitrator(logger);
@@ -1080,6 +1208,22 @@ function buildStatusCore(supervisorState = supervisor.getState()): StatusPayload
     },
     pnl: buildPnLSnapshot(),
     liveAccount: isEngineRunning && mode === 'live' ? buildLiveAccountBlock() : null,
+    // Paper-only hard-stop backstop (handoff P5): next fire time for the desk / FE.
+    paperHardStop: paperHardStop ? paperHardStop.snapshot() : null,
+    // Persistence health (round 3, task G): last start's hydrate restamp +
+    // observational reconcile, terminal close-write failures and the
+    // orders.position_id link counters — the same object on REST and every WS
+    // StatusUpdate. Built only while running; the builder nulls it otherwise.
+    persistence: isEngineRunning
+      ? buildPersistenceBlock({
+          sessionId: runtimeState.sessionId,
+          executionMode: runtimeState.sessionMode,
+          hydrateRestamp: lastHydrateRestamp,
+          reconcile: lastSessionReconcile,
+          closeWriteFailures: positionWriteSequencer.closeWriteFailures(),
+          orderLinks: orderPositionLinker.linkCounts(),
+        })
+      : null,
   });
 }
 
@@ -1747,7 +1891,13 @@ app.post('/api/engine/start', async (req, res) => {
     tradingEngine.on('position:update', async (position) => {
       try {
         broadcast({ type: 'PositionUpdate', payload: position });
-        await syncPositionToSupabase(position);
+        const positionWrite = await syncPositionToSupabase(position);
+        // orders.position_id: link this snapshot's not-yet-linked orders once the
+        // positions row is confirmed written (FK). A dropped stale update or a
+        // failed write links nothing; the next write for the position retries.
+        if (positionWrite?.status === 'written') {
+          await orderPositionLinker.link(position);
+        }
 
         // Record outcome for ML training when position is closed.
         //
@@ -1923,6 +2073,22 @@ app.post('/api/engine/start', async (req, res) => {
     if (disabledStrategies.length > 0) {
       logger.info('Disabled strategies from guardrails:', { disabledStrategies });
     }
+
+    // Read-only book hint for plugins (MarketContext.openPosition, 2026-09-29).
+    // Same accessor the router's exit short-circuit and regime gate use
+    // (`tradingEngine.getOpenPositions()`); nothing here routes or sizes. An
+    // engine that is gone (stop/restart race) answers "unknown" (undefined),
+    // never "flat", so a plugin cannot mistake a torn-down engine for a closed
+    // position. Mode-agnostic: paper and live get the same visibility.
+    signalProcessor.setOpenPositionProvider((symbol: string) => {
+      const engine = tradingEngine;
+      if (!engine) return undefined;
+      const open = engine
+        .getOpenPositions()
+        .find((p) => p.symbol === symbol && p.size > 0 && (p.side === 'long' || p.side === 'short'));
+      if (!open) return { side: 'flat', size: 0 };
+      return { side: open.side, size: open.size, entryPrice: open.averagePrice };
+    });
 
     // Set up data loader from exchange for historical data
     // Uses Coinbase public REST endpoint (no auth required) for fast warmup
@@ -2912,7 +3078,14 @@ app.post('/api/engine/start', async (req, res) => {
       mode: mode as 'paper' | 'live',
       initialEquity: liveAccountSummary ? liveAccountSummary.equityUsd : engineGuardrails.account.equity_usd,
     });
-    
+
+    // Handoff P5 — PAPER ONLY engine-side self-stop backstop (22:30 America/Chicago
+    // per guardrails `paper_session_hard_stop`). The external 10:18pm CT automation
+    // stays primary; this catches the night it does not run. Never built for live.
+    if (mode === 'paper') {
+      armPaperHardStop(sessionId);
+    }
+
     // Load historical data for warmup (don't await - do in background)
     const activeSymbols = tradingEngine.getActiveSymbols();
     logger.info(`Starting warmup for ${activeSymbols.length} symbols`);
@@ -2961,6 +3134,8 @@ app.post('/api/engine/start', async (req, res) => {
             hydrated: lastHydrateRestamp.hydrated,
             restamped: lastHydrateRestamp.restamped,
             alreadyCurrent: lastHydrateRestamp.alreadyCurrent,
+            // Open rows of the OTHER execution_mode found among the hydrated set — never restamped.
+            foreign: lastHydrateRestamp.foreign,
             symbols: lastHydrateRestamp.rows.map((row) => row.symbol),
             fromSessionIds: [...new Set(lastHydrateRestamp.rows.map((row) => row.fromSessionId ?? null))],
           }
@@ -2988,6 +3163,7 @@ app.post('/api/engine/start', async (req, res) => {
 
     // Clean up partially-initialized state so next start attempt works
     try {
+      disarmPaperHardStop('start_failed');
       if (perpsRiskMonitor) {
         perpsRiskMonitor.stop();
         perpsRiskMonitor.removeAllListeners();
@@ -3248,6 +3424,71 @@ async function runLivePreflight(input: {
   return { ok: true, warnings, checks: report.checks, account: report.account, truth };
 }
 
+/**
+ * The ONE engine stop path, shared by `POST /api/engine/stop` and the paper
+ * hard-stop backstop (handoff P5). Tears the running engine down
+ * (`engine.stop(reason)` — flatten_on_shutdown applies inside), releases the
+ * venue adapters, marks the supervisor stopped and closes the
+ * `trading_sessions` row. The caller owns `engineOperationInProgress` and the
+ * `tradingEngine !== null` precondition. Body is the former route body,
+ * byte-for-byte in behaviour for the route's `api_request` / `api_stop_request`
+ * reasons (live included).
+ *
+ * @param reasons `engineStopReason` goes to `TradingEngine.stop()`; `supervisorReason`
+ *   to `EngineSupervisor.setActualState('stopped', …)`.
+ */
+async function stopTradingEngineShared(reasons: { engineStopReason: string; supervisorReason: string }): Promise<void> {
+  const engine = tradingEngine;
+  if (!engine) {
+    throw new Error('stopTradingEngineShared: trading engine not running');
+  }
+
+  // Any stop (manual, signal or hard stop) disarms the paper backstop first so a
+  // stop that is already under way can never be followed by a second fire.
+  disarmPaperHardStop(reasons.engineStopReason);
+
+  // Update supervisor state first
+  supervisor.setDesiredState('stopped');
+
+  // Snapshot final equity + closed-trade count BEFORE tearing the engine down
+  // so we can stamp them on the trading_sessions row. `totalEquityUsd` is the
+  // equity SoT (the old code read a non-existent `.equity` and always wrote
+  // final_equity = initial_equity).
+  const snapshot = buildPnLSnapshot();
+  const finalEquity: number | null = snapshot?.totalEquityUsd ?? null;
+  const finalStats = engine.getSessionStats();
+
+  await engine.stop(reasons.engineStopReason);
+  if (perpsRiskMonitor) {
+    perpsRiskMonitor.stop();
+    perpsRiskMonitor.removeAllListeners();
+  }
+  if (exchangeRegistry) {
+    try {
+      await exchangeRegistry.shutdown();
+    } catch (regErr) {
+      logger.warn('Error tearing down ExchangeRegistry on stop:', regErr);
+    }
+  }
+  tradingEngine = null;
+  signalProcessor = null;
+  perpsRiskMonitor = null;
+  perpsAdapter = null;
+  exchangeRegistry = null;
+  hyperliquidAdapter = null;
+  activeSpotToPerpsMap = new Map();
+  stopCfmGuard();
+
+  // Update supervisor actual state
+  supervisor.setActualState('stopped', reasons.supervisorReason);
+
+  // Update metrics
+  engineRunningGauge.set(0);
+
+  // Close the trading_sessions row (best-effort, does not block response)
+  await closeTradingSession({ finalEquity, totalTrades: finalStats?.totalTrades ?? null });
+}
+
 // Stop trading engine
 app.post('/api/engine/stop', async (req, res) => {
   if (engineOperationInProgress) {
@@ -3259,46 +3500,7 @@ app.post('/api/engine/stop', async (req, res) => {
       return res.status(400).json({ error: 'Trading engine not running' });
     }
 
-    // Update supervisor state first
-    supervisor.setDesiredState('stopped');
-
-    // Snapshot final equity + closed-trade count BEFORE tearing the engine down
-    // so we can stamp them on the trading_sessions row. `totalEquityUsd` is the
-    // equity SoT (the old code read a non-existent `.equity` and always wrote
-    // final_equity = initial_equity).
-    const snapshot = buildPnLSnapshot();
-    const finalEquity: number | null = snapshot?.totalEquityUsd ?? null;
-    const finalStats = tradingEngine.getSessionStats();
-
-    await tradingEngine.stop('api_request');
-    if (perpsRiskMonitor) {
-      perpsRiskMonitor.stop();
-      perpsRiskMonitor.removeAllListeners();
-    }
-    if (exchangeRegistry) {
-      try {
-        await exchangeRegistry.shutdown();
-      } catch (regErr) {
-        logger.warn('Error tearing down ExchangeRegistry on stop:', regErr);
-      }
-    }
-    tradingEngine = null;
-    signalProcessor = null;
-    perpsRiskMonitor = null;
-    perpsAdapter = null;
-    exchangeRegistry = null;
-    hyperliquidAdapter = null;
-    activeSpotToPerpsMap = new Map();
-    stopCfmGuard();
-
-    // Update supervisor actual state
-    supervisor.setActualState('stopped', 'api_stop_request');
-
-    // Update metrics
-    engineRunningGauge.set(0);
-
-    // Close the trading_sessions row (best-effort, does not block response)
-    await closeTradingSession({ finalEquity, totalTrades: finalStats?.totalTrades ?? null });
+    await stopTradingEngineShared({ engineStopReason: 'api_request', supervisorReason: 'api_stop_request' });
 
     res.json({ success: true, message: 'Trading engine stopped' });
 
@@ -3309,6 +3511,115 @@ app.post('/api/engine/stop', async (req, res) => {
     engineOperationInProgress = false;
   }
 });
+
+// ── Handoff P5 — PAPER session hard stop (engine-side backstop) ──────────────
+//
+// Arms `runtime/paper-hard-stop.ts` for the next `paper_session_hard_stop.local_time`
+// in `.timezone` (desk: 22:30 America/Chicago). When it fires and a paper
+// engine is still running, the SAME stop path as POST /api/engine/stop runs
+// with the YAML `reason`. The external 10:18pm CT automation stays primary.
+// PAPER ONLY: only called from the paper branch of /api/engine/start, and the
+// scheduler itself refuses to arm for any other mode.
+
+/** Hard-stop retry cadence while another engine operation holds the lock. */
+const PAPER_HARD_STOP_BUSY_RETRY_MS = 10_000;
+const PAPER_HARD_STOP_BUSY_MAX_ATTEMPTS = 6;
+
+function armPaperHardStop(sessionId: string): void {
+  const config = resolvePaperSessionHardStopConfig(guardrails);
+  disarmPaperHardStop('rearm');
+  const scheduler = new PaperHardStopScheduler({
+    mode: 'paper',
+    config,
+    logger,
+    onFire: (ctx) => runPaperHardStop(ctx, sessionId, 1),
+  });
+  paperHardStop = scheduler;
+  if (!scheduler.arm()) {
+    // Disabled in YAML (or refused): keep the snapshot visible on /api/status but hold no timer.
+    logger.info('PAPER hard stop backstop not armed', { sessionId, enabled: config.enabled, localTime: config.local_time, timezone: config.timezone });
+  }
+}
+
+function disarmPaperHardStop(cause: string): void {
+  if (!paperHardStop) return;
+  const wasArmed = paperHardStop.isArmed();
+  paperHardStop.disarm();
+  paperHardStop = null;
+  if (wasArmed) {
+    logger.info('PAPER hard stop backstop disarmed', { cause });
+  }
+}
+
+/**
+ * Timer callback: stop the paper engine through the shared stop path. Retries a
+ * bounded number of times when another engine operation holds the lock; never
+ * throws into the timer (the scheduler logs anything that escapes).
+ */
+async function runPaperHardStop(ctx: PaperHardStopFireContext, sessionId: string, attempt: number): Promise<void> {
+  const firedAtIso = new Date(ctx.firedAtMs).toISOString();
+  if (!tradingEngine) {
+    logger.info('PAPER hard stop fired but no engine is running — nothing to stop', { sessionId, firedAt: firedAtIso });
+    disarmPaperHardStop('no_engine');
+    return;
+  }
+  const runningMode = tradingEngine.getConfig().mode;
+  if (runningMode !== 'paper') {
+    // Belt-and-braces: the scheduler is only ever built for paper; never stop a live engine from here.
+    logger.error('PAPER hard stop fired while the running engine is not paper — REFUSING to act', { sessionId, mode: runningMode });
+    disarmPaperHardStop('mode_mismatch');
+    return;
+  }
+  if (engineOperationInProgress) {
+    if (attempt >= PAPER_HARD_STOP_BUSY_MAX_ATTEMPTS) {
+      logger.error('PAPER hard stop could not acquire the engine lock — giving up for today', {
+        sessionId,
+        attempts: attempt,
+        firedAt: firedAtIso,
+      });
+      return;
+    }
+    logger.warn('PAPER hard stop fired while an engine operation is in progress — retrying', {
+      sessionId,
+      attempt,
+      retryInMs: PAPER_HARD_STOP_BUSY_RETRY_MS,
+    });
+    setTimeout(() => {
+      void runPaperHardStop(ctx, sessionId, attempt + 1);
+    }, PAPER_HARD_STOP_BUSY_RETRY_MS).unref();
+    return;
+  }
+
+  engineOperationInProgress = true;
+  try {
+    logger.warn('PAPER hard stop fired (engine-side backstop)', {
+      sessionId: runtimeState.sessionId ?? sessionId,
+      firedAt: firedAtIso,
+      scheduledFor: new Date(ctx.scheduledForMs).toISOString(),
+      localTime: ctx.localTime,
+      timezone: ctx.timezone,
+      reason: ctx.reason,
+      flattenOnShutdown: guardrails.compliance.flatten_on_shutdown,
+      note: 'external 10:18pm CT stop did not end this session; engine-side backstop is stopping it',
+    });
+    await stopTradingEngineShared({ engineStopReason: ctx.reason, supervisorReason: 'paper_hard_stop' });
+    // Same shape every other emitter uses, so the UI sees engineRunning=false immediately
+    // (the engine's own `engine:state_changed` → `EngineStateChanged` already went out).
+    broadcast({ type: 'StatusUpdate', payload: buildStatusCore() });
+    logger.warn('PAPER hard stop complete — paper session stopped by the engine-side backstop', {
+      sessionId,
+      reason: ctx.reason,
+    });
+  } catch (error) {
+    logger.error('PAPER hard stop failed to stop the trading engine', {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  } finally {
+    engineOperationInProgress = false;
+  }
+}
 
 // Emergency kill switch
 app.post('/api/engine/kill', async (req, res) => {
@@ -5194,37 +5505,22 @@ async function syncOrderToSupabase(order: any, stampAtEvent?: SessionStamp | nul
   };
 
   const normalizeStrategy = (strategy?: string) => {
-    const candidate = (strategy || '').toLowerCase();
-    // Must stay in sync with public.strategy_name enum in Supabase.
-    // Last confirmed 2026-04-27: breakout, vwap_mr, obi_scalper, momentum,
-    // trend_follow, system. Any addition here needs a matching ALTER TYPE
-    // migration.
-    const validStrategies = [
-      'breakout',
-      'vwap_mr',
-      'obi_scalper',
-      'momentum',
-      'trend_follow',
-      'system',
-    ];
-    if (validStrategies.includes(candidate)) {
-      return candidate;
+    // Shared mapping onto the public.strategy_name enum (persistence/strategy-name.ts;
+    // positions use the same one — finding 7). DO NOT default to a real strategy —
+    // that mislabeled every momentum / trend_follow order as "breakout" for months.
+    // `breakout` is in `disabled_strategies` and tagging flatten/exit orders with it
+    // pollutes the audit trail with synthetic activity for a strategy that's
+    // supposed to be silent. `system` is the dedicated neutral tag for engine-
+    // originated orders (flatten, exit, close-all). Anything still hitting the
+    // fallback is a genuine unknown worth auditing (empty included, as before).
+    const resolved = resolveStrategyName(strategy);
+    if (resolved.empty || resolved.unknown) {
+      logger.warn('Unknown strategy tagged on order — falling back to system', {
+        received: strategy,
+        orderId: order.id,
+      });
     }
-    if (candidate === 'vwapmeanreversion') {
-      return 'vwap_mr';
-    }
-    // DO NOT default to a real strategy — that mislabeled every momentum /
-    // trend_follow order as "breakout" for months. `breakout` is in
-    // `disabled_strategies` and tagging flatten/exit orders with it pollutes
-    // the audit trail with synthetic activity for a strategy that's supposed
-    // to be silent. `system` is the dedicated neutral tag for engine-
-    // originated orders (flatten, exit, close-all). Anything still hitting
-    // this fallback is a genuine unknown worth auditing.
-    logger.warn('Unknown strategy tagged on order — falling back to system', {
-      received: strategy,
-      orderId: order.id,
-    });
-    return 'system';
+    return resolved.value;
   };
 
   const sizeValue = Number(order.size ?? order.quantity ?? 0);
@@ -5263,7 +5559,17 @@ async function syncOrderToSupabase(order: any, stampAtEvent?: SessionStamp | nul
       stamp,
       support: sessionColumnSupport,
       write: async (payload) => {
-        const { error } = await supabase.from('orders').upsert(payload);
+        // Innermost: strategy_name enum fallback (22P02 → system, once per process).
+        const { error } = await writeWithStrategyEnumFallback({
+          table: 'orders',
+          row: payload,
+          support: strategyEnumSupport,
+          logger,
+          write: async (shape) => {
+            const { error } = await supabase.from('orders').upsert(shape);
+            return { error };
+          },
+        });
         return { error };
       },
       logger,
@@ -5354,7 +5660,7 @@ function mapExitReason(reason?: string): string | null {
   return 'manual_exit'; // fallback
 }
 
-async function syncPositionToSupabase(position: any) {
+async function syncPositionToSupabase(position: any): Promise<PositionWriteOutcome | null> {
   try {
     const symbol = position.symbol || position.product;
     const side = position.side as 'long' | 'short' | 'flat' | undefined;
@@ -5379,7 +5685,7 @@ async function syncPositionToSupabase(position: any) {
         entryPrice,
         closedAt: position.closedAt ?? null,
       });
-      return;
+      return null;
     }
 
     const openedAt = position.openTime instanceof Date
@@ -5395,11 +5701,26 @@ async function syncPositionToSupabase(position: any) {
     const defaultStop = side === 'long' ? entryPrice * 0.98 : entryPrice * 1.02;
     const defaultTakeProfit = side === 'long' ? entryPrice * 1.03 : entryPrice * 0.97;
 
+    // Same strategy_name enum mapping as orders (finding 7): a context-less
+    // position is `system`, never `breakout` (killed); an id the enum does not
+    // know (e.g. donchian_daily_s3 today) is `system` too, so the write — and
+    // above all the CLOSE write — can never fail on 22P02. Warned once per
+    // position id (the debounced ticker update rewrites this row every second).
+    const strategyResolved = resolvePositionStrategy(position);
+    if (strategyResolved.unknown && !positionStrategyWarned.has(String(position.id))) {
+      positionStrategyWarned.add(String(position.id));
+      logger.warn('Unknown strategy tagged on position — persisting as system', {
+        received: strategyResolved.received,
+        positionId: position.id,
+        symbol,
+      });
+    }
+
     const mappedPosition = {
       id: position.id, // must be UUID-compatible
       user_id: USER_ID,
       symbol,
-      strategy: (position.strategy || 'breakout') as any,
+      strategy: strategyResolved.value as any,
       side,
       qty_open: Math.abs(Number(position.size || 0)),
       entry_price: entryPrice,
@@ -5429,76 +5750,95 @@ async function syncPositionToSupabase(position: any) {
     // session's value survives its close, as before (TASK_014 P5). See
     // persistence/position-session-restamp.ts.
     const stamp = resolvePositionWriteStamp(position, currentSessionStamp());
-    const { error, onConflictTarget, conflictFellBack, stamped } = await upsertPositionRow({
-      row: mappedPosition,
-      stamp,
-      sessionSupport: sessionColumnSupport,
-      conflictSupport: positionsConflictSupport,
-      upsert: async (payload, onConflict) => {
-        const { error } = await supabase.from('positions').upsert(payload, { onConflict });
-        return { error };
+    //
+    // The row snapshot above is taken synchronously; the write itself is
+    // queued behind every earlier write for this position id and, for a
+    // close, retried with bounded backoff. Failures are logged by the
+    // sequencer (non-close: 'Failed to sync position to Supabase:' as before;
+    // close: one warn per retry, then an error naming the remediation).
+    // The outcome is returned so the caller can link orders.position_id only
+    // once the row is confirmed written (FK to positions.id).
+    return await positionWriteSequencer.enqueue({
+      positionId: String(mappedPosition.id),
+      symbol: mappedPosition.symbol,
+      sessionId: stamp?.sessionId ?? null,
+      kind: closedAt ? 'close' : 'update',
+      write: async () => {
+        const { error, onConflictTarget, conflictFellBack, stamped } = await upsertPositionRow({
+          row: mappedPosition,
+          stamp,
+          sessionSupport: sessionColumnSupport,
+          conflictSupport: positionsConflictSupport,
+          upsert: async (payload, onConflict) => {
+            // Innermost: strategy_name enum fallback (22P02 → system, once per
+            // process) so a label the deployed enum lacks can never fail the
+            // CLOSE write (finding 3 class) — the sequencer then sees success.
+            const { error } = await writeWithStrategyEnumFallback({
+              table: 'positions',
+              row: payload,
+              support: strategyEnumSupport,
+              logger,
+              write: async (shape) => {
+                const { error } = await supabase.from('positions').upsert(shape, { onConflict });
+                return { error };
+              },
+            });
+            return { error };
+          },
+          logger,
+        });
+        return {
+          error,
+          detail: {
+            onConflictTarget,
+            conflictFellBack,
+            stamped,
+            closedAt,
+            hint: describePositionUpsertError(error, onConflictTarget),
+          },
+        };
       },
-      logger,
     });
-
-    if (error) {
-      logger.error('Failed to sync position to Supabase:', {
-        error: error.message,
-        code: (error as any).code,
-        onConflictTarget,
-        conflictFellBack,
-        stamped,
-        positionId: mappedPosition.id,
-        symbol: mappedPosition.symbol,
-        closedAt,
-        hint: describePositionUpsertError(error, onConflictTarget),
-      });
-    }
   } catch (error) {
     logger.error('Error syncing position:', error);
+    return null;
   }
 }
 
 async function syncSignalToSupabase(signal: any) {
   try {
-    const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    const maybeId = (typeof signal.id === 'string' && uuidV4.test(signal.id)) ? signal.id : undefined;
+    // Row shape lives in persistence/signal-row.ts. `strategy` goes through the
+    // same strategy_name enum mapping as orders / positions (finding 7 open
+    // item closed 2026-09-29): an id the enum does not know is persisted as
+    // `system` and warned, instead of failing the INSERT with 22P02 and losing
+    // the funnel's root row.
+    const { row, strategy: strategyResolved } = buildSignalRow({ userId: USER_ID, signal });
+    if (strategyResolved.empty || strategyResolved.unknown) {
+      logger.warn('Unknown strategy tagged on signal — persisting as system', {
+        received: strategyResolved.received,
+        signalId: signal.id,
+        symbol: signal.symbol,
+      });
+    }
 
-    const decidedAt = signal.timestamp instanceof Date
-      ? signal.timestamp.toISOString()
-      : new Date(signal.timestamp ?? Date.now()).toISOString();
-
-    const direction = (signal.direction || signal.side) as string | undefined;
-    const side = direction === 'buy'
-      ? 'long'
-      : direction === 'sell'
-        ? 'short'
-        : (signal.side === 'long' || signal.side === 'short' ? signal.side : null);
-
-    const row = {
-      ...(maybeId ? { id: maybeId } : {}),
-      user_id: USER_ID,
-      symbol: signal.symbol,
-      strategy: signal.strategy, // strategy_name enum
-      decided_at: decidedAt,
-      side, // position_side enum
-      score: signal.strength || signal.score || 0,
-      confidence: signal.confidence || signal.strength || 0,
-      meta_prob: signal.metaLabel || signal.metaProb || null,
-      features: signal.metadata || signal.features || {},
-      allowed: signal.allowed !== false, // Default to true if signal was generated
-      reason: signal.reason || (signal.metadata && signal.metadata.reason) || null,
-      created_at: new Date().toISOString()
-    };
-
-    // TASK_014 P5: session stamp with schema-tolerant fallback (session-stamp.ts).
+    // TASK_014 P5: session stamp with schema-tolerant fallback (session-stamp.ts),
+    // composed over the strategy_name enum fallback (strategy-enum-fallback.ts).
     const { error } = await writeWithSessionStamp({
       table: 'signals',
-      row,
+      row: row as unknown as Record<string, unknown>,
       stamp: currentSessionStamp(),
       support: sessionColumnSupport,
       write: async (payload) => {
-        const { error } = await supabase.from('signals').insert(payload);
+        const { error } = await writeWithStrategyEnumFallback({
+          table: 'signals',
+          row: payload,
+          support: strategyEnumSupport,
+          logger,
+          write: async (shape) => {
+            const { error } = await supabase.from('signals').insert(shape);
+            return { error };
+          },
+        });
         return { error };
       },
       logger,
@@ -5731,7 +6071,10 @@ async function gracefulShutdown(signal: string) {
 
     // Stop supervisor first
     supervisor.stop();
-    
+
+    // The process is going away: never let the paper backstop fire mid-shutdown.
+    disarmPaperHardStop(`${signal}_shutdown`);
+
     // Stop perps risk monitor
     if (perpsRiskMonitor) {
       perpsRiskMonitor.stop();

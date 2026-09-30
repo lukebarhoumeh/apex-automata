@@ -280,6 +280,45 @@ describe('restampHydratedOpenPositions', () => {
     expect(table.rows.get(BTC_OPEN_ID)).toMatchObject({ session_id: ACTIVE_PAPER.sessionId, execution_mode: 'paper' });
   });
 
+  it('a hydrated row stamped execution_mode=live is never moved onto a paper session (and is reported)', async () => {
+    const LIVE_SESSION = 'sess_1790050000000_live77';
+    const table = liveSchemaPositionsTable([
+      positionRow({ id: ETH_OPEN_ID, symbol: 'ETH-USD', qty_open: 0.05, entry_price: 4321.5, opened_at: '2026-09-21T17:41:02.000Z', session_id: LIVE_SESSION, execution_mode: 'live' }),
+    ]);
+    const logger = makeLogger();
+
+    const result = await restampHydratedOpenPositions({ positions: [hydratedRefs[0]], stamp: ACTIVE_PAPER, support: new SessionColumnSupport(), read: table.read, update: table.update, logger });
+
+    // No UPDATE targets the live row; it keeps its live session stamp.
+    expect(table.updateCalls).toEqual([]);
+    expect(table.rows.get(ETH_OPEN_ID)).toMatchObject({ session_id: LIVE_SESSION, execution_mode: 'live' });
+
+    // Reported as foreign to the active mode, not as restamped / already current.
+    expect(result).toMatchObject({ outcome: 'noop', hydrated: 1, restamped: 0, alreadyCurrent: 0, foreign: 1, rows: [], error: null });
+    expect(result.foreignRows).toEqual([{ id: ETH_OPEN_ID, symbol: 'ETH-USD', fromSessionId: LIVE_SESSION, fromExecutionMode: 'live' }]);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0][0]).toMatch(/execution_mode/);
+    expect(logger.warn.mock.calls[0][1]).toMatchObject({ sessionId: ACTIVE_PAPER.sessionId, executionMode: 'paper', foreign: 1, ids: [ETH_OPEN_ID], symbols: ['ETH-USD'], foreignModes: ['live'] });
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it('mixed modes: only same-mode / NULL rows go into the UPDATE, the foreign row is counted separately', async () => {
+    const LIVE_SESSION = 'sess_1790050000000_live77';
+    const table = liveSchemaPositionsTable([
+      positionRow({ id: ETH_OPEN_ID, symbol: 'ETH-USD', qty_open: 0.05, entry_price: 4321.5, opened_at: '2026-09-21T17:41:02.000Z', session_id: LIVE_SESSION, execution_mode: 'live' }),
+      positionRow({ id: BTC_OPEN_ID, symbol: 'BTC-USD', qty_open: 0.002, entry_price: 112_450, opened_at: '2026-09-21T17:55:30.000Z', session_id: PRIOR_SESSION, execution_mode: 'paper' }),
+    ]);
+
+    const result = await restampHydratedOpenPositions({ positions: hydratedRefs, stamp: ACTIVE_PAPER, support: new SessionColumnSupport(), read: table.read, update: table.update });
+
+    expect(result).toMatchObject({ outcome: 'restamped', hydrated: 2, restamped: 1, alreadyCurrent: 0, foreign: 1 });
+    expect(result.rows.map((row) => row.id)).toEqual([BTC_OPEN_ID]);
+    expect(result.foreignRows.map((row) => row.id)).toEqual([ETH_OPEN_ID]);
+    expect(table.updateCalls).toEqual([{ ids: [BTC_OPEN_ID], columns: { session_id: ACTIVE_PAPER.sessionId, execution_mode: 'paper' } }]);
+    expect(table.rows.get(ETH_OPEN_ID)).toMatchObject({ session_id: LIVE_SESSION, execution_mode: 'live' });
+    expect(table.rows.get(BTC_OPEN_ID)).toMatchObject({ session_id: ACTIVE_PAPER.sessionId, execution_mode: 'paper' });
+  });
+
   it('a row that closed between the hydrate SELECT and the restamp is left alone', async () => {
     const table = tableBeforeRestart();
     // BTC closes (e.g. a stop fires) right after hydrate, before openTradingSession runs.
@@ -298,7 +337,7 @@ describe('restampHydratedOpenPositions', () => {
 
     const result = await restampHydratedOpenPositions({ positions: [], stamp: ACTIVE_PAPER, support: new SessionColumnSupport(), read, update });
 
-    expect(result).toEqual({ outcome: 'noop', sessionId: ACTIVE_PAPER.sessionId, hydrated: 0, restamped: 0, alreadyCurrent: 0, rows: [], error: null });
+    expect(result).toEqual({ outcome: 'noop', sessionId: ACTIVE_PAPER.sessionId, hydrated: 0, restamped: 0, alreadyCurrent: 0, foreign: 0, rows: [], foreignRows: [], error: null });
     expect(read).not.toHaveBeenCalled();
     expect(update).not.toHaveBeenCalled();
   });

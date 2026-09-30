@@ -163,6 +163,8 @@ const STATUS_PASSTHROUGH_KEYS = [
   'warmupComplete',
   'candlesBuffered',
   'pnl',
+  'paperHardStop',
+  'persistence',
   'lastMarketDataAt',
   'lastEngineHeartbeatAt',
   'timestamp',

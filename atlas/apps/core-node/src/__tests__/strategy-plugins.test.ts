@@ -343,13 +343,17 @@ describe('StrategyPlugin System', () => {
       }
       
       registry.disable('momentum');
-      
+
       const stats = registry.getStats();
-      
-      expect(stats.total).toBe(4);
-      expect(stats.enabled).toBe(3);
-      expect(stats.strategies.length).toBe(4);
-      expect(stats.byCategory['trend']).toBe(2);
+
+      // 5 builtins since donchian_daily_s3 (PAPER-S3-DONCHIAN-v0) registered
+      // 2026-09-28; it is a 'trend' plugin and is NOT on this registry's kill
+      // list (the guardrails list is applied by the caller, see
+      // donchian-daily-s3-strategy.test.ts).
+      expect(stats.total).toBe(5);
+      expect(stats.enabled).toBe(4);
+      expect(stats.strategies.length).toBe(5);
+      expect(stats.byCategory['trend']).toBe(3);
       expect(stats.byCategory['mean-reversion']).toBe(1);
       expect(stats.byCategory['momentum']).toBe(1);
     });
@@ -358,12 +362,13 @@ describe('StrategyPlugin System', () => {
   describe('createBuiltinStrategies', () => {
     it('should create all built-in strategies', () => {
       const strategies = createBuiltinStrategies();
-      
-      expect(strategies.length).toBe(4);
+
+      expect(strategies.length).toBe(5);
       expect(strategies.find(s => s.id === 'breakout')).toBeDefined();
       expect(strategies.find(s => s.id === 'vwap_mr')).toBeDefined();
       expect(strategies.find(s => s.id === 'momentum')).toBeDefined();
       expect(strategies.find(s => s.id === 'trend_follow')).toBeDefined();
+      expect(strategies.find(s => s.id === 'donchian_daily_s3')).toBeDefined();
     });
 
     it('should apply custom configs', () => {

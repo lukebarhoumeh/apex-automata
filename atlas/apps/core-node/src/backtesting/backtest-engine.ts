@@ -194,6 +194,17 @@ export interface BacktestConfig {
    * report prints the state either way.
    */
   regimeGates?: boolean;
+  /**
+   * Rule-based MetaFilter toggle (`--meta-filter on|off`, 2026-09-29).
+   * Default (absent / true): the SignalProcessor's MetaFilter runs exactly
+   * as live (cold-streak cooldown, time-of-day, quality-score threshold).
+   * `false` disables it for THIS RUN ONLY via `setMetaFilterEnabled(false)`
+   * so a strategy's rule P&L can be measured without the position-blind
+   * cold-streak pause; the engine logs a warn banner and the reports print
+   * the state. Trade outcomes are still recorded (EV-gate observed win rate
+   * unchanged). Backtest-only: paper/live never read this key.
+   */
+  metaFilter?: boolean;
   products: string[];
   signals: {
     breakout: BacktestStrategyToggle;
@@ -201,6 +212,14 @@ export interface BacktestConfig {
     momentum: BacktestStrategyToggle;
     /** Optional. When omitted, trend_follow runs with plugin defaults. */
     trendFollow?: BacktestStrategyToggle;
+    /**
+     * Optional. `donchian_daily_s3` (card PAPER-S3-DONCHIAN-v0, HOLD) is
+     * opt-in: when omitted OR `enabled: false` the plugin is disabled at the
+     * registry even if it is not on the kill list, so older callers never
+     * run it by accident. It only trades when this toggle is on AND the id
+     * is absent from `disabledStrategies` (`--include-disabled`).
+     */
+    donchianDailyS3?: BacktestStrategyToggle;
   };
   risk: {
     /**
@@ -237,6 +256,12 @@ export interface BacktestConfig {
   };
   /** Strategies disabled by Phase-3 verdict. Skipped before signal entry. */
   disabledStrategies?: string[];
+  /**
+   * Informational (`--include-disabled`): killed strategy ids that were
+   * lifted from `disabledStrategies` for THIS RUN ONLY. The engine logs a
+   * warning banner and the reports print the list; paper/live never read it.
+   */
+  forceEnabledStrategies?: string[];
   /**
    * Per-(symbol, strategy) disable map. Strictly additive vs the global
    * `disabledStrategies` list — a signal is rejected if either matches.
@@ -899,6 +924,21 @@ export class BacktestEngine extends EventEmitter {
 
     this.signalProcessor = new SignalProcessor(signalConfig, this.logger);
 
+    // Book hint for plugins (MarketContext.openPosition, 2026-09-29): the
+    // engine's own positions map, read at signal time. `processTimeSteps`
+    // fills the pending entry (step 1) and runs the stop/TP checks (step 3)
+    // BEFORE the bar reaches the SignalProcessor (step 4), so on the fill bar
+    // the hint already says `long` and on a stop-out bar it already says
+    // `flat`. Lets donchian_daily_s3 re-arm after a stop or a rejected entry
+    // instead of staying IN until its own 10-day-low exit (orphan sell).
+    this.signalProcessor.setOpenPositionProvider((symbol: string) => {
+      const open = this.positions.get(symbol);
+      if (!open || open.size <= 0) {
+        return { side: 'flat', size: 0 };
+      }
+      return { side: open.side, size: open.size, entryPrice: open.entryPrice };
+    });
+
     // Strategy selector toggles (E4 harness, 2026-09-10). `BaseStrategy.enabled`
     // defaults to true and the constructor config's `enabled: false` never
     // flips it, so before this only trend_follow (below) honoured its
@@ -936,6 +976,34 @@ export class BacktestEngine extends EventEmitter {
       }
     }
 
+    // PAPER-S3-DONCHIAN-v0 (2026-09-28): opt-in toggle. Omitted or false →
+    // disabled at the registry (never runs by accident); true → enabled, but
+    // only effective when the id is not on the kill list (`disable()` /
+    // `enable()` are no-ops on an unregistered plugin).
+    const donchianToggle = this.config.signals.donchianDailyS3;
+    if (!this.disabledStrategies.has('donchian_daily_s3')) {
+      if (donchianToggle?.enabled) {
+        if (donchianToggle.parameters && Object.keys(donchianToggle.parameters).length > 0) {
+          this.signalProcessor.updateStrategyConfig('donchian_daily_s3', { ...donchianToggle.parameters });
+        }
+        this.signalProcessor.enableStrategy('donchian_daily_s3');
+      } else {
+        this.signalProcessor.disableStrategy('donchian_daily_s3');
+      }
+    }
+
+    if (this.config.forceEnabledStrategies && this.config.forceEnabledStrategies.length > 0) {
+      this.logger.warn(
+        `DISABLED strategy force-enabled for this backtest run only — paper/live untouched: ` +
+          this.config.forceEnabledStrategies.join(', '),
+        {
+          forceEnabledStrategies: this.config.forceEnabledStrategies,
+          remainingDisabled: Array.from(this.disabledStrategies),
+          source: '--include-disabled',
+        },
+      );
+    }
+
     if (this.config.perSymbolOverrides) {
       // Same code path live trading uses for ETH-USD / BTC-USD overrides.
       this.signalProcessor.loadPerSymbolOverrides(this.config.perSymbolOverrides);
@@ -943,6 +1011,18 @@ export class BacktestEngine extends EventEmitter {
 
     if (this.config.regimeGates === false) {
       this.signalProcessor.setRegimeFilterEnabled(false);
+    }
+
+    // `--meta-filter off` (2026-09-29): run-scoped. Same mechanism the live
+    // admin endpoint uses (`setMetaFilterEnabled`), applied only to THIS
+    // engine's SignalProcessor — guardrails.yaml, paper and live untouched.
+    if (this.config.metaFilter === false) {
+      this.signalProcessor.setMetaFilterEnabled(false);
+      this.logger.warn(
+        'Rule-based MetaFilter DISABLED for this backtest run only — paper/live untouched ' +
+          '(cold-streak cooldown, time-of-day and quality-score gates are off; outcomes still recorded)',
+        { source: '--meta-filter off', metaFilter: false },
+      );
     }
 
     // Snapshot the active strategy set AFTER the disabled filter so the

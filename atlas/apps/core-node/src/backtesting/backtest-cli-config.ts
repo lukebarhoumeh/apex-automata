@@ -10,7 +10,7 @@
  */
 
 import type { GuardrailConfig } from '../config/loadGuardrails';
-import { buildPerSymbolDisabledStrategies } from '../strategies/per-symbol-disable';
+import { buildPerSymbolDisabledStrategies, type PerSymbolDisabledStrategies } from '../strategies/per-symbol-disable';
 import { buildRegimeGateConfig } from '../strategies/regime-gate';
 import { FeeModel } from '../core/fee-model';
 import type { MarketVenue } from '../trading/execution/venue-capabilities';
@@ -30,8 +30,69 @@ export const FEE_TIERS: Record<string, { makerBps: number; takerBps: number }> =
   t10k: { makerBps: 25, takerBps: 40 },
 };
 
-/** Strategy selector accepted by `--strategy`. */
-export type StrategySelector = 'breakout' | 'vwap' | 'momentum' | 'trend_follow' | 'all';
+/**
+ * Strategy selector accepted by `--strategy`.
+ *
+ * `donchian_daily_s3` (card PAPER-S3-DONCHIAN-v0) sits on the guardrails kill
+ * list, so selecting it alone runs NOTHING unless the run also passes
+ * `--include-disabled donchian_daily_s3` (see `BacktestConfigInput.includeDisabled`).
+ */
+export type StrategySelector = 'breakout' | 'vwap' | 'momentum' | 'trend_follow' | 'donchian_daily_s3' | 'all';
+
+/**
+ * `--include-disabled <id...>`: remove the listed strategy ids from THIS RUN'S
+ * copy of the guardrails kill lists — the global `disabled_strategies` and every
+ * per-symbol `disabled_strategies` map entry (per_symbol / perps_symbols /
+ * hyperliquid_symbols / cfm_symbols). Only the listed ids are lifted; anything
+ * else stays killed. Pure: guardrails.yaml, paper and live are untouched — the
+ * returned lists are the run's copy. Ids that were not disabled anyway are
+ * reported back so the caller can warn about a no-op flag.
+ */
+export function stripDisabledForRun(
+  guardrails: Pick<GuardrailConfig, 'disabled_strategies' | 'per_symbol' | 'perps_symbols' | 'hyperliquid_symbols' | 'cfm_symbols'>,
+  includeDisabled: readonly string[] | undefined,
+): {
+  disabledStrategies: string[];
+  perSymbolDisabledStrategies: PerSymbolDisabledStrategies;
+  /** Ids actually lifted from at least one list (global or per-symbol). */
+  forceEnabled: string[];
+  /** Ids requested that were on no kill list (flag was a no-op for them). */
+  notDisabled: string[];
+} {
+  const lift = new Set((includeDisabled ?? []).map((id) => String(id).trim()).filter((id) => id.length > 0));
+  const globalDisabled = [...(guardrails.disabled_strategies ?? [])];
+  const perSymbol = buildPerSymbolDisabledStrategies(guardrails);
+  if (lift.size === 0) {
+    return { disabledStrategies: globalDisabled, perSymbolDisabledStrategies: perSymbol, forceEnabled: [], notDisabled: [] };
+  }
+
+  const lifted = new Set<string>();
+  const disabledStrategies = globalDisabled.filter((id) => {
+    if (lift.has(id)) {
+      lifted.add(id);
+      return false;
+    }
+    return true;
+  });
+
+  const perSymbolDisabledStrategies: PerSymbolDisabledStrategies = {};
+  for (const [symbol, ids] of Object.entries(perSymbol)) {
+    const kept = ids.filter((id) => {
+      if (lift.has(id)) {
+        lifted.add(id);
+        return false;
+      }
+      return true;
+    });
+    if (kept.length > 0) {
+      perSymbolDisabledStrategies[symbol] = kept;
+    }
+  }
+
+  const forceEnabled = Array.from(lift).filter((id) => lifted.has(id)).sort();
+  const notDisabled = Array.from(lift).filter((id) => !lifted.has(id)).sort();
+  return { disabledStrategies, perSymbolDisabledStrategies, forceEnabled, notDisabled };
+}
 
 /**
  * Resolve a `--fee-tier` flag to a labelled maker/taker pair. Without a flag
@@ -145,6 +206,23 @@ export interface BacktestConfigInput {
    * turning it on by default is an E5 decision, not infra.
    */
   applyExitParity?: boolean;
+  /**
+   * `--include-disabled <id...>` (PAPER-S3-DONCHIAN-v0 harness hook, 2026-09-28):
+   * strategy ids lifted from THIS RUN'S copy of the guardrails kill lists
+   * (global + per-symbol) so a shelved strategy can be backtested. Never
+   * touches guardrails.yaml, paper or live. Without it, `--strategy <killed id>`
+   * runs nothing (today's semantics). See `stripDisabledForRun`.
+   */
+  includeDisabled?: string[];
+  /**
+   * `--meta-filter on|off` (2026-09-29): rule-based MetaFilter toggle for
+   * THIS RUN ONLY. Default / true → today's behaviour (no key is written, so
+   * the config is byte-identical); false → `BacktestConfig.metaFilter: false`
+   * and the engine disables the SignalProcessor's MetaFilter for the run.
+   * Same isolation as `includeDisabled`: guardrails.yaml, paper and live are
+   * untouched.
+   */
+  metaFilter?: boolean;
 }
 
 /**
@@ -161,6 +239,9 @@ export function buildBacktestConfig(input: BacktestConfigInput, guardrails: Guar
   if (input.forceRegimeConditionalGates) {
     regimeConditionalGates.enabled = true;
   }
+  // Kill lists: the guardrails lists verbatim, minus any `--include-disabled`
+  // ids for this run only (paper/live read guardrails directly, untouched).
+  const killLists = stripDisabledForRun(guardrails, input.includeDisabled);
   return {
     startDate: input.startDate,
     endDate: input.endDate,
@@ -176,6 +257,9 @@ export function buildBacktestConfig(input: BacktestConfigInput, guardrails: Guar
       minEvThreshold: guardrails.risk.min_ev_threshold,
     },
     regimeGates: input.regimeGates,
+    // `--meta-filter off` → run-scoped MetaFilter disable. Key only present
+    // when off so the default config stays byte-identical.
+    ...(input.metaFilter === false ? { metaFilter: false } : {}),
     products: input.products,
     // Strategy parameters mirror atlas/config/guardrails.yaml. trend_follow
     // is wired here too — defect #1: prior backtests silently dropped it.
@@ -214,6 +298,13 @@ export function buildBacktestConfig(input: BacktestConfigInput, guardrails: Guar
         enabled: strategy === 'trend_follow' || strategy === 'all',
         parameters: {},
       },
+      // PAPER-S3-DONCHIAN-v0: selectable, but on the guardrails kill list — the
+      // engine only registers it when `--include-disabled donchian_daily_s3`
+      // lifted it above. Plugin defaults (in20/out10) — no parameters here.
+      donchianDailyS3: {
+        enabled: strategy === 'donchian_daily_s3' || strategy === 'all',
+        parameters: {},
+      },
     },
     risk: {
       // Hard ceiling on per-position notional. Risk-based sizing is now
@@ -230,10 +321,13 @@ export function buildBacktestConfig(input: BacktestConfigInput, guardrails: Guar
       maxPositionExposurePct: guardrails.risk.max_position_exposure_pct,
       minNotionalBuffer: guardrails.account.min_notional_buffer,
     },
-    // Defect #2: honour the same kill list live uses.
-    disabledStrategies: guardrails.disabled_strategies,
+    // Defect #2: honour the same kill list live uses (minus `--include-disabled`
+    // ids for this run only).
+    disabledStrategies: killLists.disabledStrategies,
     // F4 follow-up §8 (2026-05-19): same shape as the live API server reads.
-    perSymbolDisabledStrategies: buildPerSymbolDisabledStrategies(guardrails),
+    perSymbolDisabledStrategies: killLists.perSymbolDisabledStrategies,
+    // Report / banner provenance: which killed ids this run force-enabled.
+    ...(killLists.forceEnabled.length > 0 ? { forceEnabledStrategies: killLists.forceEnabled } : {}),
     // A6 (2026-05-29): regime-conditional entry gates — resolved disabled for
     // backtests while `regime_gates.paper_only` is true; see
     // `forceRegimeConditionalGates`.

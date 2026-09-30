@@ -72,6 +72,38 @@ describe("U7 — status cache merge keeps sessionId across partial WS envelopes"
     expect(p.lastMarketDataAt).toBe(7);
   });
 
+  it("passes the round-3 `persistence` health block through untouched, and omits the key when the envelope lacks it", () => {
+    const persistence = {
+      sessionId: "sess_9",
+      executionMode: "paper",
+      hydrateRestamp: { outcome: "noop", hydrated: 0, restamped: 0, alreadyCurrent: 0, foreign: 0, symbols: [], fromSessionIds: [], error: null },
+      reconcile: { at: 5, modeScoped: true, dbOpenCount: 0, engineOpenCount: 0, inDbNotEngine: [], inEngineNotDb: [], foreignModeOpen: 0, foreignModeSymbols: [], note: "state aligned" },
+      closeWriteFailures: { count: 0, last: null },
+      orderLinks: { linked: 2, pending: 0, failed: 0, disabled: false },
+    };
+    const withBlock = normalizeRuntimeEvent({
+      type: "StatusUpdate",
+      timestamp: 1,
+      payload: { engineRunning: true, mode: "paper", sessionId: "sess_9", persistence },
+    })!.payload as StatusPayload;
+    // Verbatim: no key renaming inside the block (the backend is already camelCase).
+    expect(withBlock.persistence).toEqual(persistence);
+
+    const stopped = normalizeRuntimeEvent({
+      type: "StatusUpdate",
+      timestamp: 1,
+      payload: { engineRunning: false, mode: null, sessionId: null, persistence: null },
+    })!.payload as StatusPayload;
+    expect(stopped.persistence).toBeNull();
+
+    const legacy = normalizeRuntimeEvent({
+      type: "StatusUpdate",
+      timestamp: 1,
+      payload: { engineRunning: true, mode: "paper" },
+    })!.payload as object;
+    expect("persistence" in legacy).toBe(false);
+  });
+
   it("merges the WS status over the REST snapshot instead of replacing it", () => {
     const qc = new QueryClient();
     qc.setQueryData(["runtime-status"], restStatus());

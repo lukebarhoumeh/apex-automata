@@ -42,7 +42,7 @@ The backend uses `tsx` to run TypeScript directly (no compilation step needed fo
 
 4. **Supabase service key**: Without a real `SUPABASE_SERVICE_KEY`, the backend starts but Supabase operations (DB reads/writes) will fail with fetch errors. The API endpoints and trading engine still function for paper mode. Note: the Cloud Agent VM cannot resolve external DNS (e.g. `gdrdaajvutmewgxbjurk.supabase.co`), so even with a valid key, Supabase calls will fail with "fetch failed" errors in this environment. This does not affect local engine/API functionality.
 
-5. **Backend tests**: Run with `cd atlas/apps/core-node && pnpm test`. **38 test files / 529 tests**, all pass under Vitest in ~7s (verified 2026-05-14 on Windows). Vitest migration complete as of 2026-05-11; all tests pass under Vitest's `vi.*` API.
+5. **Backend tests**: Run with `cd atlas/apps/core-node && ENCRYPTION_KEY=<64 hex> pnpm test`. **98 test files / 1625 tests**, all pass under Vitest in ~40s (verified 2026-09-29; the count grows with every PR — `CLAUDE.md` carries the current baseline). Vitest migration complete as of 2026-05-11; all tests pass under Vitest's `vi.*` API. The config-drift scan skips Claude Code worktrees under `.claude/`.
 
 6. **Frontend lint**: `pnpm lint` at root runs ESLint across the entire repo (including backend). Pre-existing `@typescript-eslint/no-explicit-any` errors exist in both frontend and backend code.
 

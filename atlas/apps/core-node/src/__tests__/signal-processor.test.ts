@@ -1,6 +1,8 @@
 import { describe, test, expect, beforeEach, vi } from 'vitest';
 import { SignalProcessor, SignalProcessorConfig } from '../strategies/signal-processor';
 import { OHLCV } from '../indicators/technical';
+import type { MarketContext, StrategyPlugin } from '../strategies/plugins/types';
+import type { Logger } from '../core/logger';
 
 // Mock logger
 const mockLogger = {
@@ -9,6 +11,8 @@ const mockLogger = {
   error: vi.fn(),
   debug: vi.fn(),
 };
+// The processor only calls the four methods above; widen once instead of `as any` per call site.
+const testLogger = mockLogger as unknown as Logger;
 
 // Mock Supabase client
 vi.mock('@supabase/supabase-js', () => ({
@@ -55,7 +59,7 @@ describe('SignalProcessor', () => {
   };
 
   beforeEach(() => {
-    signalProcessor = new SignalProcessor(config, mockLogger as any);
+    signalProcessor = new SignalProcessor(config, testLogger);
   });
 
   describe('Candle Management', () => {
@@ -149,6 +153,77 @@ describe('SignalProcessor', () => {
 
       // Check for breakout signal
       expect(signalProcessor.getCandleCount('BTC-USD')).toBe(26);
+    });
+  });
+
+  describe('openPosition book hint (setOpenPositionProvider)', () => {
+    /** Probe plugin: records the `openPosition` hint it is handed on every bar. */
+    function probePlugin(seen: Array<MarketContext['openPosition']>): StrategyPlugin {
+      return {
+        id: 'probe_open_position',
+        name: 'probe',
+        description: 'records context.openPosition',
+        version: '0.0.1',
+        author: 'test',
+        category: 'trend',
+        tags: [],
+        enabled: true,
+        configSchema: { parameters: [] },
+        config: {},
+        requiredIndicators: [],
+        regimeCompatibility: [],
+        generateSignals(context: MarketContext) {
+          seen.push(context.openPosition);
+          return [];
+        },
+      };
+    }
+
+    function feed(sp: SignalProcessor, symbol: string, from: number, count: number): void {
+      for (let i = from; i < from + count; i++) {
+        sp.addCandle(symbol, {
+          time: 1_700_000_000_000 + i * 60_000,
+          open: 100,
+          high: 101 + (i % 3),
+          low: 99 - (i % 2),
+          close: 100 + (i % 5) * 0.1,
+          volume: 1000,
+        }, 1_700_000_000_000 + i * 60_000);
+      }
+    }
+
+    test('without a provider plugins see openPosition === undefined (unknown book)', () => {
+      const sp = new SignalProcessor({ ...config, disabledStrategies: [] }, testLogger);
+      const seen: Array<MarketContext['openPosition']> = [];
+      expect(sp.registerStrategy(probePlugin(seen))).toBe(true);
+      feed(sp, 'BTC-USD', 0, 60);
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((h) => h === undefined)).toBe(true);
+    });
+
+    test('with a provider the per-symbol hint is passed through verbatim; clearing the provider restores undefined', () => {
+      const sp = new SignalProcessor({ ...config, disabledStrategies: [] }, testLogger);
+      const seen: Array<MarketContext['openPosition']> = [];
+      sp.registerStrategy(probePlugin(seen));
+      const asked: string[] = [];
+      sp.setOpenPositionProvider((symbol) => {
+        asked.push(symbol);
+        return symbol === 'BTC-USD'
+          ? { side: 'long', size: 0.5, entryPrice: 100 }
+          : { side: 'flat', size: 0 };
+      });
+      feed(sp, 'BTC-USD', 0, 60);
+      feed(sp, 'ETH-USD', 0, 60);
+      expect(asked).toContain('BTC-USD');
+      expect(asked).toContain('ETH-USD');
+      expect(seen).toContainEqual({ side: 'long', size: 0.5, entryPrice: 100 });
+      expect(seen).toContainEqual({ side: 'flat', size: 0 });
+      expect(seen.some((h) => h === undefined)).toBe(false);
+
+      seen.length = 0;
+      sp.setOpenPositionProvider(null);
+      feed(sp, 'BTC-USD', 60, 1);
+      expect(seen).toEqual([undefined]);
     });
   });
 });

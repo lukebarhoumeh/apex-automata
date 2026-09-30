@@ -26,6 +26,11 @@
  *         UNIQUE (user_id, trade_id) and every new paper session's fill #k
  *         upserted OVER the previous session's fill #k (soak audit 2026-09-22:
  *         hkub8j 18 filled orders / 5 fill rows, 3z950m 3 / 0).
+ *         P3-B (2026-09-28): the same collision INSIDE one session — a
+ *         supervisor restart rebuilt the simulator (counter back to 0) under
+ *         the unchanged session stamp. Fixed producer-side: TradingEngine seeds
+ *         the replacement simulator with the retired one's `getFillSequence()`
+ *         (`PaperTradingConfig.fillSequenceStart`), so the shape here is unchanged.
  *   - P5  stamping: DONE — optional `session` input adds `session_id` / `execution_mode`
  *         (columns from migration 20260911170000; schema-tolerant fallback lives in
  *         persistence/session-stamp.ts)

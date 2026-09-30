@@ -14,6 +14,7 @@ import {
   StrategyPlugin,
   StrategySignal,
   MarketContext,
+  OpenPositionHint,
   createBuiltinStrategies,
   PerSymbolStrategyOverrides,
   BaseStrategy,
@@ -141,6 +142,13 @@ export interface SignalProcessorEvents {
   'warmup:complete': (symbol: string) => void;
 }
 
+/**
+ * Answers "what does the engine hold on `symbol` right now?" for the plugin
+ * MarketContext. Return `undefined` when the book is not visible (unknown);
+ * return `{ side: 'flat', size: 0 }` for a definite empty book.
+ */
+export type OpenPositionProvider = (symbol: string) => OpenPositionHint | undefined;
+
 // Warmup configuration
 const WARMUP_CONFIG = {
   minCandlesRequired: 50,  // Minimum candles needed before generating signals
@@ -171,6 +179,10 @@ export class SignalProcessor extends EventEmitter {
   // Warmup state tracking
   private warmupComplete: Map<string, boolean> = new Map();
   private dataLoader: ((symbol: string, limit: number) => Promise<OHLCV[]>) | null = null;
+
+  // Read-only book visibility for plugins (MarketContext.openPosition). Null →
+  // the hint is omitted and plugins fall back to their own state.
+  private openPositionProvider: OpenPositionProvider | null = null;
 
   // Regime detection and filtering
   private regimeDetector: RegimeDetector;
@@ -495,7 +507,21 @@ export class SignalProcessor extends EventEmitter {
   public setDataLoader(loader: (symbol: string, limit: number) => Promise<OHLCV[]>): void {
     this.dataLoader = loader;
   }
-  
+
+  /**
+   * Give plugins read-only book visibility: the provider is asked for the
+   * engine's open position on the context symbol each time a MarketContext is
+   * built (`checkSignalsViaPlugins`) and its answer is stamped on
+   * `MarketContext.openPosition`. Wired by the BacktestEngine (its positions
+   * map) and the runtime router (`TradingEngine.getOpenPositions`). `null`
+   * removes the provider — plugins then see `undefined` (today's behaviour).
+   * The provider never influences routing; it is a hint for plugins that keep
+   * an IN/OUT rule state (donchian_daily_s3).
+   */
+  public setOpenPositionProvider(provider: OpenPositionProvider | null): void {
+    this.openPositionProvider = provider;
+  }
+
   /**
    * Get the number of candles buffered for a symbol.
    */
@@ -706,6 +732,10 @@ export class SignalProcessor extends EventEmitter {
       }
     }
 
+    // Book hint for plugins with rule state (see setOpenPositionProvider).
+    // Omitted (undefined) when no provider is wired.
+    const openPosition = this.openPositionProvider ? this.openPositionProvider(symbol) : undefined;
+
     // Build market context for strategies
     const context: MarketContext = {
       symbol,
@@ -721,6 +751,7 @@ export class SignalProcessor extends EventEmitter {
       latestCandle,
       previousCandle,
       regime: regimeState,
+      ...(openPosition !== undefined ? { openPosition } : {}),
     };
 
     // Generate signals from all enabled strategies

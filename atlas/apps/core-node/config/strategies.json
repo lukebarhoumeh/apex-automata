@@ -15,6 +15,9 @@
     },
     "breakout": {
       "enabled": false
+    },
+    "donchian_daily_s3": {
+      "enabled": false
     }
   },
 

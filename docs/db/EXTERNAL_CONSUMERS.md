@@ -36,6 +36,29 @@ WHERE c.relname = 'agentic_heartbeats';
 
 **Privilege note (flag under fence — do not “fix” without TM):** 2026-09-10 verify showed `public.agentic_heartbeats` SELECT true for `service_role` only (anon/authenticated false). Equity table allows authenticated SELECT under RLS. Confirm Robinhood’s role before any grant change.
 
+## 2. Desk monitor — Supabase MCP poller (read-only)
+
+| Field | Value |
+|---|---|
+| Consumer | Desk monitor agent (the Grok Bot desk hand-off) reading through the Supabase MCP endpoint — Postgres logs show `POST /mcp`, OAuth user `3d0e1e1e-25ff-424c-81f8-142a80fb3df0`, every 10–15 min during the soak window. Runs as `postgres`, so grants and RLS do not apply to it. |
+| What it asks | "Is a paper session open, what did the last one do, is the kill switch on" — `SELECT id, status, started_at, ended_at, equity, trade_count, pnl, execution_mode FROM trading_sessions …` and `SELECT kill_switch, …, exposure FROM risk_metrics …`. Until 2026-09-29 every one of those failed with `42703` (142 Postgres errors on 2026-09-28). |
+| Contract surface | `public.desk_session_status`, `public.desk_risk_status` (read-only, `security_invoker`, SELECT for `authenticated` + `service_role`) — `20260929010733_desk_status_views_v2`. Compatibility GENERATED columns on `public.trading_sessions` (`id`, `status`, `starting_equity`, `ending_equity`, `equity`, `trade_count`, `trades_count`, `pnl`) and `public.risk_metrics` (`kill_switch`, `halt`, `exposure`) — `20260929005512_desk_compat_alias_columns`. |
+| Owner | Apex crypto (Luke). The poller's prompt is outside this repo; point it at the two views (`docs/db/DESK_QUERIES_2026-09-29.md`) and the alias columns can be dropped with the rollback block in that migration. |
+
+### Do NOT
+- Rename or drop the two views, or the alias columns, while the poller still targets the tables by name
+- Write to any of the alias columns from the runtime (they are `GENERATED ALWAYS`; a payload key with one of those names fails with `428C9`)
+- Treat `account_metrics.total_equity` as equity anywhere new: `upsert_account_metrics()` writes open-position market value there (0.00 when flat)
+
+### Live check
+```sql
+SELECT id, status, equity, trade_count, pnl, execution_mode
+FROM public.desk_session_status ORDER BY COALESCE(ended_at, started_at) DESC NULLS LAST LIMIT 1;
+SELECT status, kill_switch, active_halts, consecutive_losses, exposure FROM public.desk_risk_status;
+-- and the poller's own shape must not 42703:
+SELECT id, status, equity, trade_count, pnl FROM public.trading_sessions LIMIT 1;
+```
+
 ## Adding a new entry
 1. Name consumer + owning desk
 2. List exact `schema.object` + access path

@@ -17,6 +17,11 @@
  *   4. A desk-pinned value in the canonical file has drifted. Pins are the
  *      2026-09-10 desk approvals; changing one is a two-file change (YAML +
  *      this list) on purpose.
+ *   5. The paper regime entry gate has been loosened past its floor
+ *      (`REGIME_GATE_RULE_PINS`, TF-REGIME-GATE 2026-09-28): the trend_follow
+ *      rule must exist, must not be scoped down with `venues` / `symbols`, and
+ *      must still block `choppy`; `regime_gates.enabled` and `paper_only`
+ *      stay pinned `true` (SCALAR_PINS).
  *
  * Pure: no logging, no process.exit — the CLI wrapper in
  * `src/cli/check-config-drift.ts` and the vitest suite both consume the
@@ -39,6 +44,8 @@ export type DriftViolationCode =
   | 'pin_mismatch'
   | 'pin_floor_breached'
   | 'pin_list_missing_entry'
+  | 'regime_gate_rule_missing'
+  | 'regime_gate_rule_scoped'
   | 'cfm_symbol_strategy_enabled'
   | 'cfm_symbol_proxy_missing';
 
@@ -63,8 +70,13 @@ export const STRATEGIES_JSON_REPO_PATH = 'atlas/apps/core-node/config/strategies
 /** Only keys a non-canonical guardrails stub may contain. */
 const STUB_ALLOWED_KEYS = new Set(['DO_NOT_EDIT', 'canonical']);
 
-/** Directories never descended into when scanning for stray guardrails files. */
-const SCAN_SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'var', '.pnpm', 'coverage']);
+/**
+ * Directories never descended into when scanning for stray guardrails files.
+ * `.claude` holds Claude Code agent worktrees (`.claude/worktrees/<id>/` is a
+ * full checkout, guardrails.yaml included); scanning into it would report the
+ * canonical file of every parallel worktree as a "second editable copy".
+ */
+const SCAN_SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'var', '.pnpm', 'coverage', '.claude']);
 
 interface ScalarPin {
   key: string;
@@ -104,6 +116,10 @@ export const SCALAR_PINS: readonly ScalarPin[] = [
   // routing must stay untouched (CONFIRM_LIVE locked) — reaching live needs a
   // two-file change, never a one-line YAML flip.
   { key: 'regime_gates.paper_only', expected: true },
+  // TF-REGIME-GATE (2026-09-28 loosening): `enabled` is pinned as well. With the
+  // rule loosened to [choppy], `enabled: false` would be the one-line edit that
+  // removes the paper gate entirely while REGIME_GATE_RULE_PINS still passes.
+  { key: 'regime_gates.enabled', expected: true },
   // Graduated paper kill ladder (Risk desk SoT 2026-09-22). The `enabled`
   // flags are deliberately NOT pinned (feature flags); the rung thresholds are.
   { key: 'paper_kill_ladder.l1_size_down.consecutive_losses', expected: 3 },
@@ -122,15 +138,44 @@ export const SCALAR_PINS: readonly ScalarPin[] = [
 /**
  * Lists that must contain every listed entry (extra entries are allowed).
  * `momentum` joined the global shelf on 2026-09-11 (E2-MOM-ISO KILL).
+ * `donchian_daily_s3` (card PAPER-S3-DONCHIAN-v0, research verdict HOLD) was
+ * pinned OFF on registration (2026-09-28): the plugin is infra for a later
+ * paper A/B, not a GO. Lifting it is a desk decision and a two-file change.
  */
 export const LIST_PINS: ReadonlyArray<{ key: string; mustInclude: readonly string[] }> = [
-  { key: 'disabled_strategies', mustInclude: ['vwap_mr', 'breakout', 'momentum'] },
+  { key: 'disabled_strategies', mustInclude: ['vwap_mr', 'breakout', 'momentum', 'donchian_daily_s3'] },
   { key: 'perps_symbols.ETH-PERP-INTX.disabled_strategies', mustInclude: ['momentum'] },
   { key: 'perps_symbols.BTC-PERP-INTX.disabled_strategies', mustInclude: ['momentum'] },
 ];
 
 /** trade_cooldown_min may be raised, never dropped to the fee-churn zone. */
 export const TRADE_COOLDOWN_FLOOR_EXCLUSIVE = 5;
+
+/** One regime-gate FLOOR pin: the rule for `strategy` must exist and block every regime in `mustBlock`. */
+export interface RegimeGateRulePin {
+  strategy: string;
+  mustBlock: readonly string[];
+}
+
+/**
+ * TF-REGIME-GATE floor pins (2026-09-28, Luke decision 2026-09-23).
+ *
+ * The paper regime entry gate for trend_follow was LOOSENED from
+ * `[weak_trend, choppy]` to `[choppy]` so the paper soak takes trades in
+ * weak_trend (observability, not edge — the kill ladder is the loss brake).
+ * This pin is the FLOOR under that loosening: the trend_follow rule must still
+ * exist under `regime_gates.rules`, must apply to every venue and symbol (no
+ * `venues` / `symbols` scope — scoping it to `[PERP]` would ungate every spot
+ * entry), and must still block `choppy`, so a further one-line YAML edit
+ * cannot silently turn "loosened" into "removed". Extra blocked regimes are
+ * allowed (tightening never trips it); dropping the rule, scoping it, dropping
+ * `choppy`, or deleting the `regime_gates` block does. `regime_gates.enabled`
+ * and `regime_gates.paper_only` stay pinned in SCALAR_PINS (the other two
+ * one-line removals; live inert).
+ */
+export const REGIME_GATE_RULE_PINS: readonly RegimeGateRulePin[] = [
+  { strategy: 'trend_follow', mustBlock: ['choppy'] },
+];
 
 /** trend_follow stop / take-profit pin applied to every symbol block. */
 export const TREND_FOLLOW_PIN = { stopAtr: 2.5, takeProfitAtr: 6.0 } as const;
@@ -340,6 +385,49 @@ function checkPins(guardrails: GuardrailConfig, out: DriftViolation[]): void {
           file,
           key: pin.key,
           message: `${pin.key} must include "${entry}" (currently ${JSON.stringify(actual ?? null)})`,
+        });
+      }
+    }
+  }
+
+  // Regime-gate FLOOR (TF-REGIME-GATE 2026-09-28): rule present + still blocks
+  // its floor regimes. Reported once per missing rule / per missing regime.
+  const gateRules = guardrails.regime_gates?.rules ?? [];
+  for (const pin of REGIME_GATE_RULE_PINS) {
+    const rule = gateRules.find((r) => r.strategy === pin.strategy);
+    if (!rule) {
+      out.push({
+        code: 'regime_gate_rule_missing',
+        file,
+        key: 'regime_gates.rules',
+        message:
+          `regime_gates.rules has no "${pin.strategy}" rule (currently ${JSON.stringify(gateRules.map((r) => r.strategy))}). ` +
+          `The paper regime gate may be loosened but never removed: keep a ${pin.strategy} rule that blocks ` +
+          `${pin.mustBlock.map((r) => `"${r}"`).join(', ')} (floor pin REGIME_GATE_RULE_PINS).`,
+      });
+      continue;
+    }
+    if ((rule.venues && rule.venues.length > 0) || (rule.symbols && rule.symbols.length > 0)) {
+      out.push({
+        code: 'regime_gate_rule_scoped',
+        file,
+        key: `regime_gates.rules.${pin.strategy}`,
+        message:
+          `regime_gates.rules[${pin.strategy}] is scoped (venues=${JSON.stringify(rule.venues ?? null)}, ` +
+          `symbols=${JSON.stringify(rule.symbols ?? null)}). The floor rule must apply to every venue and symbol: ` +
+          'scoping it down is another way of removing the paper regime gate (floor pin REGIME_GATE_RULE_PINS).',
+      });
+    }
+    for (const regime of pin.mustBlock) {
+      if (!(rule.block_regimes as readonly string[]).includes(regime)) {
+        out.push({
+          code: 'regime_gate_rule_missing',
+          file,
+          key: `regime_gates.rules.${pin.strategy}.block_regimes`,
+          message:
+            `regime_gates.rules[${pin.strategy}].block_regimes must include "${regime}" ` +
+            `(currently ${JSON.stringify(rule.block_regimes)}). Floor pin REGIME_GATE_RULE_PINS: ` +
+            'the paper regime gate may be loosened but never removed.',
         });
       }
     }

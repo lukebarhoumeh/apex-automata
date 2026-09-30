@@ -16,10 +16,14 @@
  *        block carries the FE deny reason.
  *
  *   2. YAML state — `guardrails.yaml.regime_gates` is ENABLED, `paper_only`,
- *      and its trend_follow rule blocks BOTH `weak_trend` and `choppy` (the
- *      RegimeDetector's exact labels; "chop" = `choppy`). Resolved for `live`
- *      the gate is inert (live untouched); `paper_only` is a `pnpm check:config`
- *      desk pin.
+ *      and its trend_follow rule blocks ONLY `choppy` (the RegimeDetector's
+ *      exact label; "chop" = `choppy`). Until 2026-09-28 it also blocked
+ *      `weak_trend`; the desk loosened it (Luke decision 2026-09-23) so the
+ *      paper soak takes trend_follow trades in weak_trend and the paper kill
+ *      ladder (L1/L2 size-down, L4 regime pause, L6 hard kill) is the loss
+ *      brake. Resolved for `live` the gate is inert (live untouched);
+ *      `paper_only` is a `pnpm check:config` desk pin and the rule itself is
+ *      FLOOR-pinned (`REGIME_GATE_RULE_PINS`: must exist, must block `choppy`).
  *
  *   3. Router contract — the gate is NOT applied inside SignalProcessor (a
  *      trend_follow signal stamped weak_trend reaches `signal:generated`), so
@@ -37,7 +41,7 @@ import path from 'node:path';
 import { register } from 'prom-client';
 import { Logger } from '../core/logger';
 import { loadGuardrails } from '../config/loadGuardrails';
-import { SCALAR_PINS } from '../config/config-drift';
+import { REGIME_GATE_RULE_PINS, SCALAR_PINS } from '../config/config-drift';
 import {
   buildRegimeGateConfig,
   classifySignalIntent,
@@ -79,7 +83,11 @@ const mockLogger: Logger = {
   debug: vi.fn(),
 } as unknown as Logger;
 
-/** The shipped TF rule, as the router sees it in paper. */
+/**
+ * A two-regime TF rule (the pre-2026-09-28 shipped rule) used to exercise the
+ * pure helpers and the backtest engine generically. The rule that ships today
+ * is asserted from the real YAML in §2 (`[choppy]` only).
+ */
 const TF_PAPER: RegimeGateConfig = {
   enabled: true,
   paperOnly: true,
@@ -361,11 +369,12 @@ describe('guardrails.yaml — regime_gates state (TF-REGIME-GATE)', () => {
     expect(guardrails.regime_gates?.paper_only).toBe(true);
   });
 
-  it('the trend_follow rule blocks weak_trend AND choppy using the RegimeDetector labels', () => {
+  it('the trend_follow rule blocks choppy and does NOT block weak_trend (2026-09-28 loosening)', () => {
     const rules = guardrails.regime_gates?.rules ?? [];
     const tf = rules.find((r) => r.strategy === 'trend_follow');
     expect(tf, 'trend_follow rule missing').toBeDefined();
-    expect(tf?.block_regimes).toEqual(expect.arrayContaining(['weak_trend', 'choppy']));
+    expect(tf?.block_regimes).toEqual(['choppy']);
+    expect(tf?.block_regimes).not.toContain('weak_trend');
     for (const regime of tf?.block_regimes ?? []) {
       expect(['strong_trend', 'weak_trend', 'ranging', 'choppy']).toContain(regime);
     }
@@ -376,12 +385,39 @@ describe('guardrails.yaml — regime_gates state (TF-REGIME-GATE)', () => {
     expect(targets).toEqual(['trend_follow']);
   });
 
-  it('resolved for PAPER the gate is active and blocks TF entries in weak_trend + choppy', () => {
+  it('resolved for PAPER: a trend_follow ENTRY in weak_trend is NOT blocked (soak takes the trade)', () => {
     const cfg = buildRegimeGateConfig(guardrails, 'paper');
     expect(cfg.enabled).toBe(true);
-    expect(evaluateRegimeGate(cfg, { strategy: 'trend_follow', symbol: 'ETH-USD', regime: 'weak_trend' }).blocked).toBe(true);
-    expect(evaluateRegimeGate(cfg, { strategy: 'trend_follow', symbol: 'ETH-USD', regime: 'choppy' }).blocked).toBe(true);
+    for (const symbol of ['ETH-USD', 'BTC-USD', 'SOL-USD', 'ETH-PERP-INTX']) {
+      const d = evaluateRegimeGate(cfg, { strategy: 'trend_follow', symbol, regime: 'weak_trend', intent: 'entry' });
+      expect(d.blocked, `${symbol} weak_trend entry must pass`).toBe(false);
+      expect(d.reason).toBeUndefined();
+    }
+  });
+
+  it('resolved for PAPER: a trend_follow ENTRY in choppy is blocked with the deny reason text', () => {
+    const cfg = buildRegimeGateConfig(guardrails, 'paper');
+    const d = evaluateRegimeGate(cfg, { strategy: 'trend_follow', symbol: 'ETH-USD', regime: 'choppy', intent: 'entry' });
+    expect(d.blocked).toBe(true);
+    expect(d.rule).toEqual({ strategy: 'trend_follow', blockRegimes: ['choppy'] });
+    expect(d.reason).toBe('trend_follow new entry blocked: regime=choppy (paper-only regime gate blocks choppy)');
+  });
+
+  it('resolved for PAPER: strong_trend and ranging entries pass (ranging is refused upstream by the plugin)', () => {
+    const cfg = buildRegimeGateConfig(guardrails, 'paper');
     expect(evaluateRegimeGate(cfg, { strategy: 'trend_follow', symbol: 'ETH-USD', regime: 'strong_trend' }).blocked).toBe(false);
+    expect(evaluateRegimeGate(cfg, { strategy: 'trend_follow', symbol: 'ETH-USD', regime: 'ranging' }).blocked).toBe(false);
+  });
+
+  it('resolved for PAPER: an EXIT is never gated, even in choppy', () => {
+    const cfg = buildRegimeGateConfig(guardrails, 'paper');
+    const intent = classifySignalIntent('sell', 'long');
+    expect(intent).toBe('exit');
+    expect(evaluateRegimeGate(cfg, { strategy: 'trend_follow', symbol: 'ETH-USD', regime: 'choppy', intent }).blocked).toBe(false);
+    expect(
+      evaluateRegimeGate(cfg, { strategy: 'trend_follow', symbol: 'ETH-PERP-INTX', regime: 'choppy', intent: classifySignalIntent('buy', 'short') })
+        .blocked,
+    ).toBe(false);
   });
 
   it('resolved for LIVE the gate is INERT — live routing is untouched', () => {
@@ -392,11 +428,22 @@ describe('guardrails.yaml — regime_gates state (TF-REGIME-GATE)', () => {
   });
 
   it('resolved for BACKTEST the gate is inert unless forced per run', () => {
-    expect(buildRegimeGateConfig(guardrails, 'backtest').enabled).toBe(false);
+    const cfg = buildRegimeGateConfig(guardrails, 'backtest');
+    expect(cfg.enabled).toBe(false);
+    expect(evaluateRegimeGate(cfg, { strategy: 'trend_follow', symbol: 'ETH-USD', regime: 'choppy' }).blocked).toBe(false);
   });
 
   it('paper_only is a desk pin enforced by `pnpm check:config`', () => {
     expect(SCALAR_PINS).toContainEqual({ key: 'regime_gates.paper_only', expected: true });
+  });
+
+  it('the rule is FLOOR-pinned: it must exist and must keep blocking choppy (loosen, never remove)', () => {
+    expect(REGIME_GATE_RULE_PINS).toContainEqual({ strategy: 'trend_follow', mustBlock: ['choppy'] });
+    const tf = (guardrails.regime_gates?.rules ?? []).find((r) => r.strategy === 'trend_follow');
+    for (const pin of REGIME_GATE_RULE_PINS) {
+      if (pin.strategy !== 'trend_follow') continue;
+      for (const regime of pin.mustBlock) expect(tf?.block_regimes).toContain(regime);
+    }
   });
 });
 
@@ -443,12 +490,12 @@ describe('router contract — the gate lives at the router, not in SignalProcess
     expect(generated[0].metadata.regime).toBe('weak_trend');
   });
 
-  it('a blocked entry maps to the blotter row the FE renders as REJECTED with the deny reason', () => {
+  it('a blocked (choppy) entry maps to the blotter row the FE renders as REJECTED with the deny reason', () => {
     const cfg = buildRegimeGateConfig(loadGuardrails(ATLAS_ROOT), 'paper');
     const decision = evaluateRegimeGate(cfg, {
       strategy: 'trend_follow',
       symbol: 'ETH-USD',
-      regime: 'weak_trend',
+      regime: 'choppy',
       intent: classifySignalIntent('buy', undefined),
     });
     expect(decision.blocked).toBe(true);
@@ -456,9 +503,19 @@ describe('router contract — the gate lives at the router, not in SignalProcess
     expect(signalRouteColumns(verdict)).toEqual({
       allowed: false,
       routed_exchange: null,
-      reason:
-        'regime_gate: trend_follow new entry blocked: regime=weak_trend (paper-only regime gate blocks weak_trend|choppy)',
+      reason: 'regime_gate: trend_follow new entry blocked: regime=choppy (paper-only regime gate blocks choppy)',
     });
+  });
+
+  it('a weak_trend trend_follow entry from a flat book is NOT blocked at the router (2026-09-28 loosening)', () => {
+    const cfg = buildRegimeGateConfig(loadGuardrails(ATLAS_ROOT), 'paper');
+    const decision = evaluateRegimeGate(cfg, {
+      strategy: 'trend_follow',
+      symbol: 'ETH-USD',
+      regime: 'weak_trend',
+      intent: classifySignalIntent('buy', undefined),
+    });
+    expect(decision).toEqual({ blocked: false });
   });
 
   it('the same signal as an EXIT (open long on the symbol) is not blocked by the gate', () => {
@@ -466,7 +523,7 @@ describe('router contract — the gate lives at the router, not in SignalProcess
     const decision = evaluateRegimeGate(cfg, {
       strategy: 'trend_follow',
       symbol: 'ETH-USD',
-      regime: 'weak_trend',
+      regime: 'choppy',
       intent: classifySignalIntent('sell', 'long'),
     });
     expect(decision.blocked).toBe(false);
@@ -496,28 +553,26 @@ describe('buildBacktestConfig — regimeConditionalGates wiring (A6)', () => {
     expect(cfg.regimeConditionalGates?.enabled).toBe(false);
     expect(cfg.regimeConditionalGates?.paperOnly).toBe(true);
     expect(cfg.regimeConditionalGates?.mode).toBe('backtest');
-    expect(cfg.regimeConditionalGates?.rules).toEqual([
-      { strategy: 'trend_follow', blockRegimes: ['weak_trend', 'choppy'] },
-    ]);
+    expect(cfg.regimeConditionalGates?.rules).toEqual([{ strategy: 'trend_follow', blockRegimes: ['choppy'] }]);
     expect(
-      evaluateRegimeGate(cfg.regimeConditionalGates, { strategy: 'trend_follow', symbol: 'ETH-USD', regime: 'weak_trend' }).blocked,
+      evaluateRegimeGate(cfg.regimeConditionalGates, { strategy: 'trend_follow', symbol: 'ETH-USD', regime: 'choppy' }).blocked,
     ).toBe(false);
   });
 
-  it('forceRegimeConditionalGates enables the run copy (entries blocked, exits exempt) without mutating guardrails', () => {
+  it('forceRegimeConditionalGates enables the run copy (choppy entries blocked, weak_trend + exits pass) without mutating guardrails', () => {
     const cfg = buildBacktestConfig({ ...base, forceRegimeConditionalGates: true }, guardrails);
     expect(cfg.regimeConditionalGates?.enabled).toBe(true);
-    expect(
-      evaluateRegimeGate(cfg.regimeConditionalGates, { strategy: 'trend_follow', symbol: 'ETH-USD', regime: 'weak_trend' }).blocked,
-    ).toBe(true);
     expect(
       evaluateRegimeGate(cfg.regimeConditionalGates, { strategy: 'trend_follow', symbol: 'ETH-USD', regime: 'choppy' }).blocked,
     ).toBe(true);
     expect(
+      evaluateRegimeGate(cfg.regimeConditionalGates, { strategy: 'trend_follow', symbol: 'ETH-USD', regime: 'weak_trend' }).blocked,
+    ).toBe(false);
+    expect(
       evaluateRegimeGate(cfg.regimeConditionalGates, {
         strategy: 'trend_follow',
         symbol: 'ETH-USD',
-        regime: 'weak_trend',
+        regime: 'choppy',
         intent: 'exit',
       }).blocked,
     ).toBe(false);

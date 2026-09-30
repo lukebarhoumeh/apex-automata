@@ -1,6 +1,6 @@
 export type SignalSide = "BUY" | "SELL";
 export type SignalState = "ACCEPTED" | "REJECTED" | "CANCELLED";
-export type StrategyId = "meta" | "breakout" | "vwap_mr" | "trend_follow" | "momentum";
+export type StrategyId = "meta" | "breakout" | "vwap_mr" | "trend_follow" | "momentum" | "donchian_daily_s3";
 
 export interface SignalRecord {
   id: string;

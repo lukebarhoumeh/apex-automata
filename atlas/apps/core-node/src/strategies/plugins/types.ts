@@ -9,6 +9,17 @@ import { OHLCV } from '../../indicators/technical';
 import { MarketRegime, RegimeState } from '../regime-detector';
 
 /**
+ * Per-symbol book hint on {@link MarketContext.openPosition}: the engine's
+ * open position on the context symbol. `size` is in base units; `entryPrice`
+ * is the average fill when known.
+ */
+export interface OpenPositionHint {
+  side: 'long' | 'short' | 'flat';
+  size: number;
+  entryPrice?: number;
+}
+
+/**
  * Market context passed to strategy plugins for signal generation.
  * Contains all relevant market data, indicators, and regime information.
  */
@@ -50,7 +61,18 @@ export interface MarketContext {
     openPositions: number;
     dailyPnL: number;
   };
-  
+
+  /**
+   * The engine's ACTUAL open position on `symbol`, when the caller has book
+   * visibility (populated through `SignalProcessor.setOpenPositionProvider`
+   * by the BacktestEngine and the paper/live runtime). `undefined` = unknown
+   * (no provider wired) — plugins must then fall back to their own state.
+   * `side: 'flat'` is a definite "nothing open". Read-only: it is a hint for
+   * plugins that keep an IN/OUT rule state (donchian_daily_s3) so they can
+   * reconcile with entries the engine rejected or positions a stop closed.
+   */
+  openPosition?: OpenPositionHint;
+
   // Custom data that strategies can share
   sharedData?: Record<string, unknown>;
 }
