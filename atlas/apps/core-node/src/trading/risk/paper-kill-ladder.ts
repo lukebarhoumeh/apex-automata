@@ -40,7 +40,16 @@ export type LadderSoftReasonCode =
   | 'regime_pause'
   | 'sleeve_halt';
 
-/** Every soft reason code, for `risk_events` filtering (restore + sweep). */
+/**
+ * Every soft reason code, for `risk_events` filtering (restore + sweep).
+ *
+ * MIRRORED IN SQL: the `public.desk_risk_status` view hard-codes this list in
+ * its open-halt predicate (`event_type NOT IN (...)`, migration
+ * supabase/migrations/20260929010733_desk_status_views_v2.sql). Adding,
+ * removing or renaming a code here needs a NEW migration that redefines the
+ * view (applied migrations are never edited); the guard test
+ * src/__tests__/desk-risk-status-soft-codes.test.ts fails until it exists.
+ */
 export const LADDER_SOFT_REASON_CODES: readonly LadderSoftReasonCode[] = [
   'size_down_consec',
   'size_down_daily_r',
