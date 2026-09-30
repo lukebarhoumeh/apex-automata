@@ -866,6 +866,60 @@ export class OrderManager extends EventEmitter {
     return hydrated;
   }
 
+  /**
+   * Entry order ids for positions carried over from a prior session (read
+   * only). `orders.position_id` is written after a confirmed positions write
+   * since PR #82 (persistence/order-position-link.ts), so the entry order of a
+   * hydrated position is the EARLIEST order linked to it on the entry side
+   * (`buy` for a long, `sell` for a short). Returns `orders.id` per position
+   * id; positions with no linked entry order (opened before the link existed,
+   * or the link never confirmed) are absent. Throws on a query error so the
+   * caller decides how to degrade.
+   */
+  public async findEntryOrderIdsForPositions(
+    userId: string,
+    positions: ReadonlyArray<{ id: string; side: 'long' | 'short' }>,
+    creds: { supabaseUrl: string; supabaseKey: string },
+  ): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    if (!userId || positions.length === 0) return out;
+
+    const entrySide = new Map(positions.map((p) => [p.id, p.side === 'short' ? 'sell' : 'buy']));
+    const supabase = createClient(creds.supabaseUrl, creds.supabaseKey);
+    const { data, error } = await supabase
+      .from('orders')
+      .select('id, side, position_id, created_at')
+      .eq('user_id', userId)
+      .in('position_id', positions.map((p) => p.id))
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      throw new Error(`orders entry-order lookup failed: ${error.message}`);
+    }
+
+    const rows = (data ?? []) as Array<{ id?: unknown; side?: unknown; position_id?: unknown; created_at?: unknown }>;
+    // The query already orders by created_at; re-sort defensively (stable,
+    // unparseable timestamps last) so the earliest entry-side order wins.
+    const createdMs = (r: { created_at?: unknown }): number => {
+      const ms = Date.parse(String(r.created_at ?? ''));
+      return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+    };
+    const ordered = [...rows].sort((a, b) => {
+      const ta = createdMs(a);
+      const tb = createdMs(b);
+      return ta < tb ? -1 : ta > tb ? 1 : 0;
+    });
+    for (const row of ordered) {
+      const positionId = typeof row.position_id === 'string' ? row.position_id : null;
+      const id = typeof row.id === 'string' && row.id.length > 0 ? row.id : null;
+      if (!positionId || !id || out.has(positionId)) continue;
+      const wanted = entrySide.get(positionId);
+      if (!wanted || String(row.side ?? '').toLowerCase() !== wanted) continue;
+      out.set(positionId, id);
+    }
+    return out;
+  }
+
   // Track paper trading order
   public async trackPaperOrder(order: ManagedOrder): Promise<void> {
     this.orders.set(order.id, order);

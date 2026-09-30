@@ -140,9 +140,10 @@ function wallClockAsUtcMs(wc: WallClock): number {
  * Starts from the naive UTC reading of the wall clock and corrects by the
  * zone offset observed at that guess, iterating so a DST boundary between the
  * guess and the answer is absorbed. A wall time that does not exist (inside a
- * spring-forward gap) resolves to the instant the clock reads once the gap
- * has passed; an ambiguous wall time (fall-back overlap) resolves to the
- * first (DST) occurrence. Neither can happen for 22:30 in America/Chicago.
+ * spring-forward gap) is shifted forward by the gap length, e.g. 02:30 in a
+ * 1h gap resolves to 03:30 after it; an ambiguous wall time (fall-back
+ * overlap) resolves to the first (DST) occurrence. Neither can happen for
+ * 22:30 in America/Chicago.
  *
  * @param date Calendar day in the zone.
  * @param time Wall-clock hour/minute in the zone.
@@ -166,6 +167,11 @@ export function zonedTimeToUtcMs(
   // occurrence; prefer the earlier instant if it also reads as the target.
   const earlier = utc - 60 * 60 * 1000;
   if (wallClockAsUtcMs(wallClockAt(earlier, timezone)) === target) return earlier;
+  // Spring-forward gap: the target wall time never exists, so the iteration
+  // settles on an instant that reads BEFORE it (the pre-gap offset). Shift
+  // forward by the shortfall (= the gap length), offset-agnostic.
+  const reads = wallClockAsUtcMs(wallClockAt(utc, timezone));
+  if (reads < target) utc += target - reads;
   return utc;
 }
 
@@ -356,6 +362,222 @@ export class PaperHardStopScheduler {
       this.logger.info('PAPER hard stop backstop re-armed for the next occurrence', {
         nextFireAt: new Date(this.nextFireAtMs).toISOString(),
       });
+    }
+  }
+}
+
+// ── Fire handling (the server's timer callback) ─────────────────────────────
+//
+// `api/server.ts` cannot be imported in vitest, so the decision of what a fire
+// does and the busy-retry timer live here; the server supplies its module
+// state through `PaperHardStopFireRunner`'s deps (PR #82 round-2 findings 1/1b).
+
+/** Retry cadence while another engine operation holds the engine lock. */
+export const PAPER_HARD_STOP_BUSY_RETRY_MS = 10_000;
+/**
+ * Total attempts per fire, the first included: 1 fire + 5 retries, 10 s apart
+ * (~50 s), then give up for the day.
+ */
+export const PAPER_HARD_STOP_BUSY_MAX_ATTEMPTS = 6;
+
+export type HardStopFireDecision = 'run' | 'retry' | 'give_up' | 'stale_session' | 'no_engine' | 'not_paper';
+
+export interface HardStopFireInputs {
+  /** Session the scheduler (and any retry) was armed for. */
+  armedSessionId: string;
+  /** The server's current `runtimeState.sessionId` (null once the session closed). */
+  currentSessionId: string | null;
+  engineRunning: boolean;
+  /** Mode of the running engine (`tradingEngine.getConfig().mode`), null when none. */
+  engineMode: ExecutionMode | null;
+  /** Another engine operation (start/stop/kill) holds the lock. */
+  busy: boolean;
+  /** 1 for the scheduled fire, 2..n for busy retries. */
+  attempt: number;
+  maxAttempts: number;
+}
+
+/**
+ * What a hard-stop fire (or busy retry) should do. Pure.
+ *
+ * The session check comes FIRST: a retry armed for a session that has since
+ * been stopped (and possibly replaced by a new start) must never act, and must
+ * never disarm, because the scheduler may now belong to the new session.
+ */
+export function decideHardStopFire(inputs: HardStopFireInputs): HardStopFireDecision {
+  if (inputs.currentSessionId !== inputs.armedSessionId) return 'stale_session';
+  if (!inputs.engineRunning) return 'no_engine';
+  if (inputs.engineMode !== 'paper') return 'not_paper';
+  if (inputs.busy) return inputs.attempt >= inputs.maxAttempts ? 'give_up' : 'retry';
+  return 'run';
+}
+
+export interface HardStopRetryTimerOptions {
+  /** Injectable timers for tests; the default unrefs the handle so a pending retry never holds the process open. */
+  setTimeoutFn?: (fn: () => void, ms: number) => TimerHandle;
+  clearTimeoutFn?: (handle: TimerHandle) => void;
+}
+
+/**
+ * Holds at most ONE pending busy-retry. `schedule()` replaces any previous
+ * handle, `cancel()` clears it (the server calls it from every disarm), and
+ * the handle is dropped when the callback runs.
+ */
+export class HardStopRetryTimer {
+  private readonly setTimeoutFn: NonNullable<HardStopRetryTimerOptions['setTimeoutFn']>;
+  private readonly clearTimeoutFn: NonNullable<HardStopRetryTimerOptions['clearTimeoutFn']>;
+  private handle: TimerHandle | null = null;
+
+  constructor(options: HardStopRetryTimerOptions = {}) {
+    this.setTimeoutFn =
+      options.setTimeoutFn ??
+      ((fn, ms) => {
+        const handle = setTimeout(fn, ms);
+        handle.unref();
+        return handle;
+      });
+    this.clearTimeoutFn = options.clearTimeoutFn ?? ((handle) => clearTimeout(handle));
+  }
+
+  schedule(fn: () => void, delayMs: number): void {
+    this.cancel();
+    const handle = this.setTimeoutFn(() => {
+      if (this.handle === handle) this.handle = null;
+      fn();
+    }, delayMs);
+    this.handle = handle;
+  }
+
+  /** Clear the pending retry. Returns true when one was pending. Idempotent. */
+  cancel(): boolean {
+    if (this.handle === null) return false;
+    this.clearTimeoutFn(this.handle);
+    this.handle = null;
+    return true;
+  }
+
+  pending(): boolean {
+    return this.handle !== null;
+  }
+}
+
+export interface PaperHardStopFireRunnerOptions {
+  logger: Logger;
+  /** `runtimeState.sessionId`. */
+  getCurrentSessionId: () => string | null;
+  /** `tradingEngine?.getConfig().mode ?? null` — null means no engine is running. */
+  getEngineMode: () => ExecutionMode | null;
+  /** `engineOperationInProgress`. */
+  isEngineBusy: () => boolean;
+  /** The server's `disarmPaperHardStop(cause)` (used for no_engine / mode_mismatch). */
+  disarm: (cause: string) => void;
+  /**
+   * Take the engine lock and run the shared stop path. Called synchronously
+   * right after a `run` decision (no await in between), so the lock the
+   * decision saw free cannot be taken by anything else first.
+   */
+  stop: (ctx: PaperHardStopFireContext, sessionId: string) => Promise<void>;
+  retryMs?: number;
+  maxAttempts?: number;
+  retryTimer?: HardStopRetryTimer;
+}
+
+/**
+ * The server's hard-stop timer callback. Owns the single busy-retry handle so
+ * every disarm can cancel it (`cancelRetry()`), and re-checks the session on
+ * every attempt so a retry can never stop a session it was not armed for.
+ */
+export class PaperHardStopFireRunner {
+  private readonly deps: PaperHardStopFireRunnerOptions;
+  private readonly retryMs: number;
+  private readonly maxAttempts: number;
+  private readonly retryTimer: HardStopRetryTimer;
+
+  constructor(deps: PaperHardStopFireRunnerOptions) {
+    this.deps = deps;
+    this.retryMs = deps.retryMs ?? PAPER_HARD_STOP_BUSY_RETRY_MS;
+    this.maxAttempts = deps.maxAttempts ?? PAPER_HARD_STOP_BUSY_MAX_ATTEMPTS;
+    this.retryTimer = deps.retryTimer ?? new HardStopRetryTimer();
+  }
+
+  /** Cancel a pending busy-retry. Returns true when one was pending. */
+  cancelRetry(): boolean {
+    return this.retryTimer.cancel();
+  }
+
+  retryPending(): boolean {
+    return this.retryTimer.pending();
+  }
+
+  /**
+   * Handle one attempt. The scheduled fire (attempt 1) rethrows a stop failure
+   * to the scheduler, which logs it; a retry has no caller, so its failure is
+   * logged here instead of becoming an unhandled rejection.
+   *
+   * @param ctx The scheduler's fire context.
+   * @param sessionId Session the scheduler was armed for.
+   * @param attempt 1 for the fire, 2..maxAttempts for busy retries.
+   */
+  async run(ctx: PaperHardStopFireContext, sessionId: string, attempt = 1): Promise<void> {
+    const { logger } = this.deps;
+    const firedAtIso = new Date(ctx.firedAtMs).toISOString();
+    const currentSessionId = this.deps.getCurrentSessionId();
+    const engineMode = this.deps.getEngineMode();
+    const decision = decideHardStopFire({
+      armedSessionId: sessionId,
+      currentSessionId,
+      engineRunning: engineMode !== null,
+      engineMode,
+      busy: this.deps.isEngineBusy(),
+      attempt,
+      maxAttempts: this.maxAttempts,
+    });
+
+    switch (decision) {
+      case 'stale_session':
+        // Never disarm here: the scheduler may already belong to a new session.
+        logger.info('PAPER stale hard-stop retry — session changed; not stopping', {
+          sessionId,
+          currentSessionId,
+          attempt,
+          firedAt: firedAtIso,
+        });
+        return;
+      case 'no_engine':
+        logger.info('PAPER hard stop fired but no engine is running — nothing to stop', { sessionId, firedAt: firedAtIso });
+        this.deps.disarm('no_engine');
+        return;
+      case 'not_paper':
+        // Belt-and-braces: the scheduler is only ever built for paper; never stop a live engine from here.
+        logger.error('PAPER hard stop fired while the running engine is not paper — REFUSING to act', { sessionId, mode: engineMode });
+        this.deps.disarm('mode_mismatch');
+        return;
+      case 'give_up':
+        logger.error('PAPER hard stop could not acquire the engine lock — giving up for today', {
+          sessionId,
+          attempts: attempt,
+          firedAt: firedAtIso,
+        });
+        return;
+      case 'retry':
+        logger.warn('PAPER hard stop fired while an engine operation is in progress — retrying', {
+          sessionId,
+          attempt,
+          retryInMs: this.retryMs,
+        });
+        this.retryTimer.schedule(() => {
+          this.run(ctx, sessionId, attempt + 1).catch((error: unknown) => {
+            logger.error('PAPER hard stop retry threw', {
+              sessionId,
+              attempt: attempt + 1,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        }, this.retryMs);
+        return;
+      case 'run':
+        await this.deps.stop(ctx, sessionId);
+        return;
     }
   }
 }

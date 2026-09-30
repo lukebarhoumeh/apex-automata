@@ -250,7 +250,7 @@ export interface EngineOpenPosition {
   takeProfit: number | null;
   /** Epoch ms (or ISO) the position opened. */
   openTime: number | string | null;
-  /** Opened in a prior session and hydrated at engine start — not one of this session's trades. */
+  /** Opened in a prior session and hydrated at engine start — carried over; its round trip counts in the session that closes it. */
   hydratedFromPriorSession: boolean;
 }
 

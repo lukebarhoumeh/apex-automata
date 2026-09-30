@@ -12,7 +12,12 @@
  *     linker after one warn; trades without clientOrderId are never sent.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { OrderPositionLinker, pendingOrderLinks } from '../persistence/order-position-link';
+import {
+  OrderPositionLinker,
+  createSupabaseOrderLinkUpdate,
+  linkOrdersAfterPositionWrite,
+  pendingOrderLinks,
+} from '../persistence/order-position-link';
 import { PositionTracker, type PositionTrackerConfig } from '../trading/position-tracker';
 import type { Fill } from '../exchanges/coinbase';
 import type { Logger } from '../core/logger';
@@ -30,14 +35,18 @@ vi.mock('@supabase/supabase-js', () => ({
 
 const logger = { warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 
-function makeLinker(handler?: (positionId: string, orderIds: string[]) => { data: Array<{ id: string }> | null; error: PostgrestErrorLike | null }) {
+function makeLinker(
+  handler?: (positionId: string, orderIds: string[]) => { data: Array<{ id: string }> | null; error: PostgrestErrorLike | null },
+  extra: { now?: () => number; logger?: typeof logger } = {},
+) {
   const calls: Array<{ positionId: string; orderIds: string[] }> = [];
   const linker = new OrderPositionLinker({
     update: async (positionId, orderIds) => {
       calls.push({ positionId, orderIds });
       return handler ? handler(positionId, orderIds) : { data: orderIds.map((id) => ({ id })), error: null };
     },
-    logger,
+    logger: extra.logger ?? logger,
+    now: extra.now,
   });
   return { linker, calls };
 }
@@ -94,15 +103,17 @@ describe('OrderPositionLinker.link', () => {
     expect(calls).toHaveLength(2);
   });
 
-  it('a failed UPDATE is logged (never thrown) and retried on the next write', async () => {
+  it('a failed UPDATE is logged (never thrown) and retried on the first write after its backoff', async () => {
     let fail = true;
-    const { linker, calls } = makeLinker((_p, ids) => (fail ? { data: null, error: { code: '08006', message: 'connection failure' } } : { data: ids.map((id) => ({ id })), error: null }));
+    let now = 0;
+    const { linker, calls } = makeLinker((_p, ids) => (fail ? { data: null, error: { code: '08006', message: 'connection failure' } } : { data: ids.map((id) => ({ id })), error: null }), { now: () => now });
 
     const first = await linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }] });
     expect(first.error).toMatchObject({ code: '08006' });
     expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/position_id link write failed/), expect.objectContaining({ orderIds: ['o-entry'] }));
 
     fail = false;
+    now = 1_000;
     const second = await linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }] });
     expect(second.linked).toEqual(['o-entry']);
     expect(calls).toHaveLength(2);
@@ -181,6 +192,276 @@ describe('OrderPositionLinker.linkCounts (round 3, task G: /api/status persisten
     const { linker } = makeLinker(() => ({ data: null, error: { code: 'PGRST204', message: "Could not find the 'position_id' column of 'orders' in the schema cache" } }));
     await linker.link({ id: POS, trades: [{ clientOrderId: 'o-entry' }] });
     expect(linker.linkCounts()).toEqual({ linked: 0, pending: 0, failed: 0, disabled: true });
+  });
+});
+
+describe('OrderPositionLinker backoff on a failing UPDATE (review finding 5)', () => {
+  const CONNECTION_FAILURE = { code: '08006', message: 'connection failure' };
+  const mkLogger = () => ({ warn: vi.fn(), error: vi.fn(), debug: vi.fn() });
+  const openPosition = { id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }] };
+  const failureLogs = (fn: ReturnType<typeof vi.fn>) => fn.mock.calls.filter((c) => /position_id link write failed/.test(String(c[0])));
+
+  it('a permanently failing UPDATE is retried on a per-position exponential schedule (1 s·2^n, capped at 5 min), not on every ~1 s write', async () => {
+    let now = 0;
+    const log = mkLogger();
+    const { linker, calls } = makeLinker(() => ({ data: null, error: CONNECTION_FAILURE }), { now: () => now, logger: log });
+
+    // The debounced positions write fires every ~1 s for 30 min while the position is open.
+    const attemptTimes: number[] = [];
+    for (now = 0; now <= 30 * 60_000; now += 1_000) {
+      const result = await linker.link(openPosition);
+      if (result.attempted.length > 0) {
+        attemptTimes.push(now);
+        expect(result.error).toMatchObject({ code: '08006' });
+      } else {
+        // Inside the backoff window: nothing sent, still pending.
+        expect(result).toMatchObject({ attempted: [], error: null, backedOff: true });
+      }
+      expect(linker.linkCounts()).toEqual({ linked: 0, pending: 1, failed: 0, disabled: false });
+    }
+
+    const gaps = attemptTimes.slice(1).map((t, i) => t - attemptTimes[i]);
+    expect(gaps).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 300_000, 300_000, 300_000, 300_000]);
+    expect(calls).toHaveLength(14); // not ~1800
+
+    // First failure logs an error; repeats log at debug, with an error every 10th so it never goes silent.
+    const errors = failureLogs(log.error);
+    expect(errors).toHaveLength(2);
+    expect(errors[0][1]).toMatchObject({ positionId: POS, symbol: 'ETH-USD', orderIds: ['o-entry'], code: '08006', failures: 1, nextRetryInMs: 1_000 });
+    expect(errors[1][1]).toMatchObject({ failures: 10, nextRetryInMs: 300_000 });
+    expect(failureLogs(log.debug)).toHaveLength(12);
+  });
+
+  it('a success resets the schedule and the log level', async () => {
+    let now = 0;
+    let fail = true;
+    const log = mkLogger();
+    const { linker, calls } = makeLinker((_p, ids) => (fail ? { data: null, error: CONNECTION_FAILURE } : { data: ids.map((id) => ({ id })), error: null }), { now: () => now, logger: log });
+
+    await linker.link(openPosition); // t=0 fails → next at 1 s
+    now = 1_000;
+    await linker.link(openPosition); // fails → next at 3 s
+    fail = false;
+    now = 3_000;
+    expect((await linker.link(openPosition)).linked).toEqual(['o-entry']);
+
+    // A scale-in whose link fails right after: a fresh first failure (1 s, error log), not the 4 s step.
+    fail = true;
+    now = 3_001;
+    const scaled = { ...openPosition, trades: [{ clientOrderId: 'o-entry' }, { clientOrderId: 'o-scale' }] };
+    await linker.link(scaled);
+    now = 4_000;
+    expect((await linker.link(scaled)).backedOff).toBe(true);
+    now = 4_001;
+    expect((await linker.link(scaled)).attempted).toEqual(['o-scale']);
+    expect(calls).toHaveLength(5);
+    expect(failureLogs(log.error).map((c) => (c[1] as { failures: number }).failures)).toEqual([1, 1]);
+  });
+
+  it('the close write is always attempted, even inside the backoff window', async () => {
+    let now = 0;
+    let fail = true;
+    const { linker, calls } = makeLinker((_p, ids) => (fail ? { data: null, error: CONNECTION_FAILURE } : { data: ids.map((id) => ({ id })), error: null }), { now: () => now, logger: mkLogger() });
+
+    await linker.link(openPosition); // t=0 fails
+    now = 1_000;
+    await linker.link(openPosition); // fails → next at 3 s
+    fail = false;
+    now = 1_500;
+    const close = await linker.link({ id: POS, symbol: 'ETH-USD', closedAt: new Date(), trades: [{ clientOrderId: 'o-entry' }, { clientOrderId: 'o-exit' }] });
+    expect(close.backedOff).toBe(false);
+    expect(close.linked).toEqual(['o-entry', 'o-exit']);
+    expect(calls).toHaveLength(3);
+    expect(linker.snapshot()).toEqual({ positions: 0, disabled: false });
+    expect(linker.linkCounts()).toEqual({ linked: 2, pending: 0, failed: 0, disabled: false });
+  });
+});
+
+describe('OrderPositionLinker close-time UPDATE failure (review finding 6)', () => {
+  it('forgets the position, logs the still-unlinked exit order with the error, and counts it as failed', async () => {
+    const log = { warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    let fail = false;
+    const { linker } = makeLinker((_p, ids) => (fail ? { data: null, error: { code: '08006', message: 'connection failure' } } : { data: ids.map((id) => ({ id })), error: null }), { logger: log });
+
+    await linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }] });
+    expect(linker.snapshot()).toEqual({ positions: 1, disabled: false });
+
+    fail = true;
+    const close = await linker.link({ id: POS, symbol: 'ETH-USD', closedAt: new Date(), trades: [{ clientOrderId: 'o-entry' }, { clientOrderId: 'o-exit' }] });
+    expect(close.error).toMatchObject({ code: '08006' });
+
+    // The tracker has already forgotten the position: no entry may leak, nothing will retry.
+    expect(linker.snapshot()).toEqual({ positions: 0, disabled: false });
+    expect(linker.linkCounts()).toEqual({ linked: 1, pending: 0, failed: 1, disabled: false });
+    expect(log.error).toHaveBeenCalledTimes(1);
+    expect(log.error).toHaveBeenCalledWith('orders: position closed with orders still unlinked (link write failed)', {
+      positionId: POS,
+      symbol: 'ETH-USD',
+      orderIds: ['o-exit'],
+      code: '08006',
+      message: 'connection failure',
+    });
+    expect(log.error.mock.calls.some((c) => /will retry/.test(String(c[0])))).toBe(false);
+  });
+});
+
+describe('OrderPositionLinker overlapping link() calls for one position (round-2 repair)', () => {
+  const CONNECTION_FAILURE = { code: '08006', message: 'connection failure' };
+  const mkLogger = () => ({ warn: vi.fn(), error: vi.fn(), debug: vi.fn() });
+  const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  /**
+   * An UPDATE whose calls that carry `o-exit` (the close) succeed at once, while
+   * the earlier open-position UPDATE stays in flight until the test fails it —
+   * the api/server.ts `position:update` listener is not awaited by the emitter,
+   * so the close's link can be called while the open's UPDATE is pending.
+   */
+  function overlappingLinker(log: ReturnType<typeof mkLogger>) {
+    const calls: Array<{ positionId: string; orderIds: string[] }> = [];
+    let failOpen: (() => void) | null = null;
+    const linker = new OrderPositionLinker({
+      update: (positionId, orderIds) => {
+        calls.push({ positionId, orderIds });
+        if (orderIds.includes('o-exit')) return Promise.resolve({ data: orderIds.map((id) => ({ id })), error: null });
+        return new Promise((resolve) => {
+          failOpen = () => resolve({ data: null, error: CONNECTION_FAILURE });
+        });
+      },
+      logger: log,
+      now: () => 0,
+    });
+    return { linker, calls, failOpen: () => failOpen?.() };
+  }
+  const backoffSize = (linker: OrderPositionLinker) => (linker as unknown as { backoff: Map<string, unknown> }).backoff.size;
+
+  it('a failing open link that overlaps the close link (shared mutable Position, as the tracker emits) is not booked as a close failure', async () => {
+    const log = mkLogger();
+    const { linker, calls, failOpen } = overlappingLinker(log);
+
+    // PositionTracker emits the SAME mutable object for open / update / close.
+    const position: { id: string; symbol: string; closedAt?: Date; trades: Array<{ clientOrderId: string }> } = {
+      id: POS,
+      symbol: 'ETH-USD',
+      trades: [{ clientOrderId: 'o-entry' }],
+    };
+    const openLink = linker.link(position);
+    await flush();
+    // The close fill lands while the open's UPDATE is still in flight.
+    position.closedAt = new Date();
+    position.trades.push({ clientOrderId: 'o-exit' });
+    const closeLink = linker.link(position);
+    await flush();
+    failOpen();
+    const [open, close] = await Promise.all([openLink, closeLink]);
+
+    expect(open.error).toMatchObject({ code: '08006' });
+    expect(close.linked).toEqual(['o-entry', 'o-exit']);
+    // The close runs after the open settled (serialised per position) and links both.
+    expect(calls.map((c) => c.orderIds)).toEqual([['o-entry'], ['o-entry', 'o-exit']]);
+    expect(linker.linkCounts()).toEqual({ linked: 2, pending: 0, failed: 0, disabled: false });
+    expect(linker.snapshot()).toEqual({ positions: 0, disabled: false });
+    expect(backoffSize(linker)).toBe(0);
+    expect(log.error.mock.calls.some((c) => /still unlinked/.test(String(c[0])))).toBe(false);
+  });
+
+  it('the same overlap with separate snapshots leaks no pending / backoff entry for the closed position', async () => {
+    const log = mkLogger();
+    const { linker, failOpen } = overlappingLinker(log);
+
+    const openLink = linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }] });
+    await flush();
+    const closeLink = linker.link({ id: POS, symbol: 'ETH-USD', closedAt: new Date(), trades: [{ clientOrderId: 'o-entry' }, { clientOrderId: 'o-exit' }] });
+    await flush();
+    failOpen();
+    await Promise.all([openLink, closeLink]);
+
+    expect(linker.linkCounts()).toEqual({ linked: 2, pending: 0, failed: 0, disabled: false });
+    expect(linker.snapshot()).toEqual({ positions: 0, disabled: false });
+    expect(backoffSize(linker)).toBe(0);
+  });
+
+  it('once a position closed, a later link for it is a no-op (no second UPDATE, no double count, no new entry)', async () => {
+    const { linker, calls } = makeLinker(undefined, { logger: mkLogger() });
+    const closed = { id: POS, symbol: 'ETH-USD', closedAt: new Date(), trades: [{ clientOrderId: 'o-entry' }, { clientOrderId: 'o-exit' }] };
+
+    expect((await linker.link(closed)).linked).toEqual(['o-entry', 'o-exit']);
+    // e.g. two queued links for one shared object that both see closedAt set.
+    expect((await linker.link(closed)).attempted).toEqual([]);
+    expect((await linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }] })).attempted).toEqual([]);
+    expect(calls).toHaveLength(1);
+    expect(linker.linkCounts()).toEqual({ linked: 2, pending: 0, failed: 0, disabled: false });
+    expect(linker.snapshot()).toEqual({ positions: 0, disabled: false });
+  });
+
+  it('an order id added inside the backoff window is counted as pending without an UPDATE', async () => {
+    let now = 0;
+    const { linker, calls } = makeLinker(() => ({ data: null, error: CONNECTION_FAILURE }), { now: () => now, logger: mkLogger() });
+
+    await linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }] }); // t=0 fails → next at 1 s
+    now = 500;
+    const scaled = await linker.link({ id: POS, symbol: 'ETH-USD', trades: [{ clientOrderId: 'o-entry' }, { clientOrderId: 'o-scale' }] });
+    expect(scaled).toMatchObject({ attempted: [], backedOff: true });
+    expect(calls).toHaveLength(1);
+    expect(linker.linkCounts()).toEqual({ linked: 0, pending: 2, failed: 0, disabled: false });
+  });
+});
+
+describe('createSupabaseOrderLinkUpdate (review finding 8a: the production UPDATE chain)', () => {
+  const USER_ID = 'b7e8f9c2-4d6a-4c8b-9e2d-1a3b5c7d9e1f';
+
+  function recordingClient(result: { data: Array<{ id: string }> | null; error: PostgrestErrorLike | null }) {
+    const chain: unknown[][] = [];
+    const builder = {
+      update: (values: unknown) => { chain.push(['update', values]); return builder; },
+      eq: (column: string, value: unknown) => { chain.push(['eq', column, value]); return builder; },
+      in: (column: string, values: unknown) => { chain.push(['in', column, values]); return builder; },
+      select: (columns: string) => { chain.push(['select', columns]); return Promise.resolve(result); },
+    };
+    const client = { from: (table: string) => { chain.push(['from', table]); return builder; } };
+    return { client: client as unknown as Parameters<typeof createSupabaseOrderLinkUpdate>[0], chain };
+  }
+
+  it('issues UPDATE orders SET position_id WHERE user_id = … AND id IN (…) RETURNING id and passes the result through', async () => {
+    const { client, chain } = recordingClient({ data: [{ id: 'o1' }], error: null });
+    const update = createSupabaseOrderLinkUpdate(client, USER_ID);
+    await expect(update(POS, ['o1', 'o2'])).resolves.toEqual({ data: [{ id: 'o1' }], error: null });
+    expect(chain).toEqual([
+      ['from', 'orders'],
+      ['update', { position_id: POS }],
+      ['eq', 'user_id', USER_ID],
+      ['in', 'id', ['o1', 'o2']],
+      ['select', 'id'],
+    ]);
+  });
+
+  it('passes a PostgREST error through so the linker can classify it', async () => {
+    const error = { code: '08006', message: 'connection failure' };
+    const { client } = recordingClient({ data: null, error });
+    await expect(createSupabaseOrderLinkUpdate(client, USER_ID)(POS, ['o1'])).resolves.toEqual({ data: null, error });
+
+    // Wired into the linker: a missing column (42703) disables it, a transient error is a retryable failure.
+    const missingColumn = recordingClient({ data: null, error: { code: '42703', message: 'column orders.position_id does not exist' } });
+    const disabledLinker = new OrderPositionLinker({ update: createSupabaseOrderLinkUpdate(missingColumn.client, USER_ID), logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn() } });
+    expect(await disabledLinker.link({ id: POS, trades: [{ clientOrderId: 'o1' }] })).toMatchObject({ attempted: ['o1'], disabled: true });
+    expect(disabledLinker.disabled).toBe(true);
+
+    const failingLinker = new OrderPositionLinker({ update: createSupabaseOrderLinkUpdate(client, USER_ID), logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn() } });
+    expect(await failingLinker.link({ id: POS, trades: [{ clientOrderId: 'o1' }] })).toMatchObject({ attempted: ['o1'], error, disabled: false });
+    expect(failingLinker.linkCounts()).toEqual({ linked: 0, pending: 1, failed: 0, disabled: false });
+  });
+});
+
+describe('linkOrdersAfterPositionWrite (review finding 8: the FK-ordering gate api/server.ts uses)', () => {
+  it('links only after a written positions write — never after dropped, failed or no write', async () => {
+    const link = vi.fn(async () => ({ attempted: [], linked: [], missing: [], error: null, disabled: false, backedOff: false }));
+    const position = { id: POS, trades: [{ clientOrderId: 'o1' }] };
+    expect(await linkOrdersAfterPositionWrite({ status: 'dropped' }, position, { link })).toBeNull();
+    expect(await linkOrdersAfterPositionWrite({ status: 'failed' }, position, { link })).toBeNull();
+    expect(await linkOrdersAfterPositionWrite(null, position, { link })).toBeNull();
+    expect(link).not.toHaveBeenCalled();
+    await linkOrdersAfterPositionWrite({ status: 'written' }, position, { link });
+    expect(link).toHaveBeenCalledTimes(1);
+    expect(link).toHaveBeenCalledWith(position);
   });
 });
 

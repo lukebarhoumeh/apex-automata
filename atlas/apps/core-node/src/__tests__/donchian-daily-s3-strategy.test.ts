@@ -320,6 +320,23 @@ describe('DonchianDailyS3Strategy — book reconcile via context.openPosition', 
     expect(s.getSymbolState('BTC-USD').state).toBe('OUT');
   });
 
+  it('the reconcile runs before the entry check: the bar that learns of a rejection can itself re-enter', () => {
+    // Pins the header KNOWN LIMITATIONS wording (review finding 12): only the
+    // original signal bar is lost, re-entry is not suppressed for a bar.
+    // bar 30: 101 breaks the prior-20 high (100) → entry, book still flat.
+    // bar 31: 102 — book still flat (entry rejected) → IN→OUT, and 102 > the
+    //   prior-20 high (101) → a fresh buy on this same bar.
+    const s = new DonchianDailyS3Strategy();
+    const candles = dailyFromCloses([...flatBase(30), 101, 102]);
+    expect(s.generateSignals(ctx(candles.slice(0, 31), { openPosition: FLAT_BOOK })).map((x) => x.direction)).toEqual(['buy']);
+    const sameBar = s.generateSignals(ctx(candles, { openPosition: FLAT_BOOK }));
+    expect(sameBar.map((x) => x.direction)).toEqual(['buy']);
+    expect(sameBar[0].metadata.indicators.donchianHigh).toBe(101);
+    const st = s.getSymbolState('BTC-USD');
+    expect(st.lastReconcile).toEqual(expect.objectContaining({ from: 'IN', to: 'OUT', barTime: candles[31].time }));
+    expect(st.state).toBe('IN');
+  });
+
   it('hint short (not long) while IN is treated like flat: OUT, no sell', () => {
     const s = new DonchianDailyS3Strategy();
     const candles = dailyFromCloses([...flatBase(30), 101, 90]);

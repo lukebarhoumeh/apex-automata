@@ -1,5 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import { TradeAnalytics, TradeAnalyticsConfig } from '../trading/trade-analytics';
+import type { Logger } from '../core/logger';
 
 // Mock logger
 const mockLogger = {
@@ -324,6 +325,138 @@ describe('TradeAnalytics', () => {
     closed.pop();
     expect(analytics.getClosedTrades()).toHaveLength(3);
   });
+
+  test('carried-over entry: real entryTime drives duration, counted in totals and carriedOverClosed; re-seed is idempotent', () => {
+    const openedAt = new Date(Date.now() - 3_600_000);
+    const seed = { tradeId: 'carried-1', symbol: 'ETH-USD', side: 'long' as const, entryPrice: 2000, size: 1, strategy: 'trend_follow', entryTime: openedAt, carriedOver: true };
+    analytics.recordEntry(seed);
+    analytics.recordEntry(seed);
+    expect(analytics.getOpenTrades()).toHaveLength(1);
+    expect(analytics.getSessionStats()).toMatchObject({ carriedOverOpen: 1, carriedOverClosed: 0, totalTrades: 0 });
+
+    analytics.recordExit({ tradeId: 'carried-1', exitPrice: 2010, realizedPnl: 10, fees: 0 });
+    const [closed] = analytics.getClosedTrades();
+    expect(closed.carriedOver).toBe(true);
+    expect(closed.entryTime).toBe(openedAt);
+    expect(closed.duration).toBeGreaterThanOrEqual(3600);
+    expect(analytics.getSessionStats()).toMatchObject({ totalTrades: 1, carriedOverClosed: 1, carriedOverOpen: 0, winningTrades: 1 });
+  });
+
+  test('an exit with no entry at all still warns and is not counted', () => {
+    analytics.recordExit({ tradeId: 'ghost', exitPrice: 1, realizedPnl: 1, fees: 0 });
+    expect(mockLogger.warn).toHaveBeenCalledWith('Trade not found for exit', { tradeId: 'ghost' });
+    expect(analytics.getSessionStats().totalTrades).toBe(0);
+  });
+
+  test('strategy / signalId backfill fills only missing attribution on an open record', () => {
+    analytics.recordEntry({ tradeId: 'carried-2', symbol: 'BTC-USD', side: 'long', entryPrice: 50000, size: 0.1, carriedOver: true });
+    analytics.backfillAttribution('carried-2', { strategy: 'trend_follow', signalId: 'sig-1' });
+    analytics.backfillAttribution('carried-2', { strategy: 'momentum', signalId: 'sig-2' });
+    expect(analytics.getOpenTrades()[0]).toMatchObject({ strategy: 'trend_follow', signalId: 'sig-1' });
+    analytics.backfillAttribution('unknown-id', { strategy: 'trend_follow' });
+  });
+});
+
+/**
+ * Review round (carryover repair, finding "live equity double count"): in live,
+ * `initialEquity` is the account snapshot, which already marks a carried-over
+ * position at the snapshot mark and holds its prior-session realized P&L. The
+ * equity curve / HWM / maxDrawdown must only move by the in-session part of
+ * that round trip; closedTrades / totalPnl keep the full round trip (desk
+ * decision 2026-09-30). Paper (no marks: yaml constant) is unchanged.
+ */
+describe('TradeAnalytics — carried-over equity anchor (live snapshot marks)', () => {
+  const liveConfig: TradeAnalyticsConfig = {
+    supabaseUrl: 'http://localhost:54321',
+    supabaseKey: 'test-key',
+    userId: 'test-user',
+    initialEquity: 10000,
+    mode: 'live',
+    equitySampleIntervalMs: 60000,
+    initialEquityMarks: { 'BTC-USD': 52000 },
+  };
+  const seed = {
+    tradeId: 'carried-live',
+    symbol: 'BTC-USD',
+    side: 'long' as const,
+    entryPrice: 50000,
+    size: 0.1,
+    entryTime: new Date(Date.now() - 3_600_000),
+    carriedOver: true,
+  };
+  let analytics: TradeAnalytics;
+
+  afterEach(async () => {
+    await analytics.stop();
+  });
+
+  test('closed at the snapshot mark: full round trip counted, equity / HWM / maxDrawdown do not move', () => {
+    analytics = new TradeAnalytics(liveConfig, mockLogger as unknown as Logger);
+    analytics.recordEntry(seed);
+    analytics.recordExit({ tradeId: 'carried-live', exitPrice: 52000, realizedPnl: 200, fees: 0 });
+
+    const stats = analytics.getSessionStats();
+    expect(stats.totalPnl).toBe(200);
+    expect(stats.totalTrades).toBe(1);
+    expect(analytics.getClosedTrades()[0].realizedPnl).toBe(200);
+    expect(stats.highWaterMark).toBe(10000);
+    expect(stats.maxDrawdown).toBe(0);
+    expect(analytics.getEquityCurve().at(-1)!.equity).toBe(10000);
+  });
+
+  test('closed below the snapshot mark: equity falls by the in-session move only', () => {
+    analytics = new TradeAnalytics(liveConfig, mockLogger as unknown as Logger);
+    analytics.recordEntry(seed);
+    analytics.recordExit({ tradeId: 'carried-live', exitPrice: 51000, realizedPnl: 100, fees: 0 });
+
+    const stats = analytics.getSessionStats();
+    expect(stats.totalPnl).toBe(100);
+    expect(analytics.getEquityCurve().at(-1)!.equity).toBeCloseTo(9900, 6);
+    expect(stats.maxDrawdown).toBeCloseTo(100, 6);
+    expect(stats.highWaterMark).toBe(10000);
+  });
+
+  test('prior-session realized P&L carried on the position is already in the snapshot equity', () => {
+    analytics = new TradeAnalytics(liveConfig, mockLogger as unknown as Logger);
+    analytics.recordEntry({ ...seed, priorRealizedPnl: 30 });
+    analytics.recordExit({ tradeId: 'carried-live', exitPrice: 52000, realizedPnl: 230, fees: 0 });
+    expect(analytics.getSessionStats().totalPnl).toBe(230);
+    expect(analytics.getEquityCurve().at(-1)!.equity).toBeCloseTo(10000, 6);
+  });
+
+  test('a short carried-over trade uses the mirrored mark move', () => {
+    analytics = new TradeAnalytics(liveConfig, mockLogger as unknown as Logger);
+    analytics.recordEntry({ ...seed, side: 'short' });
+    // Short from 50000, snapshot mark 52000 (−200 already in equity), closed at 51000 (−100 round trip).
+    analytics.recordExit({ tradeId: 'carried-live', exitPrice: 51000, realizedPnl: -100, fees: 0 });
+    expect(analytics.getEquityCurve().at(-1)!.equity).toBeCloseTo(10100, 6);
+  });
+
+  test('in-session trades are unaffected by the marks (full P&L into equity)', () => {
+    analytics = new TradeAnalytics(liveConfig, mockLogger as unknown as Logger);
+    analytics.recordEntry({ tradeId: 'fresh', symbol: 'BTC-USD', side: 'long', entryPrice: 50000, size: 0.1 });
+    analytics.recordExit({ tradeId: 'fresh', exitPrice: 52000, realizedPnl: 200, fees: 0 });
+    expect(analytics.getEquityCurve().at(-1)!.equity).toBe(10200);
+  });
+
+  test('no mark for the symbol: full P&L into equity and a warn names the trade', () => {
+    analytics = new TradeAnalytics({ ...liveConfig, initialEquityMarks: {} }, mockLogger as unknown as Logger);
+    analytics.recordEntry(seed);
+    analytics.recordExit({ tradeId: 'carried-live', exitPrice: 52000, realizedPnl: 200, fees: 0 });
+    expect(analytics.getEquityCurve().at(-1)!.equity).toBe(10200);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('no initial-equity mark'),
+      expect.objectContaining({ tradeId: 'carried-live', symbol: 'BTC-USD' }),
+    );
+  });
+
+  test('paper (no initialEquityMarks): a carried-over round trip moves equity by its full P&L, as before', () => {
+    analytics = new TradeAnalytics({ ...liveConfig, mode: 'paper', initialEquityMarks: undefined }, mockLogger as unknown as Logger);
+    analytics.recordEntry(seed);
+    analytics.recordExit({ tradeId: 'carried-live', exitPrice: 52000, realizedPnl: 200, fees: 0 });
+    expect(analytics.getEquityCurve().at(-1)!.equity).toBe(10200);
+    expect(analytics.getSessionStats().highWaterMark).toBe(10200);
+  });
 });
 
 /**
@@ -345,7 +478,7 @@ describe('TradeAnalytics — externally owned session', () => {
   const STARTED_AT = Date.parse('2026-09-11T16:00:00.000Z');
 
   test('uses the supplied session id and start time in getSessionStats()', async () => {
-    const analytics = new TradeAnalytics({ ...baseConfig, sessionId: SESSION_ID, sessionStartedAt: STARTED_AT }, mockLogger as any);
+    const analytics = new TradeAnalytics({ ...baseConfig, sessionId: SESSION_ID, sessionStartedAt: STARTED_AT }, mockLogger as unknown as Logger);
     try {
       const stats = analytics.getSessionStats();
       expect(stats.sessionId).toBe(SESSION_ID);
@@ -359,7 +492,7 @@ describe('TradeAnalytics — externally owned session', () => {
 
   test('falls back to a self-generated id and construction time without a supplied session', async () => {
     const before = Date.now();
-    const analytics = new TradeAnalytics(baseConfig, mockLogger as any);
+    const analytics = new TradeAnalytics(baseConfig, mockLogger as unknown as Logger);
     try {
       const stats = analytics.getSessionStats();
       expect(stats.sessionId).toMatch(/^paper-\d{8}-\d{6}-[a-z0-9]{4}$/);
@@ -370,7 +503,7 @@ describe('TradeAnalytics — externally owned session', () => {
   });
 
   test('stop() skips the trading_sessions summary upsert for an externally owned session', async () => {
-    const analytics = new TradeAnalytics({ ...baseConfig, sessionId: SESSION_ID, sessionStartedAt: STARTED_AT }, mockLogger as any);
+    const analytics = new TradeAnalytics({ ...baseConfig, sessionId: SESSION_ID, sessionStartedAt: STARTED_AT }, mockLogger as unknown as Logger);
     const persistSpy = vi.spyOn(analytics, 'persistSessionSummary');
 
     await analytics.stop();
@@ -383,7 +516,7 @@ describe('TradeAnalytics — externally owned session', () => {
   });
 
   test('stop() still persists the summary for a self-owned session', async () => {
-    const analytics = new TradeAnalytics(baseConfig, mockLogger as any);
+    const analytics = new TradeAnalytics(baseConfig, mockLogger as unknown as Logger);
     const persistSpy = vi.spyOn(analytics, 'persistSessionSummary');
 
     await analytics.stop();

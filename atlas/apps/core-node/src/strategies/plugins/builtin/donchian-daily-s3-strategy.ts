@@ -114,10 +114,24 @@
  *     `atr_vol` or `short-blocked` in the harness). The BacktestEngine and
  *     the runtime router both wire the provider today; any new caller must
  *     do the same or accept that behaviour.
- *   - The reconcile is one bar late by construction: the plugin flips IN on
+ *   - The reconcile lags the book by construction: the plugin flips IN on
  *     the signal bar (a pending next-bar fill is not a position yet) and only
- *     learns of a rejection on the following bar. With the hint the cost is
- *     one bar of suppressed re-entry, not months.
+ *     learns of a rejected entry on the following bar, and of a stop-out on
+ *     its next evaluated bar (in the backtest that is the stop-out bar itself,
+ *     because stops are checked before the signal pipeline). The reconcile
+ *     runs BEFORE the entry check, so the plugin may re-enter on that same
+ *     bar when it is a breakout; re-entry is not suppressed for a bar. Only
+ *     the original (rejected) signal bar is lost.
+ *   - The reconcile is per SYMBOL, not per strategy: the engine holds one
+ *     position per symbol and its exits are strategy-agnostic, and the hint
+ *     (`MarketContext.openPosition`) carries no owning strategy. In a
+ *     multi-strategy backtest the plugin can therefore adopt as IN a long
+ *     that another strategy opened on the same symbol, and its rule exit
+ *     will close it. That is the engine's pre-existing one-position-per-symbol
+ *     semantics, not a reconcile defect. Do NOT add a strategy filter to the
+ *     hint: `positions.strategy` may be normalised (`persistence/strategy-name.ts`
+ *     falls back to `system`), so a strategy check would break restart
+ *     re-adoption of this plugin's own long.
  *   - Rule state lives in memory. On process restart every symbol boots OUT;
  *     with the hint an open long is re-adopted as IN on the FIRST evaluated
  *     bar (entry bar unknown, exit rule armed immediately), so the rule exit

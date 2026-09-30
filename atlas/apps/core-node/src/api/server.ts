@@ -41,7 +41,7 @@ import {
   type RestampOpenPositionsResult,
 } from '../persistence/position-session-restamp';
 import { PositionWriteSequencer, type PositionWriteOutcome } from '../persistence/position-write-sequencer';
-import { OrderPositionLinker } from '../persistence/order-position-link';
+import { OrderPositionLinker, createSupabaseOrderLinkUpdate, linkOrdersAfterPositionWrite } from '../persistence/order-position-link';
 import { resolvePositionStrategy, resolveStrategyName } from '../persistence/strategy-name';
 import { StrategyEnumValueSupport, writeWithStrategyEnumFallback } from '../persistence/strategy-enum-fallback';
 import { buildSignalRow } from '../persistence/signal-row';
@@ -74,7 +74,7 @@ import {
   SessionScopeQuery,
   SessionWindow,
 } from './session-scope';
-import { buildStrategySessionStats, StrategySessionStats } from './strategy-session-stats';
+import { buildStrategySessionStats, StrategySessionStats, strategyReportTradeInputs } from './strategy-session-stats';
 import { buildPnlSnapshotPayload, PnlSnapshot } from './pnl-snapshot';
 import { buildPersistenceBlock, buildStatusPayload, StatusPayload } from './status-payload';
 import { createClient } from '@supabase/supabase-js';
@@ -83,7 +83,8 @@ import { loadAndValidateEnv } from '../core/env';
 import client from 'prom-client';
 import { OHLCV } from '../indicators/technical';
 import { loadGuardrails, resolveLiveConfig, resolveCfmConfig, resolvePaperSessionHardStopConfig } from '../config/loadGuardrails';
-import { PaperHardStopScheduler, type PaperHardStopFireContext } from '../runtime/paper-hard-stop';
+import { PaperHardStopFireRunner, PaperHardStopScheduler, type PaperHardStopFireContext } from '../runtime/paper-hard-stop';
+import type { ExecutionMode } from '../runtime/session-context';
 import { FeeModel } from '../core/fee-model';
 import { CfmGuard, CfmFlattenRequiredEvent, CfmLeverageSnapshot } from '../trading/cfm/cfm-guard';
 import { OrderOpsThrottle } from '../trading/execution/order-ops-throttle';
@@ -433,17 +434,11 @@ const supabase = createClient(
 // written before 2026-09-29): after a CONFIRMED positions write, the orders of
 // that position's not-yet-linked trades are updated by primary key, scoped to
 // USER_ID; RETURNING tells the linker which ids landed so an order row that is
-// not persisted yet is retried on the next write. See persistence/order-position-link.ts.
+// not persisted yet is retried on the next write (a FAILED UPDATE only after its
+// per-position failure backoff; the close write always attempts). See
+// persistence/order-position-link.ts.
 const orderPositionLinker = new OrderPositionLinker({
-  update: async (positionId, orderIds) => {
-    const { data, error } = await supabase
-      .from('orders')
-      .update({ position_id: positionId })
-      .eq('user_id', USER_ID)
-      .in('id', orderIds)
-      .select('id');
-    return { data, error };
-  },
+  update: createSupabaseOrderLinkUpdate(supabase, USER_ID),
   logger,
 });
 
@@ -1894,10 +1889,9 @@ app.post('/api/engine/start', async (req, res) => {
         const positionWrite = await syncPositionToSupabase(position);
         // orders.position_id: link this snapshot's not-yet-linked orders once the
         // positions row is confirmed written (FK). A dropped stale update or a
-        // failed write links nothing; the next write for the position retries.
-        if (positionWrite?.status === 'written') {
-          await orderPositionLinker.link(position);
-        }
+        // failed write links nothing; the next write for the position retries
+        // (after the linker's failure backoff if the link UPDATE itself failed).
+        await linkOrdersAfterPositionWrite(positionWrite, position, orderPositionLinker);
 
         // Record outcome for ML training when position is closed.
         //
@@ -3083,7 +3077,9 @@ app.post('/api/engine/start', async (req, res) => {
     // per guardrails `paper_session_hard_stop`). The external 10:18pm CT automation
     // stays primary; this catches the night it does not run. Never built for live.
     if (mode === 'paper') {
-      armPaperHardStop(sessionId);
+      // The engine's own mode (not the request body) so the scheduler's
+      // non-paper refusal is a real second guard (review finding 2).
+      armPaperHardStop(sessionId, tradingEngine.getConfig().mode);
     }
 
     // Load historical data for warmup (don't await - do in background)
@@ -3519,29 +3515,46 @@ app.post('/api/engine/stop', async (req, res) => {
 // engine is still running, the SAME stop path as POST /api/engine/stop runs
 // with the YAML `reason`. The external 10:18pm CT automation stays primary.
 // PAPER ONLY: only called from the paper branch of /api/engine/start, and the
-// scheduler itself refuses to arm for any other mode.
+// scheduler itself refuses to arm for any other mode (it is handed the
+// engine's real mode).
+//
+// Busy lock: when the fire finds another engine operation in progress it
+// retries every 10 s, 6 attempts in all (1 fire + 5 retries), then gives up
+// for the day. The single retry handle lives in `paperHardStopFire`; every
+// disarm cancels it, and each attempt re-checks that `runtimeState.sessionId`
+// is still the session the scheduler was armed for (review findings 1/1b).
 
-/** Hard-stop retry cadence while another engine operation holds the lock. */
-const PAPER_HARD_STOP_BUSY_RETRY_MS = 10_000;
-const PAPER_HARD_STOP_BUSY_MAX_ATTEMPTS = 6;
+const paperHardStopFire = new PaperHardStopFireRunner({
+  logger,
+  getCurrentSessionId: () => runtimeState.sessionId,
+  getEngineMode: () => (tradingEngine ? tradingEngine.getConfig().mode : null),
+  isEngineBusy: () => engineOperationInProgress,
+  disarm: (cause) => disarmPaperHardStop(cause),
+  stop: (ctx, sessionId) => stopForPaperHardStop(ctx, sessionId),
+});
 
-function armPaperHardStop(sessionId: string): void {
+function armPaperHardStop(sessionId: string, mode: ExecutionMode): void {
   const config = resolvePaperSessionHardStopConfig(guardrails);
   disarmPaperHardStop('rearm');
   const scheduler = new PaperHardStopScheduler({
-    mode: 'paper',
+    mode,
     config,
     logger,
-    onFire: (ctx) => runPaperHardStop(ctx, sessionId, 1),
+    onFire: (ctx) => paperHardStopFire.run(ctx, sessionId, 1),
   });
   paperHardStop = scheduler;
   if (!scheduler.arm()) {
     // Disabled in YAML (or refused): keep the snapshot visible on /api/status but hold no timer.
-    logger.info('PAPER hard stop backstop not armed', { sessionId, enabled: config.enabled, localTime: config.local_time, timezone: config.timezone });
+    logger.info('PAPER hard stop backstop not armed', { sessionId, mode, enabled: config.enabled, localTime: config.local_time, timezone: config.timezone });
   }
 }
 
 function disarmPaperHardStop(cause: string): void {
+  // Cancel a pending busy-retry FIRST: when a stop path lands here the
+  // scheduler may already be null, and the retry must still die with it.
+  if (paperHardStopFire.cancelRetry()) {
+    logger.info('PAPER hard stop busy-retry cancelled', { cause });
+  }
   if (!paperHardStop) return;
   const wasArmed = paperHardStop.isArmed();
   paperHardStop.disarm();
@@ -3552,44 +3565,14 @@ function disarmPaperHardStop(cause: string): void {
 }
 
 /**
- * Timer callback: stop the paper engine through the shared stop path. Retries a
- * bounded number of times when another engine operation holds the lock; never
- * throws into the timer (the scheduler logs anything that escapes).
+ * `run` branch of the fire handler: take the engine lock and stop the paper
+ * engine through the shared stop path. Called by `paperHardStopFire` only
+ * after it saw the armed paper session running and the lock free, with no
+ * await in between. A failure is logged and rethrown (the scheduler or the
+ * retry logs it; neither lets it escape the timer).
  */
-async function runPaperHardStop(ctx: PaperHardStopFireContext, sessionId: string, attempt: number): Promise<void> {
+async function stopForPaperHardStop(ctx: PaperHardStopFireContext, sessionId: string): Promise<void> {
   const firedAtIso = new Date(ctx.firedAtMs).toISOString();
-  if (!tradingEngine) {
-    logger.info('PAPER hard stop fired but no engine is running — nothing to stop', { sessionId, firedAt: firedAtIso });
-    disarmPaperHardStop('no_engine');
-    return;
-  }
-  const runningMode = tradingEngine.getConfig().mode;
-  if (runningMode !== 'paper') {
-    // Belt-and-braces: the scheduler is only ever built for paper; never stop a live engine from here.
-    logger.error('PAPER hard stop fired while the running engine is not paper — REFUSING to act', { sessionId, mode: runningMode });
-    disarmPaperHardStop('mode_mismatch');
-    return;
-  }
-  if (engineOperationInProgress) {
-    if (attempt >= PAPER_HARD_STOP_BUSY_MAX_ATTEMPTS) {
-      logger.error('PAPER hard stop could not acquire the engine lock — giving up for today', {
-        sessionId,
-        attempts: attempt,
-        firedAt: firedAtIso,
-      });
-      return;
-    }
-    logger.warn('PAPER hard stop fired while an engine operation is in progress — retrying', {
-      sessionId,
-      attempt,
-      retryInMs: PAPER_HARD_STOP_BUSY_RETRY_MS,
-    });
-    setTimeout(() => {
-      void runPaperHardStop(ctx, sessionId, attempt + 1);
-    }, PAPER_HARD_STOP_BUSY_RETRY_MS).unref();
-    return;
-  }
-
   engineOperationInProgress = true;
   try {
     logger.warn('PAPER hard stop fired (engine-side backstop)', {
@@ -3923,8 +3906,9 @@ app.get('/api/analytics/trades', (req, res) => {
  *
  * GET /api/analytics/strategies[?session_id=<active id>]
  *   → { sessionId, sessionStartedAt, executionMode, engineRunning, riskDay,
- *       strategies: [{ strategyId, name, enabled, closedTrades, openTrades,
- *                      hydratedOpenCount, wins, losses, breakeven,
+ *       strategies: [{ strategyId, name, enabled, closedTrades, carriedOverClosed,
+ *                      openTrades, hydratedOpenCount (subset of openTrades),
+ *                      wins, losses, breakeven,
  *                      winRate|null, realizedPnlUsd, pnlToday, closedTradesToday,
  *                      avgTradeUsd|null, feesUsd, lastTradeAt|null, signalsGenerated|null }],
  *       totals, notes }
@@ -3955,13 +3939,10 @@ app.get('/api/analytics/strategies', (req, res) => {
 
   const engineRunning = tradingEngine !== null && tradingEngine.engineRunning;
   const sessionCounts = signalProcessor?.getSessionSignalCounts();
-  const hydratedOpens = engineRunning
-    ? (tradingEngine!.getOpenPositions?.() ?? []).filter((p: any) => p.metadata?.hydratedFromSupabase)
-    : [];
+  // Carried-over (hydrated) positions are inside both trade lists, flagged
+  // `carriedOver` (desk decision 2026-09-30); hydratedOpenCount is their subset.
   res.json(buildStrategySessionStats({
-    closedTrades: engineRunning ? tradingEngine!.getClosedTrades() : [],
-    openTrades: engineRunning ? tradingEngine!.getOpenTrades() : [],
-    hydratedOpenPositions: hydratedOpens.map((p: any) => ({ strategy: p.strategy ?? null })),
+    ...strategyReportTradeInputs(tradingEngine, engineRunning),
     strategies: signalProcessor
       ? signalProcessor.getRegisteredStrategies().map((s) => ({
           id: s.id,
@@ -4197,7 +4178,10 @@ function mapEnginePosition(p: Position) {
     stopPrice: p.stopPrice ?? null,
     takeProfit: p.takeProfit ?? null,
     openTime: p.openTime instanceof Date ? p.openTime.getTime() : p.openTime,
-    /** Opened in a prior session and hydrated at start — not one of this session's trades. */
+    /**
+     * Opened in a prior session and hydrated at start. Carried over: its round
+     * trip counts in the stats of the session that closes it (desk decision 2026-09-30).
+     */
     hydratedFromPriorSession: Boolean(p.metadata?.hydratedFromSupabase),
   };
 }
@@ -4580,13 +4564,8 @@ app.get('/api/strategies', (req, res) => {
   const strategies = signalProcessor.getRegisteredStrategies();
   const engineRunning = tradingEngine !== null && tradingEngine.engineRunning;
   const sessionCounts = signalProcessor.getSessionSignalCounts();
-  const hydratedOpens = engineRunning
-    ? (tradingEngine!.getOpenPositions?.() ?? []).filter((p: any) => p.metadata?.hydratedFromSupabase)
-    : [];
   const sessionReport = buildStrategySessionStats({
-    closedTrades: engineRunning ? tradingEngine!.getClosedTrades() : [],
-    openTrades: engineRunning ? tradingEngine!.getOpenTrades() : [],
-    hydratedOpenPositions: hydratedOpens.map((p: any) => ({ strategy: p.strategy ?? null })),
+    ...strategyReportTradeInputs(tradingEngine, engineRunning),
     strategies: strategies.map((s) => ({
       id: s.id,
       name: s.name,

@@ -85,6 +85,7 @@ describe('buildStrategySessionStats', () => {
 
     expect(report.totals).toEqual({
       closedTrades: 4,
+      carriedOverClosed: 0,
       openTrades: 2,
       hydratedOpenCount: 0,
       wins: 2,
@@ -198,65 +199,71 @@ describe('sessionSignalsEmitted takes precedence over plugin signalsGenerated', 
   });
 });
 
-describe('hydratedOpenCount', () => {
-  it('counts hydrated open positions per strategy separately from session openTrades', () => {
-    const openTrades = [{ strategy: 'momentum' }];
-    const hydratedOpenPositions = [
+describe('carried-over positions (desk decision 2026-09-30: they count in the session that closes them)', () => {
+  it('hydratedOpenCount is the carriedOver SUBSET of openTrades — never additive', () => {
+    const openTrades = [
       { strategy: 'momentum' },
-      { strategy: 'trend_follow' },
-      { strategy: 'trend_follow' },
+      { strategy: 'momentum', carriedOver: true },
+      { strategy: 'trend_follow', carriedOver: true },
+      { strategy: 'trend_follow', carriedOver: true },
     ];
 
-    const report = buildStrategySessionStats({
-      closedTrades: [],
-      openTrades,
-      hydratedOpenPositions,
-      strategies: STRATEGIES,
-      session: SESSION,
-      engineRunning: true,
-      now: NOW,
-    });
+    const report = buildStrategySessionStats({ closedTrades: [], openTrades, strategies: STRATEGIES, session: SESSION, engineRunning: true, now: NOW });
 
     const momentum = report.strategies.find((s) => s.strategyId === 'momentum')!;
-    expect(momentum.openTrades).toBe(1);
+    expect(momentum.openTrades).toBe(2);
     expect(momentum.hydratedOpenCount).toBe(1);
 
     const trend = report.strategies.find((s) => s.strategyId === 'trend_follow')!;
-    expect(trend.openTrades).toBe(0);
+    expect(trend.openTrades).toBe(2);
     expect(trend.hydratedOpenCount).toBe(2);
 
-    expect(report.totals.openTrades).toBe(1);
+    expect(report.totals.openTrades).toBe(4);
     expect(report.totals.hydratedOpenCount).toBe(3);
+    expect(report.totals.hydratedOpenCount).toBeLessThanOrEqual(report.totals.openTrades);
   });
 
-  it('is 0 when no hydrated positions are provided', () => {
-    const report = buildStrategySessionStats({ closedTrades: [], strategies: STRATEGIES, session: SESSION, engineRunning: true, now: NOW });
+  it('carried-over closes are counted in closedTrades / wins / winRate and reported as carriedOverClosed', () => {
+    const closedTrades = [
+      { ...trade('trend_follow', 40, '2026-09-11T17:10:00.000Z'), carriedOver: true },
+      trade('trend_follow', -20, '2026-09-11T17:20:00.000Z'),
+    ];
+
+    const report = buildStrategySessionStats({ closedTrades, strategies: STRATEGIES, session: SESSION, engineRunning: true, now: NOW });
+
+    const trend = report.strategies.find((s) => s.strategyId === 'trend_follow')!;
+    expect(trend).toMatchObject({ closedTrades: 2, carriedOverClosed: 1, wins: 1, losses: 1, winRate: 0.5, realizedPnlUsd: 20 });
+    expect(report.totals).toMatchObject({ closedTrades: 2, carriedOverClosed: 1 });
+  });
+
+  it('is 0 when nothing was carried over', () => {
+    const report = buildStrategySessionStats({ closedTrades: [], openTrades: [{ strategy: 'momentum' }], strategies: STRATEGIES, session: SESSION, engineRunning: true, now: NOW });
 
     for (const s of report.strategies) {
       expect(s.hydratedOpenCount).toBe(0);
+      expect(s.carriedOverClosed).toBe(0);
     }
     expect(report.totals.hydratedOpenCount).toBe(0);
+    expect(report.totals.carriedOverClosed).toBe(0);
   });
 
-  it('buckets untagged hydrated positions under "unknown"', () => {
-    const hydratedOpenPositions = [
-      { strategy: null },
-      { strategy: undefined },
-      { strategy: 'momentum' },
+  it('buckets untagged carried-over opens under "unknown"', () => {
+    const openTrades = [
+      { strategy: null, carriedOver: true },
+      { strategy: undefined, carriedOver: true },
+      { strategy: 'momentum', carriedOver: true },
     ];
 
-    const report = buildStrategySessionStats({
-      closedTrades: [],
-      hydratedOpenPositions,
-      strategies: STRATEGIES,
-      session: SESSION,
-      engineRunning: true,
-      now: NOW,
-    });
+    const report = buildStrategySessionStats({ closedTrades: [], openTrades, strategies: STRATEGIES, session: SESSION, engineRunning: true, now: NOW });
 
     const unknown = report.strategies.find((s) => s.strategyId === UNKNOWN_STRATEGY_ID)!;
-    expect(unknown.hydratedOpenCount).toBe(2);
+    expect(unknown).toMatchObject({ openTrades: 2, hydratedOpenCount: 2 });
     expect(report.strategies.find((s) => s.strategyId === 'momentum')!.hydratedOpenCount).toBe(1);
-    expect(report.totals.hydratedOpenCount).toBe(3);
+    expect(report.totals).toMatchObject({ openTrades: 3, hydratedOpenCount: 3 });
+  });
+
+  it('notes state the new contract', () => {
+    expect(STRATEGY_SESSION_STATS_NOTES.join(' ')).toMatch(/INCLUDING positions carried over/);
+    expect(STRATEGY_SESSION_STATS_NOTES.join(' ')).toMatch(/SUBSET of openTrades — never add the two/);
   });
 });

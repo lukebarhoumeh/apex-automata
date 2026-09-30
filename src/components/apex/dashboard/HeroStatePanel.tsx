@@ -156,7 +156,7 @@ export function HeroStatePanel({ session, regime, intradayEquity, openPositions,
             <span
               className="mono"
               style={{ color: "hsl(var(--accent-2))" }}
-              title="Closed = positions opened and closed this session (TradeAnalytics). Open live = engine open positions now, including any hydrated from a prior session."
+              title="Closed = round trips closed this session (TradeAnalytics), including positions carried over from a prior session. Open live = engine open positions now, including any hydrated from a prior session."
               data-testid="hero-session-sentence"
             >
               {sentence}
@@ -287,7 +287,7 @@ export function HeroStatePanel({ session, regime, intradayEquity, openPositions,
             <QuickStat
               label="Closed (session)"
               value={String(closed)}
-              title="Positions opened and closed this session (TradeAnalytics)"
+              title="Round trips closed this session (TradeAnalytics), including positions carried over from a prior session"
               testId="hero-closed"
             />
             <QuickStat

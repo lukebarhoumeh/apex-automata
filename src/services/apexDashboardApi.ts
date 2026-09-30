@@ -198,9 +198,12 @@ export async function fetchEquityCurve(): Promise<BackendEquityCurve | null> {
  * - `signalsGenerated` — signals this strategy EMITTED in the active session
  *   (cleared every gate; mirrors `/api/signals?session_id=`). Falls back to
  *   the plugin's lifetime counter only on a backend without session counts.
- * - `closedTrades` / `openTrades` — positions opened in THIS session.
- * - `hydratedOpenCount` — opens carried from a prior session and hydrated at
- *   engine start. NOT included in `openTrades`; absent on pre-#72 backends.
+ * - `closedTrades` — round trips closed in THIS session, positions carried
+ *   over from a prior session INCLUDED (desk decision 2026-09-30);
+ *   `carriedOverClosed` is that subset.
+ * - `openTrades` — open trades this session manages, carried-over INCLUDED.
+ * - `hydratedOpenCount` — the carried-over SUBSET of `openTrades` (hydrated at
+ *   engine start); never add it to `openTrades`. Absent on pre-#72 backends.
  * - `winRate` — `null` until the first close (render "—", never 0%).
  */
 export interface BackendStrategySessionStats {
@@ -208,6 +211,8 @@ export interface BackendStrategySessionStats {
   name: string | null;
   enabled: boolean | null;
   closedTrades: number;
+  /** Subset of `closedTrades` carried over from a prior session; absent on older backends. */
+  carriedOverClosed?: number;
   openTrades: number;
   hydratedOpenCount?: number;
   wins: number;
