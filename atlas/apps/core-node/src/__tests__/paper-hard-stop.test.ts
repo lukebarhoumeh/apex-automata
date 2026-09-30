@@ -6,7 +6,8 @@
  *   1. `nextHardStopAt` resolves the NEXT `HH:MM` in an IANA zone: today when
  *      still ahead, tomorrow otherwise, and lands on the real local wall clock
  *      across both America/Chicago DST transitions (2026-03-08 spring forward,
- *      2026-11-01 fall back) — never "now + 24h".
+ *      2026-11-01 fall back) — never "now + 24h". A wall time inside a
+ *      spring-forward gap resolves AFTER the gap (review finding 3).
  *   2. The guardrails schema accepts the block, defaults an absent block to
  *      `enabled: false`, and rejects a malformed `local_time` / unknown zone.
  *   3. `PaperHardStopScheduler`: fires exactly once at the boundary, re-arms
@@ -69,11 +70,28 @@ describe('wall clock helpers', () => {
     expect(zonedTimeToUtcMs({ year: 2026, month: 3, day: 8 }, { hour: 22, minute: 30 }, CHICAGO)).toBe(Date.parse('2026-03-09T03:30:00Z'));
     // Ambiguous wall time on the fall-back night resolves to the FIRST (CDT) occurrence.
     expect(zonedTimeToUtcMs({ year: 2026, month: 11, day: 1 }, { hour: 1, minute: 30 }, CHICAGO)).toBe(Date.parse('2026-11-01T06:30:00Z'));
-    // Non-existent wall time in the spring-forward gap resolves to a real instant that is
-    // no earlier than the gap (03:00 CDT == 08:00Z) and no later than 03:30 CDT.
+  });
+
+  test('a wall time inside the spring-forward gap resolves AFTER the gap, shifted by the gap length (finding 3)', () => {
+    // 2026-03-08: 02:00 CST -> 03:00 CDT; 02:30 does not exist. It resolves to 03:30 CDT
+    // (08:30Z), never to 01:30 CST (07:30Z, one hour BEFORE the gap).
     const gap = zonedTimeToUtcMs({ year: 2026, month: 3, day: 8 }, { hour: 2, minute: 30 }, CHICAGO);
-    expect(gap).toBeGreaterThanOrEqual(Date.parse('2026-03-08T07:30:00Z'));
-    expect(gap).toBeLessThanOrEqual(Date.parse('2026-03-08T08:30:00Z'));
+    expect(gap).toBe(Date.parse('2026-03-08T08:30:00Z'));
+    expect(wallClockAt(gap, CHICAGO)).toMatchObject({ year: 2026, month: 3, day: 8, hour: 3, minute: 30 });
+    // The first minute of the gap lands on the first real minute after it (03:00 CDT).
+    const gapStart = zonedTimeToUtcMs({ year: 2026, month: 3, day: 8 }, { hour: 2, minute: 0 }, CHICAGO);
+    expect(gapStart).toBe(Date.parse('2026-03-08T08:00:00Z'));
+    expect(wallClockAt(gapStart, CHICAGO)).toMatchObject({ hour: 3, minute: 0 });
+    // Wall times either side of the gap are untouched.
+    expect(zonedTimeToUtcMs({ year: 2026, month: 3, day: 8 }, { hour: 1, minute: 59 }, CHICAGO)).toBe(Date.parse('2026-03-08T07:59:00Z'));
+    expect(zonedTimeToUtcMs({ year: 2026, month: 3, day: 8 }, { hour: 3, minute: 0 }, CHICAGO)).toBe(Date.parse('2026-03-08T08:00:00Z'));
+  });
+
+  test('the shipped 22:30 America/Chicago instants are pinned on the DST days and a normal day', () => {
+    // Byte-identical before/after the finding-3 gap fix (22:30 is never in a gap or overlap).
+    expect(zonedTimeToUtcMs({ year: 2026, month: 3, day: 8 }, { hour: 22, minute: 30 }, CHICAGO)).toBe(Date.parse('2026-03-09T03:30:00Z'));
+    expect(zonedTimeToUtcMs({ year: 2026, month: 11, day: 1 }, { hour: 22, minute: 30 }, CHICAGO)).toBe(Date.parse('2026-11-02T04:30:00Z'));
+    expect(zonedTimeToUtcMs({ year: 2026, month: 9, day: 30 }, { hour: 22, minute: 30 }, CHICAGO)).toBe(Date.parse('2026-10-01T03:30:00Z'));
   });
 });
 

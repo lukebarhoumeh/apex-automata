@@ -140,9 +140,10 @@ function wallClockAsUtcMs(wc: WallClock): number {
  * Starts from the naive UTC reading of the wall clock and corrects by the
  * zone offset observed at that guess, iterating so a DST boundary between the
  * guess and the answer is absorbed. A wall time that does not exist (inside a
- * spring-forward gap) resolves to the instant the clock reads once the gap
- * has passed; an ambiguous wall time (fall-back overlap) resolves to the
- * first (DST) occurrence. Neither can happen for 22:30 in America/Chicago.
+ * spring-forward gap) is shifted forward by the gap length, e.g. 02:30 in a
+ * 1h gap resolves to 03:30 after it; an ambiguous wall time (fall-back
+ * overlap) resolves to the first (DST) occurrence. Neither can happen for
+ * 22:30 in America/Chicago.
  *
  * @param date Calendar day in the zone.
  * @param time Wall-clock hour/minute in the zone.
@@ -166,6 +167,11 @@ export function zonedTimeToUtcMs(
   // occurrence; prefer the earlier instant if it also reads as the target.
   const earlier = utc - 60 * 60 * 1000;
   if (wallClockAsUtcMs(wallClockAt(earlier, timezone)) === target) return earlier;
+  // Spring-forward gap: the target wall time never exists, so the iteration
+  // settles on an instant that reads BEFORE it (the pre-gap offset). Shift
+  // forward by the shortfall (= the gap length), offset-agnostic.
+  const reads = wallClockAsUtcMs(wallClockAt(utc, timezone));
+  if (reads < target) utc += target - reads;
   return utc;
 }
 
