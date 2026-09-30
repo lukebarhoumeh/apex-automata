@@ -41,7 +41,7 @@ import {
   type RestampOpenPositionsResult,
 } from '../persistence/position-session-restamp';
 import { PositionWriteSequencer, type PositionWriteOutcome } from '../persistence/position-write-sequencer';
-import { OrderPositionLinker } from '../persistence/order-position-link';
+import { OrderPositionLinker, createSupabaseOrderLinkUpdate, linkOrdersAfterPositionWrite } from '../persistence/order-position-link';
 import { resolvePositionStrategy, resolveStrategyName } from '../persistence/strategy-name';
 import { StrategyEnumValueSupport, writeWithStrategyEnumFallback } from '../persistence/strategy-enum-fallback';
 import { buildSignalRow } from '../persistence/signal-row';
@@ -436,15 +436,7 @@ const supabase = createClient(
 // USER_ID; RETURNING tells the linker which ids landed so an order row that is
 // not persisted yet is retried on the next write. See persistence/order-position-link.ts.
 const orderPositionLinker = new OrderPositionLinker({
-  update: async (positionId, orderIds) => {
-    const { data, error } = await supabase
-      .from('orders')
-      .update({ position_id: positionId })
-      .eq('user_id', USER_ID)
-      .in('id', orderIds)
-      .select('id');
-    return { data, error };
-  },
+  update: createSupabaseOrderLinkUpdate(supabase, USER_ID),
   logger,
 });
 
@@ -1896,9 +1888,7 @@ app.post('/api/engine/start', async (req, res) => {
         // orders.position_id: link this snapshot's not-yet-linked orders once the
         // positions row is confirmed written (FK). A dropped stale update or a
         // failed write links nothing; the next write for the position retries.
-        if (positionWrite?.status === 'written') {
-          await orderPositionLinker.link(position);
-        }
+        await linkOrdersAfterPositionWrite(positionWrite, position, orderPositionLinker);
 
         // Record outcome for ML training when position is closed.
         //

@@ -29,6 +29,7 @@ import {
   upsertPositionRow,
   type PositionsConflictTarget,
 } from '../persistence/position-upsert';
+import { OrderPositionLinker, linkOrdersAfterPositionWrite } from '../persistence/order-position-link';
 import { resolvePositionWriteStamp } from '../persistence/position-session-restamp';
 import { PositionWriteSequencer, type PositionWriteOutcome } from '../persistence/position-write-sequencer';
 import { SessionColumnSupport } from '../persistence/session-stamp';
@@ -627,5 +628,106 @@ describe('paper fill → positions row (live schema, session-stamped)', () => {
     expect(logger.warn.mock.calls[0][0]).toMatch(/close write failed; retrying/);
     expect(logger.warn.mock.calls[0][1]).toMatchObject({ positionId: opened.id, symbol: 'ETH-USD', sessionId: STAMP.sessionId, attempt: 1, nextDelayMs: 250, code: '08006', transient: true });
     expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it('orders.position_id is linked only after a WRITTEN positions write (FK order): open + close link, a failed or dropped write never does (review finding 8b)', async () => {
+    const logger = makeLogger();
+    const tracker = new PositionTracker(trackerConfig, asLogger(logger));
+    trackers.push(tracker);
+
+    const table = liveSchemaPositionsTable();
+    const conflictSupport = new PositionsConflictTargetSupport(resolvePositionsConflictTarget({}), { logger });
+    const sessionSupport = new SessionColumnSupport();
+
+    // The scale-in's positions upsert is rejected (single attempt for a non-close write → `failed`).
+    let failNextUpdate = false;
+    const upsert = async (payload: Row, onConflict: PositionsConflictTarget) => {
+      if (failNextUpdate && payload.closed_at == null) {
+        failNextUpdate = false;
+        return { error: RLS_DENIED };
+      }
+      return table.upsert(payload, onConflict);
+    };
+
+    // In-memory `orders` with the FK `position_id REFERENCES positions(id)`:
+    // an UPDATE naming a position whose row is not in `positions` violates it.
+    const orders = new Map<string, Row>(['coid-entry', 'coid-scale', 'coid-exit'].map((id) => [id, { id, position_id: null }]));
+    const updates: Array<{ positionId: string; orderIds: string[]; positionRowPersisted: boolean }> = [];
+    const linker = new OrderPositionLinker({
+      update: async (positionId, orderIds) => {
+        const positionRowPersisted = table.rows.has(positionId);
+        updates.push({ positionId, orderIds: [...orderIds], positionRowPersisted });
+        if (!positionRowPersisted) return { data: null, error: { code: '23503', message: 'insert or update on table "orders" violates foreign key constraint "orders_position_id_fkey"' } };
+        const data = orderIds.filter((id) => orders.has(id)).map((id) => { orders.get(id)!.position_id = positionId; return { id }; });
+        return { data, error: null };
+      },
+      logger,
+    });
+    const linkCalls: Array<{ status: PositionWriteOutcome['status']; kind: PositionWriteOutcome['kind'] }> = [];
+    const gatedLinker = { link: (p: Position) => linker.link(p) };
+
+    // Same composition as api/server.ts `position:update`: sequenced upsert, then the FK-ordering gate.
+    const sequencer = new PositionWriteSequencer({ logger, sleep: async () => {} });
+    const outcomes: PositionWriteOutcome[] = [];
+    const persist = async (position: Position) => {
+      const row = mapPositionRow(position);
+      const stamp = resolvePositionWriteStamp(position, STAMP);
+      const outcome = await sequencer.enqueue({
+        positionId: String(row.id),
+        symbol: position.symbol,
+        sessionId: stamp?.sessionId ?? null,
+        kind: row.closed_at ? 'close' : 'update',
+        write: () => upsertPositionRow({ row, stamp, sessionSupport, conflictSupport, upsert, logger }),
+      });
+      outcomes.push(outcome);
+      const linkResult = await linkOrdersAfterPositionWrite(outcome, position, gatedLinker);
+      if (linkResult) linkCalls.push({ status: outcome.status, kind: outcome.kind });
+    };
+    const pending: Promise<void>[] = [];
+    tracker.on('position:opened', (p) => { pending.push(persist(p)); });
+    tracker.on('position:updated', (p) => { pending.push(persist(p)); });
+    tracker.on('position:closed', (p) => { pending.push(persist(p)); });
+
+    // 1. Open → written → the entry order is linked.
+    await tracker.processFill(
+      paperFill({ order_id: 'exch-entry', trade_id: 1, product_id: 'ETH-USD', side: 'buy', size: '0.05', price: '4321.5', created_at: '2026-09-21T17:41:02.000Z' }),
+      { strategy: 'trend_follow', clientOrderId: 'coid-entry' },
+    );
+    await Promise.all(pending);
+    const opened = tracker.getPosition('ETH-USD')!;
+    // A snapshot of the open position as a stale update would carry it.
+    const staleSnapshot = { ...opened, trades: [...opened.trades] } as Position;
+
+    // 2. Scale-in whose positions write FAILS → no link attempt.
+    failNextUpdate = true;
+    await tracker.processFill(
+      paperFill({ order_id: 'exch-scale', trade_id: 2, product_id: 'ETH-USD', side: 'buy', size: '0.05', price: '4330', created_at: '2026-09-21T17:50:00.000Z' }),
+      { strategy: 'trend_follow', clientOrderId: 'coid-scale' },
+    );
+    await Promise.all(pending);
+
+    // 3. Close → written → the scale-in (retried) and exit orders are linked.
+    await tracker.processFill(
+      paperFill({ order_id: 'exch-exit', trade_id: 3, product_id: 'ETH-USD', side: 'sell', size: '0.1', price: '4451.15', created_at: '2026-09-21T18:02:11.000Z' }),
+      { tag: 'take_profit', clientOrderId: 'coid-exit' },
+    );
+    await Promise.all(pending);
+    const closedTrades = opened.trades;
+
+    // 4. A stale update reaching the handler after the close → dropped → no link attempt.
+    await persist(staleSnapshot);
+
+    expect(outcomes.map((o) => [o.kind, o.status])).toEqual([['update', 'written'], ['update', 'failed'], ['close', 'written'], ['update', 'dropped']]);
+    expect(linkCalls).toEqual([{ status: 'written', kind: 'update' }, { status: 'written', kind: 'close' }]);
+    expect(updates).toEqual([
+      { positionId: opened.id, orderIds: ['coid-entry'], positionRowPersisted: true },
+      { positionId: opened.id, orderIds: ['coid-scale', 'coid-exit'], positionRowPersisted: true },
+    ]);
+    // Every order the position's trades carry is linked to it, and nothing else.
+    expect(closedTrades.map((t) => t.clientOrderId)).toEqual(['coid-entry', 'coid-scale', 'coid-exit']);
+    expect([...orders.values()].filter((o) => o.position_id === opened.id).map((o) => o.id)).toEqual(closedTrades.map((t) => t.clientOrderId));
+    expect(linker.linkCounts()).toEqual({ linked: 3, pending: 0, failed: 0, disabled: false });
+    expect(linker.snapshot()).toEqual({ positions: 0, disabled: false });
+    expect(table.rows.get(opened.id)).toMatchObject({ closed_at: '2026-09-21T18:02:11.000Z', qty_open: 0 });
   });
 });
