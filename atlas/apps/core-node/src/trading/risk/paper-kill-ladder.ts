@@ -49,6 +49,8 @@ export type LadderSoftReasonCode =
  * removing or renaming a code here needs a NEW migration that redefines the
  * view (applied migrations are never edited); the guard test
  * src/__tests__/desk-risk-status-soft-codes.test.ts fails until it exists.
+ * The guard compares the two as SETS (SQL NOT IN is set membership), so
+ * reordering this array alone needs no migration.
  */
 export const LADDER_SOFT_REASON_CODES: readonly LadderSoftReasonCode[] = [
   'size_down_consec',
