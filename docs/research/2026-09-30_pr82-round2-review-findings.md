@@ -2,7 +2,9 @@
 
 **Scope:** the round-2 diff of PR #82 (`e411355..0a3825e`): paper 22:30 CT hard stop, persistence findings 6/7, order↔position linker, mode-scoped reconcile, Donchian book reconcile, and the four desk-status migrations.
 **Method:** five read-only reviewers (one dimension each) → dedupe → three independent verifiers per finding (refute / reproduce in a clean worktree / impact + fix). A finding is confirmed when at least two of three verifiers could not refute it and it has non-zero impact.
-**Outcome:** 13 findings, 0 high. 9 confirmed, 1 refuted, 3 unverified (their verifiers hit a usage limit). The fix stage did not run for the same reason, so **none of the items below is fixed yet** except where noted.
+**Outcome:** 13 findings, 0 high. 9 confirmed, 1 refuted, 3 unverified (their verifiers hit a usage limit).
+
+**Status 2026-09-30: ALL FIXED** in the post-#82 follow-up PR, each with a failing-first test and its own adversarial review (hard stop: ship-with-nits, no repair needed; linker, carried-over and guards: ship-with-nits, repaired). Finding 7 followed the desk decision to COUNT carried-over positions (Luke, 2026-09-30). The unverified items 11–13 were handled as doc notes plus a guard test. Open follow-ups from that PR: `trade_log` has no metadata column, so carried-over rows are identifiable only by `entry_time < trading_sessions.started_at`; a same-session supervisor restart also marks re-hydrated positions `carriedOver` (counts only, totals unaffected).
 
 None of these touches a live gate, a desk pin, money, or order flow. The hard-stop items are paper-only by construction.
 
