@@ -8,11 +8,12 @@
  *   signals   `sessionStats.signalsGenerated` (session-scoped emits, API #72)
  *             → plugin `stats.signalsGenerated` (lifetime counter; pre-#72
  *               backend only) → null ("—")
- *   closed    `sessionStats.closedTrades` → client bucketing of the session
- *             ledger (`/api/analytics/trades`) → 0
+ *   closed    `sessionStats.closedTrades` (carried-over round trips INCLUDED
+ *             since the 2026-09-30 desk decision) → client bucketing of the
+ *             session ledger (`/api/analytics/trades`) → 0
  *   open      engine open positions (`/api/positions` → engineOpenPositions,
- *             hydrated INCLUDED) → `sessionStats.openTrades + hydratedOpenCount`
- *             → null
+ *             hydrated INCLUDED) → `sessionStats.openTrades` (carried-over
+ *             INCLUDED; `hydratedOpenCount` is a subset, never added) → null
  *   hydrated  engine positions flagged `hydratedFromPriorSession` →
  *             `sessionStats.hydratedOpenCount` → null
  *   winRate   null whenever `closed === 0` — a rate over zero trades is not
@@ -101,9 +102,10 @@ export function resolveStrategySessionCounts(
     hydratedOpen = mine.filter((p) => p.hydratedFromPriorSession).length;
     pnlOpen = mine.reduce((acc, p) => acc + (finite(p.unrealizedPnL) ?? 0), 0);
   } else if (ss) {
-    const sessionOpen = finite(ss.openTrades) ?? 0;
+    // openTrades already contains the carried-over opens; hydratedOpenCount is
+    // their subset (desk decision 2026-09-30) — adding it would double count.
+    open = finite(ss.openTrades) ?? 0;
     hydratedOpen = finite(ss.hydratedOpenCount);
-    open = sessionOpen + (hydratedOpen ?? 0);
   }
 
   return { signals, closed, open, hydratedOpen, pnlClosed, pnlOpen, wins, losses, winRate };

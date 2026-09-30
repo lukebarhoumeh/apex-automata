@@ -125,6 +125,13 @@ export interface TradeRecord {
   exitOrderId?: string;
   maxFavorableExcursion?: number; // MFE in USD
   maxAdverseExcursion?: number;   // MAE in USD
+  /**
+   * Opened before this TradeAnalytics instance existed and seeded from the
+   * hydrated book at engine start (desk decision 2026-09-30: carried-over round
+   * trips count in the session that closes them). `entryTime` is then the
+   * position's real open time (`positions.opened_at`), not the seed time.
+   */
+  carriedOver?: boolean;
 }
 
 export interface SessionStats {
@@ -144,6 +151,10 @@ export interface SessionStats {
   winningTrades: number;
   losingTrades: number;
   breakEvenTrades: number;
+  /** Subset of `totalTrades` whose entry was carried over from a prior session (hydrated at start). */
+  carriedOverClosed: number;
+  /** Open trades carried over from a prior session and not yet closed (subset of the open records). */
+  carriedOverOpen: number;
   
   // Ratios
   winRate: number;
@@ -281,7 +292,13 @@ export class TradeAnalytics extends EventEmitter {
   // ============================================================================
   
   /**
-   * Record a new trade entry.
+   * Record a new trade entry. Idempotent per `tradeId` (Map.set): recording the
+   * same id again replaces the open record, so a re-hydrate cannot duplicate it.
+   *
+   * @param params.entryTime Real open time; defaults to now. Set for a position
+   *   carried over from a prior session so duration / avg hold are measured
+   *   from `positions.opened_at`, not from the engine start.
+   * @param params.carriedOver Marks a record seeded from the hydrated book.
    */
   public recordEntry(params: {
     tradeId: string;
@@ -294,6 +311,8 @@ export class TradeAnalytics extends EventEmitter {
     signalId?: string;
     reasonCode?: string;
     entryOrderId?: string;
+    entryTime?: Date;
+    carriedOver?: boolean;
   }): void {
     const slippageBps = params.expectedPrice 
       ? ((params.entryPrice - params.expectedPrice) / params.expectedPrice) * 10000
@@ -308,7 +327,10 @@ export class TradeAnalytics extends EventEmitter {
       id: params.tradeId,
       symbol: params.symbol,
       side: params.side,
-      entryTime: new Date(),
+      entryTime:
+        params.entryTime instanceof Date && Number.isFinite(params.entryTime.getTime())
+          ? params.entryTime
+          : new Date(),
       entryPrice: params.entryPrice,
       size: params.size,
       fees: 0,
@@ -320,6 +342,7 @@ export class TradeAnalytics extends EventEmitter {
       entryOrderId: params.entryOrderId,
       maxFavorableExcursion: 0,
       maxAdverseExcursion: 0,
+      ...(params.carriedOver === true ? { carriedOver: true } : {}),
     };
     
     this.trades.set(params.tradeId, trade);
@@ -337,6 +360,7 @@ export class TradeAnalytics extends EventEmitter {
       side: params.side,
       price: params.entryPrice,
       slippageBps: adjustedSlippage,
+      carriedOver: params.carriedOver === true,
     });
   }
   
@@ -530,6 +554,9 @@ export class TradeAnalytics extends EventEmitter {
     const winningTrades = this.closedTrades.filter(t => t.outcome === 'win').length;
     const losingTrades = this.closedTrades.filter(t => t.outcome === 'loss').length;
     const breakEvenTrades = this.closedTrades.filter(t => t.outcome === 'breakeven').length;
+    const carriedOverClosed = this.closedTrades.filter(t => t.carriedOver === true).length;
+    let carriedOverOpen = 0;
+    for (const t of this.trades.values()) if (t.carriedOver === true) carriedOverOpen += 1;
     
     const winRate = n > 0 ? winningTrades / n : 0;
     const lossRate = n > 0 ? losingTrades / n : 0;
@@ -584,6 +611,8 @@ export class TradeAnalytics extends EventEmitter {
       winningTrades,
       losingTrades,
       breakEvenTrades,
+      carriedOverClosed,
+      carriedOverOpen,
       
       winRate,
       profitFactor,

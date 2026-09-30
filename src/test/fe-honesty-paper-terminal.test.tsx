@@ -121,7 +121,8 @@ const TF: BackendStrategy = {
   category: "trend",
   enabled: true,
   stats: { signalsGenerated: 41 },
-  sessionStats: sessionStats({ signalsGenerated: 8, openTrades: 0, hydratedOpenCount: 3 }),
+  // Carried-over contract (2026-09-30): openTrades INCLUDES the 3 hydrated opens; hydratedOpenCount is their subset.
+  sessionStats: sessionStats({ signalsGenerated: 8, openTrades: 3, hydratedOpenCount: 3 }),
 };
 
 const enginePos = (o: Partial<EngineOpenPosition> = {}): EngineOpenPosition => ({
@@ -382,12 +383,16 @@ describe("C — signals emitted / closed (session) / open (live) are distinct co
     expect(resolveStrategySessionCounts("trend_follow", null, undefined, null).signals).toBeNull();
   });
 
-  it("open (live) counts engine positions incl. hydrated; falls back to openTrades + hydratedOpenCount", () => {
+  it("open (live) counts engine positions incl. hydrated; falls back to openTrades (hydratedOpenCount is a subset, never added)", () => {
     const fromPositions = resolveStrategySessionCounts("trend_follow", TF, undefined, THREE_HYDRATED);
     expect(fromPositions).toMatchObject({ closed: 0, open: 3, hydratedOpen: 3, pnlOpen: 55, winRate: null });
 
     const fromStats = resolveStrategySessionCounts("trend_follow", TF, undefined, null);
     expect(fromStats).toMatchObject({ open: 3, hydratedOpen: 3, pnlOpen: null });
+
+    // One session-opened + two carried-over opens: 3 open, not 5.
+    const mixed = resolveStrategySessionCounts("trend_follow", { sessionStats: sessionStats({ openTrades: 3, hydratedOpenCount: 2 }) }, undefined, null);
+    expect(mixed).toMatchObject({ open: 3, hydratedOpen: 2 });
 
     const otherStrategy = resolveStrategySessionCounts("momentum", { sessionStats: sessionStats({ strategyId: "momentum" }) }, undefined, THREE_HYDRATED);
     expect(otherStrategy).toMatchObject({ open: 0, hydratedOpen: 0 });

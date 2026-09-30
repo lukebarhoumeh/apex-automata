@@ -8,7 +8,10 @@
  * counter — of SIGNALS) and this module adds the honest trade fields next to
  * it, computed from the session's closed trades only:
  *
- *   closedTrades   positions opened AND closed in this engine session
+ *   closedTrades   round trips CLOSED in this engine session, including
+ *                  positions carried over (hydrated) from a prior session —
+ *                  desk decision 2026-09-30, "so we can collect data each
+ *                  time"; `carriedOverClosed` is that subset
  *   pnlToday       realized USD on trades that exited on the current UTC day
  *   winRate        wins / closedTrades, `null` until the first close
  *
@@ -26,6 +29,8 @@ export interface StrategyTradeLike {
   fees?: number | null;
   outcome?: 'win' | 'loss' | 'breakeven' | null;
   exitTime?: Date | number | string | null;
+  /** Seeded from the hydrated book at engine start (opened in a prior session). */
+  carriedOver?: boolean | null;
 }
 
 /** The slice of a registered strategy plugin this module reads. */
@@ -52,14 +57,15 @@ export interface StrategySessionStats {
   name: string | null;
   /** Registry enabled flag; `null` when the strategy is not registered (only seen on trades). */
   enabled: boolean | null;
-  /** Positions opened and closed within this session. */
+  /** Round trips closed in this session, carried-over positions included. */
   closedTrades: number;
-  /** Positions opened in this session and still open. */
+  /** Subset of `closedTrades` whose position was carried over from a prior session. */
+  carriedOverClosed: number;
+  /** Open trades this session manages, carried-over positions included. */
   openTrades: number;
   /**
-   * Positions opened in a prior session and hydrated at engine start.
-   * NOT included in `openTrades` (which is session-scoped).
-   * FE should render these separately (e.g. "2 carried from prior session").
+   * Subset of `openTrades` carried over from a prior session (hydrated at
+   * engine start). A SUBSET — never add it to `openTrades`.
    */
   hydratedOpenCount: number;
   wins: number;
@@ -87,6 +93,7 @@ export interface StrategySessionStats {
 
 export interface StrategySessionStatsTotals {
   closedTrades: number;
+  carriedOverClosed: number;
   openTrades: number;
   hydratedOpenCount: number;
   wins: number;
@@ -114,8 +121,8 @@ export interface StrategySessionStatsReport {
 }
 
 export const STRATEGY_SESSION_STATS_NOTES: readonly string[] = [
-  'closedTrades counts positions opened AND closed in this engine session; positions hydrated from a prior session are excluded.',
-  'hydratedOpenCount counts positions opened in a prior session and hydrated at engine start — not included in openTrades.',
+  'closedTrades counts round trips closed in this engine session, INCLUDING positions carried over (hydrated) from a prior session (desk decision 2026-09-30); carriedOverClosed is that subset.',
+  'openTrades counts open trades this session manages, carried-over positions included; hydratedOpenCount is the carried-over SUBSET of openTrades — never add the two.',
   'winRate and avgTradeUsd are null until the first closed trade — render "—", not 0%.',
   'pnlToday is realized USD on closed trades whose exit falls on riskDay (UTC); it differs from realizedPnlUsd when the session spans midnight UTC.',
   'signalsGenerated is the session-scoped emitted signal count (signals that cleared all gates) — it mirrors /api/signals?session_id=<active>.',
@@ -141,23 +148,38 @@ function normalizeStrategyId(strategy: string | null | undefined): string {
   return trimmed.length > 0 ? trimmed : UNKNOWN_STRATEGY_ID;
 }
 
-/** Position-like shape for hydrated opens (only strategy tag needed). */
-export interface HydratedOpenLike {
-  strategy?: string | null;
-}
-
 interface Bucket {
   closed: StrategyTradeLike[];
   open: number;
   hydratedOpen: number;
 }
 
+/** The slice of TradingEngine the strategy report reads (TradeAnalytics accessors). */
+export interface StrategyReportTradeSource {
+  getClosedTrades(): readonly StrategyTradeLike[];
+  getOpenTrades(): readonly StrategyTradeLike[];
+}
+
+/**
+ * Trade inputs for `buildStrategySessionStats`, shared by BOTH server.ts call
+ * sites (`/api/analytics/strategies` and `/api/strategies[].sessionStats`) so
+ * they cannot drift. Carried-over positions arrive already inside both lists
+ * (flagged `carriedOver`), so there is no separate hydrated input to add on
+ * top — that is what keeps the open side from being double counted.
+ */
+export function strategyReportTradeInputs(
+  engine: StrategyReportTradeSource | null | undefined,
+  engineRunning: boolean,
+): { closedTrades: readonly StrategyTradeLike[]; openTrades: readonly StrategyTradeLike[] } {
+  if (!engine || !engineRunning) return { closedTrades: [], openTrades: [] };
+  return { closedTrades: engine.getClosedTrades(), openTrades: engine.getOpenTrades() };
+}
+
 /**
  * Build the per-strategy session report.
  *
- * @param input.closedTrades Closed trades of the session (`TradeAnalytics.getRecentTrades(Infinity)`).
- * @param input.openTrades Open trades of the session (`TradeAnalytics.getOpenTrades()`).
- * @param input.hydratedOpenPositions Positions hydrated from a prior session (PositionTracker opens with `metadata.hydratedFromSupabase`).
+ * @param input.closedTrades Closed trades of the session (`TradeAnalytics.getClosedTrades()`), carried-over included.
+ * @param input.openTrades Open trades of the session (`TradeAnalytics.getOpenTrades()`), carried-over included.
  * @param input.strategies Registered plugins; every one appears in the output even with zero trades.
  * @param input.session Active session identity from the API runtime state.
  * @param input.engineRunning Whether the engine is running (report is empty-but-honest otherwise).
@@ -166,7 +188,6 @@ interface Bucket {
 export function buildStrategySessionStats(input: {
   closedTrades: readonly StrategyTradeLike[];
   openTrades?: readonly StrategyTradeLike[];
-  hydratedOpenPositions?: readonly HydratedOpenLike[];
   strategies: readonly StrategyDescriptorLike[];
   session: { sessionId: string | null; sessionStartedAt: number | null; executionMode: ExecutionMode | null };
   engineRunning: boolean;
@@ -187,8 +208,11 @@ export function buildStrategySessionStats(input: {
   };
 
   for (const trade of input.closedTrades) bucketFor(trade.strategy).closed.push(trade);
-  for (const trade of input.openTrades ?? []) bucketFor(trade.strategy).open += 1;
-  for (const pos of input.hydratedOpenPositions ?? []) bucketFor(pos.strategy).hydratedOpen += 1;
+  for (const trade of input.openTrades ?? []) {
+    const bucket = bucketFor(trade.strategy);
+    bucket.open += 1;
+    if (trade.carriedOver === true) bucket.hydratedOpen += 1;
+  }
 
   // Registered strategies first (registry order), then any strategy that only
   // appears on trades (e.g. a plugin unregistered mid-session, or 'unknown').
@@ -210,6 +234,7 @@ export function buildStrategySessionStats(input: {
     let feesUsd = 0;
     let pnlToday = 0;
     let closedTradesToday = 0;
+    let carriedOverClosed = 0;
     let lastTradeAt: number | null = null;
 
     for (const trade of bucket.closed) {
@@ -219,6 +244,7 @@ export function buildStrategySessionStats(input: {
       if (trade.outcome === 'win') wins += 1;
       else if (trade.outcome === 'loss') losses += 1;
       else breakeven += 1;
+      if (trade.carriedOver === true) carriedOverClosed += 1;
 
       const exitedAt = toEpochMs(trade.exitTime);
       if (exitedAt !== null) {
@@ -244,6 +270,7 @@ export function buildStrategySessionStats(input: {
       name: descriptor?.name ?? null,
       enabled: descriptor ? Boolean(descriptor.enabled) : null,
       closedTrades,
+      carriedOverClosed,
       openTrades: bucket.open,
       hydratedOpenCount: bucket.hydratedOpen,
       wins,
@@ -263,6 +290,7 @@ export function buildStrategySessionStats(input: {
   const totals = strategies.reduce<StrategySessionStatsTotals>(
     (acc, s) => ({
       closedTrades: acc.closedTrades + s.closedTrades,
+      carriedOverClosed: acc.carriedOverClosed + s.carriedOverClosed,
       openTrades: acc.openTrades + s.openTrades,
       hydratedOpenCount: acc.hydratedOpenCount + s.hydratedOpenCount,
       wins: acc.wins + s.wins,
@@ -273,7 +301,7 @@ export function buildStrategySessionStats(input: {
       pnlToday: acc.pnlToday + s.pnlToday,
       feesUsd: acc.feesUsd + s.feesUsd,
     }),
-    { closedTrades: 0, openTrades: 0, hydratedOpenCount: 0, wins: 0, losses: 0, breakeven: 0, winRate: null, realizedPnlUsd: 0, pnlToday: 0, feesUsd: 0 },
+    { closedTrades: 0, carriedOverClosed: 0, openTrades: 0, hydratedOpenCount: 0, wins: 0, losses: 0, breakeven: 0, winRate: null, realizedPnlUsd: 0, pnlToday: 0, feesUsd: 0 },
   );
   totals.winRate = totals.closedTrades > 0 ? totals.wins / totals.closedTrades : null;
 

@@ -3,7 +3,7 @@ import { countHydratedPositions, type Position, type PositionSide } from "@/type
 
 /** Tooltip for the hydrated chip on positions carried from a prior session. */
 export const HYDRATED_TITLE =
-  "Opened in a prior session and hydrated at engine start — live and counted as open, not one of this session's trades.";
+  "Opened in a prior session and hydrated at engine start — carried over: counted as open now, and its round trip counts in this session's closed trades when it closes.";
 
 /** `3 active` / `3 active · 3 hydrated from prior session`. */
 export function openPositionsSubtitle(positions: readonly Position[]): string {

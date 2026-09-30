@@ -74,7 +74,7 @@ import {
   SessionScopeQuery,
   SessionWindow,
 } from './session-scope';
-import { buildStrategySessionStats, StrategySessionStats } from './strategy-session-stats';
+import { buildStrategySessionStats, StrategySessionStats, strategyReportTradeInputs } from './strategy-session-stats';
 import { buildPnlSnapshotPayload, PnlSnapshot } from './pnl-snapshot';
 import { buildPersistenceBlock, buildStatusPayload, StatusPayload } from './status-payload';
 import { createClient } from '@supabase/supabase-js';
@@ -3906,8 +3906,9 @@ app.get('/api/analytics/trades', (req, res) => {
  *
  * GET /api/analytics/strategies[?session_id=<active id>]
  *   → { sessionId, sessionStartedAt, executionMode, engineRunning, riskDay,
- *       strategies: [{ strategyId, name, enabled, closedTrades, openTrades,
- *                      hydratedOpenCount, wins, losses, breakeven,
+ *       strategies: [{ strategyId, name, enabled, closedTrades, carriedOverClosed,
+ *                      openTrades, hydratedOpenCount (subset of openTrades),
+ *                      wins, losses, breakeven,
  *                      winRate|null, realizedPnlUsd, pnlToday, closedTradesToday,
  *                      avgTradeUsd|null, feesUsd, lastTradeAt|null, signalsGenerated|null }],
  *       totals, notes }
@@ -3938,13 +3939,10 @@ app.get('/api/analytics/strategies', (req, res) => {
 
   const engineRunning = tradingEngine !== null && tradingEngine.engineRunning;
   const sessionCounts = signalProcessor?.getSessionSignalCounts();
-  const hydratedOpens = engineRunning
-    ? (tradingEngine!.getOpenPositions?.() ?? []).filter((p: any) => p.metadata?.hydratedFromSupabase)
-    : [];
+  // Carried-over (hydrated) positions are inside both trade lists, flagged
+  // `carriedOver` (desk decision 2026-09-30); hydratedOpenCount is their subset.
   res.json(buildStrategySessionStats({
-    closedTrades: engineRunning ? tradingEngine!.getClosedTrades() : [],
-    openTrades: engineRunning ? tradingEngine!.getOpenTrades() : [],
-    hydratedOpenPositions: hydratedOpens.map((p: any) => ({ strategy: p.strategy ?? null })),
+    ...strategyReportTradeInputs(tradingEngine, engineRunning),
     strategies: signalProcessor
       ? signalProcessor.getRegisteredStrategies().map((s) => ({
           id: s.id,
@@ -4180,7 +4178,10 @@ function mapEnginePosition(p: Position) {
     stopPrice: p.stopPrice ?? null,
     takeProfit: p.takeProfit ?? null,
     openTime: p.openTime instanceof Date ? p.openTime.getTime() : p.openTime,
-    /** Opened in a prior session and hydrated at start — not one of this session's trades. */
+    /**
+     * Opened in a prior session and hydrated at start. Carried over: its round
+     * trip counts in the stats of the session that closes it (desk decision 2026-09-30).
+     */
     hydratedFromPriorSession: Boolean(p.metadata?.hydratedFromSupabase),
   };
 }
@@ -4563,13 +4564,8 @@ app.get('/api/strategies', (req, res) => {
   const strategies = signalProcessor.getRegisteredStrategies();
   const engineRunning = tradingEngine !== null && tradingEngine.engineRunning;
   const sessionCounts = signalProcessor.getSessionSignalCounts();
-  const hydratedOpens = engineRunning
-    ? (tradingEngine!.getOpenPositions?.() ?? []).filter((p: any) => p.metadata?.hydratedFromSupabase)
-    : [];
   const sessionReport = buildStrategySessionStats({
-    closedTrades: engineRunning ? tradingEngine!.getClosedTrades() : [],
-    openTrades: engineRunning ? tradingEngine!.getOpenTrades() : [],
-    hydratedOpenPositions: hydratedOpens.map((p: any) => ({ strategy: p.strategy ?? null })),
+    ...strategyReportTradeInputs(tradingEngine, engineRunning),
     strategies: strategies.map((s) => ({
       id: s.id,
       name: s.name,

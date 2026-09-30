@@ -324,6 +324,28 @@ describe('TradeAnalytics', () => {
     closed.pop();
     expect(analytics.getClosedTrades()).toHaveLength(3);
   });
+
+  test('carried-over entry: real entryTime drives duration, counted in totals and carriedOverClosed; re-seed is idempotent', () => {
+    const openedAt = new Date(Date.now() - 3_600_000);
+    const seed = { tradeId: 'carried-1', symbol: 'ETH-USD', side: 'long' as const, entryPrice: 2000, size: 1, strategy: 'trend_follow', entryTime: openedAt, carriedOver: true };
+    analytics.recordEntry(seed);
+    analytics.recordEntry(seed);
+    expect(analytics.getOpenTrades()).toHaveLength(1);
+    expect(analytics.getSessionStats()).toMatchObject({ carriedOverOpen: 1, carriedOverClosed: 0, totalTrades: 0 });
+
+    analytics.recordExit({ tradeId: 'carried-1', exitPrice: 2010, realizedPnl: 10, fees: 0 });
+    const [closed] = analytics.getClosedTrades();
+    expect(closed.carriedOver).toBe(true);
+    expect(closed.entryTime).toBe(openedAt);
+    expect(closed.duration).toBeGreaterThanOrEqual(3600);
+    expect(analytics.getSessionStats()).toMatchObject({ totalTrades: 1, carriedOverClosed: 1, carriedOverOpen: 0, winningTrades: 1 });
+  });
+
+  test('an exit with no entry at all still warns and is not counted', () => {
+    analytics.recordExit({ tradeId: 'ghost', exitPrice: 1, realizedPnl: 1, fees: 0 });
+    expect(mockLogger.warn).toHaveBeenCalledWith('Trade not found for exit', { tradeId: 'ghost' });
+    expect(analytics.getSessionStats().totalTrades).toBe(0);
+  });
 });
 
 /**

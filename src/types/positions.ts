@@ -21,7 +21,8 @@ export interface Position {
   /**
    * Opened in a PRIOR session and hydrated into the engine at start
    * (`/api/positions` → `engineOpenPositions[].hydratedFromPriorSession`).
-   * Live and counted as open, but not one of this session's trades.
+   * Live and counted as open; carried over, so its round trip counts in the
+   * closed trades of the session that closes it (desk decision 2026-09-30).
    */
   hydratedFromPriorSession?: boolean;
 }

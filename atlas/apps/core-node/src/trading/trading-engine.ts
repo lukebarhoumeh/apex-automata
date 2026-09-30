@@ -1373,6 +1373,10 @@ export class TradingEngine extends EventEmitter {
       });
     }
 
+    if (positionsResult.status === 'fulfilled') {
+      this.seedTradeAnalyticsFromHydratedPositions();
+    }
+
     this.logger.info('Startup state hydration: complete', {
       positionsHydrated: positions,
       ordersHydrated: orders,
@@ -1380,6 +1384,49 @@ export class TradingEngine extends EventEmitter {
       positionsOk: positionsResult.status === 'fulfilled',
       ordersOk: ordersResult.status === 'fulfilled',
     });
+  }
+
+  /**
+   * Desk decision 2026-09-30 (PR #82 review finding 7): positions carried over
+   * from a prior session count in the stats of the session that closes them.
+   * A hydrated position never emits `position:opened` (finding-6 fix), so seed
+   * TradeAnalytics here with the hydrated book: real open time
+   * (`positions.opened_at`), hydrated entry price / size / strategy, marked
+   * `carriedOver`. Its close then goes through the normal `position:closed` →
+   * `recordExit` path (closedTrades, totalTrades, trade_log, the
+   * trading_sessions total_trades stamp). Scale-ins after hydrate emit
+   * `position:updated` exactly like an in-session scale-in.
+   *
+   * Reporting only: no PositionTracker event is emitted (in particular no
+   * `position:opened`, so the RiskEngine soft-launch entry counter is untouched),
+   * and no gate / risk consumer (RiskEngine, kill ladder, meta-filter, EV gate,
+   * PnL service) reads TradeAnalytics — they all listen to PositionTracker
+   * events, whose close path already covered hydrated positions.
+   * Idempotent: recordEntry is keyed by position id (Map.set).
+   */
+  private seedTradeAnalyticsFromHydratedPositions(): void {
+    if (!this.tradeAnalytics || !this.positionTracker) return;
+    let seeded = 0;
+    for (const position of this.positionTracker.getOpenPositions()) {
+      if (!position.metadata?.hydratedFromSupabase) continue;
+      if (position.side !== 'long' && position.side !== 'short') continue;
+      this.tradeAnalytics.recordEntry({
+        tradeId: position.id,
+        symbol: position.symbol,
+        side: position.side,
+        // Straight after hydrate averagePrice IS the persisted entry_price.
+        entryPrice: position.averagePrice,
+        size: position.size,
+        strategy: position.strategy,
+        signalId: position.signalId,
+        entryTime: position.openTime,
+        carriedOver: true,
+      });
+      seeded++;
+    }
+    if (seeded > 0) {
+      this.logger.info('TradeAnalytics seeded with carried-over positions', { seeded });
+    }
   }
 
   private initializePaperSimulator(): void {
