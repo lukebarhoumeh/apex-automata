@@ -22,12 +22,18 @@ import { TradingEngine, TradingEngineConfig } from '../trading/trading-engine';
 import type { Fill } from '../exchanges/coinbase/types';
 import type { Logger } from '../core/logger';
 import { buildStrategySessionStats, strategyReportTradeInputs } from '../api/strategy-session-stats';
+import { auditOneTrade } from '../cli/audit-trades';
+import type { LiveAccountTruth } from '../trading/account/live-account-truth';
 
 vi.mock('../config/secrets');
 vi.mock('../exchanges/coinbase');
 
 const db = vi.hoisted(() => ({
   positionsRows: [] as Array<Record<string, unknown>>,
+  /** Rows answered to an `orders` query filtered `.in('position_id', …)` (entry order recovery). */
+  orderLinkRows: [] as Array<Record<string, unknown>>,
+  orderLinkError: null as { message: string; code?: string } | null,
+  orderLinkQueries: [] as Array<{ table: string; column: string; values: unknown }>,
   upserts: [] as Array<{ table: string; row: Record<string, unknown> }>,
 }));
 
@@ -35,12 +41,25 @@ vi.mock('@supabase/supabase-js', () => {
   const FILTER_METHODS = ['eq', 'neq', 'is', 'in', 'gte', 'lte', 'gt', 'lt', 'order', 'limit'];
   function makeBuilder(table: string) {
     let op = 'select';
+    let positionIdFilter = false;
     const builder: Record<string, unknown> = {};
-    const resolve = () => ({
-      data: op === 'select' ? (table === 'positions' ? db.positionsRows : []) : null,
-      error: null,
-    });
+    const resolve = () => {
+      if (op === 'select' && table === 'orders' && positionIdFilter) {
+        return db.orderLinkError ? { data: null, error: db.orderLinkError } : { data: db.orderLinkRows, error: null };
+      }
+      return {
+        data: op === 'select' ? (table === 'positions' ? db.positionsRows : []) : null,
+        error: null,
+      };
+    };
     for (const name of FILTER_METHODS) builder[name] = () => builder;
+    builder.in = (column: string, values: unknown) => {
+      if (column === 'position_id') {
+        positionIdFilter = true;
+        db.orderLinkQueries.push({ table, column, values });
+      }
+      return builder;
+    };
     builder.select = () => builder;
     for (const name of ['insert', 'update', 'delete']) {
       builder[name] = () => {
@@ -194,6 +213,12 @@ function tradeNotFoundWarned(): boolean {
 function tradeLogRows(): Array<Record<string, unknown>> {
   return db.upserts.filter((u) => u.table === 'trade_log').map((u) => u.row);
 }
+
+beforeEach(() => {
+  db.orderLinkRows = [];
+  db.orderLinkError = null;
+  db.orderLinkQueries = [];
+});
 
 describe('carried-over (hydrated) positions count in session stats — desk decision 2026-09-30', () => {
   let engine: TradingEngine;
@@ -380,5 +405,187 @@ describe('both server.ts strategy-report call sites use the shared trade inputs'
       expect(call.slice(0, 200)).toMatch(/^\s*\.\.\.strategyReportTradeInputs\(tradingEngine, engineRunning\),/);
     }
     expect(server).not.toMatch(/hydratedOpenPositions/);
+  });
+});
+
+/**
+ * Review round (carryover repair). Each block pins one review finding:
+ *  - entry_order_id: the carried-over trade_log row carries the entry order id
+ *    recovered from `orders.position_id` (linked since #82), so audit-trades no
+ *    longer flags it "trade_log.entry_order_id is NULL".
+ *  - strategy backfill: a legacy hydrated row with NULL strategy follows the
+ *    tracker's backfill from the first fill, like the gate path does.
+ *  - live equity anchor: see trade-analytics.test.ts for the math; here the
+ *    engine wires the live snapshot marks into TradeAnalytics (paper does not).
+ */
+function fakeAuditClient(): Parameters<typeof auditOneTrade>[0] {
+  const make = (table: string) => {
+    const b: Record<string, unknown> = {};
+    for (const m of ['select', 'eq', 'lte', 'order', 'limit']) b[m] = () => b;
+    b.maybeSingle = () => Promise.resolve({ data: { id: 'found' }, error: null });
+    b.then = (ok?: (v: unknown) => unknown, ko?: (e: unknown) => unknown) =>
+      Promise.resolve(
+        table === 'fills'
+          ? { count: 1, error: null }
+          : { data: [{ id: HYDRATED_ID, opened_at: '2026-01-01T00:00:00Z', closed_at: null }], error: null },
+      ).then(ok, ko);
+    return b;
+  };
+  return { from: (table: string) => make(table) } as unknown as Parameters<typeof auditOneTrade>[0];
+}
+
+describe('review repair: carried-over entry order id recovered from orders.position_id', () => {
+  let engine: TradingEngine;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    db.upserts = [];
+    db.positionsRows = [priorSessionRow(Date.now() - TWO_HOURS_MS)];
+  });
+
+  afterEach(async () => {
+    await teardown(engine);
+  });
+
+  it('seeds entryOrderId from the earliest same-side order linked to the position; trade_log + audit carry it', async () => {
+    db.orderLinkRows = [
+      // Exit-side order linked to the same position: never the entry.
+      { id: 'prior-sell', side: 'sell', position_id: HYDRATED_ID, created_at: '2026-09-29T09:00:00Z' },
+      { id: 'prior-entry', side: 'buy', position_id: HYDRATED_ID, created_at: '2026-09-29T10:00:00Z' },
+      { id: 'prior-scale-in', side: 'buy', position_id: HYDRATED_ID, created_at: '2026-09-29T11:00:00Z' },
+      // Another position's order: ignored even if the store returned it.
+      { id: 'other-pos', side: 'buy', position_id: 'another-position', created_at: '2026-09-29T08:00:00Z' },
+    ];
+    engine = wireEngine();
+    await internals(engine).hydrateStateFromSupabase();
+
+    expect(db.orderLinkQueries).toEqual([{ table: 'orders', column: 'position_id', values: [HYDRATED_ID] }]);
+    expect(engine.getOpenTrades()[0].entryOrderId).toBe('prior-entry');
+
+    await tracker(engine).processFill(fill('sell', '0.1', '51000'), { tag: 'take_profit' });
+    await new Promise((r) => setImmediate(r));
+    const [row] = tradeLogRows();
+    expect(row.entry_order_id).toBe('prior-entry');
+
+    const audit = await auditOneTrade(fakeAuditClient(), row as unknown as Parameters<typeof auditOneTrade>[1]);
+    expect(audit.violations.map((v) => v.reason)).not.toContain('trade_log.entry_order_id is NULL');
+  });
+
+  it('lookup failure: the position is still seeded (entry_order_id stays NULL) and the failure is logged', async () => {
+    db.orderLinkError = { message: 'boom', code: '500' };
+    engine = wireEngine();
+    await internals(engine).hydrateStateFromSupabase();
+
+    const open = engine.getOpenTrades();
+    expect(open).toHaveLength(1);
+    expect(open[0].carriedOver).toBe(true);
+    expect(open[0].entryOrderId).toBeUndefined();
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('entry order lookup failed'),
+      expect.objectContaining({ positionIds: [HYDRATED_ID], error: expect.stringContaining('boom') }),
+    );
+  });
+
+  it('no linked order (legacy position): entry_order_id stays NULL, no error', async () => {
+    engine = wireEngine();
+    await internals(engine).hydrateStateFromSupabase();
+    expect(engine.getOpenTrades()[0].entryOrderId).toBeUndefined();
+    expect(logger.error).not.toHaveBeenCalledWith(expect.stringContaining('entry order lookup'), expect.anything());
+  });
+});
+
+describe('review repair: carried-over record follows the tracker strategy backfill', () => {
+  let engine: TradingEngine;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    db.upserts = [];
+    db.positionsRows = [{ ...priorSessionRow(Date.now() - TWO_HOURS_MS), strategy: null }];
+    engine = wireEngine();
+    await internals(engine).hydrateStateFromSupabase();
+  });
+
+  afterEach(async () => {
+    await teardown(engine);
+  });
+
+  it('NULL-strategy hydrated row, scale-in with trend_follow, close → reported under trend_follow everywhere', async () => {
+    const recordTradeOutcome = vi.fn();
+    internals(engine).signalProcessor = { recordTradeOutcome };
+
+    await tracker(engine).processFill(fill('buy', '0.1', '50500'), { strategy: 'trend_follow', tag: 'entry' });
+    expect(engine.getOpenTrades()[0].strategy).toBe('trend_follow');
+    await tracker(engine).processFill(fill('sell', '0.2', '49000'), { tag: 'stop_loss' });
+
+    expect(engine.getClosedTrades()[0].strategy).toBe('trend_follow');
+    expect(recordTradeOutcome.mock.calls[0][0]).toMatchObject({ strategy: 'trend_follow' });
+    await new Promise((r) => setImmediate(r));
+    expect(tradeLogRows()[0].strategy).toBe('trend_follow');
+
+    const report = buildStrategySessionStats({
+      ...strategyReportTradeInputs(engine, true),
+      strategies: [{ id: 'trend_follow', name: 'Trend Follow', enabled: true }],
+      session: { sessionId: SESSION_ID, sessionStartedAt: config.session!.startedAt, executionMode: 'paper' },
+      engineRunning: true,
+    });
+    expect(report.strategies.map((s) => [s.strategyId, s.closedTrades])).toEqual([['trend_follow', 1]]);
+  });
+});
+
+describe('review repair: live TradeAnalytics equity is anchored on the account snapshot marks', () => {
+  const MARK = 52000;
+  function liveEngine(): TradingEngine {
+    const snapshot = {
+      fetchedAt: Date.now(),
+      quoteAvailableUsd: 5000,
+      quoteHoldUsd: 0,
+      baseBalances: { BTC: { available: 0.1, hold: 0 } },
+      equityUsd: 10000,
+      feeTier: null,
+      products: {},
+      marks: { 'BTC-USD': { price: MARK, source: 'product' } },
+    };
+    const truth = { requireSnapshot: () => snapshot, getSnapshot: () => snapshot } as unknown as LiveAccountTruth;
+    const engine = new TradingEngine({ ...config, mode: 'live', liveAccountTruth: truth }, logger);
+    const e = internals(engine);
+    e.exchange = new EventEmitter();
+    e.initializeOrderManager();
+    e.initializePositionTracker();
+    e.initializeTradeAnalytics();
+    e.isRunning = true;
+    return engine;
+  }
+
+  let engine: TradingEngine;
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    db.upserts = [];
+    db.positionsRows = [{ ...priorSessionRow(Date.now() - TWO_HOURS_MS), execution_mode: 'live' }];
+    engine = liveEngine();
+    await internals(engine).hydrateStateFromSupabase();
+  });
+
+  afterEach(async () => {
+    await teardown(engine);
+  });
+
+  it('closed at the snapshot mark: round trip +200 counted, equity / HWM / maxDrawdown unchanged', async () => {
+    await tracker(engine).processFill(fill('sell', '0.1', String(MARK)), { tag: 'take_profit' });
+    const stats = engine.getSessionStats()!;
+    expect(stats.totalTrades).toBe(1);
+    expect(stats.carriedOverClosed).toBe(1);
+    expect(stats.totalPnl).toBeCloseTo(200, 6);
+    expect(stats.highWaterMark).toBe(10000);
+    expect(stats.maxDrawdown).toBe(0);
+    expect(engine.getEquityCurve().at(-1)!.equity).toBeCloseTo(10000, 6);
+  });
+
+  it('paper engine: a carried-over close still moves equity by the full round trip (unchanged)', async () => {
+    const paper = wireEngine();
+    db.positionsRows = [priorSessionRow(Date.now() - TWO_HOURS_MS)];
+    await internals(paper).hydrateStateFromSupabase();
+    await tracker(paper).processFill(fill('sell', '0.1', String(MARK)), { tag: 'take_profit' });
+    expect(paper.getEquityCurve().at(-1)!.equity).toBeCloseTo(10200, 6);
+    await teardown(paper);
   });
 });

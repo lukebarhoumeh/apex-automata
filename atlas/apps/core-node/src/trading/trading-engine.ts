@@ -412,6 +412,21 @@ export class TradingEngine extends EventEmitter {
   }
 
   /**
+   * Live only: the per-symbol marks the session equity snapshot valued base
+   * holdings at, so TradeAnalytics can move its equity curve by only the
+   * in-session part of a carried-over round trip. Paper returns undefined
+   * (its equity is the yaml constant; nothing is marked).
+   */
+  private resolveSessionEquityMarks(): Record<string, number> | undefined {
+    if (this.config.mode !== 'live') return undefined;
+    const marks: Record<string, number> = {};
+    for (const [symbol, mark] of Object.entries(this.assertLiveAccountTruth().requireSnapshot().marks ?? {})) {
+      if (Number.isFinite(mark?.price) && mark.price > 0) marks[symbol] = mark.price;
+    }
+    return marks;
+  }
+
+  /**
    * Session FeeModel. Live overlays the account's real Coinbase spot tier on the yaml
    * model; paper/backtest keep the yaml assumption so the three layers stay comparable.
    */
@@ -1100,6 +1115,7 @@ export class TradingEngine extends EventEmitter {
   
   private initializeTradeAnalytics(): void {
     const initialEquity = this.resolveSessionEquityUsd();
+    const initialEquityMarks = this.resolveSessionEquityMarks();
     const analyticsConfig: TradeAnalyticsConfig = {
       supabaseUrl: this.config.supabase.url,
       supabaseKey: this.config.supabase.serviceKey,
@@ -1110,6 +1126,7 @@ export class TradingEngine extends EventEmitter {
       // Bind analytics to the API server's session so every surface reports one id.
       sessionId: this.config.session?.sessionId,
       sessionStartedAt: this.config.session?.startedAt,
+      ...(initialEquityMarks ? { initialEquityMarks } : {}),
     };
     
     this.tradeAnalytics = new TradeAnalytics(analyticsConfig, this.logger);
@@ -1130,6 +1147,9 @@ export class TradingEngine extends EventEmitter {
     });
     
     this.positionTracker!.on('position:updated', (position: Position) => {
+      // A carried-over record follows the tracker's strategy backfill (legacy
+      // NULL-strategy row adopting the first fill's strategy). Fill-if-missing.
+      this.tradeAnalytics!.backfillAttribution(position.id, { strategy: position.strategy, signalId: position.signalId });
       // Update open trade with current price for MFE/MAE tracking
       this.tradeAnalytics!.updateOpenTrade(
         position.id,
@@ -1139,6 +1159,7 @@ export class TradingEngine extends EventEmitter {
     });
     
     this.positionTracker!.on('position:closed', (position: Position) => {
+      this.tradeAnalytics!.backfillAttribution(position.id, { strategy: position.strategy, signalId: position.signalId });
       this.tradeAnalytics!.recordExit({
         tradeId: position.id,
         exitPrice: position.exitPrice ?? position.marketPrice,
@@ -1374,7 +1395,7 @@ export class TradingEngine extends EventEmitter {
     }
 
     if (positionsResult.status === 'fulfilled') {
-      this.seedTradeAnalyticsFromHydratedPositions();
+      await this.seedTradeAnalyticsFromHydratedPositions(userId);
     }
 
     this.logger.info('Startup state hydration: complete', {
@@ -1403,13 +1424,41 @@ export class TradingEngine extends EventEmitter {
    * PnL service) reads TradeAnalytics — they all listen to PositionTracker
    * events, whose close path already covered hydrated positions.
    * Idempotent: recordEntry is keyed by position id (Map.set).
+   *
+   * Entry order id: recovered read-only from `orders.position_id` (linked
+   * since PR #82) so the trade_log row passes audit-trades; a lookup failure
+   * is logged and the seed continues with entry_order_id NULL (reporting only,
+   * never blocks the start). Prior realized P&L is passed for the live equity
+   * anchor (`TradeRecord.preSessionPnl`); paper ignores it.
    */
-  private seedTradeAnalyticsFromHydratedPositions(): void {
+  private async seedTradeAnalyticsFromHydratedPositions(userId: string): Promise<void> {
     if (!this.tradeAnalytics || !this.positionTracker) return;
+    const hydrated = this.positionTracker
+      .getOpenPositions()
+      .filter((p) => p.metadata?.hydratedFromSupabase && (p.side === 'long' || p.side === 'short'));
+    if (hydrated.length === 0) return;
+
+    let entryOrderIds = new Map<string, string>();
+    if (this.orderManager) {
+      const positionIds = hydrated.map((p) => p.id);
+      try {
+        entryOrderIds = await this.orderManager.findEntryOrderIdsForPositions(
+          userId,
+          hydrated.map((p) => ({ id: p.id, side: p.side as 'long' | 'short' })),
+          { supabaseUrl: this.config.supabase.url, supabaseKey: this.config.supabase.serviceKey },
+        );
+      } catch (err) {
+        this.logger.error('TradeAnalytics carried-over seed: entry order lookup failed (trade_log.entry_order_id stays NULL)', {
+          positionIds,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     let seeded = 0;
-    for (const position of this.positionTracker.getOpenPositions()) {
-      if (!position.metadata?.hydratedFromSupabase) continue;
+    for (const position of hydrated) {
       if (position.side !== 'long' && position.side !== 'short') continue;
+      const entryOrderId = entryOrderIds.get(position.id);
       this.tradeAnalytics.recordEntry({
         tradeId: position.id,
         symbol: position.symbol,
@@ -1421,11 +1470,16 @@ export class TradingEngine extends EventEmitter {
         signalId: position.signalId,
         entryTime: position.openTime,
         carriedOver: true,
+        priorRealizedPnl: position.realizedPnL,
+        ...(entryOrderId ? { entryOrderId } : {}),
       });
       seeded++;
     }
     if (seeded > 0) {
-      this.logger.info('TradeAnalytics seeded with carried-over positions', { seeded });
+      this.logger.info('TradeAnalytics seeded with carried-over positions', {
+        seeded,
+        entryOrderIdsRecovered: entryOrderIds.size,
+      });
     }
   }
 

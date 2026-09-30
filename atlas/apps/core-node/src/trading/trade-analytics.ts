@@ -132,6 +132,15 @@ export interface TradeRecord {
    * position's real open time (`positions.opened_at`), not the seed time.
    */
   carriedOver?: boolean;
+  /**
+   * Live only: the part of this carried-over round trip that is already inside
+   * `initialEquity` (the account snapshot marks the position at the snapshot
+   * mark and holds its prior-session realized P&L). recordExit moves the
+   * equity curve / HWM / maxDrawdown by `realizedPnl - preSessionPnl`; the
+   * record, closedTrades and totalPnl keep the full round trip. Absent in
+   * paper (yaml equity constant) and for in-session trades.
+   */
+  preSessionPnl?: number;
 }
 
 export interface SessionStats {
@@ -209,6 +218,14 @@ export interface TradeAnalyticsConfig {
   sessionId?: string;
   /** Epoch ms the externally owned session opened; defaults to construction time. */
   sessionStartedAt?: number;
+  /**
+   * Live only: the per-symbol marks `initialEquity` was valued at (the
+   * LiveAccountTruth snapshot marks every base holding at market). Lets a
+   * carried-over trade move the equity curve by its in-session part only
+   * (`TradeRecord.preSessionPnl`). Omitted in paper, where `initialEquity` is
+   * the yaml constant and carries no position value.
+   */
+  initialEquityMarks?: Record<string, number>;
 }
 
 // ============================================================================
@@ -299,6 +316,10 @@ export class TradeAnalytics extends EventEmitter {
    *   carried over from a prior session so duration / avg hold are measured
    *   from `positions.opened_at`, not from the engine start.
    * @param params.carriedOver Marks a record seeded from the hydrated book.
+   * @param params.priorRealizedPnl Carried-over only: realized P&L the position
+   *   already booked before this session (`positions.realized_pnl_usd`). Used
+   *   with `initialEquityMarks` for the live equity anchor; never changes the
+   *   round-trip P&L recorded on exit.
    */
   public recordEntry(params: {
     tradeId: string;
@@ -313,6 +334,7 @@ export class TradeAnalytics extends EventEmitter {
     entryOrderId?: string;
     entryTime?: Date;
     carriedOver?: boolean;
+    priorRealizedPnl?: number;
   }): void {
     const slippageBps = params.expectedPrice 
       ? ((params.entryPrice - params.expectedPrice) / params.expectedPrice) * 10000
@@ -344,6 +366,11 @@ export class TradeAnalytics extends EventEmitter {
       maxAdverseExcursion: 0,
       ...(params.carriedOver === true ? { carriedOver: true } : {}),
     };
+
+    if (params.carriedOver === true && this.config.initialEquityMarks) {
+      const preSessionPnl = this.preSessionPnlFor(trade, params.priorRealizedPnl);
+      if (preSessionPnl !== undefined) trade.preSessionPnl = preSessionPnl;
+    }
     
     this.trades.set(params.tradeId, trade);
     
@@ -364,6 +391,38 @@ export class TradeAnalytics extends EventEmitter {
     });
   }
   
+  /**
+   * P&L of a carried-over trade already inside a live `initialEquity`: prior
+   * realized + the seeded size marked from entry to the snapshot mark. Without
+   * a mark for the symbol the full round trip goes into equity (warned).
+   */
+  private preSessionPnlFor(trade: TradeRecord, priorRealizedPnl: number | undefined): number | undefined {
+    const mark = this.config.initialEquityMarks?.[trade.symbol];
+    if (typeof mark !== 'number' || !Number.isFinite(mark) || mark <= 0) {
+      this.logger.warn('TradeAnalytics: no initial-equity mark for carried-over trade; its full P&L moves the equity curve', {
+        tradeId: trade.id,
+        symbol: trade.symbol,
+      });
+      return undefined;
+    }
+    const markMove = trade.side === 'long' ? trade.size * (mark - trade.entryPrice) : trade.size * (trade.entryPrice - mark);
+    const prior = typeof priorRealizedPnl === 'number' && Number.isFinite(priorRealizedPnl) ? priorRealizedPnl : 0;
+    return prior + markMove;
+  }
+
+  /**
+   * Fill strategy / signalId on an open record only where they are missing.
+   * The tracker backfills `Position.strategy` from the first fill that carries
+   * one (a legacy hydrated row with NULL strategy); the carried-over record
+   * follows it so reporting matches the gate path. Never overwrites.
+   */
+  public backfillAttribution(tradeId: string, attribution: { strategy?: string; signalId?: string }): void {
+    const trade = this.trades.get(tradeId);
+    if (!trade) return;
+    if (!trade.strategy && attribution.strategy) trade.strategy = attribution.strategy;
+    if (!trade.signalId && attribution.signalId) trade.signalId = attribution.signalId;
+  }
+
   /**
    * Update an open trade with current market price (for MFE/MAE tracking).
    */
@@ -452,14 +511,17 @@ export class TradeAnalytics extends EventEmitter {
     this.trades.delete(params.tradeId);
     this.closedTrades.push(trade);
     
-    // Update equity FIRST so HWM/drawdown calculation is accurate
-    this.currentEquity += params.realizedPnl;
+    // Update equity FIRST so HWM/drawdown calculation is accurate. A live
+    // carried-over trade only adds its in-session part: the rest is already in
+    // the snapshot-valued initialEquity (preSessionPnl; undefined otherwise).
+    const equityDelta = params.realizedPnl - (trade.preSessionPnl ?? 0);
+    this.currentEquity += equityDelta;
     
     // Update running statistics (uses currentEquity for HWM/drawdown)
     this.updateStatistics(trade);
     
     // Add to equity curve
-    this.addEquityPoint(params.realizedPnl, params.tradeId);
+    this.addEquityPoint(equityDelta, params.tradeId);
     
     // Update Prometheus metrics
     tradeExecutedCounter.inc({ symbol: trade.symbol, side: trade.side, outcome });
