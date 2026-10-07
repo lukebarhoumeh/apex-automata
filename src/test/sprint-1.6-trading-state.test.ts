@@ -8,6 +8,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { deriveTradingUiState, type RuntimeStatusPayload } from '@/runtime/state/deriveTradingUiState';
 import type { RuntimeConnectivity } from '@/runtime/connectivity/types';
+import type { TradingUiState } from '@/runtime/state/tradingState';
+
+/** Narrow a TradingUiState union result to a specific variant for assertions. */
+type StateOf<S extends TradingUiState['state']> = Extract<TradingUiState, { state: S }>;
 
 describe('deriveTradingUiState', () => {
   // Default connected state
@@ -32,7 +36,7 @@ describe('deriveTradingUiState', () => {
       const result = deriveTradingUiState(runningStatus, connectivity);
       
       expect(result.state).toBe('DISCONNECTED');
-      expect((result as any).reason).toContain('Backend unreachable');
+      expect((result as StateOf<'DISCONNECTED'>).reason).toContain('Backend unreachable');
     });
 
     it('returns DISCONNECTED when WS is closed', () => {
@@ -56,7 +60,7 @@ describe('deriveTradingUiState', () => {
       const result = deriveTradingUiState(runningStatus, connectivity);
       
       expect(result.state).toBe('STALE');
-      expect((result as any).ageMs).toBe(15000);
+      expect((result as StateOf<'STALE'>).ageMs).toBe(15000);
     });
   });
 
@@ -69,7 +73,7 @@ describe('deriveTradingUiState', () => {
       const result = deriveTradingUiState(status, connectedState);
       
       expect(result.state).toBe('KILL_SWITCH');
-      expect((result as any).reasons).toContain('daily_loss');
+      expect((result as StateOf<'KILL_SWITCH'>).reasons).toContain('daily_loss');
     });
 
     it('returns KILL_SWITCH when tradingState is HALTED', () => {
@@ -81,7 +85,7 @@ describe('deriveTradingUiState', () => {
       const result = deriveTradingUiState(status, connectedState);
       
       expect(result.state).toBe('KILL_SWITCH');
-      expect((result as any).reasonCode).toBe('spread_burst');
+      expect((result as StateOf<'KILL_SWITCH'>).reasonCode).toBe('spread_burst');
     });
 
     it('includes dailyStopHit in reasons', () => {
@@ -93,7 +97,7 @@ describe('deriveTradingUiState', () => {
       const result = deriveTradingUiState(status, connectedState);
       
       expect(result.state).toBe('KILL_SWITCH');
-      expect((result as any).reasons).toContain('daily_stop');
+      expect((result as StateOf<'KILL_SWITCH'>).reasons).toContain('daily_stop');
     });
   });
 
@@ -145,7 +149,7 @@ describe('deriveTradingUiState', () => {
       const result = deriveTradingUiState(null, connectedState);
       
       expect(result.state).toBe('DISCONNECTED');
-      expect((result as any).reason).toContain('Waiting for status');
+      expect((result as StateOf<'DISCONNECTED'>).reason).toContain('Waiting for status');
     });
   });
 });

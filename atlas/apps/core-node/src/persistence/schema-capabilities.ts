@@ -11,6 +11,7 @@
 
 import { SupabaseClient, createClient } from '@supabase/supabase-js';
 import { Logger } from '../core/logger';
+import type { PostgrestErrorLike } from '../core/postgrest-errors';
 
 export interface ColumnInfo {
   name: string;
@@ -71,12 +72,12 @@ export function hasUniqueConstraint(caps: SchemaCapabilities, table: string, col
 export function filterToExistingColumns(
   caps: SchemaCapabilities,
   table: string,
-  row: Record<string, any>
-): Record<string, any> {
+  row: Record<string, unknown>
+): Record<string, unknown> {
   const tableInfo = caps.tables.get(table);
   if (!tableInfo?.exists) return row;
 
-  const filtered: Record<string, any> = {};
+  const filtered: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(row)) {
     if (tableInfo.columns.has(key)) {
       filtered[key] = value;
@@ -164,11 +165,12 @@ async function loadTableCapabilities(
     // For now, we'll mark columns as "unknown" and rely on runtime detection
     logger.debug(`Table ${table} exists`);
 
-  } catch (error: any) {
-    if (error.code === '42P01') {
+  } catch (error) {
+    const pgError = error as PostgrestErrorLike;
+    if (pgError.code === '42P01') {
       return caps;
     }
-    logger.warn(`Error loading table capabilities for ${table}`, { error: error.message });
+    logger.warn(`Error loading table capabilities for ${table}`, { error: pgError.message });
   }
 
   return caps;

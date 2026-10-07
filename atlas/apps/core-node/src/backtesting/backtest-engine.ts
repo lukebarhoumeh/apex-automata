@@ -5,7 +5,14 @@ import type { OHLCV } from '../indicators/technical';
 // NOTE (indicator-standardization, 2026-05): TechnicalIndicators import was
 // dead in this file. The signal pipeline owns indicator computation; this
 // engine just consumes signals. Removed to keep call-graph honest.
-import { SignalProcessor, Signal } from '../strategies/signal-processor';
+import {
+  SignalProcessor,
+  Signal,
+  type SignalProcessorConfig,
+  type BreakoutConfig,
+  type VWAPConfig,
+  type MomentumConfig,
+} from '../strategies/signal-processor';
 import {
   PerSymbolDisabledStrategies,
   isSymbolStrategyDisabled,
@@ -820,13 +827,13 @@ export class BacktestEngine extends EventEmitter {
       const metrics = await promRegister.getMetricsAsJSON();
       for (const m of metrics) {
         if (m.name === 'atlas_strategy_signals_generated_total') {
-          for (const sample of (m as any).values ?? []) {
+          for (const sample of m.values ?? []) {
             const strategy = sample.labels?.strategy ?? 'unknown';
             candidatesPerStrategy[strategy] =
               (candidatesPerStrategy[strategy] ?? 0) + Number(sample.value || 0);
           }
         } else if (m.name === 'atlas_signal_filtered_total') {
-          for (const sample of (m as any).values ?? []) {
+          for (const sample of m.values ?? []) {
             const stage = sample.labels?.stage ?? 'unknown';
             const reason = sample.labels?.reason ?? 'unknown';
             filteredByStage[stage] = filteredByStage[stage] || {};
@@ -834,7 +841,7 @@ export class BacktestEngine extends EventEmitter {
               (filteredByStage[stage][reason] ?? 0) + Number(sample.value || 0);
           }
         } else if (m.name === 'atlas_signal_funnel_total') {
-          for (const sample of (m as any).values ?? []) {
+          for (const sample of m.values ?? []) {
             const stage = sample.labels?.stage ?? 'unknown';
             const strategy = sample.labels?.strategy ?? 'unknown';
             funnelByStage[stage] = funnelByStage[stage] || {};
@@ -875,31 +882,37 @@ export class BacktestEngine extends EventEmitter {
     // overrides loaded." Both are fixed below: we let the plugin registry
     // own instantiation, then apply trend_follow params via
     // updateStrategyConfig, then forward per-symbol overrides.
-    const signalConfig = {
+    // Parameter maps come off the config as `Record<string, unknown>`;
+    // narrow them to the strategy config shapes the SignalProcessor expects
+    // (same `??`-fallback runtime behavior as before, just typed).
+    const breakoutParams = this.config.signals.breakout.parameters as Partial<BreakoutConfig>;
+    const vwapParams = this.config.signals.vwapMeanReversion.parameters as Partial<VWAPConfig>;
+    const momentumParams = this.config.signals.momentum.parameters as Partial<MomentumConfig>;
+    const signalConfig: SignalProcessorConfig = {
       supabaseUrl: '',
       supabaseKey: '',
       strategies: {
         breakout: {
           enabled: this.config.signals.breakout.enabled,
-          period: (this.config.signals.breakout.parameters as any).period ?? 20,
-          atrPeriod: (this.config.signals.breakout.parameters as any).atrPeriod ?? 14,
-          atrMultiplier: (this.config.signals.breakout.parameters as any).atrMultiplier ?? 2,
-          volumeThreshold: (this.config.signals.breakout.parameters as any).volumeThreshold ?? 1.5,
+          period: breakoutParams.period ?? 20,
+          atrPeriod: breakoutParams.atrPeriod ?? 14,
+          atrMultiplier: breakoutParams.atrMultiplier ?? 2,
+          volumeThreshold: breakoutParams.volumeThreshold ?? 1.5,
         },
         vwapMeanReversion: {
           enabled: this.config.signals.vwapMeanReversion.enabled,
-          deviationEntry: (this.config.signals.vwapMeanReversion.parameters as any).deviationEntry ?? 2,
-          deviationExit: (this.config.signals.vwapMeanReversion.parameters as any).deviationExit ?? 0.5,
-          minVolume: (this.config.signals.vwapMeanReversion.parameters as any).minVolume ?? 1000,
+          deviationEntry: vwapParams.deviationEntry ?? 2,
+          deviationExit: vwapParams.deviationExit ?? 0.5,
+          minVolume: vwapParams.minVolume ?? 1000,
         },
         momentum: {
           enabled: this.config.signals.momentum.enabled,
-          rsiPeriod: (this.config.signals.momentum.parameters as any).rsiPeriod ?? 14,
-          rsiOverbought: (this.config.signals.momentum.parameters as any).rsiOverbought ?? 70,
-          rsiOversold: (this.config.signals.momentum.parameters as any).rsiOversold ?? 30,
-          macdFast: (this.config.signals.momentum.parameters as any).macdFast ?? 12,
-          macdSlow: (this.config.signals.momentum.parameters as any).macdSlow ?? 26,
-          macdSignal: (this.config.signals.momentum.parameters as any).macdSignal ?? 9,
+          rsiPeriod: momentumParams.rsiPeriod ?? 14,
+          rsiOverbought: momentumParams.rsiOverbought ?? 70,
+          rsiOversold: momentumParams.rsiOversold ?? 30,
+          macdFast: momentumParams.macdFast ?? 12,
+          macdSlow: momentumParams.macdSlow ?? 26,
+          macdSignal: momentumParams.macdSignal ?? 9,
         },
       },
       metaLabeling: {
@@ -920,7 +933,7 @@ export class BacktestEngine extends EventEmitter {
       // (position-aware, exits exempt), not inside the SignalProcessor.
       enableArbiter: true,
       usePluginStrategies: true,
-    } as any;
+    };
 
     this.signalProcessor = new SignalProcessor(signalConfig, this.logger);
 

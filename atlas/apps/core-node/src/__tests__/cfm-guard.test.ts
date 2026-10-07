@@ -23,6 +23,8 @@ import { TradingEngine, TradingEngineConfig } from '../trading/trading-engine';
 import type { ManagedOrder } from '../trading/order-manager';
 import type { Fill } from '../exchanges/coinbase/types';
 import type { Logger } from '../core/logger';
+import { tradingEngineInternals } from './helpers/trading-engine-test-access';
+import { riskEngineInternals } from './helpers/risk-engine-test-access';
 
 vi.mock('../config/secrets');
 vi.mock('../exchanges/coinbase');
@@ -292,7 +294,7 @@ const engineConfig: TradingEngineConfig = {
 
 function wireEngine() {
   const engine = new TradingEngine(engineConfig, logger);
-  const e = engine as any;
+  const e = tradingEngineInternals(engine);
   e.exchange = new EventEmitter();
   e.initializePaperSimulator();
   e.initializeOrderManager();
@@ -302,15 +304,15 @@ function wireEngine() {
   e.isRunning = true;
   const quote = (bid: number, ask: number, last: number) => {
     e.marketPrices.set(BIP, last);
-    e.paperSimulator.updateMarketQuote(BIP, { bid, ask, last });
-    e.positionTracker.updateMarketPrice(BIP, last);
+    e.paperSimulator!.updateMarketQuote(BIP, { bid, ask, last });
+    e.positionTracker!.updateMarketPrice(BIP, last);
   };
   quote(77_715, 77_720, 77_717);
   return { engine, quote };
 }
 
 function teardown(engine: TradingEngine): void {
-  const e = engine as any;
+  const e = tradingEngineInternals(engine);
   e.riskEngine?.stop?.();
   e.positionTracker?.stopUpdateLoop?.();
   e.orderManager?.destroy?.();
@@ -356,8 +358,9 @@ describe('TradingEngine + CfmGuard (paper) — gate vetoes, kill code, flattenSy
     expect(engine.getLastOrderRejection()).toMatchObject({ productId: BIP, source: 'risk_engine' });
     expect(engine.getLastOrderRejection()!.reason).toMatch(/^CDE_HOURS_GAP: CDE weekly break in \d+ min/);
 
-    (engine as any).marketPrices.set('BTC-USD', 85_901);
-    (engine as any).paperSimulator.updateMarketQuote('BTC-USD', { bid: 85_900, ask: 85_902, last: 85_901 });
+    const eng = tradingEngineInternals(engine);
+    eng.marketPrices.set('BTC-USD', 85_901);
+    eng.paperSimulator!.updateMarketQuote('BTC-USD', { bid: 85_900, ask: 85_902, last: 85_901 });
     const spot = await engine.createOrder({ product_id: 'BTC-USD', side: 'buy', type: 'limit', size: '0.005', price: '85890', post_only: true }, ctx);
     expect(spot).not.toBeNull();
   });
@@ -400,7 +403,7 @@ describe('TradingEngine + CfmGuard (paper) — gate vetoes, kill code, flattenSy
     expect(fills).toHaveLength(2);
     expect(fills[1].side).toBe('sell');
     expect(fills[1].fee_side).toBe('taker'); // a forced flatten is a taker exit, attributed honestly
-    const flattenOrder: ManagedOrder | undefined = (engine as any).orderManager.getOrderByExchangeOrderId(fills[1].order_id);
+    const flattenOrder: ManagedOrder | undefined = tradingEngineInternals(engine).orderManager!.getOrderByExchangeOrderId(fills[1].order_id);
     expect(flattenOrder?.metadata).toMatchObject({ tag: 'flatten', reason: 'cde_hours_gap' });
     expect(flattenOrder?.strategy).toBe('system');
   });
@@ -418,7 +421,7 @@ describe('TradingEngine + CfmGuard (paper) — gate vetoes, kill code, flattenSy
     expect(tick.leverage.breached).toBe(true);
     expect(tick.leverageBreachEmitted).toBe(true);
     expect(risk.canEnterTrades()).toBe(false);
-    const status = (risk as any).riskStateMachine.getStatus();
+    const status = riskEngineInternals(risk).riskStateMachine.getStatus();
     expect(status).toMatchObject({ tradingState: 'HALTED', reasonCode: 'leverage_breach', daily: false });
 
     const blocked = await engine.createOrder(entry('0.01', '1099000'), ctx);

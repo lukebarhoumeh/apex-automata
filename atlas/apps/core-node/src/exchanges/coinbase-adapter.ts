@@ -13,6 +13,7 @@ import { CoinbaseExchange } from './coinbase';
 import {
   CoinbaseConfig,
   CoinbaseOrder,
+  Granularity,
   OrderRequest,
   Ticker,
   Account,
@@ -106,7 +107,7 @@ export class CoinbaseAdapter extends EventEmitter implements IExchangeAdapter {
       this.emit('ticker:update', mapped);
     });
 
-    this.exchange.on('orderbook', (ob: any) => {
+    this.exchange.on('orderbook', (ob: { product_id?: string; bids?: Array<[string, string]>; asks?: Array<[string, string]> }) => {
       const mapped: AdapterOrderBook = {
         symbol: ob.product_id || '',
         bids: ob.bids || [],
@@ -157,12 +158,14 @@ export class CoinbaseAdapter extends EventEmitter implements IExchangeAdapter {
     end?: number,
   ): Promise<AdapterCandle[]> {
     const candles = await this.exchange.getCandles(symbol, {
-      granularity: (parseInt(granularity, 10) || 300) as any,
+      granularity: (parseInt(granularity, 10) || 300) as Granularity,
       start: start ? new Date(start).toISOString() : undefined,
       end: end ? new Date(end).toISOString() : undefined,
     });
     return candles.map((c) => ({
-      timestamp: typeof c.time === 'number' ? c.time * 1000 : new Date(c.time as any).getTime(),
+      // Candle.time is declared number, but defend against string timestamps
+      // from older payloads (type-only cast keeps the legacy branch compiling).
+      timestamp: typeof c.time === 'number' ? c.time * 1000 : new Date(c.time as unknown as string).getTime(),
       open: typeof c.open === 'string' ? parseFloat(c.open) : c.open,
       high: typeof c.high === 'string' ? parseFloat(c.high) : c.high,
       low: typeof c.low === 'string' ? parseFloat(c.low) : c.low,
@@ -302,10 +305,10 @@ export class CoinbaseAdapter extends EventEmitter implements IExchangeAdapter {
   private mapOrderToResult(order: CoinbaseOrder): AdapterOrderResult {
     return {
       orderId: order.id,
-      clientOrderId: (order as any).client_oid || undefined,
+      clientOrderId: (order as CoinbaseOrder & { client_oid?: string }).client_oid || undefined,
       symbol: order.product_id,
       side: order.side,
-      type: order.type === 'stop' ? 'stop_limit' : order.type as any,
+      type: order.type === 'stop' ? 'stop_limit' : order.type,
       status: this.mapOrderStatus(order.status),
       size: order.size || order.funds || '0',
       filledSize: order.filled_size || '0',

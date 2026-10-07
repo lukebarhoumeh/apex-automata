@@ -21,7 +21,7 @@ const mockLogger: Logger = {
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
-} as any;
+};
 
 // Mock Supabase client
 const mockInsert = vi.fn();

@@ -31,7 +31,7 @@ export const RiskDashboard = () => {
   const riskHeat = totalEquity > 0 ? (exposureUsd / totalEquity) * 100 : 0;
   
   // Max drawdown from snapshot (already in 0-100 percentage range)
-  const maxDrawdownPct = (snapshot as any)?.maxDrawdownPct ?? (
+  const maxDrawdownPct = (snapshot as { maxDrawdownPct?: number } | null)?.maxDrawdownPct ?? (
     dailyPnL < 0 && totalEquity > 0
       ? Math.abs(dailyPnL / totalEquity) * 100
       : 0

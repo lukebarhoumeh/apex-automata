@@ -22,6 +22,19 @@ export type CoinbaseErrorKind =
   | 'unknown';      // Unknown error
 
 /**
+ * Loosely-typed Coinbase error response body.
+ * The exact shape varies by endpoint; these are the fields we probe for.
+ */
+interface CoinbaseErrorBody {
+  id?: string;
+  code?: string;
+  error_code?: string;
+  message?: string;
+  error?: string;
+  msg?: string;
+}
+
+/**
  * Base error class for all Coinbase-related errors
  */
 export class CoinbaseError extends Error {
@@ -81,11 +94,12 @@ export class CoinbaseApiError extends CoinbaseError {
    * Create from an axios-style error response
    */
   static fromResponse(
-    response: { status: number; data?: any; headers?: Record<string, string> },
+    response: { status: number; data?: unknown; headers?: Record<string, string> },
     route?: string,
     method?: string
   ): CoinbaseApiError {
-    const { status, data, headers } = response;
+    const { status, headers } = response;
+    const data = response.data as CoinbaseErrorBody | undefined;
     const { kind, retryable, retryAfterMs } = classifyHttpStatus(status, data, headers);
     
     const coinbaseCode = data?.id || data?.code || data?.error_code;
@@ -109,7 +123,7 @@ export class CoinbaseApiError extends CoinbaseError {
   /**
    * Serialize for logging
    */
-  toJSON(): Record<string, any> {
+  toJSON(): Record<string, unknown> {
     return {
       name: this.name,
       kind: this.kind,
@@ -157,25 +171,26 @@ export class CoinbaseNetworkError extends CoinbaseError {
    * Create from an axios-style error
    */
   static fromAxiosError(
-    error: any,
+    error: unknown,
     route?: string,
     method?: string
   ): CoinbaseNetworkError {
-    const isTimeout = error.code === 'ECONNABORTED' || 
-                      error.code === 'ETIMEDOUT' ||
-                      error.message?.includes('timeout');
+    const err = error as { code?: string; message?: string };
+    const isTimeout = err.code === 'ECONNABORTED' ||
+                      err.code === 'ETIMEDOUT' ||
+                      err.message?.includes('timeout');
 
     return new CoinbaseNetworkError({
       kind: isTimeout ? 'timeout' : 'network',
-      message: error.message || 'Network error',
-      originalError: error,
-      code: error.code,
+      message: err.message || 'Network error',
+      originalError: error as Error,
+      code: err.code,
       route,
       method,
     });
   }
 
-  toJSON(): Record<string, any> {
+  toJSON(): Record<string, unknown> {
     return {
       name: this.name,
       kind: this.kind,
@@ -213,7 +228,7 @@ export class CircuitOpenError extends CoinbaseError {
  */
 function classifyHttpStatus(
   status: number,
-  data?: any,
+  data?: CoinbaseErrorBody,
   headers?: Record<string, string>
 ): { kind: CoinbaseErrorKind; retryable: boolean; retryAfterMs?: number } {
   // Rate limited
@@ -296,7 +311,7 @@ export function isRetryableError(error: unknown): boolean {
 /**
  * Check if an error is a rate limit error
  */
-export function isRateLimitError(error: unknown): boolean {
+export function isRateLimitError(error: unknown): error is CoinbaseApiError {
   return error instanceof CoinbaseApiError && error.kind === 'rate_limit';
 }
 

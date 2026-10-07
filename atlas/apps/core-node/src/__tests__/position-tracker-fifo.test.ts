@@ -1,5 +1,7 @@
 import { describe, test, expect, beforeEach, vi } from 'vitest';
 import { PositionTracker, PositionTrackerConfig } from '../trading/position-tracker';
+import type { Fill } from '../exchanges/coinbase';
+import type { Logger } from '../core/logger';
 
 // Mock logger
 const mockLogger = {
@@ -44,7 +46,7 @@ describe('PositionTracker FIFO PnL', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    tracker = new PositionTracker(config, mockLogger as any);
+    tracker = new PositionTracker(config, mockLogger as unknown as Logger);
   });
 
   test('buy, buy, sell consumes FIFO and allocates fees', async () => {
@@ -54,7 +56,7 @@ describe('PositionTracker FIFO PnL', () => {
       size: '1',
       price: '100',
       fee: '1',
-    } as any);
+    } as unknown as Fill);
 
     await tracker.processFill({
       ...baseFill,
@@ -64,7 +66,7 @@ describe('PositionTracker FIFO PnL', () => {
       size: '1',
       price: '110',
       fee: '1',
-    } as any);
+    } as unknown as Fill);
 
     await tracker.processFill({
       ...baseFill,
@@ -74,7 +76,7 @@ describe('PositionTracker FIFO PnL', () => {
       size: '1',
       price: '120',
       fee: '1',
-    } as any);
+    } as unknown as Fill);
 
     const position = tracker.getPosition('BTC-USD');
     expect(position?.realizedPnL).toBeCloseTo(18); // (120-100) - entryFee(1) - exitFee(1) = 18
@@ -89,7 +91,7 @@ describe('PositionTracker FIFO PnL', () => {
       size: '1',
       price: '100',
       fee: '1',
-    } as any);
+    } as unknown as Fill);
 
     await tracker.processFill({
       ...baseFill,
@@ -99,7 +101,7 @@ describe('PositionTracker FIFO PnL', () => {
       size: '2',
       price: '90',
       fee: '2',
-    } as any);
+    } as unknown as Fill);
 
     const position = tracker.getPosition('BTC-USD');
     expect(position?.realizedPnL).toBeCloseTo(-12); // (-10) - entryFee(1) - exitFee(1) = -12

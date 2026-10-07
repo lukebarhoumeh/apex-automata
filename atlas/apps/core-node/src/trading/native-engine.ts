@@ -4,9 +4,56 @@ import { Signal } from '../strategies/signal-processor';
 import { MarketData } from '../exchanges/types';
 import { Order } from '../trading/types';
 
+/** Tick payload handed to the native addon's processMarketData. */
+interface NativeTickData {
+  symbol: string;
+  bid: number;
+  ask: number;
+  last: number;
+  bidSize: number;
+  askSize: number;
+  lastSize: number;
+}
+
+/** Signal shape the native addon reports through the onSignal callback. */
+interface NativeSignalPayload {
+  symbol: string;
+  strategy: string;
+  direction: string;
+  strength: number;
+  entryPrice: number;
+  stopLoss: number;
+  takeProfit: number;
+}
+
+/**
+ * Minimal surface of the optional C++ addon (build/Release/trading_engine.node).
+ * The addon ships no type declarations; this interface documents exactly the
+ * calls the wrapper makes.
+ */
+interface INativeTradingEngine {
+  initialize(
+    config: NativeEngineConfig,
+    callbacks: {
+      onSignal: (signal: NativeSignalPayload) => void;
+      onOrder: (order: unknown) => void;
+    },
+  ): boolean;
+  processMarketData(tick: NativeTickData): void;
+  updateExchangeMetrics(exchange: string, metrics: ExchangeMetrics): void;
+  routeOrder(
+    order: { id: string; symbol: string; side: string; quantity: number; price: number },
+    marketData: Record<string, { bid: number; ask: number; bidSize: number; askSize: number }>,
+  ): RouteResult[];
+  getFeatures(): number[];
+  getStats(): Record<string, unknown>;
+  shutdown(): void;
+}
+
 // Try to load native module, fallback to TypeScript implementation if not available
-let NativeTradingEngine: any;
+let NativeTradingEngine: (new () => INativeTradingEngine) | null;
 try {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional conditional require of the optional native addon; must stay inside try/catch for the TS fallback
   NativeTradingEngine = require('../../build/Release/trading_engine.node').TradingEngine;
 } catch (error) {
   console.warn('Native trading engine not available, using TypeScript implementation');
@@ -56,7 +103,7 @@ export interface RouteResult {
 }
 
 export class NativeEngineWrapper extends EventEmitter {
-  private nativeEngine: any;
+  private nativeEngine: INativeTradingEngine | undefined;
   private logger: Logger;
   private isNative: boolean;
   private config: NativeEngineConfig;
@@ -79,10 +126,10 @@ export class NativeEngineWrapper extends EventEmitter {
       this.nativeEngine = new NativeTradingEngine();
       
       const callbacks = {
-        onSignal: (signal: any) => {
+        onSignal: (signal: NativeSignalPayload) => {
           this.handleNativeSignal(signal);
         },
-        onOrder: (order: any) => {
+        onOrder: (order: unknown) => {
           this.emit('order:created', order);
         }
       };
@@ -143,7 +190,7 @@ export class NativeEngineWrapper extends EventEmitter {
           price: order.price
         };
 
-        const marketDataMap: Record<string, any> = {};
+        const marketDataMap: Record<string, { bid: number; ask: number; bidSize: number; askSize: number }> = {};
         for (const [exchange, data] of Object.entries(marketData)) {
           marketDataMap[exchange] = {
             bid: data.bid,
@@ -177,7 +224,7 @@ export class NativeEngineWrapper extends EventEmitter {
     return [];
   }
 
-  public getStats(): any {
+  public getStats(): Record<string, unknown> {
     if (this.isNative && this.nativeEngine) {
       try {
         return this.nativeEngine.getStats();
@@ -204,7 +251,7 @@ export class NativeEngineWrapper extends EventEmitter {
     }
   }
 
-  private handleNativeSignal(nativeSignal: any): void {
+  private handleNativeSignal(nativeSignal: NativeSignalPayload): void {
     // Convert native signal to TypeScript Signal type
     const signal: Signal = {
       id: `${nativeSignal.symbol}_${nativeSignal.strategy}_${Date.now()}`,

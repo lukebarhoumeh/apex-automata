@@ -38,6 +38,8 @@ import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import { RiskEngine, RiskEngineConfig } from '../trading/risk-engine';
 import { PositionTracker, PositionTrackerConfig } from '../trading/position-tracker';
 import { GuardrailConfig } from '../config/loadGuardrails';
+import type { Logger } from '../core/logger';
+import { riskEngineInternals } from './helpers/risk-engine-test-access';
 
 /**
  * Recording Supabase mock. Every query builder chain is captured as a
@@ -122,6 +124,7 @@ const mockLogger = {
   error: vi.fn(),
   debug: vi.fn(),
 };
+const typedLogger = mockLogger as unknown as Logger;
 
 const guardrails = {
   disabled_strategies: [],
@@ -298,7 +301,7 @@ describe('RiskEngine kill-switch reset persistence', () => {
   beforeEach(() => {
     harness.reset();
     vi.clearAllMocks();
-    positionTracker = new PositionTracker(positionTrackerConfig, mockLogger as any);
+    positionTracker = new PositionTracker(positionTrackerConfig, typedLogger);
     engine = null;
   });
 
@@ -312,7 +315,7 @@ describe('RiskEngine kill-switch reset persistence', () => {
       harness.respond('risk_metrics.select', () => ({ data: haltedRow(todayIso()) }));
 
       engine = await waitForLoaders(
-        new RiskEngine({ ...baseConfig, ignorePersistedKillSwitch: true }, mockLogger as any, positionTracker)
+        new RiskEngine({ ...baseConfig, ignorePersistedKillSwitch: true }, typedLogger, positionTracker)
       );
 
       expect(engine.getMetrics().killSwitchActive).toBe(false);
@@ -355,7 +358,7 @@ describe('RiskEngine kill-switch reset persistence', () => {
       // stale row a boot may discard on its own (Risk desk pin 2026-09-22).
       harness.respond('risk_metrics.select', () => ({ data: { ...haltedRow(yesterdayIso()), kill_switch_active: false } }));
 
-      engine = await waitForLoaders(new RiskEngine(baseConfig, mockLogger as any, positionTracker));
+      engine = await waitForLoaders(new RiskEngine(baseConfig, typedLogger, positionTracker));
 
       expect(engine.getMetrics().killSwitchActive).toBe(false);
       expect(engine.getMetrics().consecutiveLosses).toBe(0);
@@ -383,7 +386,7 @@ describe('RiskEngine kill-switch reset persistence', () => {
     test('a stale row that is still LATCHED is restored halted, not discarded — nothing is written (no RISK_CLEAR reset)', async () => {
       harness.respond('risk_metrics.select', () => ({ data: haltedRow(yesterdayIso()) }));
 
-      engine = await waitForLoaders(new RiskEngine(baseConfig, mockLogger as any, positionTracker));
+      engine = await waitForLoaders(new RiskEngine(baseConfig, typedLogger, positionTracker));
 
       expect(engine.getMetrics().killSwitchActive).toBe(true);
       expect(engine.getMetrics().consecutiveLosses).toBe(10);
@@ -401,7 +404,7 @@ describe('RiskEngine kill-switch reset persistence', () => {
       harness.respond('risk_metrics.select', () => ({ data: haltedRow(yesterdayIso()) }));
 
       engine = await waitForLoaders(
-        new RiskEngine({ ...baseConfig, ignorePersistedKillSwitch: true }, mockLogger as any, positionTracker)
+        new RiskEngine({ ...baseConfig, ignorePersistedKillSwitch: true }, typedLogger, positionTracker)
       );
 
       expect(engine.getMetrics().killSwitchActive).toBe(false);
@@ -420,7 +423,7 @@ describe('RiskEngine kill-switch reset persistence', () => {
     test('same-day halt without the reset flag is restored and nothing is written', async () => {
       harness.respond('risk_metrics.select', () => ({ data: haltedRow(todayIso()) }));
 
-      engine = await waitForLoaders(new RiskEngine(baseConfig, mockLogger as any, positionTracker));
+      engine = await waitForLoaders(new RiskEngine(baseConfig, typedLogger, positionTracker));
 
       expect(engine.getMetrics().killSwitchActive).toBe(true);
       expect(engine.getMetrics().consecutiveLosses).toBe(10);
@@ -435,7 +438,7 @@ describe('RiskEngine kill-switch reset persistence', () => {
       }));
 
       engine = await waitForLoaders(
-        new RiskEngine({ ...baseConfig, ignorePersistedKillSwitch: true }, mockLogger as any, positionTracker)
+        new RiskEngine({ ...baseConfig, ignorePersistedKillSwitch: true }, typedLogger, positionTracker)
       );
 
       expect(riskEventClears()).toHaveLength(1);
@@ -448,7 +451,7 @@ describe('RiskEngine kill-switch reset persistence', () => {
 
     test('no persisted row: nothing to reset, nothing written', async () => {
       engine = await waitForLoaders(
-        new RiskEngine({ ...baseConfig, ignorePersistedKillSwitch: true }, mockLogger as any, positionTracker)
+        new RiskEngine({ ...baseConfig, ignorePersistedKillSwitch: true }, typedLogger, positionTracker)
       );
 
       expect(harness.callsFor('risk_metrics', 'upsert')).toHaveLength(0);
@@ -458,11 +461,11 @@ describe('RiskEngine kill-switch reset persistence', () => {
 
   describe('deactivateKillSwitch()', () => {
     async function haltedEngine(): Promise<RiskEngine> {
-      const e = await waitForLoaders(new RiskEngine(baseConfig, mockLogger as any, positionTracker));
+      const e = await waitForLoaders(new RiskEngine(baseConfig, typedLogger, positionTracker));
       // Trip the switch the way a losing streak does, then forget the
       // constructor-time DB traffic so assertions only see the resume.
-      (e as any).metrics.consecutiveLosses = 10;
-      (e as any).checkKillSwitches();
+      riskEngineInternals(e).metrics.consecutiveLosses = 10;
+      riskEngineInternals(e).checkKillSwitches();
       expect(e.getMetrics().killSwitchActive).toBe(true);
       expect(e.canEnterTrades()).toBe(false);
       harness.calls.length = 0;
@@ -505,7 +508,7 @@ describe('RiskEngine kill-switch reset persistence', () => {
 
       // Regression guard: before the fix the untouched 10-loss streak made
       // the very next metrics tick re-halt trading.
-      (engine as any).checkKillSwitches();
+      riskEngineInternals(engine).checkKillSwitches();
       expect(engine.getMetrics().killSwitchActive).toBe(false);
       expect(engine.canEnterTrades()).toBe(true);
 
@@ -600,9 +603,9 @@ describe('RiskEngine kill-switch reset persistence', () => {
 
     test('without a userId nothing is written but the resume still succeeds', async () => {
       const { userId: _omit, ...anonymous } = baseConfig;
-      engine = new RiskEngine(anonymous, mockLogger as any, positionTracker);
-      (engine as any).metrics.consecutiveLosses = 10;
-      (engine as any).checkKillSwitches();
+      engine = new RiskEngine(anonymous, typedLogger, positionTracker);
+      riskEngineInternals(engine).metrics.consecutiveLosses = 10;
+      riskEngineInternals(engine).checkKillSwitches();
       expect(engine.getMetrics().killSwitchActive).toBe(true);
       harness.calls.length = 0;
 
@@ -615,7 +618,7 @@ describe('RiskEngine kill-switch reset persistence', () => {
     });
 
     test('is idempotent when trading is already RUNNING', async () => {
-      engine = await waitForLoaders(new RiskEngine(baseConfig, mockLogger as any, positionTracker));
+      engine = await waitForLoaders(new RiskEngine(baseConfig, typedLogger, positionTracker));
       harness.calls.length = 0;
 
       await expect(engine.deactivateKillSwitch()).resolves.toBe(true);

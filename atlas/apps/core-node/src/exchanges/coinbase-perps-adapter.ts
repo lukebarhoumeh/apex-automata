@@ -17,6 +17,8 @@ import { FeeModel } from '../core/fee-model';
 import {
   CoinbasePerpsProduct,
   CoinbaseIntxPosition,
+  CoinbaseIntxPortfolio,
+  CoinbaseFundingRate,
 } from './coinbase/types';
 import { CoinbaseAdapter } from './coinbase-adapter';
 import {
@@ -28,6 +30,21 @@ import {
   AdapterPortfolioSummary,
   IPerpsAdapter,
 } from './types';
+
+/**
+ * Structural view of the private `restClient` hanging off CoinbaseExchange,
+ * narrowed to the optional perps/INTX surface this adapter probes for.
+ * Accessed reflectively (cast) because `restClient` is private on
+ * CoinbaseExchange and the frozen coinbase files cannot be edited to expose it.
+ * Methods are optional because older/stubbed clients may not implement them.
+ */
+interface PerpsRestClient {
+  getPerpsProducts?: () => Promise<CoinbasePerpsProduct[]>;
+  getIntxPositions?: () => Promise<CoinbaseIntxPosition[]>;
+  getFundingRate?: (productId: string) => Promise<CoinbaseFundingRate | null>;
+  setLeverage?: (productId: string, leverage: number) => Promise<boolean>;
+  getIntxPortfolio?: () => Promise<CoinbaseIntxPortfolio | null>;
+}
 
 export class CoinbasePerpsAdapter extends CoinbaseAdapter implements IPerpsAdapter {
   override readonly id = 'coinbase-perps';
@@ -69,7 +86,7 @@ export class CoinbasePerpsAdapter extends CoinbaseAdapter implements IPerpsAdapt
    */
   async refreshPerpsProducts(): Promise<void> {
     const exchange = this.getUnderlyingExchange();
-    const restClient = (exchange as any).restClient;
+    const restClient = (exchange as unknown as { restClient?: PerpsRestClient }).restClient;
     if (!restClient?.getPerpsProducts) {
       this.perpsLogger.warn('REST client does not support getPerpsProducts — no perps available');
       return;
@@ -108,7 +125,7 @@ export class CoinbasePerpsAdapter extends CoinbaseAdapter implements IPerpsAdapt
    */
   override async getPositions(): Promise<AdapterPosition[]> {
     const exchange = this.getUnderlyingExchange();
-    const restClient = (exchange as any).restClient;
+    const restClient = (exchange as unknown as { restClient?: PerpsRestClient }).restClient;
     if (!restClient?.getIntxPositions) {
       return [];
     }
@@ -127,7 +144,7 @@ export class CoinbasePerpsAdapter extends CoinbaseAdapter implements IPerpsAdapt
    */
   async getFundingRate(symbol: string): Promise<AdapterFundingRate | null> {
     const exchange = this.getUnderlyingExchange();
-    const restClient = (exchange as any).restClient;
+    const restClient = (exchange as unknown as { restClient?: PerpsRestClient }).restClient;
     if (!restClient?.getFundingRate) {
       return null;
     }
@@ -157,7 +174,7 @@ export class CoinbasePerpsAdapter extends CoinbaseAdapter implements IPerpsAdapt
     }
 
     const exchange = this.getUnderlyingExchange();
-    const restClient = (exchange as any).restClient;
+    const restClient = (exchange as unknown as { restClient?: PerpsRestClient }).restClient;
     if (!restClient?.setLeverage) {
       this.perpsLogger.warn('REST client does not support setLeverage');
       return false;
@@ -186,7 +203,7 @@ export class CoinbasePerpsAdapter extends CoinbaseAdapter implements IPerpsAdapt
    */
   async getPortfolioSummary(): Promise<AdapterPortfolioSummary | null> {
     const exchange = this.getUnderlyingExchange();
-    const restClient = (exchange as any).restClient;
+    const restClient = (exchange as unknown as { restClient?: PerpsRestClient }).restClient;
     if (!restClient?.getIntxPortfolio) {
       return null;
     }

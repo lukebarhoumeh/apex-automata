@@ -14,7 +14,7 @@ interface Alert {
   severity: "info" | "warn" | "error";
   title: string;
   message: string | null;
-  data: any;
+  data: unknown;
   created_at: string;
   acked_at: string | null;
 }

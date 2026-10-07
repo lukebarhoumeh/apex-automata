@@ -37,9 +37,31 @@ export interface ManagedOrder {
   createdAt: Date;
   updatedAt: Date;
   parentOrderId?: string; // For TWAP child orders
-  metadata?: Record<string, any>;
+  metadata?: OrderMetadata;
   fills: Fill[];
   strategy?: string;
+}
+
+/**
+ * Free-form metadata carried on a managed order. The keys the runtime actually
+ * reads are typed; anything else rides along untyped (`unknown`).
+ */
+export interface OrderMetadata {
+  /** Originating signal's id (persisted to `orders.signal_id`). */
+  signalId?: string;
+  /** Entry/exit tag forwarded into the position's FillContext. */
+  tag?: string;
+  /** Market regime stamped on the entry signal. */
+  regime?: string;
+  /** When true, a post-only rejection is terminal (never re-priced). */
+  noChase?: boolean;
+  /** Number of in-place venue edits applied to this order. */
+  editCount?: number;
+  intendedEntryPrice?: number;
+  stopPrice?: number;
+  takeProfit?: number;
+  hydratedFromSupabase?: boolean;
+  [key: string]: unknown;
 }
 
 export interface TWAPOrder extends ManagedOrder {
@@ -120,7 +142,10 @@ export class OrderManager extends EventEmitter {
     this.logger.info(`OrderManager: Exchange adapter set to '${adapter.id}'`);
 
     adapter.on('order:update', (result: AdapterOrderResult) => {
-      const mappedOrder: any = {
+      // Adapter results are bridged into the legacy CoinbaseOrder shape the
+      // existing handler understands; statuses outside the CoinbaseOrder
+      // union pass through unchanged, hence the two-step cast.
+      const mappedOrder = {
         id: result.orderId,
         product_id: result.symbol,
         side: result.side,
@@ -133,7 +158,7 @@ export class OrderManager extends EventEmitter {
         settled: result.status === 'filled',
         size: result.size,
         price: result.avgFillPrice,
-      };
+      } as unknown as CoinbaseOrder;
       this.handleExchangeOrder(mappedOrder);
     });
   }
@@ -158,8 +183,10 @@ export class OrderManager extends EventEmitter {
       return byExchangeId;
     }
     
-    // Coinbase often echoes client_oid (or similar) back on order payloads.
-    const clientOid = (order as any).client_oid || (order as any).client_order_id || (order as any).clientOrderId;
+    // Coinbase often echoes client_oid (or similar) back on order payloads;
+    // the CoinbaseOrder type does not declare these echo fields.
+    const echoed = order as CoinbaseOrder & { client_oid?: string; client_order_id?: string; clientOrderId?: string };
+    const clientOid = echoed.client_oid || echoed.client_order_id || echoed.clientOrderId;
     if (typeof clientOid === 'string' && clientOid.length > 0) {
       const byClient = this.orders.get(clientOid);
       if (byClient) {
@@ -277,7 +304,7 @@ export class OrderManager extends EventEmitter {
   public async createOrder(
     request: Omit<OrderRequest, 'client_oid'>,
     init?: {
-      metadata?: Record<string, any>;
+      metadata?: OrderMetadata;
       strategy?: string;
       noChase?: boolean;
     }
@@ -447,7 +474,7 @@ export class OrderManager extends EventEmitter {
     return slices;
   }
 
-  private scheduleTWAPSlices(twapOrder: TWAPOrder, request: any): void {
+  private scheduleTWAPSlices(twapOrder: TWAPOrder, request: Omit<OrderRequest, 'client_oid' | 'size'>): void {
     const timers: NodeJS.Timeout[] = [];
 
     for (const slice of twapOrder.slices) {
@@ -471,7 +498,7 @@ export class OrderManager extends EventEmitter {
   private async executeTWAPSlice(
     twapOrder: TWAPOrder,
     slice: TWAPSlice,
-    request: any
+    request: Omit<OrderRequest, 'client_oid' | 'size'>
   ): Promise<void> {
     try {
       this.logger.info(`Executing TWAP slice ${slice.id} for order ${twapOrder.id}`);
@@ -555,7 +582,7 @@ export class OrderManager extends EventEmitter {
       try {
         const order = await this.exchange.createOrder(request);
         return order;
-      } catch (error: any) {
+      } catch (error) {
         retries++;
 
         // Check if it's a post-only rejection

@@ -9,12 +9,12 @@ import { EngineSupervisor, DEFAULT_SUPERVISOR_CONFIG, RestartReason } from '../r
 import { Logger } from '../core/logger';
 
 // Mock logger
-const mockLogger: Logger = {
+const mockLogger = {
   info: vi.fn(),
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
-} as any;
+} as unknown as Logger;
 
 describe('EngineSupervisor', () => {
   let supervisor: EngineSupervisor;
@@ -185,7 +185,7 @@ describe('EngineSupervisor', () => {
       
       // Force heartbeat stale (bypass the reset that happens after successful restart)
       // so the next tick detects stale within the cooldown window
-      (supervisor as any).lastEngineHeartbeatAt = 0;
+      (supervisor as unknown as { lastEngineHeartbeatAt: number }).lastEngineHeartbeatAt = 0;
       
       // Advance 1s — heartbeat is stale but within cooldown (2000ms)
       await vi.advanceTimersByTimeAsync(1000);

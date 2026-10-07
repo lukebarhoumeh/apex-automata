@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
+import { Badge, type BadgeProps } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { supabase } from '@/integrations/supabase/client';
@@ -136,7 +136,7 @@ export const AlertsPanel = () => {
                       <div className="flex items-start justify-between gap-2">
                         <div className="flex items-center gap-2">
                           <span className="font-medium text-sm">{alert.title}</span>
-                          <Badge variant={getSeverityColor(alert.severity) as any} className="text-xs">
+                          <Badge variant={getSeverityColor(alert.severity) as unknown as BadgeProps['variant']} className="text-xs">
                             {alert.severity}
                           </Badge>
                         </div>

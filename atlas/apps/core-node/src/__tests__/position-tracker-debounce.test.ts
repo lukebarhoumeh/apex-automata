@@ -4,6 +4,8 @@ import {
   type PositionTrackerConfig,
   type Position,
 } from '../trading/position-tracker';
+import type { Fill } from '../exchanges/coinbase';
+import type { Logger } from '../core/logger';
 
 /**
  * D10 — verify the per-symbol debounce on `position:updated`.
@@ -36,7 +38,7 @@ vi.mock('@supabase/supabase-js', () => ({
   }),
 }));
 
-function makeFill(overrides: Partial<any>) {
+function makeFill(overrides: Partial<Fill>): Fill {
   const now = new Date().toISOString();
   return {
     trade_id: overrides.trade_id ?? 1,
@@ -72,7 +74,7 @@ describe('PositionTracker debounce (D10)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
-    tracker = new PositionTracker(config, mockLogger as any);
+    tracker = new PositionTracker(config, mockLogger as unknown as Logger);
   });
 
   afterEach(() => {
@@ -87,7 +89,7 @@ describe('PositionTracker debounce (D10)', () => {
     // Open a long position so updateMarketPrice has a live position to mutate.
     // processFill emits 'position:opened' for the first trade (not 'updated'),
     // so it does not pollute our counter.
-    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '50000', size: '1', fee: '0' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '50000', size: '1', fee: '0' }));
     expect(updates.length).toBe(0);
 
     // 10 rapid mark-price updates within the debounce window. None should
@@ -115,7 +117,7 @@ describe('PositionTracker debounce (D10)', () => {
     tracker.on('position:updated', (p: Position) => updates.push(p));
     tracker.on('position:closed', (p: Position) => closes.push(p));
 
-    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '50000', size: '1', fee: '0' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '50000', size: '1', fee: '0' }));
 
     // Schedule a pending debounced update.
     tracker.updateMarketPrice('BTC-USD', 50_500);
@@ -126,7 +128,7 @@ describe('PositionTracker debounce (D10)', () => {
     //   (a) immediate (no timer wait)
     //   (b) the LAST event observers see for this symbol (no trailing 'updated')
     await tracker.processFill(
-      makeFill({ trade_id: 2, side: 'sell', price: '50_500', size: '1', fee: '0' }) as any,
+      makeFill({ trade_id: 2, side: 'sell', price: '50_500', size: '1', fee: '0' }),
     );
 
     expect(closes.length).toBe(1);
@@ -144,7 +146,7 @@ describe('PositionTracker debounce (D10)', () => {
     const updates: Position[] = [];
     tracker.on('position:updated', (p: Position) => updates.push(p));
 
-    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '50000', size: '1', fee: '0' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '50000', size: '1', fee: '0' }));
 
     // First burst → 1 tail emit.
     for (let i = 0; i < 5; i++) tracker.updateMarketPrice('BTC-USD', 50_010 + i);
@@ -167,7 +169,7 @@ describe('PositionTracker debounce (D10)', () => {
     tracker.on('position:updated', (p: Position) => updates.push(p));
 
     // Open 0.10 — first trade emits 'position:opened', not 'updated'.
-    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '50000', size: '0.10', fee: '0' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '50000', size: '0.10', fee: '0' }));
     expect(updates.length).toBe(0);
 
     // A mark-price tick schedules a debounced update (pending, not yet emitted).
@@ -178,7 +180,7 @@ describe('PositionTracker debounce (D10)', () => {
     // the fill row already landed synchronously (order:filled) and a process
     // kill inside the 1 s debounce window would otherwise leave qty_open /
     // realized_pnl_usd stale, and the next start hydrates the PRE-fill size.
-    await tracker.processFill(makeFill({ trade_id: 2, side: 'sell', price: '50100', size: '0.05', fee: '0' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 2, side: 'sell', price: '50100', size: '0.05', fee: '0' }));
     expect(updates.length).toBe(1);
     expect(updates[0].symbol).toBe('BTC-USD');
     expect(updates[0].size).toBeCloseTo(0.05, 10);
@@ -190,7 +192,7 @@ describe('PositionTracker debounce (D10)', () => {
     expect(updates.length).toBe(1);
 
     // Scale-in 0.05 → size back to 0.10, again emitted synchronously.
-    await tracker.processFill(makeFill({ trade_id: 3, side: 'buy', price: '50050', size: '0.05', fee: '0' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 3, side: 'buy', price: '50050', size: '0.05', fee: '0' }));
     expect(updates.length).toBe(2);
     expect(updates[1].size).toBeCloseTo(0.10, 10);
     expect(updates[1].trades.length).toBe(3);
@@ -209,8 +211,8 @@ describe('PositionTracker debounce (D10)', () => {
     const updates: Position[] = [];
     tracker.on('position:updated', (p: Position) => updates.push(p));
 
-    await tracker.processFill(makeFill({ trade_id: 1, product_id: 'BTC-USD', side: 'buy', price: '50000', size: '1' }) as any);
-    await tracker.processFill(makeFill({ trade_id: 2, product_id: 'ETH-USD', side: 'buy', price: '3000', size: '1' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 1, product_id: 'BTC-USD', side: 'buy', price: '50000', size: '1' }));
+    await tracker.processFill(makeFill({ trade_id: 2, product_id: 'ETH-USD', side: 'buy', price: '3000', size: '1' }));
 
     // Interleaved bursts on two symbols.
     for (let i = 0; i < 5; i++) {

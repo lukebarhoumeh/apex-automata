@@ -12,6 +12,7 @@
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import { PositionTracker, PositionTrackerConfig } from '../trading/position-tracker';
 import type { Fill } from '../exchanges/coinbase';
+import type { Logger } from '../core/logger';
 
 const mockLogger = {
   info: vi.fn(),
@@ -21,7 +22,7 @@ const mockLogger = {
 };
 
 // Each test sets this to control what supabase.from('positions').select(...).eq(...).is(...) returns.
-type QueryResult = { data: any[] | null; error: { message: string; code?: string } | null };
+type QueryResult = { data: Array<Record<string, unknown>> | null; error: { message: string; code?: string } | null };
 let nextQueryResult: QueryResult = { data: [], error: null };
 // Optional FIFO of per-call results (schema-tolerance tests); falls back to nextQueryResult when drained.
 let queuedQueryResults: QueryResult[] = [];
@@ -64,7 +65,7 @@ describe('PositionTracker.hydrateOpenPositions', () => {
     nextQueryResult = { data: [], error: null };
     queuedQueryResults = [];
     selectCalls = [];
-    tracker = new PositionTracker(baseConfig, mockLogger as any);
+    tracker = new PositionTracker(baseConfig, mockLogger as unknown as Logger);
   });
 
   afterEach(() => {

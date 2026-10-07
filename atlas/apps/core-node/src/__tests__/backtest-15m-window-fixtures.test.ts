@@ -24,7 +24,7 @@ import { rollupCandles } from '../cli/backtest-backfill';
 import { HistoricalDataLoader, type BarFixtureFile } from '../backtesting/data-loader';
 
 function makeLogger() {
-  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as any;
+  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
 
 const STEP = 900;

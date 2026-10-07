@@ -11,8 +11,9 @@ import {
   isOnConflictTargetError,
 } from '../core/postgrest-errors';
 import { ExecutionModeScope } from '../trading/risk/execution-mode-scope';
+import type { Logger } from '../core/logger';
 
-const logger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } as any;
+const logger: Logger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
 
 describe('postgrest-errors', () => {
   test('isMissingColumnError: Postgres 42703 and PostgREST PGRST204 both count', () => {

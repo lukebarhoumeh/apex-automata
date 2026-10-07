@@ -29,6 +29,12 @@ import { RiskEngine, RiskEngineConfig } from '../trading/risk-engine';
 import { Position, PositionTracker, PositionTrackerConfig } from '../trading/position-tracker';
 import { GuardrailConfig, GuardrailsSchema, PaperKillLadderConfig } from '../config/loadGuardrails';
 import type { LadderTransition } from '../trading/risk/paper-kill-ladder';
+import type { RiskStateChangeEvent } from '../trading/risk-state';
+import type { Logger } from '../core/logger';
+import { riskEngineInternals } from './helpers/risk-engine-test-access';
+
+/** `risk_events` row payload shape the mocked Supabase harness records. */
+type RiskEventPayload = { event_type: string; execution_mode?: string; details: Record<string, unknown> };
 
 interface RecordedCall {
   table: string;
@@ -107,7 +113,7 @@ const mockLogger = {
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
-};
+} as unknown as Logger & { error: ReturnType<typeof vi.fn> };
 
 /** Desk SoT ladder block (as shipped in guardrails.yaml). */
 const deskLadder = GuardrailsSchema.shape.paper_kill_ladder.parse({
@@ -294,7 +300,7 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
     harness.reset();
     vi.clearAllMocks();
     vi.useRealTimers();
-    positionTracker = new PositionTracker(positionTrackerConfig, mockLogger as any);
+    positionTracker = new PositionTracker(positionTrackerConfig, mockLogger);
     portfolio = { totalUnrealizedPnL: 0, totalRealizedPnL: 0, totalPnL: 0, positionCount: 0, totalValue: 0 };
     engine = null;
   });
@@ -306,7 +312,7 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
   });
 
   async function freshEngine(overrides: Partial<RiskEngineConfig> = {}): Promise<RiskEngine> {
-    const e = await waitForLoaders(new RiskEngine({ ...baseConfig, ...overrides }, mockLogger as any, positionTracker));
+    const e = await waitForLoaders(new RiskEngine({ ...baseConfig, ...overrides }, mockLogger, positionTracker));
     vi.spyOn(positionTracker, 'getPortfolioSummary').mockImplementation(() => ({ ...portfolio }));
     harness.calls.length = 0;
     vi.clearAllMocks();
@@ -325,7 +331,7 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
 
   const haltedCodes = (e: RiskEngine) => {
     const codes: string[] = [];
-    e.on('risk:state_changed', (ev: any) => {
+    e.on('risk:state_changed', (ev: RiskStateChangeEvent) => {
       if (ev.newState.state === 'HALTED') codes.push(ev.newState.reasonCode);
     });
     return codes;
@@ -358,9 +364,9 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
 
         // Legacy streak kill (8) still fires without the ladder.
         for (let i = 0; i < 8; i++) closeTrade(-1);
-        (engine as any).checkKillSwitches();
+        riskEngineInternals(engine).checkKillSwitches();
         expect(engine.getRiskStatus()).toMatchObject({ tradingState: 'HALTED', reasonCode: 'consecutive_losses' });
-        expect(harness.callsFor('risk_events', 'insert').every((c) => (c.payload as any).event_type === 'consecutive_losses')).toBe(true);
+        expect(harness.callsFor('risk_events', 'insert').every((c) => (c.payload as RiskEventPayload).event_type === 'consecutive_losses')).toBe(true);
         harness.calls.length = 0;
       }
     });
@@ -376,7 +382,7 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
 
       // Live keeps its legacy consecutive-loss kill at 8.
       for (let i = 0; i < 8; i++) closeTrade(-1);
-      (engine as any).checkKillSwitches();
+      riskEngineInternals(engine).checkKillSwitches();
       await flush();
       expect(engine.getRiskStatus()).toMatchObject({ tradingState: 'HALTED', reasonCode: 'consecutive_losses' });
       expect(ladderInserts()).toHaveLength(1);
@@ -434,7 +440,7 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
       await flush();
       expect(ladderInserts()).toEqual([]);
 
-      await (engine as any).updateMetrics();
+      await riskEngineInternals(engine).updateMetrics();
       await flush();
 
       expect(engine.getRiskStatus().paperKillLadder).toMatchObject({ sizeLevel: 1, sizeReasonCode: 'size_down_daily_r', positionMultiplierCap: 0.5 });
@@ -570,7 +576,7 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
       // Expiry: the next tick releases the pause and retires exactly that row.
       harness.calls.length = 0;
       clock.mockReturnValue(t0 + 4 * HOUR + 1);
-      (engine as any).checkKillSwitches();
+      riskEngineInternals(engine).checkKillSwitches();
       await flush();
 
       expect(engine.checkPaperKillLadderEntry({ strategy: 'trend_follow', regime: 'weak_trend' })).toMatchObject({ allowed: true });
@@ -623,7 +629,7 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
       expect(codes).toEqual(['daily_stop']);
       expect(mockLogger.error).toHaveBeenCalledWith(expect.stringContaining('KILL SWITCH TRIGGERED: L6 hard kill'));
 
-      const halt = harness.callsFor('risk_events', 'insert').map((c) => c.payload as any).find((p) => p.event_type === 'daily_stop');
+      const halt = harness.callsFor('risk_events', 'insert').map((c) => c.payload as RiskEventPayload).find((p) => p.event_type === 'daily_stop');
       expect(halt).toMatchObject({
         execution_mode: 'paper',
         details: { eventType: 'halt', reasonCode: 'daily_stop', daily: true, ladderLevel: 6, dailyPnlR: -4, thresholdR: -4 },
@@ -642,7 +648,7 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
 
       // 12 small losses: streak 12 but only -1.2R -> L1 (consec), L2 (consec) — no kill.
       for (let i = 0; i < 12; i++) closeTrade(-10);
-      (engine as any).checkKillSwitches();
+      riskEngineInternals(engine).checkKillSwitches();
       await flush();
       expect(engine.getMetrics().consecutiveLosses).toBe(12);
       expect(engine.getMetrics().killSwitchActive).toBe(false);
@@ -657,9 +663,9 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
       const status = engine.getRiskStatus();
       expect(status).toMatchObject({ tradingState: 'HALTED', reasonCode: 'consecutive_losses', daily: false });
       expect(codes).toEqual(['consecutive_losses']);
-      const halt = harness.callsFor('risk_events', 'insert').map((c) => c.payload as any).find((p) => p.event_type === 'consecutive_losses');
-      expect(halt.details).toMatchObject({ ladderLevel: 6, consecutiveLosses: 13, consecutiveLossesThreshold: 12, thresholdR: -2 });
-      expect(halt.details.dailyPnlR).toBeCloseTo(-2.1, 5);
+      const halt = harness.callsFor('risk_events', 'insert').map((c) => c.payload as RiskEventPayload).find((p) => p.event_type === 'consecutive_losses');
+      expect(halt!.details).toMatchObject({ ladderLevel: 6, consecutiveLosses: 13, consecutiveLossesThreshold: 12, thresholdR: -2 });
+      expect(halt!.details.dailyPnlR).toBeCloseTo(-2.1, 5);
     });
 
     test('unrealized drawdown to -4R kills on the metrics tick (no close needed), as daily_stop', async () => {
@@ -667,7 +673,7 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
       portfolio.totalUnrealizedPnL = -400;
       portfolio.totalPnL = -400;
 
-      await (engine as any).updateMetrics();
+      await riskEngineInternals(engine).updateMetrics();
       await flush();
 
       expect(engine.getMetrics().killSwitchActive).toBe(true);
@@ -680,23 +686,23 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
 
       // 8 tiny losses: legacy would halt on consecutive_losses; the ladder only sizes down.
       for (let i = 0; i < 8; i++) closeTrade(-1);
-      (engine as any).checkKillSwitches();
+      riskEngineInternals(engine).checkKillSwitches();
       expect(engine.getMetrics().consecutiveLosses).toBe(8);
       expect(engine.getRiskStatus().tradingState).toBe('RUNNING');
       expect(engine.applyPaperKillLadderSizing(1).multiplier).toBe(0.25);
 
       // Legacy 2% USD daily guardrail (-$200 = -2R) no longer halts; -2R is L2, the kill is -4R.
-      (engine as any).enforceLossGuardrails(9750);
+      riskEngineInternals(engine).enforceLossGuardrails(9750);
       expect(engine.getRiskStatus().tradingState).toBe('RUNNING');
       // Legacy USD fallback in checkKillSwitches is skipped too.
-      (engine as any).metrics.dailyPnL = -250;
-      (engine as any).checkKillSwitches();
+      riskEngineInternals(engine).metrics.dailyPnL = -250;
+      riskEngineInternals(engine).checkKillSwitches();
       expect(engine.getRiskStatus().tradingState).toBe('RUNNING');
 
       // Every other existing halt is unchanged: weekly stop still fires from the same path.
-      (engine as any).dailyStartEquity = 10000;
-      (engine as any).weeklyStartEquity = 10600;
-      (engine as any).enforceLossGuardrails(9900);
+      riskEngineInternals(engine).dailyStartEquity = 10000;
+      riskEngineInternals(engine).weeklyStartEquity = 10600;
+      riskEngineInternals(engine).enforceLossGuardrails(9900);
       expect(engine.getRiskStatus()).toMatchObject({ tradingState: 'HALTED', reasonCode: 'weekly_stop' });
     });
 
@@ -707,12 +713,12 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
       expect(engine.getPaperKillLadder()).not.toBeNull();
       expect(engine.getRiskStatus().thresholds.dailyStopR).toBe(-2);
 
-      (engine as any).enforceLossGuardrails(9800);
+      riskEngineInternals(engine).enforceLossGuardrails(9800);
       expect(engine.getRiskStatus()).toMatchObject({ tradingState: 'HALTED', reasonCode: 'daily_stop' });
       await engine.deactivateKillSwitch();
 
       for (let i = 0; i < 8; i++) closeTrade(-1);
-      (engine as any).checkKillSwitches();
+      riskEngineInternals(engine).checkKillSwitches();
       expect(engine.getRiskStatus()).toMatchObject({ tradingState: 'HALTED', reasonCode: 'consecutive_losses' });
     });
 
@@ -720,13 +726,13 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
       engine = await freshEngine();
       const codes = haltedCodes(engine);
 
-      (engine as any).metrics.errorRate = 20;
-      (engine as any).checkKillSwitches();
+      riskEngineInternals(engine).metrics.errorRate = 20;
+      riskEngineInternals(engine).checkKillSwitches();
       expect(engine.getRiskStatus().reasonCode).toBe('error_rate');
       await engine.deactivateKillSwitch();
 
-      (engine as any).metrics.averageLatency = 2000;
-      (engine as any).checkKillSwitches();
+      riskEngineInternals(engine).metrics.averageLatency = 2000;
+      riskEngineInternals(engine).checkKillSwitches();
       expect(engine.getRiskStatus().reasonCode).toBe('latency');
       await engine.deactivateKillSwitch();
 
@@ -805,7 +811,7 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
       expect(engine.getMetrics().consecutiveLosses).toBe(0);
       expect(engine.getMetrics().killSwitchActive).toBe(false);
       expect(engine.getRiskStatus().paperKillLadder).toMatchObject({ sizeLevel: 0, positionMultiplierCap: 1, highestActiveLevel: 0 });
-      (engine as any).checkKillSwitches();
+      riskEngineInternals(engine).checkKillSwitches();
       expect(engine.getRiskStatus().tradingState).toBe('RUNNING');
       expect(engine.applyPaperKillLadderSizing(1).multiplier).toBe(1);
     });
@@ -822,7 +828,7 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
     async function bootLatched(events: unknown[]) {
       harness.respond('risk_metrics.select', () => ({ data: latched() }));
       harness.respond('risk_events.select', () => ({ data: events }));
-      const e = await waitForLoaders(new RiskEngine(baseConfig, mockLogger as any, positionTracker));
+      const e = await waitForLoaders(new RiskEngine(baseConfig, mockLogger, positionTracker));
       await vi.waitFor(() => expect(harness.callsFor('risk_events', 'select').length).toBeGreaterThan(0));
       await flush();
       return e;
@@ -855,12 +861,12 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
 
     test('a restart without CLEAR retires stale soft rows (the in-memory ladder starts empty) but leaves halts alone', async () => {
       harness.respond('risk_metrics.select', () => ({ data: { ...latched(), kill_switch_active: false, consecutive_losses: 4 } }));
-      engine = await waitForLoaders(new RiskEngine(baseConfig, mockLogger as any, positionTracker));
+      engine = await waitForLoaders(new RiskEngine(baseConfig, mockLogger, positionTracker));
       await flush();
 
       // Restored streak (4) re-derives the L1 cap on the first tick.
       expect(engine.getMetrics().consecutiveLosses).toBe(4);
-      (engine as any).checkKillSwitches();
+      riskEngineInternals(engine).checkKillSwitches();
       expect(engine.applyPaperKillLadderSizing(1).multiplier).toBe(0.5);
       expect(engine.getRiskStatus()).toMatchObject({ tradingState: 'RUNNING', paperKillLadder: { frozenStrategies: [], regimePauses: [] } });
 
@@ -883,7 +889,7 @@ describe('RiskEngine x paper kill ladder (L1–L6)', () => {
 
     test('without the ladder a restart performs no risk_events writes (restore stays read-only)', async () => {
       harness.respond('risk_metrics.select', () => ({ data: { ...latched(), kill_switch_active: false } }));
-      engine = await waitForLoaders(new RiskEngine({ ...baseConfig, guardrails: baseGuardrails }, mockLogger as any, positionTracker));
+      engine = await waitForLoaders(new RiskEngine({ ...baseConfig, guardrails: baseGuardrails }, mockLogger, positionTracker));
       await flush();
       expect(harness.callsFor('risk_events', 'update')).toHaveLength(0);
       expect(harness.callsFor('risk_events', 'insert')).toHaveLength(0);

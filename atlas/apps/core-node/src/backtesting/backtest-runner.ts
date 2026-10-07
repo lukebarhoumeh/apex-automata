@@ -36,6 +36,20 @@ export interface BacktestDataOptions extends LoadCandlesOptions {
   minBucketFill?: number;
 }
 
+/**
+ * One grid-search point: dotted config paths (e.g. `risk.stopLossPercent`)
+ * mapped to the numeric value under test. Produced by
+ * `generateParameterCombinations` from `{ min, max, step }` ranges.
+ */
+export type ParameterSet = Record<string, number>;
+
+/** One optimization run's outcome, as collected by `runOptimization`. */
+export interface OptimizationResult {
+  params: ParameterSet;
+  metric: number;
+  metrics: BacktestResult['metrics'];
+}
+
 /** Where `saveResults` wrote a run, so harnesses can cross-reference. */
 export interface SavedBacktestPaths {
   jsonPath: string;
@@ -346,11 +360,11 @@ ${trades.slice(-10).map(t =>
     parameterRanges: Record<string, { min: number; max: number; step: number }>,
     metric: keyof BacktestResult['metrics'] = 'sharpeRatio',
     dataOptions: BacktestDataOptions = {},
-  ): Promise<{ bestParams: any; bestMetric: number; allResults: any[] }> {
+  ): Promise<{ bestParams: ParameterSet; bestMetric: number; allResults: OptimizationResult[] }> {
     this.logger.info('Starting parameter optimization');
 
-    const allResults: any[] = [];
-    let bestParams: any = {};
+    const allResults: OptimizationResult[] = [];
+    let bestParams: ParameterSet = {};
     let bestMetric = -Infinity;
 
     // Generate all parameter combinations
@@ -385,11 +399,11 @@ ${trades.slice(-10).map(t =>
     return { bestParams, bestMetric, allResults };
   }
 
-  private generateParameterCombinations(ranges: Record<string, { min: number; max: number; step: number }>): any[] {
+  private generateParameterCombinations(ranges: Record<string, { min: number; max: number; step: number }>): ParameterSet[] {
     const keys = Object.keys(ranges);
-    const combinations: any[] = [];
+    const combinations: ParameterSet[] = [];
 
-    function generate(index: number, current: any): void {
+    function generate(index: number, current: ParameterSet): void {
       if (index === keys.length) {
         combinations.push({ ...current });
         return;
@@ -412,7 +426,7 @@ ${trades.slice(-10).map(t =>
     return combinations;
   }
 
-  private applyParameters(baseConfig: BacktestConfig, params: any): BacktestConfig {
+  private applyParameters(baseConfig: BacktestConfig, params: ParameterSet): BacktestConfig {
     // Structured clone so Date instances and the FeeModel survive (a JSON
     // round-trip turned dates into strings and dropped the FeeModel's
     // prototype, which broke `config.startDate.toISOString()` downstream).
@@ -428,13 +442,15 @@ ${trades.slice(-10).map(t =>
     // Apply parameters (dotted paths, e.g. 'risk.stopLossPercent')
     for (const [key, value] of Object.entries(params)) {
       const keys = key.split('.');
-      let obj: any = config;
+      // Dotted-path traversal writes through arbitrary config nesting, so
+      // walk it as a generic string-keyed record.
+      let obj: Record<string, unknown> = config as unknown as Record<string, unknown>;
 
       for (let i = 0; i < keys.length - 1; i++) {
         if (obj[keys[i]] === undefined) {
           obj[keys[i]] = {};
         }
-        obj = obj[keys[i]];
+        obj = obj[keys[i]] as Record<string, unknown>;
       }
 
       obj[keys[keys.length - 1]] = value;

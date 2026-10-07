@@ -25,6 +25,7 @@ import { RiskEngine, RiskEngineConfig } from '../trading/risk-engine';
 import { PositionTracker, PositionTrackerConfig } from '../trading/position-tracker';
 import { FeeModel } from '../core/fee-model';
 import { GuardrailConfig } from '../config/loadGuardrails';
+import type { Logger } from '../core/logger';
 
 // The engine never talks to the DB in these tests (no userId), but the
 // constructor still builds a client — stub the module.
@@ -49,7 +50,7 @@ const mockLogger = {
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
-};
+} as unknown as Logger;
 
 /** Canonical YAML-shaped fixture: Coinbase spot 25/40, perps 0/5, HL -1.5/4.5. */
 function buildGuardrails() {
@@ -212,7 +213,7 @@ describe('RiskEngine live-tier EV gate fee plumbing', () => {
       feeModel: yamlModel,
       ...overrides,
     };
-    return new RiskEngine(config, mockLogger as any, positionTracker);
+    return new RiskEngine(config, mockLogger, positionTracker);
   }
 
   beforeEach(() => {
@@ -221,7 +222,7 @@ describe('RiskEngine live-tier EV gate fee plumbing', () => {
     guardrails = buildGuardrails();
     guardrailsSnapshot = JSON.stringify(guardrails);
     yamlModel = FeeModel.fromGuardrails(guardrails);
-    positionTracker = new PositionTracker(positionTrackerConfig, mockLogger as any);
+    positionTracker = new PositionTracker(positionTrackerConfig, mockLogger);
     engine = buildEngine();
   });
 

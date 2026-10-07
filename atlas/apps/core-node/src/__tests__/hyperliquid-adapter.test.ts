@@ -16,7 +16,7 @@ const mockLogger: Logger = {
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
-} as any;
+};
 
 const TEST_FEES: FeesConfig = {
   coinbase: {

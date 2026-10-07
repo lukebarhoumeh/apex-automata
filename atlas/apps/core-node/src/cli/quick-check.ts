@@ -9,8 +9,9 @@ async function testSupabase(url: string, key: string) {
     const { data, error } = await supabase.from('symbols').select('symbol').limit(3);
     if (error) throw error;
     return { ok: true, sample: data?.map(d => d.symbol) };
-  } catch (e: any) {
-    return { ok: false, error: String(e?.message || e) };
+  } catch (e) {
+    const message = (e as { message?: unknown } | null)?.message;
+    return { ok: false, error: String(message || e) };
   }
 }
 

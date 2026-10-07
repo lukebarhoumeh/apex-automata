@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, type WebSocket as WsSocket } from 'ws';
 import { createLogger } from '../core/logger';
 import { TradingEngine, TradingEngineConfig, EngineState } from '../trading/trading-engine';
 import { SignalProcessor } from '../strategies/signal-processor';
@@ -73,6 +73,7 @@ import {
   SessionScopedTable,
   SessionScopeQuery,
   SessionWindow,
+  type SessionScopeBuilder,
 } from './session-scope';
 import { buildStrategySessionStats, StrategySessionStats, strategyReportTradeInputs } from './strategy-session-stats';
 import { buildPnlSnapshotPayload, PnlSnapshot } from './pnl-snapshot';
@@ -89,10 +90,16 @@ import { FeeModel } from '../core/fee-model';
 import { CfmGuard, CfmFlattenRequiredEvent, CfmLeverageSnapshot } from '../trading/cfm/cfm-guard';
 import { OrderOpsThrottle } from '../trading/execution/order-ops-throttle';
 import { resolveEntryExecution } from '../trading/execution/execution-policy';
-import { isMissingColumnError } from '../core/postgrest-errors';
+import { isMissingColumnError, type PostgrestErrorLike } from '../core/postgrest-errors';
 import { validateSchemaOrFail } from '../config/validateSchema';
-import { OrderRequest } from '../exchanges/coinbase';
+import { OrderRequest, type Candle, type CoinbaseExchange, type Ticker } from '../exchanges/coinbase';
 import type { Position } from '../trading/position-tracker';
+import type { RiskMetrics } from '../trading/risk-engine';
+import type { OrderMetadata } from '../trading/order-manager';
+import type { Signal } from '../strategies/signal-processor';
+import type { RegimeState } from '../strategies/regime-detector';
+import type { MetaFilterResult, TradeOutcome } from '../strategies/meta-filter';
+import type { SignalRowInput } from '../persistence/signal-row';
 import { MetricsTracker } from '../trading/metrics-tracker';
 import { SecretManager } from '../config/secrets';
 import { AdvancedTradeRestClient, loadAdvancedTradeAuth } from '../exchanges/coinbase/advanced-trade-client';
@@ -116,7 +123,13 @@ import { HyperliquidAdapter } from '../exchanges/hyperliquid';
 import { initHyperliquidAdapter } from '../exchanges/hyperliquid-init';
 import { PerpsRiskMonitor } from '../trading/perps';
 import { TradeOutcomeCollector } from '../ml/trade-outcome-collector';
-import { EngineSupervisor, SupervisorState, RestartReason } from '../runtime/engine-supervisor';
+import {
+  EngineSupervisor,
+  SupervisorState,
+  RestartReason,
+  type EngineState as SupervisorEngineState,
+  type TradingMode,
+} from '../runtime/engine-supervisor';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 
@@ -340,8 +353,8 @@ let metricsInterval: NodeJS.Timeout | null = null;
 let statusBroadcastInterval: NodeJS.Timeout | null = null;
 
 // In-memory configs (will be persisted/hot-reloaded later)
-let riskConfig: any = null;
-let signalsConfig: any = null;
+let riskConfig: z.infer<typeof riskConfigSchema> | null = null;
+let signalsConfig: z.infer<typeof signalsConfigSchema> | null = null;
 
 // Load and validate environment - fails fast with clear errors if misconfigured
 const atlasRoot = path.resolve(process.cwd(), '../..');
@@ -654,7 +667,7 @@ async function openTradingSession(params: {
       const enginePositions = tradingEngine?.getOpenPositions?.() ?? [];
       const reconcile = classifyReconcileRows({
         rows: (dbOpenRows ?? []) as unknown as ReconcileOpenRow[],
-        engineSymbols: enginePositions.map((p: any) => p.symbol),
+        engineSymbols: enginePositions.map((p) => p.symbol),
         executionMode: params.mode,
         modeColumnPresent: reconcileModeColumnPresent,
       });
@@ -883,12 +896,12 @@ supervisor.setReconnectExchangeCallback(async (): Promise<boolean> => {
   
   try {
     const exchange = tradingEngine.getExchange();
-    if (exchange && typeof (exchange as any).forceWsReconnect === 'function') {
-      (exchange as any).forceWsReconnect();
+    if (exchange && typeof exchange.forceWsReconnect === 'function') {
+      exchange.forceWsReconnect();
       return true;
     } else if (exchange) {
       // Fallback to direct WS client access
-      const wsClient = (exchange as any).getWsClient?.();
+      const wsClient = exchange.getWsClient?.();
       if (wsClient && typeof wsClient.forceReconnect === 'function') {
         wsClient.forceReconnect();
         return true;
@@ -907,10 +920,10 @@ supervisor.setReconnectExchangeCallback(async (): Promise<boolean> => {
 supervisor.start();
 
 // WebSocket clients
-const wsClients = new Set<any>();
+const wsClients = new Set<WsSocket>();
 
 // Broadcast to all WebSocket clients
-function broadcast(data: any) {
+function broadcast(data: unknown) {
   const envelope = (data && typeof data === 'object' && !Array.isArray(data))
     ? (Object.prototype.hasOwnProperty.call(data, 'timestamp') ? data : { ...data, timestamp: Date.now() })
     : { type: 'Alert', payload: data, timestamp: Date.now() };
@@ -1240,10 +1253,10 @@ app.get('/api/pnl', (req, res) => {
 app.get('/api/status', (req, res) => {
   // Get comprehensive exchange health if available
   const exchange = tradingEngine?.getExchange();
-  const wsHealth = exchange ? (exchange as any).getWsHealth?.() : null;
-  const exchangeHealth = exchange ? (exchange as any).getExchangeHealth?.() : null;
-  const restHealth = exchange ? (exchange as any).getRestHealth?.() : null;
-  const reconcilerState = exchange ? (exchange as any).getReconcilerState?.() : null;
+  const wsHealth = exchange ? exchange.getWsHealth?.() : null;
+  const exchangeHealth = exchange ? exchange.getExchangeHealth?.() : null;
+  const restHealth = exchange ? exchange.getRestHealth?.() : null;
+  const reconcilerState = exchange ? exchange.getReconcilerState?.() : null;
 
   res.json({
     // Core contract (sessionId, sessionStartedAt, pnl, engineState, ... ) — identical
@@ -1274,8 +1287,8 @@ app.get('/api/status', (req, res) => {
     exchangeHealth: exchangeHealth ? {
       degraded: exchangeHealth.degraded,
       degradedReasons: exchangeHealth.degradedReasons,
-      allowsEntries: exchange ? (exchange as any).allowsNewEntries?.() : true,
-      allowsExits: exchange ? (exchange as any).allowsExits?.() : true,
+      allowsEntries: exchange ? exchange.allowsNewEntries?.() : true,
+      allowsExits: exchange ? exchange.allowsExits?.() : true,
     } : null,
     // Reconciler state
     reconciler: reconcilerState ? {
@@ -1327,11 +1340,11 @@ app.get('/api/exchange/health', (req, res) => {
     });
   }
 
-  const exchangeHealth = (exchange as any).getExchangeHealth?.() ?? null;
-  const wsHealth = (exchange as any).getWsHealth?.() ?? null;
-  const restHealth = (exchange as any).getRestHealth?.() ?? null;
-  const reconcilerState = (exchange as any).getReconcilerState?.() ?? null;
-  const gapFillerStatus = (exchange as any).getGapFillerStatus?.() ?? [];
+  const exchangeHealth = exchange.getExchangeHealth?.() ?? null;
+  const wsHealth = exchange.getWsHealth?.() ?? null;
+  const restHealth = exchange.getRestHealth?.() ?? null;
+  const reconcilerState = exchange.getReconcilerState?.() ?? null;
+  const gapFillerStatus = exchange.getGapFillerStatus?.() ?? [];
 
   res.json({
     available: true,
@@ -1341,10 +1354,10 @@ app.get('/api/exchange/health', (req, res) => {
     reconciler: reconcilerState,
     gapFiller: {
       trackedSymbols: gapFillerStatus,
-      hasStaleData: gapFillerStatus.some((s: any) => s.isStale),
+      hasStaleData: gapFillerStatus.some((s) => s.isStale),
     },
-    allowsEntries: (exchange as any).allowsNewEntries?.() ?? true,
-    allowsExits: (exchange as any).allowsExits?.() ?? true,
+    allowsEntries: exchange.allowsNewEntries?.() ?? true,
+    allowsExits: exchange.allowsExits?.() ?? true,
   });
 });
 
@@ -1357,7 +1370,7 @@ app.post('/api/exchange/reset-circuit', (req, res) => {
   }
 
   try {
-    (exchange as any).forceCloseRestCircuit?.();
+    exchange.forceCloseRestCircuit?.();
     logger.info('Exchange REST circuit breaker force reset via API');
     res.json({ success: true, message: 'Circuit breaker reset' });
   } catch (error) {
@@ -1375,7 +1388,7 @@ app.post('/api/exchange/reconcile', async (req, res) => {
   }
 
   try {
-    await (exchange as any).triggerReconciliation?.();
+    await exchange.triggerReconciliation?.();
     logger.info('Reconciliation triggered via API');
     res.json({ success: true, message: 'Reconciliation triggered' });
   } catch (error) {
@@ -1730,8 +1743,11 @@ app.post('/api/engine/start', async (req, res) => {
       supervisor.recordEngineHeartbeat();
     });
 
-    tradingEngine.on('engine:state_changed', (state, reason) => {
-      supervisor.setActualState(state as any, reason);
+    tradingEngine.on('engine:state_changed', (state: EngineState, reason: string) => {
+      // The engine's state union ('starting'/'stopping') and the supervisor's
+      // ('paused') overlap but differ; the supervisor has always received the
+      // engine's raw state verbatim — the double assertion preserves that.
+      supervisor.setActualState(state as unknown as SupervisorEngineState, reason);
       
       // Broadcast state change to UI
       broadcast({
@@ -1757,7 +1773,10 @@ app.post('/api/engine/start', async (req, res) => {
     });
 
     // Set up event listeners to update frontend
-    tradingEngine.on('market:ticker', (ticker) => {
+    // The engine re-emits the raw Coinbase WS ticker (snake_case); some
+    // historical feeds carried camelCase best-bid/ask, so both spellings are
+    // read below — the intersection types the superset without changing reads.
+    tradingEngine.on('market:ticker', (ticker: Ticker & { bestBid?: string | number; bestAsk?: string | number }) => {
       // Record market data for supervisor monitoring
       supervisor.recordMarketData();
       const toNumber = (value: unknown, fallback: number): number => {
@@ -1771,9 +1790,9 @@ app.post('/api/engine/start', async (req, res) => {
         return;
       }
 
-      const bid = toNumber((ticker as any).best_bid ?? (ticker as any).bestBid, price);
-      const ask = toNumber((ticker as any).best_ask ?? (ticker as any).bestAsk, price);
-      const volume = toNumber((ticker as any).last_size ?? (ticker as any).volume_24h, 0);
+      const bid = toNumber(ticker.best_bid ?? ticker.bestBid, price);
+      const ask = toNumber(ticker.best_ask ?? ticker.bestAsk, price);
+      const volume = toNumber(ticker.last_size ?? ticker.volume_24h, 0);
       const ts = ticker.time ? new Date(ticker.time).getTime() : Date.now();
       const timestamp = Number.isFinite(ts) ? ts : Date.now();
 
@@ -1795,7 +1814,7 @@ app.post('/api/engine/start', async (req, res) => {
       processTickerForCandles({
         product_id: ticker.product_id,
         price: ticker.price,
-        last_size: (ticker as any).last_size,
+        last_size: ticker.last_size,
         time: ticker.time,
       });
 
@@ -1933,7 +1952,7 @@ app.post('/api/engine/start', async (req, res) => {
       }
     });
 
-    tradingEngine.on('risk:metrics', (metrics: any) => {
+    tradingEngine.on('risk:metrics', (metrics: RiskMetrics) => {
       runtimeState.risk = {
         exposureUsd: metrics.currentExposure ?? 0,
         dailyPnLUsd: metrics.dailyPnL ?? 0,
@@ -2090,7 +2109,9 @@ app.post('/api/engine/start', async (req, res) => {
       // Try primary: exchange REST client (works with credentials)
       if (tradingEngine) {
         try {
-          const exchange = (tradingEngine as any).exchange;
+          // Private-field peek, kept as a property access (not the public
+          // getter) so the runtime path stays byte-identical; typed structurally.
+          const exchange = (tradingEngine as unknown as { exchange: CoinbaseExchange | null }).exchange;
           if (exchange) {
             const end = new Date();
             const start = new Date(end.getTime() - limit * 60 * 1000);
@@ -2102,7 +2123,7 @@ app.post('/api/engine/start', async (req, res) => {
             });
             
             if (candles && candles.length > 0) {
-              return candles.map((c: any) => ({
+              return candles.map((c: Candle) => ({
                 time: c.time * 1000,
                 open: c.open,
                 high: c.high,
@@ -2150,7 +2171,7 @@ app.post('/api/engine/start', async (req, res) => {
         }
         
         const candles = data
-          .filter((c: any) => Array.isArray(c) && c.length >= 6)
+          .filter((c: number[]) => Array.isArray(c) && c.length >= 6)
           .map((c: number[]) => ({
             time: c[0] * 1000, // Convert to milliseconds
             open: c[3],
@@ -2159,7 +2180,7 @@ app.post('/api/engine/start', async (req, res) => {
             close: c[4],
             volume: c[5],
           }))
-          .sort((a: any, b: any) => a.time - b.time); // Sort oldest first
+          .sort((a, b) => a.time - b.time); // Sort oldest first
         
         logger.info(`Loaded ${candles.length} historical candles from public API for ${symbol}`);
         return candles;
@@ -2240,8 +2261,11 @@ app.post('/api/engine/start', async (req, res) => {
     });
 
     // Listen for regime updates and broadcast
-    signalProcessor.on('regime:updated', (symbol: string, regimeState: any) => {
-      runtimeState.regime = regimeState.regime;
+    signalProcessor.on('regime:updated', (symbol: string, regimeState: RegimeState) => {
+      // Pre-existing shape mismatch preserved: runtimeState.regime is typed
+      // 'trend' | 'chop' (UI contract) but has always been assigned the
+      // detector's MarketRegime verbatim — the assertion keeps that behavior.
+      runtimeState.regime = regimeState.regime as unknown as Regime;
       broadcast({
         type: 'RegimeUpdate',
         payload: {
@@ -2270,7 +2294,7 @@ app.post('/api/engine/start', async (req, res) => {
     });
 
     // Listen for regime-filtered signals
-    signalProcessor.on('signal:regime_filtered', (signal: any, regimeState: any, reason: string) => {
+    signalProcessor.on('signal:regime_filtered', (signal: Signal, regimeState: RegimeState, reason: string) => {
       broadcast({
         type: 'SignalFiltered',
         payload: {
@@ -2283,7 +2307,7 @@ app.post('/api/engine/start', async (req, res) => {
     });
 
     // Listen for meta-filtered signals (trade quality)
-    signalProcessor.on('signal:meta_filtered', (signal: any, result: any, reason: string) => {
+    signalProcessor.on('signal:meta_filtered', (signal: Signal, result: MetaFilterResult, reason: string) => {
       broadcast({
         type: 'SignalFiltered',
         payload: {
@@ -2292,7 +2316,7 @@ app.post('/api/engine/start', async (req, res) => {
           coldStreakActive: result.coldStreakActive,
           reason,
           filterType: 'meta',
-          rulesEvaluated: result.rulesEvaluated?.map((r: any) => ({
+          rulesEvaluated: result.rulesEvaluated?.map((r) => ({
             rule: r.rule,
             passed: r.passed,
             reason: r.reason,
@@ -2515,7 +2539,9 @@ app.post('/api/engine/start', async (req, res) => {
           };
           // For perps symbols, add reduce_only flag to prevent accidental flip
           if (signal.symbol.includes('-PERP-')) {
-            (closeOrder as any).reduce_only = true;
+            // reduce_only rides outside the typed OrderRequest shape (perps-only
+            // flag the spot type does not carry); same property write as before.
+            (closeOrder as Omit<OrderRequest, 'client_oid'> & { reduce_only?: boolean }).reduce_only = true;
           }
 
           const exit = await tradingEngine!.createOrder(closeOrder, {
@@ -3061,7 +3087,7 @@ app.post('/api/engine/start', async (req, res) => {
     }
 
     // Update supervisor state
-    supervisor.setDesiredState('running', mode as any);
+    supervisor.setDesiredState('running', mode as TradingMode);
     supervisor.setActualState('running', 'engine_started');
 
     // Persist a trading_sessions row so the UI can scope this run's state.
@@ -3212,7 +3238,7 @@ type LivePreflightResult =
   | {
       ok: false;
       error: string;
-      details?: Record<string, any>;
+      details?: Record<string, unknown>;
       warnings: string[];
       checks?: LivePreflightCheck[];
       account?: LiveAccountSummary | null;
@@ -4186,6 +4212,15 @@ function mapEnginePosition(p: Position) {
   };
 }
 
+/**
+ * The slice of the supabase-js query builder the blotter reads drive: the
+ * chainable filters session-scope applies plus the awaitable result. The
+ * builder is cast onto this (see createQuery below) because inferring the
+ * full PostgrestFilterBuilder generic chain trips TS2589.
+ */
+type BlotterQueryBuilder = SessionScopeBuilder<BlotterQueryBuilder> &
+  PromiseLike<{ data: unknown[] | null; error: PostgrestErrorLike | null }>;
+
 function registerBlotterEndpoint(table: SessionScopedTable, route: string): void {
   app.get(route, async (req, res) => {
     const parsed = parseSessionScopeQuery(req.query as Record<string, unknown>, { allowStatus: table === 'positions' });
@@ -4209,14 +4244,17 @@ function registerBlotterEndpoint(table: SessionScopedTable, route: string): void
     }
 
     try {
-      const result = await readWithSessionScope<Record<string, unknown>, any>({
+      const result = await readWithSessionScope({
         table,
         userId: USER_ID,
         window,
         limit: parsed.query.limit,
         status: parsed.query.status,
         support: sessionColumnSupport,
-        createQuery: () => supabase.from(table).select(BLOTTER_SELECT[table]),
+        // Cast to the narrow self-referential builder slice session-scope
+        // drives: inferring the full PostgrestFilterBuilder generics here
+        // trips TS2589 (excessively deep instantiation).
+        createQuery: () => supabase.from(table).select(BLOTTER_SELECT[table]) as unknown as BlotterQueryBuilder,
         execute: async (builder) => {
           const { data, error } = await builder;
           return { data: (data ?? null) as Record<string, unknown>[] | null, error };
@@ -4267,8 +4305,8 @@ app.get('/api/regime/status', (req, res) => {
   }
   
   const allStates = signalProcessor.getAllRegimeStates();
-  const statesObj: Record<string, any> = {};
-  
+  const statesObj: Record<string, unknown> = {};
+
   for (const [symbol, state] of allStates) {
     statesObj[symbol] = {
       regime: state.regime,
@@ -4292,8 +4330,8 @@ app.get('/api/regime/state', (req, res) => {
   }
 
   const allStates = signalProcessor.getAllRegimeStates();
-  const statesObj: Record<string, any> = {};
-  
+  const statesObj: Record<string, unknown> = {};
+
   for (const [symbol, state] of allStates) {
     statesObj[symbol] = {
       regime: state.regime,
@@ -4410,7 +4448,7 @@ app.get('/api/metafilter/performance', (req, res) => {
   }
 
   const performances = signalProcessor.getAllStrategyPerformances();
-  const result: Record<string, any> = {};
+  const result: Record<string, unknown> = {};
   
   for (const [strategy, perf] of performances) {
     result[strategy] = {
@@ -4522,7 +4560,10 @@ app.post('/api/metafilter/outcome', (req, res) => {
     return res.status(400).json({ error: 'Invalid trade outcome', details: parsed.error.format() });
   }
 
-  const outcome = parsed.data as any;
+  // The zod payload carries ISO strings (and omits fields TradeOutcome marks
+  // required, e.g. direction/signalStrength) — exactly what the runtime has
+  // always passed through; the lines below convert the dates in place.
+  const outcome = parsed.data as unknown as TradeOutcome;
 
   outcome.entryTime = outcome.entryTime ? new Date(outcome.entryTime) : new Date();
   outcome.exitTime = outcome.exitTime ? new Date(outcome.exitTime) : new Date();
@@ -4973,6 +5014,19 @@ app.post('/api/strategies/symbol-overrides/bulk', (req, res) => {
 
 // ============ Extended Risk Control Endpoints ============
 
+/**
+ * Private RiskEngine members the ops endpoints below have always peeked at
+ * directly (never via public API). Typed structurally so the reads stay
+ * byte-identical; every field optional because this is a view, not a contract.
+ */
+interface RiskEngineInternals {
+  maxOpenPositionsLimit?: number;
+  blockedSymbols?: Set<string>;
+  isSoftLaunchActive?: () => boolean;
+  softLaunchEntryTrades?: number;
+  config?: { softLaunch?: { maxEntryTrades?: number } };
+}
+
 // Get risk controller status
 app.get('/api/risk/status', (req, res) => {
   const riskEngine = tradingEngine?.getRiskEngineInstance();
@@ -4998,7 +5052,7 @@ app.get('/api/risk/status', (req, res) => {
     },
     positions: {
       open: positions.length,
-      max: (riskEngine as any).maxOpenPositionsLimit || 5,
+      max: (riskEngine as unknown as RiskEngineInternals).maxOpenPositionsLimit || 5,
     },
     // Graduated paper kill ladder L1–L6 (paper only; `{ enabled: false }` otherwise).
     paperKillLadder: riskEngine.getPaperKillLadderStatus(),
@@ -5048,7 +5102,7 @@ app.get('/api/risk/blocked/symbols', (req, res) => {
 
   const blocked: string[] = [];
   // Access internal state
-  const blockedSymbols = (riskEngine as any).blockedSymbols;
+  const blockedSymbols = (riskEngine as unknown as RiskEngineInternals).blockedSymbols;
   if (blockedSymbols instanceof Set) {
     blocked.push(...blockedSymbols);
   }
@@ -5067,7 +5121,7 @@ app.post('/api/risk/unblock/symbol/:symbol', (req, res) => {
   }
 
   const { symbol } = req.params;
-  const blockedSymbols = (riskEngine as any).blockedSymbols as Set<string>;
+  const blockedSymbols = (riskEngine as unknown as RiskEngineInternals).blockedSymbols;
   
   if (blockedSymbols?.has(symbol)) {
     blockedSymbols.delete(symbol);
@@ -5120,9 +5174,10 @@ app.get('/api/risk/soft-launch', (req, res) => {
     return res.status(400).json({ error: 'Risk engine not running' });
   }
 
-  const softLaunchActive = (riskEngine as any).isSoftLaunchActive?.() || false;
-  const softLaunchTrades = (riskEngine as any).softLaunchEntryTrades || 0;
-  const softLaunchConfig = (riskEngine as any).config?.softLaunch;
+  const internals = riskEngine as unknown as RiskEngineInternals;
+  const softLaunchActive = internals.isSoftLaunchActive?.() || false;
+  const softLaunchTrades = internals.softLaunchEntryTrades || 0;
+  const softLaunchConfig = internals.config?.softLaunch;
   
   res.json({
     active: softLaunchActive,
@@ -5319,7 +5374,10 @@ app.post('/api/backtest/run', async (req, res) => {
         avgWin: metrics.averageWin || 0,
         avgLoss: metrics.averageLoss || 0,
         expectancyPerTrade: trades.length > 0 ? (metrics.netProfit || 0) / trades.length : 0,
-        equityCurve: equityCurve.map((point: any) => ({
+        // NB: the engine's equity points carry `timestamp`, not `date` — the
+        // `.date` read (undefined at runtime) predates this typing and is
+        // preserved as-is; the optional field types the existing behavior.
+        equityCurve: equityCurve.map((point: { equity: number; date?: string }) => ({
           date: point.date,
           equity: point.equity
         }))
@@ -5432,10 +5490,36 @@ async function initializeAccountMetrics() {
 }
 
 /**
+ * Structural shape of an order snapshot reaching the persister. Live
+ * ManagedOrders and hydrated/legacy shapes (symbol / quantity / signalId
+ * variants) both flow through, so every alternate spelling is optional and
+ * the defensive runtime fallbacks below are unchanged.
+ */
+interface PersistableOrderSnapshot {
+  id: string;
+  exchangeOrderId?: string | null;
+  signalId?: string | null;
+  productId?: string;
+  product?: string;
+  symbol?: string;
+  side?: string;
+  type?: string;
+  status?: string;
+  size?: number | string | null;
+  quantity?: number | string | null;
+  price?: number | string | null;
+  strategy?: string;
+  metaProb?: number | null;
+  createdAt?: Date;
+  updatedAt?: Date;
+  metadata?: OrderMetadata | null;
+}
+
+/**
  * Persist an order row. `stampAtEvent` is the session stamp captured when the
  * triggering engine event fired; when omitted the current stamp is read here.
  */
-async function syncOrderToSupabase(order: any, stampAtEvent?: SessionStamp | null) {
+async function syncOrderToSupabase(order: PersistableOrderSnapshot, stampAtEvent?: SessionStamp | null) {
   const mapOrderStatus = (status?: string) => {
     switch ((status || '').toLowerCase()) {
       case 'open':
@@ -5517,11 +5601,12 @@ async function syncOrderToSupabase(order: any, stampAtEvent?: SessionStamp | nul
       signal_id: signalId,
       symbol: order.productId || order.product || order.symbol,
       side: ((order.side || 'buy').toLowerCase() === 'sell' ? 'sell' : 'buy') as 'buy' | 'sell',
-      type: mapOrderType(order.type) as any,
-      status: mapOrderStatus(order.status) as any,
-      price: order.price ? parseFloat(order.price) : null,
+      type: mapOrderType(order.type),
+      status: mapOrderStatus(order.status),
+      // parseFloat coerces via ToString, so a numeric price behaves as before.
+      price: order.price ? parseFloat(order.price as string) : null,
       quantity: normalizedQuantity,
-      strategy: normalizeStrategy(order.strategy) as any,
+      strategy: normalizeStrategy(order.strategy),
       meta_prob: order.metaProb || null,
       created_at: order.createdAt ? order.createdAt.toISOString() : new Date().toISOString(),
       updated_at: order.updatedAt ? order.updatedAt.toISOString() : new Date().toISOString()
@@ -5639,7 +5724,40 @@ function mapExitReason(reason?: string): string | null {
   return 'manual_exit'; // fallback
 }
 
-async function syncPositionToSupabase(position: any): Promise<PositionWriteOutcome | null> {
+/**
+ * Structural shape of a position snapshot reaching the persister. Live
+ * PositionTracker positions AND hydrated Supabase rows (snake_case variants)
+ * both flow through, so every field is optional and both spellings are typed;
+ * the defensive runtime fallbacks below are unchanged.
+ */
+interface PersistablePositionSnapshot {
+  id?: string | number;
+  symbol?: string;
+  product?: string;
+  side?: 'long' | 'short' | 'flat';
+  size?: number | string;
+  averagePrice?: number;
+  avgPrice?: number | string;
+  entry_price?: number | string;
+  exitPrice?: number | string;
+  exit_price?: number | string;
+  stopPrice?: number | string;
+  stop_price_at_entry?: number | string;
+  takeProfit?: number | string;
+  take_profit_price?: number | string;
+  openTime?: Date | string | number;
+  closedAt?: Date | string | number | null;
+  exitReason?: string;
+  exit_reason?: string;
+  realizedPnL?: number | string;
+  realizedPnl?: number | string;
+  realized_pnl_usd?: number | string;
+  strategy?: unknown;
+  trades?: { side?: 'buy' | 'sell'; size?: number; price?: number }[];
+  metadata?: Record<string, unknown>;
+}
+
+async function syncPositionToSupabase(position: PersistablePositionSnapshot): Promise<PositionWriteOutcome | null> {
   try {
     const symbol = position.symbol || position.product;
     const side = position.side as 'long' | 'short' | 'flat' | undefined;
@@ -5699,7 +5817,7 @@ async function syncPositionToSupabase(position: any): Promise<PositionWriteOutco
       id: position.id, // must be UUID-compatible
       user_id: USER_ID,
       symbol,
-      strategy: strategyResolved.value as any,
+      strategy: strategyResolved.value,
       side,
       qty_open: Math.abs(Number(position.size || 0)),
       entry_price: entryPrice,
@@ -5784,7 +5902,7 @@ async function syncPositionToSupabase(position: any): Promise<PositionWriteOutco
   }
 }
 
-async function syncSignalToSupabase(signal: any) {
+async function syncSignalToSupabase(signal: SignalRowInput) {
   try {
     // Row shape lives in persistence/signal-row.ts. `strategy` goes through the
     // same strategy_name enum mapping as orders / positions (finding 7 open
@@ -5912,7 +6030,21 @@ async function persistSignalRouteVerdict(
   }
 }
 
-async function createSupabaseAlert(alert: any) {
+/**
+ * Heterogeneous alert payload (risk:alert rides fee-tier changes, kill-switch
+ * latches and forwarded risk-engine alerts verbatim) — the known keys are
+ * typed, everything else rides along untyped.
+ */
+interface AlertPayload {
+  type?: string;
+  severity?: string;
+  title?: string;
+  message?: string;
+  data?: unknown;
+  [key: string]: unknown;
+}
+
+async function createSupabaseAlert(alert: AlertPayload) {
   try {
     const { error } = await supabase
       .from('alerts')

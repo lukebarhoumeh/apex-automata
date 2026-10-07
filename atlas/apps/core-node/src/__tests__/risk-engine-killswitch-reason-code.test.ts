@@ -24,9 +24,11 @@
  */
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import { RiskEngine, RiskEngineConfig } from '../trading/risk-engine';
-import { isDailyHaltReason, RiskHaltReasonCode } from '../trading/risk-state';
+import { isDailyHaltReason, RiskHaltReasonCode, RiskStateChangeEvent } from '../trading/risk-state';
 import { PositionTracker, PositionTrackerConfig } from '../trading/position-tracker';
 import { GuardrailConfig } from '../config/loadGuardrails';
+import type { Logger } from '../core/logger';
+import { riskEngineInternals } from './helpers/risk-engine-test-access';
 
 interface RecordedCall {
   table: string;
@@ -105,6 +107,7 @@ const mockLogger = {
   error: vi.fn(),
   debug: vi.fn(),
 };
+const typedLogger = mockLogger as unknown as Logger;
 
 const guardrails = {
   disabled_strategies: [],
@@ -265,7 +268,7 @@ describe('RiskEngine kill switch reasonCode (P0: no more `unknown`)', () => {
   beforeEach(() => {
     harness.reset();
     vi.clearAllMocks();
-    positionTracker = new PositionTracker(positionTrackerConfig, mockLogger as any);
+    positionTracker = new PositionTracker(positionTrackerConfig, typedLogger);
     engine = null;
   });
 
@@ -276,7 +279,7 @@ describe('RiskEngine kill switch reasonCode (P0: no more `unknown`)', () => {
   });
 
   async function freshEngine(overrides: Partial<RiskEngineConfig> = {}): Promise<RiskEngine> {
-    const e = await waitForLoaders(new RiskEngine({ ...baseConfig, ...overrides }, mockLogger as any, positionTracker));
+    const e = await waitForLoaders(new RiskEngine({ ...baseConfig, ...overrides }, typedLogger, positionTracker));
     harness.calls.length = 0;
     vi.clearAllMocks();
     return e;
@@ -394,10 +397,10 @@ describe('RiskEngine kill switch reasonCode (P0: no more `unknown`)', () => {
     type Trip = { code: RiskHaltReasonCode; arm: (e: RiskEngine) => void };
 
     const viaCheckKillSwitches: Trip[] = [
-      { code: 'consecutive_losses', arm: (e) => { (e as any).metrics.consecutiveLosses = 8; (e as any).checkKillSwitches(); } },
-      { code: 'error_rate', arm: (e) => { (e as any).metrics.errorRate = 20; (e as any).checkKillSwitches(); } },
-      { code: 'latency', arm: (e) => { (e as any).metrics.averageLatency = 2000; (e as any).checkKillSwitches(); } },
-      { code: 'daily_stop', arm: (e) => { (e as any).metrics.dailyPnL = -200; (e as any).checkKillSwitches(); } },
+      { code: 'consecutive_losses', arm: (e) => { riskEngineInternals(e).metrics.consecutiveLosses = 8; riskEngineInternals(e).checkKillSwitches(); } },
+      { code: 'error_rate', arm: (e) => { riskEngineInternals(e).metrics.errorRate = 20; riskEngineInternals(e).checkKillSwitches(); } },
+      { code: 'latency', arm: (e) => { riskEngineInternals(e).metrics.averageLatency = 2000; riskEngineInternals(e).checkKillSwitches(); } },
+      { code: 'daily_stop', arm: (e) => { riskEngineInternals(e).metrics.dailyPnL = -200; riskEngineInternals(e).checkKillSwitches(); } },
     ];
 
     // Equity-based guardrails. Limits from the fixture: daily 2% = $200,
@@ -405,31 +408,31 @@ describe('RiskEngine kill switch reasonCode (P0: no more `unknown`)', () => {
     const viaLossGuardrails: Trip[] = [
       {
         code: 'daily_stop',
-        arm: (e) => { (e as any).enforceLossGuardrails(9800); },
+        arm: (e) => { riskEngineInternals(e).enforceLossGuardrails(9800); },
       },
       {
         code: 'weekly_stop',
         arm: (e) => {
-          (e as any).dailyStartEquity = 10000;
-          (e as any).weeklyStartEquity = 10600;
-          (e as any).enforceLossGuardrails(9900); // daily -100 (ok), weekly -700 (trip)
+          riskEngineInternals(e).dailyStartEquity = 10000;
+          riskEngineInternals(e).weeklyStartEquity = 10600;
+          riskEngineInternals(e).enforceLossGuardrails(9900); // daily -100 (ok), weekly -700 (trip)
         },
       },
       {
         code: 'max_drawdown',
         arm: (e) => {
-          (e as any).dailyStartEquity = 8600;
-          (e as any).weeklyStartEquity = 8600;
-          (e as any).enforceLossGuardrails(8500); // daily/weekly -100 (ok), 10000 -> 8500 = -1500 (trip)
+          riskEngineInternals(e).dailyStartEquity = 8600;
+          riskEngineInternals(e).weeklyStartEquity = 8600;
+          riskEngineInternals(e).enforceLossGuardrails(8500); // daily/weekly -100 (ok), 10000 -> 8500 = -1500 (trip)
         },
       },
       {
         code: 'rapid_loss',
         arm: (e) => {
-          (e as any).dailyStartEquity = 9700;
-          (e as any).weeklyStartEquity = 9700;
-          (e as any).enforceLossGuardrails(10000);
-          (e as any).enforceLossGuardrails(9790); // -210 inside the 10m window (trip)
+          riskEngineInternals(e).dailyStartEquity = 9700;
+          riskEngineInternals(e).weeklyStartEquity = 9700;
+          riskEngineInternals(e).enforceLossGuardrails(10000);
+          riskEngineInternals(e).enforceLossGuardrails(9790); // -210 inside the 10m window (trip)
         },
       },
     ];
@@ -454,7 +457,7 @@ describe('RiskEngine kill switch reasonCode (P0: no more `unknown`)', () => {
     test('no guardrail path or caller ever produces an `unknown` halt', async () => {
       engine = await freshEngine();
       const codes = new Set<string>();
-      engine.on('risk:state_changed', (ev: any) => {
+      engine.on('risk:state_changed', (ev: RiskStateChangeEvent) => {
         if (ev.newState.state === 'HALTED') codes.add(ev.newState.reasonCode);
       });
 
@@ -493,7 +496,7 @@ describe('RiskEngine kill switch reasonCode (P0: no more `unknown`)', () => {
     async function bootLatched(events: unknown[], overrides: Partial<RiskEngineConfig> = {}) {
       harness.respond('risk_metrics.select', () => ({ data: latchedFlatRow() }));
       harness.respond('risk_events.select', () => ({ data: events }));
-      const e = await waitForLoaders(new RiskEngine({ ...baseConfig, ...overrides }, mockLogger as any, positionTracker));
+      const e = await waitForLoaders(new RiskEngine({ ...baseConfig, ...overrides }, typedLogger, positionTracker));
       if (!overrides.ignorePersistedKillSwitch) {
         await vi.waitFor(() => expect(harness.callsFor('risk_events', 'select').length).toBeGreaterThan(0));
         await new Promise((r) => setTimeout(r, 0));
@@ -598,7 +601,7 @@ describe('RiskEngine kill switch reasonCode (P0: no more `unknown`)', () => {
       harness.respond('risk_metrics.select', () => ({ data: { ...latchedFlatRow(), kill_switch_active: false } }));
       harness.respond('risk_events.select', () => ({ data: [openRow('manual_killswitch', { reason: 'stale' })] }));
 
-      engine = await waitForLoaders(new RiskEngine(baseConfig, mockLogger as any, positionTracker));
+      engine = await waitForLoaders(new RiskEngine(baseConfig, typedLogger, positionTracker));
 
       expect(engine.canEnterTrades()).toBe(true);
       expect(harness.callsFor('risk_events', 'select')).toHaveLength(0);

@@ -25,10 +25,10 @@ export interface BacktestConfig {
   
   // Strategy parameters
   strategies: {
-    breakout?: { enabled: boolean; params: any };
-    momentum?: { enabled: boolean; params: any };
-    meanReversion?: { enabled: boolean; params: any };
-    arbitrage?: { enabled: boolean; params: any };
+    breakout?: { enabled: boolean; params: Record<string, unknown> };
+    momentum?: { enabled: boolean; params: Record<string, unknown> };
+    meanReversion?: { enabled: boolean; params: Record<string, unknown> };
+    arbitrage?: { enabled: boolean; params: Record<string, unknown> };
     ml?: { enabled: boolean; modelPath?: string };
   };
   
@@ -144,7 +144,7 @@ export class AdvancedBacktestEngine extends EventEmitter {
   private dailyReturns: number[] = [];
   
   // Signal generation (would integrate with actual strategies)
-  private signalGenerators: Map<string, any> = new Map();
+  private signalGenerators: Map<string, unknown> = new Map();
   
   constructor(config: BacktestConfig, logger: Logger) {
     super();
@@ -392,7 +392,7 @@ export class AdvancedBacktestEngine extends EventEmitter {
         id: `${symbol}_${strategy}_${timestamp.getTime()}`,
         timestamp,
         symbol,
-        strategy: strategy as any,
+        strategy: strategy as Signal['strategy'],
         direction,
         strength: 0.5 + Math.random() * 0.5,
         price: latest.close,

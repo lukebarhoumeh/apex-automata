@@ -30,7 +30,7 @@ import { BacktestEngine, type BacktestConfig } from '../backtesting/backtest-eng
 import type { OHLCV } from '../indicators/technical';
 
 function makeLogger() {
-  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as any;
+  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
 
 const T0 = Date.UTC(2026, 0, 1, 0, 0, 0); // 2026-01-01T00:00:00Z

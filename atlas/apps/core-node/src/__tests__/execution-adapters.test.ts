@@ -15,6 +15,8 @@ import {
   MarketDataEnv,
   PlaceOrderRequest,
   BrokerOrderEvent,
+  OrderRejectedEvent,
+  FillEvent,
   ProductSpec,
   buildDefaultProductSpecs,
   validateOrderAgainstSpec,
@@ -40,7 +42,7 @@ const mockLogger: Logger = {
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
-} as any;
+} as unknown as Logger;
 
 // Test fee fixture — mirrors the production guardrails.yaml -> fees: block so
 // adapters built in tests use realistic (and deterministic) fee numbers.
@@ -306,10 +308,10 @@ describe('Post-Only Behavior', () => {
 
     await adapter.placeOrder(request);
 
-    const rejected = events.find(e => e.type === 'order_rejected');
+    const rejected = events.find((e): e is OrderRejectedEvent => e.type === 'order_rejected');
     expect(rejected).toBeDefined();
-    expect((rejected as any).reason).toContain('Post-only');
-    expect((rejected as any).code).toBe('post_only_rejected');
+    expect(rejected!.reason).toContain('Post-only');
+    expect(rejected!.code).toBe('post_only_rejected');
   });
 
   it('should reject post-only sell order below bid', async () => {
@@ -325,9 +327,9 @@ describe('Post-Only Behavior', () => {
 
     await adapter.placeOrder(request);
 
-    const rejected = events.find(e => e.type === 'order_rejected');
+    const rejected = events.find((e): e is OrderRejectedEvent => e.type === 'order_rejected');
     expect(rejected).toBeDefined();
-    expect((rejected as any).reason).toContain('Post-only');
+    expect(rejected!.reason).toContain('Post-only');
   });
 
   it('should accept post-only buy order below ask', async () => {
@@ -446,9 +448,9 @@ describe('Deterministic RNG', () => {
     await adapter2.stop();
 
     // Fill prices should be identical with same seed
-    const fill1 = events1.find(e => e.type === 'fill') as any;
-    const fill2 = events2.find(e => e.type === 'fill') as any;
+    const fill1 = events1.find((e): e is FillEvent => e.type === 'fill');
+    const fill2 = events2.find((e): e is FillEvent => e.type === 'fill');
     
-    expect(fill1.price).toBe(fill2.price);
+    expect(fill1!.price).toBe(fill2!.price);
   });
 });

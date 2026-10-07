@@ -103,6 +103,28 @@ export interface TradeOutcome {
   filtersBlocked: string[];
 }
 
+/**
+ * Market context the signal processor passes alongside a signal into
+ * {@link MetaFilter.filter} (and on into the decision log).
+ */
+export interface MetaFilterSignalContext {
+  volumeRatio?: number;
+  atr?: number;
+  regime?: string;
+  mtfAlignment?: number;
+  /**
+   * Pre-computed CoinDesk aggregate sentiment for the signal's base asset.
+   * Producer (signal-processor) is responsible for fetching this asynchronously
+   * before calling .filter(). When undefined and the rule is enabled, the
+   * rule abstains (no penalty).
+   */
+  coindeskSentiment?: {
+    score: number;
+    articleCount: number;
+    freshnessMs: number;
+  };
+}
+
 // Historical strategy performance
 export interface StrategyPerformance {
   strategy: string;
@@ -333,23 +355,7 @@ export class MetaFilter extends EventEmitter {
    */
   public filter(
     signal: Signal,
-    context: {
-      volumeRatio?: number;
-      atr?: number;
-      regime?: string;
-      mtfAlignment?: number;
-      /**
-       * Pre-computed CoinDesk aggregate sentiment for the signal's base asset.
-       * Producer (signal-processor) is responsible for fetching this asynchronously
-       * before calling .filter(). When undefined and the rule is enabled, the
-       * rule abstains (no penalty).
-       */
-      coindeskSentiment?: {
-        score: number;
-        articleCount: number;
-        freshnessMs: number;
-      };
-    } = {},
+    context: MetaFilterSignalContext = {},
     nowMs: number = Date.now(),
   ): MetaFilterResult {
     metaFilterReceivedCounter.inc({ symbol: signal.symbol, strategy: signal.strategy });
@@ -1003,7 +1009,7 @@ export class MetaFilter extends EventEmitter {
 
   private logDecision(
     signal: Signal,
-    context: any,
+    context: MetaFilterSignalContext,
     passed: boolean,
     qualityScore: number,
     rulesEvaluated: MetaFilterResult['rulesEvaluated'],
@@ -1147,11 +1153,11 @@ export class MetaFilter extends EventEmitter {
   public getStats(): {
     enabled: boolean;
     config: MetaFilterConfig;
-    strategies: Record<string, any>;
+    strategies: Record<string, Pick<StrategyPerformance, 'totalTrades' | 'winRate' | 'consecutiveLosses' | 'avgWinningStrength' | 'profitFactor'>>;
     coldStreaks: Record<string, boolean>;
     decisionLogSize: number;
   } {
-    const strategies: Record<string, any> = {};
+    const strategies: Record<string, Pick<StrategyPerformance, 'totalTrades' | 'winRate' | 'consecutiveLosses' | 'avgWinningStrength' | 'profitFactor'>> = {};
     for (const [strategy, perf] of this.strategyPerformance) {
       strategies[strategy] = {
         totalTrades: perf.totalTrades,

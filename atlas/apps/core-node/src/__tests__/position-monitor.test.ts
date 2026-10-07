@@ -1,7 +1,8 @@
-import { describe, test, expect, beforeEach, vi } from 'vitest';
-import { PositionMonitor, PositionMonitorConfig, MonitoredPosition } from '../trading/position-monitor';
+import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
+import { PositionMonitor, PositionMonitorConfig, MonitoredPosition, PositionExitCondition } from '../trading/position-monitor';
 import { PositionTracker, PositionTrackerConfig, Position } from '../trading/position-tracker';
 import { GuardrailConfig } from '../config/loadGuardrails';
+import type { Logger } from '../core/logger';
 
 // Mock logger
 const mockLogger = {
@@ -64,8 +65,8 @@ describe('PositionMonitor', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    positionTracker = new PositionTracker(positionTrackerConfig, mockLogger as any);
-    positionMonitor = new PositionMonitor(config, mockLogger as any, positionTracker);
+    positionTracker = new PositionTracker(positionTrackerConfig, mockLogger as unknown as Logger);
+    positionMonitor = new PositionMonitor(config, mockLogger as unknown as Logger, positionTracker);
   });
 
   afterEach(() => {
@@ -128,7 +129,7 @@ describe('PositionMonitor', () => {
 
   describe('Stop Loss Detection', () => {
     test('should detect stop loss trigger for long position', async () => {
-      const exitEvents: any[] = [];
+      const exitEvents: PositionExitCondition[] = [];
       positionMonitor.on('exit:triggered', (cond) => exitEvents.push(cond));
 
       const position: Position = {
@@ -165,7 +166,7 @@ describe('PositionMonitor', () => {
     });
 
     test('should detect stop loss trigger for short position', async () => {
-      const exitEvents: any[] = [];
+      const exitEvents: PositionExitCondition[] = [];
       positionMonitor.on('exit:triggered', (cond) => exitEvents.push(cond));
 
       const position: Position = {
@@ -203,7 +204,7 @@ describe('PositionMonitor', () => {
 
   describe('Take Profit Detection', () => {
     test('should detect take profit for long position', async () => {
-      const exitEvents: any[] = [];
+      const exitEvents: PositionExitCondition[] = [];
       positionMonitor.on('exit:triggered', (cond) => exitEvents.push(cond));
 
       const position: Position = {
@@ -240,7 +241,7 @@ describe('PositionMonitor', () => {
 
   describe('Time Stop Detection', () => {
     test('should detect time stop when bars exceed limit', async () => {
-      const exitEvents: any[] = [];
+      const exitEvents: PositionExitCondition[] = [];
       positionMonitor.on('exit:triggered', (cond) => exitEvents.push(cond));
 
       const position: Position = {

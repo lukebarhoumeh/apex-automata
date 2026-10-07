@@ -21,7 +21,7 @@ function makeLogger() {
     debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
-  } as any;
+  };
 }
 
 function buildSyntheticCandles(count: number, seed = 1): OHLCV[] {

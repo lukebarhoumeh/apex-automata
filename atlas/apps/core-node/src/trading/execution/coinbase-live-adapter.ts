@@ -215,11 +215,14 @@ export class CoinbaseLiveExecutionAdapter extends EventEmitter implements IExecu
         this.logger.warn('Post-order reconciliation failed', { error: e.message });
       });
 
-    } catch (error: any) {
+    } catch (error) {
       this.pendingOrders.delete(request.clientOrderId);
 
-      const message = error.message || String(error);
-      const code = error.coinbaseCode || error.code;
+      // Types-only narrowing: the hardened REST layer throws Error subclasses
+      // that may carry coinbaseCode/code; runtime reads are unchanged.
+      const err = error as Error & { coinbaseCode?: string; code?: string };
+      const message = err.message || String(error);
+      const code = err.coinbaseCode || err.code;
 
       this.emitEvent({
         type: 'order_rejected',
@@ -269,11 +272,11 @@ export class CoinbaseLiveExecutionAdapter extends EventEmitter implements IExecu
         this.logger.warn('Post-cancel reconciliation failed', { error: e.message });
       });
 
-    } catch (error: any) {
+    } catch (error) {
       this.logger.error('Live order cancel failed', {
         clientOrderId,
         exchangeOrderId,
-        error: error.message,
+        error: (error as Error).message,
       });
 
       // Still emit canceled if cancel might have succeeded
@@ -305,8 +308,8 @@ export class CoinbaseLiveExecutionAdapter extends EventEmitter implements IExecu
           this.pendingOrders.delete(clientId);
         }
       }
-    } catch (error: any) {
-      this.logger.error('Cancel all orders failed', { symbol, error: error.message });
+    } catch (error) {
+      this.logger.error('Cancel all orders failed', { symbol, error: (error as Error).message });
     }
   }
 
@@ -318,7 +321,8 @@ export class CoinbaseLiveExecutionAdapter extends EventEmitter implements IExecu
       const orders = await this.exchange.getOpenOrders();
       
       return orders.map(order => ({
-        clientOrderId: (order as any).client_oid || order.id,
+        // Coinbase echoes client_oid on some order payloads but the CoinbaseOrder type omits it.
+        clientOrderId: (order as CoinbaseOrder & { client_oid?: string }).client_oid || order.id,
         exchangeOrderId: order.id,
         symbol: order.product_id,
         side: order.side as 'buy' | 'sell',
@@ -329,8 +333,8 @@ export class CoinbaseLiveExecutionAdapter extends EventEmitter implements IExecu
         status: order.status,
         createdAt: new Date(order.created_at).getTime(),
       }));
-    } catch (error: any) {
-      this.logger.error('Get open orders failed', { error: error.message });
+    } catch (error) {
+      this.logger.error('Get open orders failed', { error: (error as Error).message });
       return [];
     }
   }
@@ -338,7 +342,7 @@ export class CoinbaseLiveExecutionAdapter extends EventEmitter implements IExecu
   /**
    * Get fills since cursor
    */
-  public async getFillsSince(cursor: any): Promise<FillRecord[]> {
+  public async getFillsSince(cursor: unknown): Promise<FillRecord[]> {
     try {
       const fills = await this.exchange.getFills(undefined, undefined, 100);
       
@@ -355,8 +359,8 @@ export class CoinbaseLiveExecutionAdapter extends EventEmitter implements IExecu
         liquidity: fill.liquidity === 'M' ? 'maker' : 'taker',
         ts: new Date(fill.created_at).getTime(),
       }));
-    } catch (error: any) {
-      this.logger.error('Get fills failed', { error: error.message });
+    } catch (error) {
+      this.logger.error('Get fills failed', { error: (error as Error).message });
       return [];
     }
   }
@@ -405,7 +409,8 @@ export class CoinbaseLiveExecutionAdapter extends EventEmitter implements IExecu
    * Handle order update from exchange
    */
   private handleOrderUpdate(order: CoinbaseOrder): void {
-    const clientOrderId = (order as any).client_oid || 
+    // client_oid is echoed on some payloads but not part of the CoinbaseOrder type.
+    const clientOrderId = (order as CoinbaseOrder & { client_oid?: string }).client_oid ||
                           this.getClientOrderId(order.id);
 
     if (!clientOrderId) {

@@ -60,18 +60,27 @@ const getEventBadge = (eventType: string, active: boolean) => {
   }
 };
 
-const formatEventDetails = (details: any): string => {
+interface RiskEventDetailsJson {
+  reason?: string;
+  spread_pctile?: number;
+  atr_mult?: number;
+  daily_loss_r?: number;
+  drawdown?: number;
+}
+
+const formatEventDetails = (details: unknown): string => {
   if (!details) return "—";
   if (typeof details === "string") return details;
-  
+
   // Extract meaningful info from JSON
+  const d = details as RiskEventDetailsJson;
   const parts: string[] = [];
-  if (details.reason) parts.push(details.reason);
-  if (details.spread_pctile) parts.push(`Spread: ${details.spread_pctile}%`);
-  if (details.atr_mult) parts.push(`ATR: ${details.atr_mult}x`);
-  if (details.daily_loss_r) parts.push(`Loss: ${details.daily_loss_r}R`);
-  if (details.drawdown) parts.push(`DD: ${(details.drawdown * 100).toFixed(1)}%`);
-  
+  if (d.reason) parts.push(d.reason);
+  if (d.spread_pctile) parts.push(`Spread: ${d.spread_pctile}%`);
+  if (d.atr_mult) parts.push(`ATR: ${d.atr_mult}x`);
+  if (d.daily_loss_r) parts.push(`Loss: ${d.daily_loss_r}R`);
+  if (d.drawdown) parts.push(`DD: ${(d.drawdown * 100).toFixed(1)}%`);
+
   return parts.length > 0 ? parts.join(" • ") : JSON.stringify(details).slice(0, 50);
 };
 

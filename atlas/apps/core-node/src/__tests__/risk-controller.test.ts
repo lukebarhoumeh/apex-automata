@@ -19,6 +19,11 @@ const mockLogger: Logger = {
 // Mock position tracker
 class MockPositionTracker extends EventEmitter {
   private positions: Position[] = [];
+
+  /** Test seam: register an open position (only the fields the controller reads). */
+  pushOpenPosition(position: Pick<Position, 'id' | 'symbol' | 'side' | 'size'>) {
+    this.positions.push(position as Position);
+  }
   
   getOpenPositions() {
     return this.positions;
@@ -288,7 +293,7 @@ describe('RiskController', () => {
     it('should block new trades when at max positions', () => {
       // Simulate 5 open positions (max)
       for (let i = 0; i < 5; i++) {
-        (positionTracker as any).positions.push({
+        positionTracker.pushOpenPosition({
           id: `pos-${i}`,
           symbol: 'BTC-USD',
           side: 'long',
@@ -302,7 +307,7 @@ describe('RiskController', () => {
     });
 
     it('should allow trades when under max positions', () => {
-      (positionTracker as any).positions.push({
+      positionTracker.pushOpenPosition({
         id: 'pos-1',
         symbol: 'BTC-USD',
         side: 'long',

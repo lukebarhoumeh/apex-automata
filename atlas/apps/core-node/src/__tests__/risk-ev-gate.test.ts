@@ -20,6 +20,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { evaluateEvGate, type EvGateInputs } from '../trading/risk/ev-gate';
 import { FeeModel } from '../core/fee-model';
 import type { FeesConfig } from '../config/loadGuardrails';
+import type { Logger } from '../core/logger';
 
 function makeLogger() {
   return {
@@ -27,7 +28,7 @@ function makeLogger() {
     debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
-  } as any;
+  } as unknown as Logger & { warn: ReturnType<typeof vi.fn> };
 }
 
 // Distinct rates per bucket so any cross-bucket leak is visible.
@@ -189,7 +190,7 @@ describe('evaluateEvGate — A3 pre-trade EV math', () => {
 
   it('no FeeModel + no override default-allows', () => {
     const inputs = baseInputs();
-    delete (inputs as any).feeModel;
+    delete inputs.feeModel;
     const result = evaluateEvGate(inputs, makeLogger());
     expect(result.allowed).toBe(true);
     expect(result.reason).toBe('no_fee_model_default_allow');

@@ -275,6 +275,6 @@ export function isPerpsAdapter(adapter: IExchangeAdapter): adapter is IExchangeA
     'getFundingRate' in adapter &&
     'setLeverage' in adapter &&
     'getPerpsSymbols' in adapter &&
-    typeof (adapter as any).getFundingRate === 'function'
+    typeof (adapter as Partial<IPerpsAdapter>).getFundingRate === 'function'
   );
 }

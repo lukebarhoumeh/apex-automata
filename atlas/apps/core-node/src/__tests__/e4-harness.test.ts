@@ -54,12 +54,12 @@ import {
   type ExpectancyStats,
 } from '../backtesting/e4-harness';
 import { BacktestRunner } from '../backtesting/backtest-runner';
-import type { BacktestTrade } from '../backtesting/backtest-engine';
+import type { BacktestConfig, BacktestTrade } from '../backtesting/backtest-engine';
 import type { DataProvenance } from '../backtesting/data-loader';
 import { loadGuardrails, type GuardrailConfig } from '../config/loadGuardrails';
 
 function makeLogger() {
-  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as any;
+  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
 
 const ATLAS_ROOT = path.resolve(__dirname, '../../../..');
@@ -96,7 +96,7 @@ function trade(
     pnl,
     pnlPercent: pnl / (entryPrice * size),
     exitReason: opts.reason ?? (pnl > 0 ? 'take_profit' : 'stop_loss'),
-    signal: {} as any,
+    signal: {} as BacktestTrade['signal'],
     stopLoss: stop,
     takeProfit: entryPrice + 3 * (entryPrice - stop),
     venue: 'spot',
@@ -402,7 +402,7 @@ describe('E4 §7 — zero knobs + data path', () => {
       mutate(g);
       return () => assertZeroKnobs(g, [...E4_CARD.products], 'trend_follow', 1, feeTier);
     };
-    expect(drift((g) => { (g.per_symbol!['ETH-USD'].strategy_overrides as any).trend_follow.takeProfitAtr = 5.0; })).toThrow(/E4_ZERO_KNOBS_DRIFT.*ETH-USD.*card A1 requires 2\.5\/6/);
+    expect(drift((g) => { g.per_symbol!['ETH-USD'].strategy_overrides!.trend_follow.takeProfitAtr = 5.0; })).toThrow(/E4_ZERO_KNOBS_DRIFT.*ETH-USD.*card A1 requires 2\.5\/6/);
     expect(drift((g) => { g.filters.atr_volatility_min = 0.004; })).toThrow(/atr_volatility_min=0\.004/);
     expect(drift((g) => { g.risk.min_ev_threshold = 1; })).toThrow(/min_ev_threshold=1/);
     expect(() => assertZeroKnobs(guardrails, [...E4_CARD.products], 'trend_follow', 0, feeTier)).toThrow(/cooldown must be ≥ 1 bar/);
@@ -520,7 +520,7 @@ describe('E4 §8 — end-to-end on committed REAL fixtures', () => {
     });
     const stubRunner = {
       createDataProvider: () => async (product: string) => ({ candles: [], provenance: provenance(product) }),
-      runBacktestDetailed: vi.fn(async (config: any) => ({ result: resultFor(config.commission === 0 ? zeroTrades : feeTrades, config.commission), saved: null })),
+      runBacktestDetailed: vi.fn(async (config: BacktestConfig) => ({ result: resultFor(config.commission === 0 ? zeroTrades : feeTrades, config.commission), saved: null })),
     } as unknown as BacktestRunner;
 
     const report = await runE4(request({
@@ -534,7 +534,7 @@ describe('E4 §8 — end-to-end on committed REAL fixtures', () => {
     expect(report.zeroFee.failFast).toBe('none');
     expect(report.monteCarlo).not.toBeNull(); // informational
     expect(report.stress).toEqual([]); // GO packaging stopped
-    expect((stubRunner.runBacktestDetailed as any).mock.calls.length).toBe(2); // fee book + zero-fee only
+    expect(vi.mocked(stubRunner.runBacktestDetailed).mock.calls.length).toBe(2); // fee book + zero-fee only
     expect(report.verdict).toBe('RESEARCH SCREEN ONLY');
     const text = renderE4Report(report);
     expect(text).toContain('Stage 4 — Fee stress: NOT RUN (preflight E[n] below gate ⇒ GO packaging stopped)');
@@ -600,7 +600,7 @@ describe('E4 §8 — end-to-end on committed REAL fixtures', () => {
     const calls: string[] = [];
     const provider = memoizeProvider(async (product) => {
       calls.push(product);
-      return { candles: [], provenance: {} as any };
+      return { candles: [], provenance: {} as DataProvenance };
     });
     const s = new Date('2026-08-01T00:00:00Z');
     const e = new Date('2026-09-01T00:00:00Z');

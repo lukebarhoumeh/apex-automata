@@ -51,7 +51,7 @@ describe('SignalArbitrator', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    arbiter = new SignalArbitrator(mockLogger as any);
+    arbiter = new SignalArbitrator(mockLogger);
   });
 
   describe('cross-venue netting', () => {
@@ -169,7 +169,7 @@ describe('SignalArbitrator', () => {
     });
 
     test('honors a custom reversalStrengthThreshold (with reversalIntent flag)', () => {
-      arbiter = new SignalArbitrator(mockLogger as any, { reversalStrengthThreshold: 0.5 });
+      arbiter = new SignalArbitrator(mockLogger, { reversalStrengthThreshold: 0.5 });
       const open = [makePosition({ symbol: 'BTC-USD', side: 'long' })];
       const sig = makeSignal({
         symbol: 'BTC-USD',
@@ -243,7 +243,7 @@ describe('SignalArbitrator', () => {
     test('dedup window expires after configured ms', () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-04-22T12:00:00Z'));
-      arbiter = new SignalArbitrator(mockLogger as any, { dedupWindowMs: 100 });
+      arbiter = new SignalArbitrator(mockLogger, { dedupWindowMs: 100 });
       arbiter.arbitrate(makeSignal({ id: 'a' }), []);
       vi.advanceTimersByTime(150);
       expect(arbiter.arbitrate(makeSignal({ id: 'b' }), []).allow).toBe(true);
@@ -272,7 +272,7 @@ describe('SignalArbitrator', () => {
     test('cleanup() drops decisions older than maxAge', () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-04-22T12:00:00Z'));
-      arbiter = new SignalArbitrator(mockLogger as any);
+      arbiter = new SignalArbitrator(mockLogger);
       arbiter.arbitrate(makeSignal({ id: 'a' }), []);
       expect(arbiter.size()).toBe(1);
       vi.advanceTimersByTime(10 * 60 * 1000);

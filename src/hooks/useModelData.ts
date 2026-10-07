@@ -18,7 +18,7 @@ export interface Model {
     f1?: number;
     calibration?: Array<{ predicted: number; actual: number }>;
   } | null;
-  input_schema: any;
+  input_schema: unknown;
   created_at: string;
   user_id: string;
 }

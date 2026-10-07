@@ -2,7 +2,7 @@ import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
 import { CoinbaseExchange } from './coinbase';
 import { Order, Fill, MarketData } from './types';
-import { UltraFastWebSocket, MultiExchangeWebSocketManager } from './ultra-fast-websocket';
+import { UltraFastWebSocket, MultiExchangeWebSocketManager, MarketDataUpdate } from './ultra-fast-websocket';
 
 // Exchange interface that all exchanges must implement
 export interface Exchange {
@@ -398,7 +398,7 @@ export class MultiExchangeConnector extends EventEmitter {
     latency: number;
     lastUpdate: number;
   }> {
-    const status: Record<string, any> = {};
+    const status: Record<string, { connected: boolean; latency: number; lastUpdate: number }> = {};
     
     for (const [name, connected] of this.connectionStatus) {
       const latencies = this.latencyTracking.get(name) || [];
@@ -449,7 +449,7 @@ export class MultiExchangeConnector extends EventEmitter {
     });
   }
   
-  private handleMarketData(data: any): void {
+  private handleMarketData(data: MarketDataUpdate & { exchange: string }): void {
     const { exchange, symbol, type } = data;
     
     // Update latency tracking
@@ -487,7 +487,7 @@ export class MultiExchangeConnector extends EventEmitter {
     });
   }
   
-  private updateLastPrice(exchange: string, symbol: string, ticker: any): void {
+  private updateLastPrice(exchange: string, symbol: string, ticker: { price?: number; last?: number }): void {
     if (!this.lastPrices.has(symbol)) {
       this.lastPrices.set(symbol, new Map());
     }
@@ -499,7 +499,7 @@ export class MultiExchangeConnector extends EventEmitter {
     this.checkPriceDivergence(symbol);
   }
   
-  private updateOrderBook(exchange: string, symbol: string, data: any): void {
+  private updateOrderBook(exchange: string, symbol: string, data: { bids?: Array<[string, string]>; asks?: Array<[string, string]> }): void {
     // Get or create order book
     let orderBook = this.orderBooks.get(symbol);
     if (!orderBook) {
@@ -582,7 +582,7 @@ export class MultiExchangeConnector extends EventEmitter {
     orderBook.timestamp = Date.now();
   }
   
-  private processTrade(exchange: string, symbol: string, trade: any): void {
+  private processTrade(exchange: string, symbol: string, trade: { price?: number | string; size?: number | string; side?: string; timestamp?: number }): void {
     // Check if this is our order
     for (const [orderId, orderInfo] of this.activeOrders) {
       if (orderInfo.exchange === exchange && 

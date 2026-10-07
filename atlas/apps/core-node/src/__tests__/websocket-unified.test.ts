@@ -9,16 +9,26 @@
  * 5. Stall detection
  */
 
-import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach, type Mock } from 'vitest';
 import { SubscriptionManager, CoinbaseChannelSpec } from '../exchanges/coinbase/ws/coinbase-ws.interface';
 import { CoinbaseWebSocket } from '../exchanges/coinbase/websocket';
 import { CoinbaseExchange } from '../exchanges/coinbase';
 import { Logger } from '../core/logger';
 import WebSocket from 'ws';
 
-// Mock ws module
+// Mock ws module (vi.mock turns the default-export class into a mock constructor)
 vi.mock('ws');
-const MockWebSocket = WebSocket as any;
+const MockWebSocket = WebSocket as unknown as Mock;
+
+/** Structural stand-in for the `ws` socket instance the client drives. */
+interface MockWsInstance {
+  on: ReturnType<typeof vi.fn>;
+  send: ReturnType<typeof vi.fn>;
+  close: ReturnType<typeof vi.fn>;
+  ping: ReturnType<typeof vi.fn>;
+  readyState: number;
+  removeAllListeners: ReturnType<typeof vi.fn>;
+}
 
 // Mock logger
 const mockLogger: Logger = {
@@ -26,7 +36,7 @@ const mockLogger: Logger = {
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
-} as any;
+};
 
 describe('SubscriptionManager', () => {
   let manager: SubscriptionManager;
@@ -139,12 +149,12 @@ describe('SubscriptionManager', () => {
 
 describe('CoinbaseWebSocket - Unified Implementation', () => {
   let wsClient: CoinbaseWebSocket;
-  let mockWsInstance: any;
+  let mockWsInstance: MockWsInstance;
 
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
-    
+
     mockWsInstance = {
       on: vi.fn(),
       send: vi.fn(),
@@ -249,12 +259,12 @@ describe('CoinbaseWebSocket - Unified Implementation', () => {
       // Should have resubscribed to both channels
       expect(mockWsInstance.send).toHaveBeenCalledTimes(2);
       
-      const sentMessages = mockWsInstance.send.mock.calls.map((call: any) => 
-        JSON.parse(call[0])
-      );
-      
-      const tickerSub = sentMessages.find((m: any) => m.channels.includes('ticker'));
-      const level2Sub = sentMessages.find((m: any) => m.channels.includes('level2'));
+      // Subscribe frames are JSON strings; parse into their known shape.
+      const sentMessages: Array<{ channels: string[]; product_ids: string[] }> =
+        mockWsInstance.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+
+      const tickerSub = sentMessages.find((m) => m.channels.includes('ticker'));
+      const level2Sub = sentMessages.find((m) => m.channels.includes('level2'));
       
       expect(tickerSub?.product_ids).toContain('BTC-USD');
       expect(tickerSub?.product_ids).toContain('ETH-USD');

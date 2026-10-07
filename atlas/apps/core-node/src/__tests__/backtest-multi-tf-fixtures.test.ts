@@ -39,7 +39,7 @@ import { HistoricalDataLoader, type BarFixtureFile } from '../backtesting/data-l
 import type { OHLCV } from '../indicators/technical';
 
 function makeLogger() {
-  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as any;
+  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
 
 const HOUR_MS = 3_600_000;

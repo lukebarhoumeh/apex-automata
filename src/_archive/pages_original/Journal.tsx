@@ -7,7 +7,7 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { BookOpen, Plus, Search, Trash2, Edit, Calendar } from "lucide-react";
-import { useJournalEntries, useCreateJournalEntry, useUpdateJournalEntry, useDeleteJournalEntry } from "@/hooks/useJournal";
+import { useJournalEntries, useCreateJournalEntry, useUpdateJournalEntry, useDeleteJournalEntry, type JournalEntry } from "@/hooks/useJournal";
 import { format } from "date-fns";
 
 const Journal = () => {
@@ -49,7 +49,7 @@ const Journal = () => {
     setIsDialogOpen(false);
   };
 
-  const handleEdit = (entry: any) => {
+  const handleEdit = (entry: JournalEntry) => {
     setFormData({
       title: entry.title,
       note: entry.note || "",

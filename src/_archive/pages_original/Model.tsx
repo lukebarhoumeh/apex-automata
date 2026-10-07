@@ -34,7 +34,7 @@ const Model = () => {
 
   useEffect(() => {
     if (currentConfig?.params) {
-      const params = currentConfig.params as Record<string, any>;
+      const params = currentConfig.params as { threshold?: number };
       if (params.threshold) {
         setThreshold(params.threshold);
       }
