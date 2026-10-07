@@ -13,7 +13,7 @@ interface Strategy {
   name: string;
   enabled: boolean;
   version: number;
-  default_params: any;
+  default_params: unknown;
 }
 
 export const StrategiesPanel = () => {

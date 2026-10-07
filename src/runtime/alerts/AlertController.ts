@@ -250,8 +250,9 @@ export class AlertController {
       payload.eventType === 'killswitch_triggered' ||
       payload.eventType === 'daily_stop'
     ) {
-      const reason = (payload.details as any)?.reasonCode || payload.eventType;
-      const message = (payload.details as any)?.message;
+      const details = payload.details as { reasonCode?: string; message?: string } | undefined;
+      const reason = details?.reasonCode || payload.eventType;
+      const message = details?.message;
       this.showAlert({
         key: `risk:${payload.eventType}:${reason}`,
         title: '🚨 Risk Event: ' + (payload.eventType === 'daily_stop' ? 'Daily Stop Hit' : 'Kill Switch'),

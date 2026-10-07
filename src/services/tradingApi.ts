@@ -6,9 +6,23 @@ const WS_URL = API_URL.replace('http://', 'ws://').replace('https://', 'wss://')
 export interface TradingEngineStatus {
   engineRunning: boolean;
   mode: 'paper' | 'live';
-  positions: any[];
-  riskMetrics: any;
-  activeOrders: any[];
+  positions: unknown[];
+  riskMetrics: unknown;
+  activeOrders: unknown[];
+}
+
+/** Envelope for messages received from the backend WebSocket. */
+interface TradingApiMessage {
+  type: string;
+  data?: unknown;
+  payload?: unknown;
+}
+
+/** Generic JSON response from the engine control endpoints. */
+export interface EngineCommandResponse {
+  success?: boolean;
+  message?: string;
+  [key: string]: unknown;
 }
 
 type TradingApiListener = (data: unknown) => void;
@@ -73,13 +87,13 @@ class TradingApiService {
     }
   }
 
-  private handleMessage(message: any) {
+  private handleMessage(message: TradingApiMessage) {
     const { type, data, payload } = message;
     // Backend sends payload, not data
     this.emit(type, payload || data);
   }
 
-  private emit(event: string, data: any) {
+  private emit(event: string, data: unknown) {
     const listeners = this.listeners.get(event);
     if (listeners) {
       listeners.forEach(listener => listener(data));
@@ -112,7 +126,7 @@ class TradingApiService {
   public async startEngine(
     mode: 'paper' | 'live' = 'paper',
     opts?: { confirm?: string; marketDataEnv?: 'sandbox' | 'production' }
-  ): Promise<any> {
+  ): Promise<EngineCommandResponse> {
     const response = await fetch(`${API_URL}/api/engine/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -127,7 +141,7 @@ class TradingApiService {
     return response.json();
   }
 
-  public async stopEngine(): Promise<any> {
+  public async stopEngine(): Promise<EngineCommandResponse> {
     const response = await fetch(`${API_URL}/api/engine/stop`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' }
@@ -141,7 +155,7 @@ class TradingApiService {
     return response.json();
   }
 
-  public async activateKillSwitch(): Promise<any> {
+  public async activateKillSwitch(): Promise<EngineCommandResponse> {
     const response = await fetch(`${API_URL}/api/engine/kill`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' }

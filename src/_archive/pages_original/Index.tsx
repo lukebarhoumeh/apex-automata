@@ -75,7 +75,7 @@ const Index = () => {
         />
         
         {/* Navigation Tabs */}
-        <Tabs value={activeView} onValueChange={(v) => setActiveView(v as any)} className="w-full">
+        <Tabs value={activeView} onValueChange={(v) => setActiveView(v as "overview" | "trading" | "risk" | "settings")} className="w-full">
           <div className="flex items-center justify-between mb-4">
             <TabsList className="bg-slate-800/50 border border-slate-700/50 p-1">
               <TabsTrigger value="overview" className="flex items-center gap-2 data-[state=active]:bg-emerald-600 data-[state=active]:text-white">

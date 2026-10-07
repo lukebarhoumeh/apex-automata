@@ -40,7 +40,7 @@ export const useSignals = (filters?: SignalFilters) => {
         query = query.eq("symbol", filters.symbol);
       }
       if (filters?.strategy) {
-        query = query.eq("strategy", filters.strategy as any);
+        query = query.eq("strategy", filters.strategy as Signal["strategy"]);
       }
       if (filters?.dateFrom) {
         query = query.gte("decided_at", filters.dateFrom);

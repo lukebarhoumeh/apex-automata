@@ -23,6 +23,7 @@ interface StrategySignal {
     donchianN?: number;
     atrPctileMin?: number;
     zAbsMin?: number;
+    threshold?: number;
   };
   win_rate: number | null;
   avg_r: number | null;
@@ -66,18 +67,18 @@ const Signals = () => {
       await runtimeClient.updateSignalsConfig({
         breakout: {
           enabled: breakoutConfig?.enabled ?? true,
-          adxMin: (breakoutConfig?.params as any)?.adxMin,
-          donchianN: (breakoutConfig?.params as any)?.donchianN,
-          atrPctileMin: (breakoutConfig?.params as any)?.atrPctileMin,
+          adxMin: breakoutConfig?.params?.adxMin,
+          donchianN: breakoutConfig?.params?.donchianN,
+          atrPctileMin: breakoutConfig?.params?.atrPctileMin,
         },
         vwap_mr: {
           enabled: vwapConfig?.enabled ?? true,
-          zAbsMin: (vwapConfig?.params as any)?.zAbsMin,
-          adxMax: (vwapConfig?.params as any)?.adxMax,
+          zAbsMin: vwapConfig?.params?.zAbsMin,
+          adxMax: vwapConfig?.params?.adxMax,
         },
         meta: {
           enabled: metaConfig?.enabled ?? true,
-          threshold: (metaConfig?.params as any)?.threshold || 0.65,
+          threshold: metaConfig?.params?.threshold || 0.65,
         },
       });
 
@@ -163,11 +164,11 @@ const Signals = () => {
                     <div className="flex items-center justify-between">
                       <Label className="text-sm font-mono">Probability Threshold</Label>
                       <Badge variant="outline" className="font-mono tabular-nums">
-                        {((getConfig("meta")?.params as any)?.threshold || 0.65).toFixed(2)}
+                        {(getConfig("meta")?.params?.threshold || 0.65).toFixed(2)}
                       </Badge>
                     </div>
                     <Slider
-                      value={[((getConfig("meta")?.params as any)?.threshold || 0.65) * 100]}
+                      value={[(getConfig("meta")?.params?.threshold || 0.65) * 100]}
                       onValueChange={([val]) =>
                         updateLocal("meta", {
                           params: { threshold: val / 100 },
@@ -228,11 +229,11 @@ const Signals = () => {
                       <div className="flex items-center justify-between">
                         <Label className="text-xs font-mono">ADX Minimum</Label>
                         <Badge variant="outline" className="font-mono text-xs tabular-nums">
-                          {(getConfig("breakout")?.params as any)?.adxMin || 25}
+                          {getConfig("breakout")?.params?.adxMin || 25}
                         </Badge>
                       </div>
                       <Slider
-                        value={[(getConfig("breakout")?.params as any)?.adxMin || 25]}
+                        value={[getConfig("breakout")?.params?.adxMin || 25]}
                         onValueChange={([val]) =>
                           updateLocal("breakout", {
                             params: { ...getConfig("breakout")?.params, adxMin: val },
@@ -249,11 +250,11 @@ const Signals = () => {
                       <div className="flex items-center justify-between">
                         <Label className="text-xs font-mono">Donchian Period</Label>
                         <Badge variant="outline" className="font-mono text-xs tabular-nums">
-                          {(getConfig("breakout")?.params as any)?.donchianN || 20}
+                          {getConfig("breakout")?.params?.donchianN || 20}
                         </Badge>
                       </div>
                       <Slider
-                        value={[(getConfig("breakout")?.params as any)?.donchianN || 20]}
+                        value={[getConfig("breakout")?.params?.donchianN || 20]}
                         onValueChange={([val]) =>
                           updateLocal("breakout", {
                             params: { ...getConfig("breakout")?.params, donchianN: val },
@@ -315,11 +316,11 @@ const Signals = () => {
                       <div className="flex items-center justify-between">
                         <Label className="text-xs font-mono">Z-Score Minimum</Label>
                         <Badge variant="outline" className="font-mono text-xs tabular-nums">
-                          {(getConfig("vwap_mr")?.params as any)?.zAbsMin || 2.0}
+                          {getConfig("vwap_mr")?.params?.zAbsMin || 2.0}
                         </Badge>
                       </div>
                       <Slider
-                        value={[(getConfig("vwap_mr")?.params as any)?.zAbsMin || 2.0]}
+                        value={[getConfig("vwap_mr")?.params?.zAbsMin || 2.0]}
                         onValueChange={([val]) =>
                           updateLocal("vwap_mr", {
                             params: { ...getConfig("vwap_mr")?.params, zAbsMin: val / 10 },
@@ -340,11 +341,11 @@ const Signals = () => {
                       <div className="flex items-center justify-between">
                         <Label className="text-xs font-mono">ADX Maximum</Label>
                         <Badge variant="outline" className="font-mono text-xs tabular-nums">
-                          {(getConfig("vwap_mr")?.params as any)?.adxMax || 25}
+                          {getConfig("vwap_mr")?.params?.adxMax || 25}
                         </Badge>
                       </div>
                       <Slider
-                        value={[(getConfig("vwap_mr")?.params as any)?.adxMax || 25]}
+                        value={[getConfig("vwap_mr")?.params?.adxMax || 25]}
                         onValueChange={([val]) =>
                           updateLocal("vwap_mr", {
                             params: { ...getConfig("vwap_mr")?.params, adxMax: val },

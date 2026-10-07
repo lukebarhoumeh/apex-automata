@@ -302,7 +302,7 @@ export const SignalsTable = () => {
                 <div>
                   <span className="text-sm text-muted-foreground mb-2 block">Related Orders</span>
                   <div className="space-y-2">
-                    {signalDetails.orders.map((order: any) => (
+                    {signalDetails.orders.map((order) => (
                       <div key={order.id} className="flex items-center justify-between p-2 bg-muted/20 rounded">
                         <div className="flex items-center gap-2">
                           <Badge variant="outline">{order.type}</Badge>

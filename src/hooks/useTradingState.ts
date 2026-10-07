@@ -47,7 +47,7 @@ export function useTradingState(): UseTradingStateResult {
         mode: payload.mode,
         paused: payload.paused,
         tradingState: payload.tradingState,
-        haltReasonCode: (payload as any).haltReasonCode,
+        haltReasonCode: payload.haltReasonCode,
         dailyStopHit: payload.dailyStopHit,
         killSwitch: payload.killSwitch,
       });
@@ -73,7 +73,7 @@ export function useTradingState(): UseTradingStateResult {
         mode: runtimeStatus.mode,
         paused: runtimeStatus.paused,
         tradingState: runtimeStatus.tradingState,
-        haltReasonCode: (runtimeStatus as any).haltReasonCode,
+        haltReasonCode: runtimeStatus.haltReasonCode,
         dailyStopHit: runtimeStatus.dailyStopHit,
         killSwitch: runtimeStatus.killSwitch,
       };
