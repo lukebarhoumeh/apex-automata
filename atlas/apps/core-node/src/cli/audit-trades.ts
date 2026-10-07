@@ -38,6 +38,7 @@ import { loadEnv } from '../core/env';
  * NOT match what an actual untyped call returns — instantiate with `any` so the
  * parameter type and the constructed client agree.
  */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- intentional: the Database generic must be `any` to match the untyped createClient() call in main() (see doc comment above)
 type Supabase = ReturnType<typeof createClient<any>>;
 
 interface CliArgs {
@@ -280,7 +281,7 @@ export async function auditOneTrade(
         return;
       }
 
-      const overlapping = (data ?? []).find((row: any) => {
+      const overlapping = (data ?? []).find((row: { closed_at?: string | null }) => {
         if (!row.closed_at) return true; // still open — covers trade exit
         if (!trade.exit_time) return true; // trade still open, any covering position works
         return new Date(row.closed_at).getTime() >= new Date(trade.exit_time).getTime();

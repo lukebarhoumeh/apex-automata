@@ -15,6 +15,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { Counter, Gauge } from 'prom-client';
 import { Logger } from '../core/logger';
+import type { PostgrestErrorLike } from '../core/postgrest-errors';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -82,10 +83,10 @@ export type WriteKind = 'insert' | 'upsert' | 'update';
 export interface WriteOp {
   kind: WriteKind;
   table: string;
-  row?: Record<string, any>;
-  rows?: Record<string, any>[];
-  match?: Record<string, any>;
-  patch?: Record<string, any>;
+  row?: Record<string, unknown>;
+  rows?: Record<string, unknown>[];
+  match?: Record<string, unknown>;
+  patch?: Record<string, unknown>;
   onConflict?: string;
   /** Key for deduplication (same key = same logical write) */
   dedupeKey?: string;
@@ -161,22 +162,24 @@ const RETRYABLE_ERROR_CODES = new Set([
   'PGRST000', // Supabase REST generic error
 ]);
 
-function isSchemaError(error: any): boolean {
+function isSchemaError(error: unknown): boolean {
   if (!error) return false;
-  const code = error.code || '';
+  const pgError = error as PostgrestErrorLike;
+  const code = pgError.code || '';
   if (SCHEMA_ERROR_CODES.has(code)) return true;
-  const msg = (error.message || '').toLowerCase();
+  const msg = (pgError.message || '').toLowerCase();
   return msg.includes('column') && msg.includes('does not exist') ||
          msg.includes('relation') && msg.includes('does not exist') ||
          msg.includes('constraint') && msg.includes('does not exist');
 }
 
-function isRetryableError(error: any): boolean {
+function isRetryableError(error: unknown): boolean {
   if (!error) return true; // No error = retryable (network issue)
-  const code = error.code || '';
+  const pgError = error as PostgrestErrorLike;
+  const code = pgError.code || '';
   if (RETRYABLE_ERROR_CODES.has(code)) return true;
   if (SCHEMA_ERROR_CODES.has(code)) return false;
-  const msg = (error.message || '').toLowerCase();
+  const msg = (pgError.message || '').toLowerCase();
   return msg.includes('timeout') ||
          msg.includes('network') ||
          msg.includes('connection') ||
@@ -379,7 +382,7 @@ export class SupabaseWriter {
 
   // ============ Convenience Methods ============
 
-  public insert(table: string, row: Record<string, any>, options?: {
+  public insert(table: string, row: Record<string, unknown>, options?: {
     dedupeKey?: string;
     critical?: boolean;
   }): void {
@@ -391,7 +394,7 @@ export class SupabaseWriter {
     });
   }
 
-  public upsert(table: string, row: Record<string, any>, onConflict: string, options?: {
+  public upsert(table: string, row: Record<string, unknown>, onConflict: string, options?: {
     dedupeKey?: string;
     coalesceKey?: string;
     critical?: boolean;
@@ -405,7 +408,7 @@ export class SupabaseWriter {
     });
   }
 
-  public update(table: string, match: Record<string, any>, patch: Record<string, any>, options?: {
+  public update(table: string, match: Record<string, unknown>, patch: Record<string, unknown>, options?: {
     dedupeKey?: string;
     critical?: boolean;
   }): void {
@@ -466,9 +469,9 @@ export class SupabaseWriter {
 
   private async executeOp(op: WriteOp): Promise<void> {
     try {
-      let error: any = null;
+      let error: PostgrestErrorLike | null = null;
 
-      const supabaseCall = async (): Promise<any> => {
+      const supabaseCall = async (): Promise<{ error: PostgrestErrorLike | null }> => {
         switch (op.kind) {
           case 'insert':
             return this.supabase.from(op.table).insert(op.row || op.rows);
@@ -494,7 +497,7 @@ export class SupabaseWriter {
       } else {
         this.onSuccess(op);
       }
-    } catch (e: any) {
+    } catch (e) {
       await this.handleError(op, e);
     }
   }
@@ -545,8 +548,11 @@ export class SupabaseWriter {
     }
   }
 
-  private async handleError(op: WriteOp, error: any): Promise<void> {
-    this.lastError = error.message || String(error);
+  private async handleError(op: WriteOp, error: unknown): Promise<void> {
+    // Raw PostgREST error payloads / thrown exceptions — narrow to the shared
+    // PostgrestErrorLike shape for code/message reads (fields are optional).
+    const pgError = error as PostgrestErrorLike;
+    this.lastError = pgError.message || String(error);
 
     // Track consecutive failures for circuit breaker (all error types count)
     this.consecutiveFailures++;
@@ -559,9 +565,9 @@ export class SupabaseWriter {
       this.logger.error('Schema mismatch (non-retryable)', {
         table: op.table,
         error: this.lastError,
-        code: error.code,
+        code: pgError.code,
       });
-      dbSchemaErrors.labels({ table: op.table, error_type: error.code || 'unknown' }).inc();
+      dbSchemaErrors.labels({ table: op.table, error_type: pgError.code || 'unknown' }).inc();
       dbWriteTotal.labels({ table: op.table, result: 'schema_error' }).inc();
 
       // Spool critical ops even on schema error (may be fixed later)
@@ -576,7 +582,7 @@ export class SupabaseWriter {
       this.logger.error('Non-retryable write error', {
         table: op.table,
         error: this.lastError,
-        code: error.code,
+        code: pgError.code,
       });
       dbWriteTotal.labels({ table: op.table, result: 'permanent_error' }).inc();
       return;

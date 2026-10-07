@@ -14,7 +14,7 @@ export interface AlertPayload {
   title: string;
   message: string;
   timestamp: Date;
-  metadata?: Record<string, any>;
+  metadata?: Record<string, unknown>;
 }
 
 export interface TransportConfig {
