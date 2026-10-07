@@ -31,6 +31,15 @@ import { createClient } from '@supabase/supabase-js';
 import { createLogger, Logger } from '../core/logger';
 import { loadEnv } from '../core/env';
 
+/**
+ * The client type produced by the untyped `createClient(url, key, opts)` call
+ * in main(). Plain `ReturnType<typeof createClient>` resolves the generics to
+ * their declaration defaults (`unknown` database / `never` schema), which does
+ * NOT match what an actual untyped call returns — instantiate with `any` so the
+ * parameter type and the constructed client agree.
+ */
+type Supabase = ReturnType<typeof createClient<any>>;
+
 interface CliArgs {
   /** Inclusive lower bound on trade_log.entry_time. */
   since: Date;
@@ -167,7 +176,7 @@ export function usage(): string {
  * @returns         Result with empty `violations` array on pass.
  */
 export async function auditOneTrade(
-  supabase: ReturnType<typeof createClient>,
+  supabase: Supabase,
   trade: TradeLogRow,
 ): Promise<TradeAuditResult> {
   const violations: ViolationDetail[] = [];
@@ -314,7 +323,7 @@ export async function auditOneTrade(
  * @returns         Aggregated AuditSummary.
  */
 export async function auditTrades(
-  supabase: ReturnType<typeof createClient>,
+  supabase: Supabase,
   since: Date,
   logger: Logger,
 ): Promise<AuditSummary> {

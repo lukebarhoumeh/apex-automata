@@ -34,8 +34,10 @@ import {
 } from './types';
 
 export class CoinbaseAdapter extends EventEmitter implements IExchangeAdapter {
-  readonly id = 'coinbase';
-  readonly name = 'Coinbase Advanced Trade';
+  // Typed as string (not inferred literals) so subclasses (CoinbasePerpsAdapter)
+  // can override with their own id/name, matching IExchangeAdapter's `string` contract.
+  readonly id: string = 'coinbase';
+  readonly name: string = 'Coinbase Advanced Trade';
   readonly exchangeType: ExchangeType = 'spot';
 
   private exchange: CoinbaseExchange;
