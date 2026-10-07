@@ -34,11 +34,19 @@ function createLogger(): Logger {
   return { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as Logger;
 }
 
+/** Parsed JSON request body — only the fields the assertions inspect are modeled. */
+interface RecordedBody {
+  order_id?: string;
+  price?: string;
+  size?: string;
+  order_configuration?: { limit_limit_gtc?: { post_only?: boolean } };
+  [key: string]: unknown;
+}
 interface RecordedCall {
   method: string;
   path: string;
   headers: Record<string, string>;
-  body: any;
+  body: RecordedBody | undefined;
 }
 interface MockResponse {
   status: number;
@@ -258,7 +266,7 @@ async function startAdapterWithOpenOrder(edit: (c: RecordedCall) => MockResponse
   });
   await adapter.start();
   await adapter.placeOrder({ clientOrderId: 'c-77', symbol: 'BIP-20DEC30-CDE', side: 'buy', type: 'limit', price: 77700, quantity: 10, postOnly: true, timeInForce: 'GTC' });
-  expect(mock.calls[0].body.order_configuration.limit_limit_gtc.post_only).toBe(true);
+  expect(mock.calls[0].body!.order_configuration!.limit_limit_gtc!.post_only).toBe(true);
   return { adapter, mock, logger };
 }
 

@@ -19,7 +19,8 @@
  */
 
 import { describe, test, expect, beforeEach, vi } from 'vitest';
-import { SignalProcessor, SignalProcessorConfig } from '../strategies/signal-processor';
+import { SignalProcessor, SignalProcessorConfig, type Signal } from '../strategies/signal-processor';
+import type { Logger } from '../core/logger';
 import type { OHLCV } from '../indicators/technical';
 
 const mockLogger = {
@@ -92,11 +93,11 @@ function makeBreakoutCandle(baseTime: number, idx: number): OHLCV {
 describe('Bug 1 — phantom-flatten at boot', () => {
   let sp: SignalProcessor;
   beforeEach(() => {
-    sp = new SignalProcessor(baseSpConfig, mockLogger as any);
+    sp = new SignalProcessor(baseSpConfig, mockLogger as unknown as Logger);
   });
 
   test('addHistoricalCandle never emits signal:generated, even past the warmup threshold', () => {
-    const signals: any[] = [];
+    const signals: Signal[] = [];
     sp.on('signal:generated', (signal) => signals.push(signal));
 
     const baseTime = Date.now() - 200 * 60_000;
@@ -112,7 +113,7 @@ describe('Bug 1 — phantom-flatten at boot', () => {
   });
 
   test('spot→perps mirror loop using addHistoricalCandle leaves zero signals after warmup', () => {
-    const signals: any[] = [];
+    const signals: Signal[] = [];
     sp.on('signal:generated', (signal) => signals.push(signal));
 
     const baseTime = Date.now() - 200 * 60_000;
@@ -136,7 +137,7 @@ describe('Bug 1 — phantom-flatten at boot', () => {
   });
 
   test('addCandle (live path) still emits signals after warmup — fix did not break live trading', () => {
-    const signals: any[] = [];
+    const signals: Signal[] = [];
     sp.on('signal:generated', (signal) => signals.push(signal));
 
     const baseTime = Date.now() - 100 * 60_000;
@@ -187,7 +188,7 @@ describe('Bug 2 — close-all cancels orders BEFORE closing positions', () => {
         callLog.push({ op: 'cancel', id });
         return true;
       }),
-      createOrder: vi.fn(async (req: any) => {
+      createOrder: vi.fn(async (req: { product_id: string; side: 'buy' | 'sell'; type: string; size: string }) => {
         const orderId = `flatten-${req.product_id}`;
         callLog.push({ op: 'create', id: orderId });
         return { id: orderId };
@@ -235,7 +236,7 @@ describe('Bug 2 — close-all cancels orders BEFORE closing positions', () => {
       getActiveOrders: () => activeOrders,
       getOpenPositions: () => openPositions,
       cancelOrder: vi.fn(async (id: string) => id !== 'ord-1'),
-      createOrder: vi.fn(async (_req: any) => ({ id: 'flat-1' })),
+      createOrder: vi.fn(async (_req: unknown) => ({ id: 'flat-1' })),
     };
 
     let ordersCancelled = 0;
@@ -292,13 +293,13 @@ describe('Bug 3 — unknown-strategy fallback is NOT a disabled real strategy', 
   test('fallback value is never a disabled real strategy', () => {
     for (const garbage of ['xyz', 'whatever', undefined, null, 42, {}, []]) {
       const result = normalizeStrategyFallback(garbage);
-      expect(DISABLED_STRATEGIES).not.toContain(result as any);
+      expect(DISABLED_STRATEGIES).not.toContain(result as (typeof DISABLED_STRATEGIES)[number]);
     }
   });
 
   test('fallback value is one of the explicitly allowed neutral tags', () => {
     const result = normalizeStrategyFallback('something_unknown');
-    expect(NEUTRAL_TAGS).toContain(result as any);
+    expect(NEUTRAL_TAGS).toContain(result as (typeof NEUTRAL_TAGS)[number]);
   });
 
   test('known strategies still pass through unchanged', () => {

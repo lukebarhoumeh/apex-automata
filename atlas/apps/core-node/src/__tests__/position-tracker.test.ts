@@ -1,5 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
-import { PositionTracker, PositionTrackerConfig } from '../trading/position-tracker';
+import { PositionTracker, PositionTrackerConfig, type Position } from '../trading/position-tracker';
+import type { Fill } from '../exchanges/coinbase';
+import type { Logger } from '../core/logger';
 
 // Mock logger
 const mockLogger = {
@@ -25,7 +27,7 @@ vi.mock('@supabase/supabase-js', () => ({
   }),
 }));
 
-function makeFill(overrides: Partial<any>) {
+function makeFill(overrides: Partial<Fill>): Fill {
   const now = new Date().toISOString();
   return {
     trade_id: overrides.trade_id ?? 1,
@@ -60,7 +62,7 @@ describe('PositionTracker', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    tracker = new PositionTracker(config, mockLogger as any);
+    tracker = new PositionTracker(config, mockLogger as unknown as Logger);
   });
 
   afterEach(() => {
@@ -69,11 +71,11 @@ describe('PositionTracker', () => {
 
   test('accumulates realized P&L after a position is closed and removed from memory', async () => {
     // Open long: buy 1 @ 100, fee 1 (cost basis = 101)
-    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '100', size: '1', fee: '1' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '100', size: '1', fee: '1' }));
     tracker.updateMarketPrice('BTC-USD', 100);
 
     // Close long: sell 1 @ 110, fee 1 (net proceeds = 109), realized PnL = 109 - 101 = 8
-    await tracker.processFill(makeFill({ trade_id: 2, side: 'sell', price: '110', size: '1', fee: '1' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 2, side: 'sell', price: '110', size: '1', fee: '1' }));
 
     expect(tracker.getPosition('BTC-USD')).toBeUndefined();
 
@@ -86,13 +88,13 @@ describe('PositionTracker', () => {
 
   test('allocates fees correctly when a trade flips the position direction', async () => {
     // Open long: buy 1 @ 100, fee 1 => avg = 101
-    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '100', size: '1', fee: '1' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '100', size: '1', fee: '1' }));
     tracker.updateMarketPrice('BTC-USD', 100);
 
     // Sell 2 @ 110, fee 2:
     // - closes 1 with half the fee (1) => realized = (110 - 101) - 1 = 8
     // - opens short 1 with remaining fee (1) => short avg proceeds = 110 - 1 = 109
-    await tracker.processFill(makeFill({ trade_id: 2, side: 'sell', price: '110', size: '2', fee: '2' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 2, side: 'sell', price: '110', size: '2', fee: '2' }));
 
     const flipped = tracker.getPosition('BTC-USD');
     expect(flipped).toBeDefined();
@@ -101,7 +103,7 @@ describe('PositionTracker', () => {
     expect(flipped!.averagePrice).toBeCloseTo(109, 8);
 
     // Close short: buy 1 @ 100, fee 1 => realized = (109 - 100) - 1 = 8; total realized = 16
-    await tracker.processFill(makeFill({ trade_id: 3, side: 'buy', price: '100', size: '1', fee: '1' }) as any);
+    await tracker.processFill(makeFill({ trade_id: 3, side: 'buy', price: '100', size: '1', fee: '1' }));
 
     expect(tracker.getPosition('BTC-USD')).toBeUndefined();
     const summary = tracker.getPortfolioSummary();
@@ -110,11 +112,11 @@ describe('PositionTracker', () => {
   });
 
   test('keeps the entry regime on position.metadata.regime through the close (paper kill ladder L4 attribution)', async () => {
-    const closed: any[] = [];
+    const closed: Position[] = [];
     tracker.on('position:closed', (p) => closed.push(p));
 
     // Entry fill stamps the regime the signal was opened in.
-    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '100', size: '1' }) as any, {
+    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '100', size: '1' }), {
       strategy: 'trend_follow',
       tag: 'entry',
       regime: 'weak_trend',
@@ -122,7 +124,7 @@ describe('PositionTracker', () => {
     expect(tracker.getPosition('BTC-USD')!.metadata).toMatchObject({ entryTag: 'entry', regime: 'weak_trend' });
 
     // The exit fill (position monitor stop-out) carries no regime and must not erase the entry's.
-    await tracker.processFill(makeFill({ trade_id: 2, side: 'sell', price: '95', size: '1' }) as any, {
+    await tracker.processFill(makeFill({ trade_id: 2, side: 'sell', price: '95', size: '1' }), {
       strategy: 'system',
       tag: 'stop_loss',
     });
@@ -133,13 +135,13 @@ describe('PositionTracker', () => {
   });
 
   test('backfills the regime on an existing position only when it has none', async () => {
-    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '100', size: '1' }) as any, { strategy: 'trend_follow' });
+    await tracker.processFill(makeFill({ trade_id: 1, side: 'buy', price: '100', size: '1' }), { strategy: 'trend_follow' });
     expect(tracker.getPosition('BTC-USD')!.metadata?.regime).toBeUndefined();
 
-    await tracker.processFill(makeFill({ trade_id: 2, side: 'buy', price: '101', size: '1' }) as any, { regime: 'choppy' });
+    await tracker.processFill(makeFill({ trade_id: 2, side: 'buy', price: '101', size: '1' }), { regime: 'choppy' });
     expect(tracker.getPosition('BTC-USD')!.metadata?.regime).toBe('choppy');
 
-    await tracker.processFill(makeFill({ trade_id: 3, side: 'buy', price: '102', size: '1' }) as any, { regime: 'strong_trend' });
+    await tracker.processFill(makeFill({ trade_id: 3, side: 'buy', price: '102', size: '1' }), { regime: 'strong_trend' });
     expect(tracker.getPosition('BTC-USD')!.metadata?.regime).toBe('choppy');
   });
 });

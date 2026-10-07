@@ -8,7 +8,9 @@
  */
 import { describe, test, expect, beforeEach, vi } from 'vitest';
 import { EventEmitter } from 'events';
-import { OrderManager, OrderManagerConfig } from '../trading/order-manager';
+import { OrderManager, OrderManagerConfig, type ManagedOrder } from '../trading/order-manager';
+import type { CoinbaseExchange } from '../exchanges/coinbase';
+import type { Logger } from '../core/logger';
 
 const mockLogger = {
   info: vi.fn(),
@@ -17,7 +19,7 @@ const mockLogger = {
   debug: vi.fn(),
 };
 
-let nextQueryResult: { data: any[] | null; error: { message: string } | null } = { data: [], error: null };
+let nextQueryResult: { data: Array<Record<string, unknown>> | null; error: { message: string } | null } = { data: [], error: null };
 
 vi.mock('@supabase/supabase-js', () => ({
   createClient: () => ({
@@ -58,7 +60,7 @@ describe('OrderManager.hydrateOpenOrders', () => {
     vi.clearAllMocks();
     nextQueryResult = { data: [], error: null };
     exchange = new MockExchange();
-    manager = new OrderManager(baseConfig, mockLogger as any, exchange as any);
+    manager = new OrderManager(baseConfig, mockLogger as unknown as Logger, exchange as unknown as CoinbaseExchange);
   });
 
   test('returns 0 with empty userId', async () => {
@@ -67,7 +69,7 @@ describe('OrderManager.hydrateOpenOrders', () => {
   });
 
   test('returns 0 with missing creds', async () => {
-    const n = await manager.hydrateOpenOrders('user-x', { supabaseUrl: '', supabaseKey: '' } as any);
+    const n = await manager.hydrateOpenOrders('user-x', { supabaseUrl: '', supabaseKey: '' });
     expect(n).toBe(0);
   });
 
@@ -112,7 +114,7 @@ describe('OrderManager.hydrateOpenOrders', () => {
     const active = manager.getActiveOrders();
     expect(active).toHaveLength(2);
 
-    const byExch = manager.getOrderByExchangeOrderId('exch-1');
+    const byExch = manager.getOrderByExchangeOrderId('exch-1') as (ManagedOrder & { symbol?: string }) | undefined;
     expect(byExch).toBeDefined();
     expect(byExch!.symbol ?? byExch!.product).toBe('BTC-USD');
 

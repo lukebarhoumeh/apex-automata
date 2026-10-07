@@ -2,6 +2,8 @@ import { describe, test, expect, beforeEach, vi } from 'vitest';
 import { EventEmitter } from 'events';
 import { OrderManager, OrderManagerConfig } from '../trading/order-manager';
 import type { CoinbaseOrder, Fill, OrderRequest } from '../exchanges/coinbase/types';
+import type { CoinbaseExchange } from '../exchanges/coinbase';
+import type { Logger } from '../core/logger';
 
 // Mock logger
 const mockLogger = {
@@ -14,7 +16,8 @@ const mockLogger = {
 class MockExchange extends EventEmitter {
   public async createOrder(request: OrderRequest): Promise<CoinbaseOrder> {
     const now = new Date().toISOString();
-    const exchangeOrder: any = {
+    // CoinbaseOrder plus the client_oid echo the mapping test depends on.
+    const exchangeOrder: CoinbaseOrder & { client_oid?: string } = {
       id: 'exch-1',
       product_id: request.product_id,
       side: request.side,
@@ -62,7 +65,7 @@ describe('OrderManager', () => {
   
   beforeEach(() => {
     exchange = new MockExchange();
-    orderManager = new OrderManager(config, mockLogger as any, exchange as any);
+    orderManager = new OrderManager(config, mockLogger as unknown as Logger, exchange as unknown as CoinbaseExchange);
   });
   
   test('reconciles fills using exchange order id mapping', async () => {

@@ -21,6 +21,7 @@ import { EventEmitter } from 'events';
 import { TradingEngine, TradingEngineConfig } from '../trading/trading-engine';
 import type { ManagedOrder } from '../trading/order-manager';
 import type { Logger } from '../core/logger';
+import { tradingEngineInternals } from './helpers/trading-engine-test-access';
 
 vi.mock('../config/secrets');
 vi.mock('../exchanges/coinbase');
@@ -83,7 +84,7 @@ const SIGNAL_ID = '6f1c2a3e-9b4d-4c8e-8f21-0a1b2c3d4e5f';
 
 function wireEngine(): TradingEngine {
   const engine = new TradingEngine(config, logger);
-  const e = engine as any;
+  const e = tradingEngineInternals(engine);
   e.exchange = new EventEmitter();
   e.initializePaperSimulator();
   e.initializeOrderManager();
@@ -95,13 +96,13 @@ function wireEngine(): TradingEngine {
   e.isRunning = true;
   for (const symbol of config.products) {
     e.marketPrices.set(symbol, ETH_PRICE);
-    e.paperSimulator.updateMarketPrice(symbol, ETH_PRICE);
+    e.paperSimulator!.updateMarketPrice(symbol, ETH_PRICE);
   }
   return engine;
 }
 
 function teardown(engine: TradingEngine): void {
-  const e = engine as any;
+  const e = tradingEngineInternals(engine);
   e.riskEngine?.stop?.();
   e.positionTracker?.stopUpdateLoop?.();
   e.orderManager?.destroy?.();
@@ -143,7 +144,7 @@ describe('paper path — approved entry → paper order (PAPER_DISABLE_SOFT_LAUN
     expect(order!.side).toBe('buy');
     expect(order!.size).toBeCloseTo(0.482131, 6);
     expect(order!.strategy).toBe('trend_follow');
-    expect(order!.metadata.signalId).toBe(SIGNAL_ID);
+    expect(order!.metadata!.signalId).toBe(SIGNAL_ID);
     expect(created).toHaveLength(1);
     expect(created[0].id).toBe(order!.id);
     expect(engine.getLastOrderRejection()).toBeNull();

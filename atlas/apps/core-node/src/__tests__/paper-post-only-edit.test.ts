@@ -31,6 +31,7 @@ import type { FeesConfig } from '../config/loadGuardrails';
 import type { CoinbaseExchange } from '../exchanges/coinbase';
 import type { CoinbaseOrder, Fill, OrderRequest, Ticker } from '../exchanges/coinbase/types';
 import type { Logger } from '../core/logger';
+import { tradingEngineInternals } from './helpers/trading-engine-test-access';
 
 vi.mock('../config/secrets');
 vi.mock('../exchanges/coinbase');
@@ -549,7 +550,7 @@ const engineConfig: TradingEngineConfig = {
 
 function wireEngine(): TradingEngine {
   const engine = new TradingEngine(engineConfig, logger);
-  const e = engine as any;
+  const e = tradingEngineInternals(engine);
   e.exchange = new EventEmitter();
   e.initializePaperSimulator();
   e.initializeOrderManager();
@@ -561,7 +562,7 @@ function wireEngine(): TradingEngine {
 }
 
 function teardown(engine: TradingEngine): void {
-  const e = engine as any;
+  const e = tradingEngineInternals(engine);
   e.riskEngine?.stop?.();
   e.positionTracker?.stopUpdateLoop?.();
   e.orderManager?.destroy?.();
@@ -575,11 +576,11 @@ describe('TradingEngine paper path — post-only miss is attributable; edit work
     process.env.PAPER_DISABLE_SOFT_LAUNCH = 'true';
     vi.clearAllMocks();
     engine = wireEngine();
-    const e = engine as any;
+    const e = tradingEngineInternals(engine);
     e.marketPrices.set(BIP, 77717);
-    e.paperSimulator.updateMarketQuote(BIP, { bid: 77715, ask: 77720, last: 77717 });
+    e.paperSimulator!.updateMarketQuote(BIP, { bid: 77715, ask: 77720, last: 77717 });
     e.marketPrices.set('ETH-USD', 2752.3);
-    e.paperSimulator.updateMarketQuote('ETH-USD', { bid: 2752.0, ask: 2752.5, last: 2752.3 });
+    e.paperSimulator!.updateMarketQuote('ETH-USD', { bid: 2752.0, ask: 2752.5, last: 2752.3 });
   });
 
   afterEach(() => {
@@ -625,7 +626,7 @@ describe('TradingEngine paper path — post-only miss is attributable; edit work
     expect(order!.status).toBe('open');
     expect(engine.getLastOrderRejection()).toBeNull();
 
-    (engine as any).paperSimulator.updateMarketQuote(BIP, { bid: 77705, ask: 77710, last: 77708 });
+    tradingEngineInternals(engine).paperSimulator!.updateMarketQuote(BIP, { bid: 77705, ask: 77710, last: 77708 });
     await new Promise((r) => setTimeout(r, 20));
 
     expect(fills).toHaveLength(1);
