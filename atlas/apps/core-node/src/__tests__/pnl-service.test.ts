@@ -10,32 +10,41 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { PnLService, PnLServiceConfig } from '../trading/pnl/pnl-service';
-import { PnLSnapshot } from '../trading/pnl/pnl-types';
+import { PnLService } from '../trading/pnl/pnl-service';
+import { PnLSnapshot, PnLServiceConfig } from '../trading/pnl/pnl-types';
 import { Logger } from '../core/logger';
+import type { Position, PositionTracker } from '../trading/position-tracker';
 import { EventEmitter } from 'events';
 
 // Mock logger
-const mockLogger: Logger = {
+const mockLogger = {
   info: vi.fn(),
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
-} as any;
+} as unknown as Logger;
+
+/** The slice of a real Position the PnL service reads in these tests. */
+type MockPosition = Pick<Position, 'symbol' | 'side' | 'size' | 'averagePrice' | 'marketPrice'> &
+  Partial<Position>;
+
+/** Typed window onto the private day-rollover hook the tests trigger by hand. */
+const pnlServiceInternals = (svc: PnLService) =>
+  svc as unknown as { performDayRollover(newRiskDay: string): void };
 
 // Mock PositionTracker
 class MockPositionTracker extends EventEmitter {
-  private positions: any[] = [];
+  private positions: MockPosition[] = [];
 
   getOpenPositions() {
     return this.positions;
   }
 
-  setPositions(positions: any[]) {
+  setPositions(positions: MockPosition[]) {
     this.positions = positions;
   }
 
-  addPosition(position: any) {
+  addPosition(position: MockPosition) {
     this.positions.push(position);
     this.emit('position:opened', position);
   }
@@ -78,7 +87,7 @@ describe('PnLService', () => {
 
   describe('P&L Identity: totalEquity = start + realized + unrealized', () => {
     it('should start with totalEquity = sessionStartEquity when no positions', () => {
-      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as any);
+      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       const snapshot = pnlService.getSnapshot();
 
@@ -89,7 +98,7 @@ describe('PnLService', () => {
     });
 
     it('should update unrealized when position has mark > entry (long)', () => {
-      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as any);
+      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       // Open a long position
       mockPositionTracker.addPosition({
@@ -116,7 +125,7 @@ describe('PnLService', () => {
     });
 
     it('should update unrealized when position has mark < entry (long loss)', () => {
-      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as any);
+      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       mockPositionTracker.addPosition({
         symbol: 'BTC-USD',
@@ -136,7 +145,7 @@ describe('PnLService', () => {
     });
 
     it('should move P&L from unrealized to realized on close', () => {
-      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as any);
+      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       mockPositionTracker.addPosition({
         symbol: 'BTC-USD',
@@ -164,7 +173,7 @@ describe('PnLService', () => {
 
   describe('Short Positions', () => {
     it('should compute positive unrealized for short when price drops', () => {
-      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as any);
+      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       mockPositionTracker.addPosition({
         symbol: 'BTC-USD',
@@ -184,7 +193,7 @@ describe('PnLService', () => {
     });
 
     it('should compute negative unrealized for short when price rises', () => {
-      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as any);
+      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       mockPositionTracker.addPosition({
         symbol: 'BTC-USD',
@@ -206,7 +215,7 @@ describe('PnLService', () => {
 
   describe('Multiple Positions', () => {
     it('should sum unrealized across multiple positions', () => {
-      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as any);
+      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       mockPositionTracker.addPosition({
         symbol: 'BTC-USD',
@@ -241,7 +250,7 @@ describe('PnLService', () => {
 
   describe('Daily P&L', () => {
     it('should compute daily P&L correctly', () => {
-      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as any);
+      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       mockPositionTracker.addPosition({
         symbol: 'BTC-USD',
@@ -262,7 +271,7 @@ describe('PnLService', () => {
     it('should compute daily P&L in R units', () => {
       pnlService = new PnLService(createConfig({
         perTradeRiskFraction: 0.01, // 1% = $500
-      }), mockLogger, mockPositionTracker as any);
+      }), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       mockPositionTracker.addPosition({
         symbol: 'BTC-USD',
@@ -285,7 +294,7 @@ describe('PnLService', () => {
 
   describe('Day Rollover', () => {
     it('should reset dayStartEquity on rollover', () => {
-      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as any);
+      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       // Open and close a position to accumulate realized P&L
       mockPositionTracker.addPosition({
@@ -302,7 +311,7 @@ describe('PnLService', () => {
       expect(snapshot.totalEquityUsd).toBe(51000);
 
       // Manually trigger rollover (in real code, this happens on time boundary)
-      (pnlService as any).performDayRollover('2025-02-04');
+      pnlServiceInternals(pnlService).performDayRollover('2025-02-04');
 
       snapshot = pnlService.getSnapshot();
 
@@ -315,7 +324,7 @@ describe('PnLService', () => {
 
   describe('Equity Curve', () => {
     it('should track equity curve points', () => {
-      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as any);
+      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       // Trigger snapshot emissions
       pnlService.updateMarkPrice('BTC-USD', 50000);
@@ -331,7 +340,7 @@ describe('PnLService', () => {
 
   describe('Events', () => {
     it('should emit pnl:snapshot event', () => {
-      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as any);
+      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       const snapshotHandler = vi.fn();
       pnlService.on('pnl:snapshot', snapshotHandler);
@@ -344,12 +353,12 @@ describe('PnLService', () => {
     });
 
     it('should emit pnl:day_rollover event', () => {
-      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as any);
+      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       const rolloverHandler = vi.fn();
       pnlService.on('pnl:day_rollover', rolloverHandler);
 
-      (pnlService as any).performDayRollover('2025-02-04');
+      pnlServiceInternals(pnlService).performDayRollover('2025-02-04');
 
       expect(rolloverHandler).toHaveBeenCalledWith(expect.objectContaining({
         newDay: '2025-02-04',
@@ -359,7 +368,7 @@ describe('PnLService', () => {
 
   describe('Snapshot Consistency', () => {
     it('should always satisfy the P&L identity', () => {
-      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as any);
+      pnlService = new PnLService(createConfig(), mockLogger, mockPositionTracker as unknown as PositionTracker);
 
       // Series of operations
       mockPositionTracker.addPosition({

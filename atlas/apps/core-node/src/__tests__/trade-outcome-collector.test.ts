@@ -1,5 +1,6 @@
 import { describe, test, expect, beforeEach, vi } from 'vitest';
 import { TradeOutcomeCollector } from '../ml/trade-outcome-collector';
+import type { Logger } from '../core/logger';
 import type { Position } from '../trading/position-tracker';
 import type { RegimeState } from '../strategies/regime-detector';
 
@@ -114,7 +115,7 @@ describe('TradeOutcomeCollector', () => {
         enabled: true,
         profitThreshold: 0,
       },
-      mockLogger as any,
+      mockLogger as unknown as Logger,
     );
   });
 

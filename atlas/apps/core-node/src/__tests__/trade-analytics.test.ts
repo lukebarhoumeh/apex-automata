@@ -40,7 +40,7 @@ describe('TradeAnalytics', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    analytics = new TradeAnalytics(config, mockLogger as any);
+    analytics = new TradeAnalytics(config, mockLogger as unknown as Logger);
   });
 
   afterEach(async () => {
@@ -181,7 +181,7 @@ describe('TradeAnalytics', () => {
     
     // Simulate time passing
     const trade1 = analytics.getOpenTrades()[0];
-    (trade1 as any).entryTime = new Date(Date.now() - 60000);
+    trade1.entryTime = new Date(Date.now() - 60000);
     
     analytics.recordExit({
       tradeId: 'trade-1',
@@ -200,7 +200,7 @@ describe('TradeAnalytics', () => {
     });
     
     const trade2 = analytics.getOpenTrades()[0];
-    (trade2 as any).entryTime = new Date(Date.now() - 120000);
+    trade2.entryTime = new Date(Date.now() - 120000);
     
     analytics.recordExit({
       tradeId: 'trade-2',

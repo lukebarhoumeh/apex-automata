@@ -11,18 +11,20 @@ import { Logger } from '../core/logger';
 import { buildFillRow } from '../persistence/fill-row';
 import type { SessionStamp } from '../persistence/session-stamp';
 import type { Fill } from '../exchanges/coinbase/types';
+import type { GuardrailConfig } from '../config/loadGuardrails';
+import { tradingEngineInternals } from './helpers/trading-engine-test-access';
 
 // Mock dependencies
 vi.mock('../config/secrets');
 vi.mock('../exchanges/coinbase');
 
 // Mock logger
-const mockLogger: Logger = {
+const mockLogger = {
   info: vi.fn(),
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
-} as any;
+} as unknown as Logger;
 
 // Mock guardrails
 const mockGuardrails = {
@@ -104,7 +106,8 @@ const mockConfig: TradingEngineConfig = {
   security: {
     encryptionKey: 'test-encryption-key',
   },
-  guardrails: mockGuardrails as any,
+  // The fixture carries only the guardrail sections these tests exercise.
+  guardrails: mockGuardrails as unknown as GuardrailConfig,
 };
 
 describe('TradingEngine Lifecycle', () => {
@@ -151,15 +154,15 @@ describe('TradingEngine Lifecycle', () => {
       // Detach the in-flight (hanging) start so afterEach's stop() doesn't
       // hit the 2s "waiting for start to finish" branch. The actual start
       // promise is intentionally orphaned — it's catch'd above.
-      (engine as any).startInFlight = false;
+      tradingEngineInternals(engine).startInFlight = false;
     });
   });
 
   describe('Idempotent Start', () => {
     it('should not start twice', async () => {
       // Manually set running state to simulate already running
-      (engine as any).isRunning = true;
-      (engine as any).engineState = 'running';
+      tradingEngineInternals(engine).isRunning = true;
+      tradingEngineInternals(engine).engineState = 'running';
       
       await engine.start();
       
@@ -171,7 +174,7 @@ describe('TradingEngine Lifecycle', () => {
 
     it('should not start while starting', async () => {
       // Set starting state
-      (engine as any).engineState = 'starting';
+      tradingEngineInternals(engine).engineState = 'starting';
       
       await engine.start();
       
@@ -191,8 +194,8 @@ describe('TradingEngine Lifecycle', () => {
 
     it('should not double-stop', async () => {
       // Set running then stopping state
-      (engine as any).isRunning = true;
-      (engine as any).engineState = 'stopping';
+      tradingEngineInternals(engine).isRunning = true;
+      tradingEngineInternals(engine).engineState = 'stopping';
       
       await engine.stop();
       
@@ -206,7 +209,7 @@ describe('TradingEngine Lifecycle', () => {
       engine.on('engine:heartbeat', heartbeatHandler);
       
       // Manually start heartbeat (normally done in start())
-      (engine as any).startHeartbeat();
+      tradingEngineInternals(engine).startHeartbeat();
       
       // Initial heartbeat
       expect(heartbeatHandler).toHaveBeenCalledTimes(1);
@@ -216,16 +219,16 @@ describe('TradingEngine Lifecycle', () => {
       expect(heartbeatHandler).toHaveBeenCalledTimes(2);
       
       // Stop heartbeat
-      (engine as any).stopHeartbeat();
+      tradingEngineInternals(engine).stopHeartbeat();
     });
 
     it('should track last heartbeat timestamp', () => {
-      (engine as any).startHeartbeat();
+      tradingEngineInternals(engine).startHeartbeat();
       
       const lastHeartbeat = engine.getLastHeartbeatAt();
       expect(lastHeartbeat).toBeGreaterThan(0);
       
-      (engine as any).stopHeartbeat();
+      tradingEngineInternals(engine).stopHeartbeat();
     });
   });
 
@@ -235,7 +238,7 @@ describe('TradingEngine Lifecycle', () => {
       engine.on('engine:state_changed', stateChangedHandler);
       
       // Simulate kill switch by calling setEngineState
-      (engine as any).setEngineState('halted', 'kill_switch: daily_loss_limit');
+      tradingEngineInternals(engine).setEngineState('halted', 'kill_switch: daily_loss_limit');
       
       expect(engine.getEngineState()).toBe('halted');
       expect(stateChangedHandler).toHaveBeenCalledWith('halted', 'kill_switch: daily_loss_limit');
@@ -243,15 +246,15 @@ describe('TradingEngine Lifecycle', () => {
 
     it('should not stop engine on kill switch', () => {
       // Set engine as running
-      (engine as any).isRunning = true;
-      (engine as any).engineState = 'running';
+      tradingEngineInternals(engine).isRunning = true;
+      tradingEngineInternals(engine).engineState = 'running';
       
       // Simulate kill switch
-      (engine as any).setEngineState('halted', 'kill_switch: test');
+      tradingEngineInternals(engine).setEngineState('halted', 'kill_switch: test');
       
       // Engine should still be "running" (isRunning flag)
       // but state should be halted
-      expect((engine as any).isRunning).toBe(true);
+      expect(tradingEngineInternals(engine).isRunning).toBe(true);
       expect(engine.getEngineState()).toBe('halted');
     });
   });
@@ -270,25 +273,26 @@ describe('TradingEngine Lifecycle', () => {
 
     function armDataGapMonitor(lastDataAgeBySymbol: Record<string, number>) {
       const riskEngine = { activateKillSwitch: vi.fn() };
-      (engine as any).riskEngine = riskEngine;
-      (engine as any).isRunning = true;
-      (engine as any).engineStartTime = Date.now() - GRACE_MS - 1;
-      (engine as any).activeSymbols = Object.keys(lastDataAgeBySymbol);
+      tradingEngineInternals(engine).riskEngine = riskEngine;
+      tradingEngineInternals(engine).isRunning = true;
+      tradingEngineInternals(engine).engineStartTime = Date.now() - GRACE_MS - 1;
+      tradingEngineInternals(engine).activeSymbols = Object.keys(lastDataAgeBySymbol);
       for (const [symbol, ageMs] of Object.entries(lastDataAgeBySymbol)) {
-        (engine as any).lastMarketDataPerSymbol.set(symbol, Date.now() - ageMs);
+        tradingEngineInternals(engine).lastMarketDataPerSymbol.set(symbol, Date.now() - ageMs);
       }
-      (engine as any).startDataGapMonitor();
+      tradingEngineInternals(engine).startDataGapMonitor();
       return riskEngine;
     }
 
     afterEach(() => {
       // Tear down the interval by hand: engineState is still 'stopped', so
       // the outer afterEach's stop() short-circuits and never reaches it.
-      if ((engine as any).dataGapMonitor) {
-        clearInterval((engine as any).dataGapMonitor);
-        (engine as any).dataGapMonitor = null;
+      const internals = tradingEngineInternals(engine);
+      if (internals.dataGapMonitor) {
+        clearInterval(internals.dataGapMonitor);
+        internals.dataGapMonitor = null;
       }
-      (engine as any).isRunning = false;
+      internals.isRunning = false;
     });
 
     it('all-symbols market-data gap activates the kill switch as data_gap', () => {
@@ -319,7 +323,7 @@ describe('TradingEngine Lifecycle', () => {
 
     it('stale data inside the startup grace period is ignored', () => {
       const riskEngine = armDataGapMonitor({ 'BTC-USD': GAP_MS + 5_000 });
-      (engine as any).engineStartTime = Date.now();
+      tradingEngineInternals(engine).engineStartTime = Date.now();
 
       vi.advanceTimersByTime(CHECK_INTERVAL_MS);
 
@@ -328,7 +332,7 @@ describe('TradingEngine Lifecycle', () => {
 
     it('emergencyStop(reason) activates the kill switch as manual_killswitch with the operator text', async () => {
       const riskEngine = { activateKillSwitch: vi.fn() };
-      (engine as any).riskEngine = riskEngine;
+      tradingEngineInternals(engine).riskEngine = riskEngine;
 
       await engine.emergencyStop('Operator emergency stop');
 
@@ -361,7 +365,7 @@ describe('TradingEngine Lifecycle', () => {
       const mockRiskEngine = {
         getMetrics: () => ({ killSwitchActive: true }),
       };
-      (engine as any).riskEngine = mockRiskEngine;
+      tradingEngineInternals(engine).riskEngine = mockRiskEngine;
       
       const fatalHandler = vi.fn();
       engine.on('engine:fatal', fatalHandler);
@@ -401,7 +405,7 @@ describe('TradingEngine Lifecycle', () => {
 
       // Detach the in-flight (hanging) start so afterEach's stop() can
       // short-circuit. Same rationale as in "should track state changes".
-      (engine as any).startInFlight = false;
+      tradingEngineInternals(engine).startInFlight = false;
     });
   });
 
@@ -411,7 +415,7 @@ describe('TradingEngine Lifecycle', () => {
       expect(engine.getExchange()).toBeNull();
       
       // After mock initialization
-      (engine as any).exchange = { test: true };
+      tradingEngineInternals(engine).exchange = { test: true };
       expect(engine.getExchange()).toEqual({ test: true });
     });
   });
@@ -451,7 +455,7 @@ describe('TradingEngine — FeeModel wiring (B5 engine-integration)', () => {
 
   it('engine-built paper simulator charges ~5 bps on ETH-PERP-INTX (perps tier, not spot)', async () => {
     // Drive the same private init path engine.start() uses for paper mode.
-    (engine as any).initializePaperSimulator();
+    tradingEngineInternals(engine).initializePaperSimulator();
     const sim = engine.getPaperSimulator();
     expect(sim).not.toBeNull();
 
@@ -533,18 +537,18 @@ describe('TradingEngine — paper trade_id continuity across an in-session super
 
   it('stop() then the start()-path simulator rebuild: the next fill does not collide with the earlier one', async () => {
     // Engine start #1 (paper): build the simulator exactly as start() does.
-    (engine as any).initializePaperSimulator();
+    tradingEngineInternals(engine).initializePaperSimulator();
     const before = await oneFill();
     expect(before.fill.trade_id).toBe(1);
     expect(before.row.trade_id).toBe(`paper-${session.sessionId}-1`);
 
     // Supervisor restart on the same engine + session: real stop(), then the
     // paper-mode init step start() runs.
-    (engine as any).isRunning = true;
-    (engine as any).engineState = 'running';
+    tradingEngineInternals(engine).isRunning = true;
+    tradingEngineInternals(engine).engineState = 'running';
     await engine.stop('supervisor_restart: test');
     expect(engine.getEngineState()).toBe('stopped');
-    (engine as any).initializePaperSimulator();
+    tradingEngineInternals(engine).initializePaperSimulator();
 
     const after = await oneFill();
     expect(after.sim).not.toBe(before.sim); // a genuinely fresh simulator instance
