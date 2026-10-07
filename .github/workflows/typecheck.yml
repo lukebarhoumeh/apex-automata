@@ -1,0 +1,66 @@
+name: typecheck
+
+# Typecheck gate (2026-10-07). Keeps `tsc --noEmit` green in core-node and the
+# root frontend `pnpm build` passing, so type errors can never silently
+# re-accumulate (they sat at ~10 errors for months because nothing in CI ran
+# tsc). Deliberately a SEPARATE workflow from backtest-gate / config-drift:
+# both of those are path-filtered, and a filtered typecheck would skip exactly
+# the PRs most likely to break types. No path filter — runs on every PR.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: typecheck-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck:
+    name: tsc --noEmit (core-node) + frontend build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          # core-node engines.node = ">=20"; use the active LTS.
+          node-version: '20'
+          cache: pnpm
+
+      - name: Install workspace deps
+        # Root pnpm-lock.yaml is the single source of truth and includes
+        # atlas/apps/core-node as a workspace member (see backtest-gate.yml).
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore Rollup native binary
+        # atlas/apps/core-node/.npmrc sets optional=false which prevents the
+        # platform-specific @rollup/rollup-linux-x64-gnu from installing; the
+        # frontend `pnpm build` (vite -> rollup) needs it on the Linux runner.
+        # See AGENTS.md "Important gotchas" item 1 and backtest-gate.yml.
+        # Rollup version is pinned by the root pnpm-lock.yaml — keep in sync.
+        run: |
+          cd /tmp
+          npm pack @rollup/rollup-linux-x64-gnu@4.52.4
+          tar xzf rollup-rollup-linux-x64-gnu-*.tgz
+          DEST="$GITHUB_WORKSPACE/node_modules/.pnpm/rollup@4.52.4/node_modules/@rollup/rollup-linux-x64-gnu"
+          mkdir -p "$DEST"
+          cp -r package/* "$DEST"/
+          rm -rf package rollup-rollup-linux-x64-gnu-*.tgz
+
+      - name: Typecheck core-node (tsc --noEmit)
+        working-directory: atlas/apps/core-node
+        run: pnpm exec tsc -p tsconfig.json --noEmit
+
+      - name: Build frontend (root pnpm build)
+        run: pnpm build
