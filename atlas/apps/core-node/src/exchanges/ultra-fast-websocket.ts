@@ -247,6 +247,7 @@ export class UltraFastWebSocket extends EventEmitter {
   
   private createOptimizedAgent(): any {
     // Create custom HTTPS agent with optimized settings
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional lazy require: agent is built on demand inside this method, keeping module load fast
     const agent = new (require('https').Agent)({
       keepAlive: true,
       keepAliveMsecs: 1000,
@@ -254,7 +255,9 @@ export class UltraFastWebSocket extends EventEmitter {
       maxFreeSockets: 5,
       timeout: 60000,
       // Optimize TLS
-      secureOptions: require('constants').SSL_OP_NO_TLSv1 | 
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional lazy require of node 'constants' for TLS option flags
+      secureOptions: require('constants').SSL_OP_NO_TLSv1 |
+                    // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional lazy require of node 'constants' for TLS option flags
                     require('constants').SSL_OP_NO_TLSv1_1,
       ciphers: 'ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384'
     });

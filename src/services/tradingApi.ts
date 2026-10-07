@@ -11,9 +11,11 @@ export interface TradingEngineStatus {
   activeOrders: any[];
 }
 
+type TradingApiListener = (data: unknown) => void;
+
 class TradingApiService {
   private ws: WebSocket | null = null;
-  private listeners: Map<string, Set<Function>> = new Map();
+  private listeners: Map<string, Set<TradingApiListener>> = new Map();
   private reconnectTimeout: NodeJS.Timeout | null = null;
   private isConnecting = false;
 
@@ -84,7 +86,7 @@ class TradingApiService {
     }
   }
 
-  public on(event: string, callback: Function) {
+  public on(event: string, callback: TradingApiListener) {
     if (!this.listeners.has(event)) {
       this.listeners.set(event, new Set());
     }

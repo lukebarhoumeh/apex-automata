@@ -7,6 +7,7 @@ import { Order } from '../trading/types';
 // Try to load native module, fallback to TypeScript implementation if not available
 let NativeTradingEngine: any;
 try {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional conditional require of the optional native addon; must stay inside try/catch for the TS fallback
   NativeTradingEngine = require('../../build/Release/trading_engine.node').TradingEngine;
 } catch (error) {
   console.warn('Native trading engine not available, using TypeScript implementation');
