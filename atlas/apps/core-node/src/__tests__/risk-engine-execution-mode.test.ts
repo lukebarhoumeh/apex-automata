@@ -27,6 +27,7 @@ import { RiskStateMachine } from '../trading/risk-state';
 import { PositionTracker, PositionTrackerConfig } from '../trading/position-tracker';
 import { GuardrailConfig } from '../config/loadGuardrails';
 import type { Logger } from '../core/logger';
+import { riskEngineInternals } from './helpers/risk-engine-test-access';
 
 interface RecordedCall {
   table: string;
@@ -366,7 +367,7 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
   beforeEach(() => {
     harness.reset();
     vi.clearAllMocks();
-    positionTracker = new PositionTracker(positionTrackerConfig, mockLogger as any);
+    positionTracker = new PositionTracker(positionTrackerConfig, typedLogger);
     engine = null;
   });
 
@@ -380,7 +381,7 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
       harness.respond('risk_metrics.select', tableSelect([paperHaltedRow(), liveCleanRow()]));
 
       engine = await waitForLoaders(
-        new RiskEngine(liveConfig(), mockLogger as any, positionTracker)
+        new RiskEngine(liveConfig(), typedLogger, positionTracker)
       );
 
       const select = harness.callsFor('risk_metrics', 'select')[0];
@@ -401,7 +402,7 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
       harness.respond('risk_metrics.select', tableSelect([paperHaltedRow()]));
 
       engine = await waitForLoaders(
-        new RiskEngine(liveConfig(), mockLogger as any, positionTracker)
+        new RiskEngine(liveConfig(), typedLogger, positionTracker)
       );
 
       expect(engine.getMetrics().killSwitchActive).toBe(false);
@@ -416,7 +417,7 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
       harness.respond('risk_metrics.select', tableSelect([liveHalted, paperClean]));
 
       engine = await waitForLoaders(
-        new RiskEngine({ ...baseConfig, executionMode: 'paper' }, mockLogger as any, positionTracker)
+        new RiskEngine({ ...baseConfig, executionMode: 'paper' }, typedLogger, positionTracker)
       );
 
       expect(hasModeFilter(harness.callsFor('risk_metrics', 'select')[0])).toBe('paper');
@@ -429,7 +430,7 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
       harness.respond('risk_metrics.select', tableSelect([paperHaltedRow(), liveCleanRow()]));
 
       engine = await waitForLoaders(
-        new RiskEngine({ ...baseConfig, executionMode: 'paper' }, mockLogger as any, positionTracker)
+        new RiskEngine({ ...baseConfig, executionMode: 'paper' }, typedLogger, positionTracker)
       );
 
       expect(engine.getMetrics().killSwitchActive).toBe(true);
@@ -440,7 +441,7 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
     test('executionMode defaults to paper when omitted (backward compatible)', async () => {
       harness.respond('risk_metrics.select', tableSelect([paperHaltedRow(), liveCleanRow()]));
 
-      engine = await waitForLoaders(new RiskEngine(baseConfig, mockLogger as any, positionTracker));
+      engine = await waitForLoaders(new RiskEngine(baseConfig, typedLogger, positionTracker));
 
       expect(engine.getExecutionMode()).toBe('paper');
       expect(hasModeFilter(harness.callsFor('risk_metrics', 'select')[0])).toBe('paper');
@@ -452,11 +453,11 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
     test('upsert is stamped with the mode and keyed on (user_id, execution_mode)', async () => {
       harness.respond('risk_metrics.select', tableSelect([]));
       engine = await waitForLoaders(
-        new RiskEngine(liveConfig(), mockLogger as any, positionTracker)
+        new RiskEngine(liveConfig(), typedLogger, positionTracker)
       );
       harness.calls.length = 0;
 
-      await (engine as any).persistMetrics();
+      await riskEngineInternals(engine).persistMetrics();
 
       const upserts = harness.callsFor('risk_metrics', 'upsert');
       expect(upserts).toHaveLength(1);
@@ -467,10 +468,10 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
     test('manual resume in live only clears live risk_events and writes a live-stamped row', async () => {
       harness.respond('risk_metrics.select', tableSelect([liveCleanRow()]));
       engine = await waitForLoaders(
-        new RiskEngine(liveConfig(), mockLogger as any, positionTracker)
+        new RiskEngine(liveConfig(), typedLogger, positionTracker)
       );
-      (engine as any).metrics.consecutiveLosses = 10;
-      (engine as any).checkKillSwitches();
+      riskEngineInternals(engine).metrics.consecutiveLosses = 10;
+      riskEngineInternals(engine).checkKillSwitches();
       expect(engine.canEnterTrades()).toBe(false);
       harness.calls.length = 0;
 
@@ -505,7 +506,7 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
       engine = await waitForLoaders(
         new RiskEngine(
           { ...baseConfig, executionMode: 'paper', ignorePersistedKillSwitch: true },
-          mockLogger as any,
+          typedLogger,
           positionTracker
         )
       );
@@ -531,12 +532,12 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
       );
 
       engine = await waitForLoaders(
-        new RiskEngine(liveConfig(), mockLogger as any, positionTracker)
+        new RiskEngine(liveConfig(), typedLogger, positionTracker)
       );
 
       const select = harness.callsFor('daily_equity', 'select')[0];
       expect(hasModeFilter(select)).toBe('live');
-      expect((engine as any).dailyStartEquity).toBe(1250);
+      expect(riskEngineInternals(engine).dailyStartEquity).toBe(1250);
       // A row existed, so nothing was re-saved.
       expect(harness.callsFor('daily_equity', 'upsert')).toHaveLength(0);
     });
@@ -549,7 +550,7 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
       ]));
 
       engine = await waitForLoaders(
-        new RiskEngine(liveConfig(), mockLogger as any, positionTracker)
+        new RiskEngine(liveConfig(), typedLogger, positionTracker)
       );
 
       const upserts = harness.callsFor('daily_equity', 'upsert');
@@ -665,7 +666,7 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
       engine = await waitForLoaders(
         new RiskEngine(
           { ...baseConfig, executionMode: 'paper', ignorePersistedKillSwitch: true },
-          mockLogger as any,
+          typedLogger,
           positionTracker
         )
       );
@@ -720,7 +721,7 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
 
       // Subsequent ticks do not re-probe: exactly one legacy upsert each.
       harness.calls.length = 0;
-      await (engine as any).persistMetrics();
+      await riskEngineInternals(engine).persistMetrics();
       expect(harness.callsFor('risk_metrics', 'upsert')).toHaveLength(1);
       expect(harness.callsFor('risk_metrics', 'upsert')[0].payload).not.toHaveProperty(MODE_COLUMN);
     });
@@ -729,7 +730,7 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
       harness.respond('risk_metrics.select', tableSelect([], { legacy: true }));
 
       engine = await waitForLoaders(
-        new RiskEngine(liveConfig(), mockLogger as any, positionTracker)
+        new RiskEngine(liveConfig(), typedLogger, positionTracker)
       );
 
       expect(mockLogger.warn).toHaveBeenCalledWith(
@@ -741,7 +742,7 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
     test('a 42P10 on the legacy key (migration applied mid-process) switches back to the scoped shape', async () => {
       harness.respond('risk_metrics.select', tableSelect([], { legacy: true }));
       engine = await waitForLoaders(
-        new RiskEngine(liveConfig(), mockLogger as any, positionTracker)
+        new RiskEngine(liveConfig(), typedLogger, positionTracker)
       );
       // Table is now latched legacy by the failed scoped read.
       let schemaMigrated = false;
@@ -753,14 +754,14 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
       });
       harness.calls.length = 0;
 
-      await (engine as any).persistMetrics();
+      await riskEngineInternals(engine).persistMetrics();
       expect(harness.callsFor('risk_metrics', 'upsert')).toHaveLength(1);
       expect(harness.callsFor('risk_metrics', 'upsert')[0].payload).not.toHaveProperty(MODE_COLUMN);
 
       // Migration lands between ticks.
       schemaMigrated = true;
       harness.calls.length = 0;
-      await (engine as any).persistMetrics();
+      await riskEngineInternals(engine).persistMetrics();
       const upserts = harness.callsFor('risk_metrics', 'upsert');
       expect(upserts).toHaveLength(2);
       expect(upserts[0].payload).not.toHaveProperty(MODE_COLUMN); // legacy attempt -> 42P10
@@ -769,7 +770,7 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
 
       // From here on it goes mode-aware directly.
       harness.calls.length = 0;
-      await (engine as any).persistMetrics();
+      await riskEngineInternals(engine).persistMetrics();
       expect(harness.callsFor('risk_metrics', 'upsert')).toHaveLength(1);
       expect(harness.callsFor('risk_metrics', 'upsert')[0].payload).toMatchObject({ [MODE_COLUMN]: 'live' });
     });
@@ -777,12 +778,12 @@ describe('RiskEngine execution_mode isolation (TASK_014 P5)', () => {
     test('a genuine DB failure is still reported, not mistaken for a schema gap', async () => {
       harness.respond('risk_metrics.select', tableSelect([]));
       engine = await waitForLoaders(
-        new RiskEngine(liveConfig(), mockLogger as any, positionTracker)
+        new RiskEngine(liveConfig(), typedLogger, positionTracker)
       );
       harness.respond('risk_metrics.upsert', () => ({ error: { code: '500', message: 'boom' } }));
       harness.calls.length = 0;
 
-      await (engine as any).persistMetrics();
+      await riskEngineInternals(engine).persistMetrics();
 
       expect(harness.callsFor('risk_metrics', 'upsert')).toHaveLength(1); // no legacy retry
       expect(mockLogger.error).toHaveBeenCalledWith(
@@ -801,7 +802,7 @@ describe('RiskStateMachine execution_mode scoping (risk_events)', () => {
 
   function machine(executionMode: 'paper' | 'live') {
     return new RiskStateMachine({
-      logger: mockLogger as any,
+      logger: typedLogger,
       supabaseUrl: 'http://localhost:54321',
       supabaseKey: 'test-key',
       userId: USER_ID,

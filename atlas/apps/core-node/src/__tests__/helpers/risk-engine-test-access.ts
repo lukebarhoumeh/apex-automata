@@ -35,6 +35,7 @@ export interface RiskEngineTestAccess {
   weeklyStartEquity: number;
   checkKillSwitches(): void;
   updateMetrics(): Promise<void>;
+  persistMetrics(): Promise<void>;
   enforceLossGuardrails(currentEquity: number): void;
   simulatePositionAfterOrder(
     position: Position | undefined,
