@@ -2,6 +2,9 @@ import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import { RiskEngine, RiskEngineConfig } from '../trading/risk-engine';
 import { PositionTracker, PositionTrackerConfig } from '../trading/position-tracker';
 import { GuardrailConfig } from '../config/loadGuardrails';
+import { Logger } from '../core/logger';
+import type { Fill, OrderRequest } from '../exchanges/coinbase';
+import { riskEngineInternals } from './helpers/risk-engine-test-access';
 
 // Mock logger
 const mockLogger = {
@@ -9,7 +12,7 @@ const mockLogger = {
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
-};
+} as unknown as Logger;
 
 // Mock Supabase client
 vi.mock('@supabase/supabase-js', () => ({
@@ -158,8 +161,8 @@ describe('RiskEngine', () => {
   };
 
   beforeEach(() => {
-    positionTracker = new PositionTracker(positionTrackerConfig, mockLogger as any);
-    riskEngine = new RiskEngine(riskEngineConfig, mockLogger as any, positionTracker);
+    positionTracker = new PositionTracker(positionTrackerConfig, mockLogger);
+    riskEngine = new RiskEngine(riskEngineConfig, mockLogger, positionTracker);
   });
   
   afterEach(() => {
@@ -218,9 +221,9 @@ describe('RiskEngine', () => {
   describe('Risk Checks', () => {
     test('should reject order when kill switch is active', async () => {
       // Force kill switch active without triggering flatten side-effects
-      (riskEngine as any).killSwitchActive = true;
-      (riskEngine as any).metrics.killSwitchActive = true;
-      
+      riskEngineInternals(riskEngine).killSwitchActive = true;
+      riskEngineInternals(riskEngine).metrics.killSwitchActive = true;
+
       const check = await riskEngine.checkOrder({
         product_id: 'BTC-USD',
         side: 'buy',
@@ -249,23 +252,23 @@ describe('RiskEngine', () => {
         settled: true,
         created_at: new Date().toISOString(),
         usd_volume: '5000',
-      } as any);
+      });
       positionTracker.updateMarketPrice('BTC-USD', 50000);
-      
+
       // Force kill switch active without triggering flatten side-effects
-      (riskEngine as any).killSwitchActive = true;
-      (riskEngine as any).metrics.killSwitchActive = true;
-      
+      riskEngineInternals(riskEngine).killSwitchActive = true;
+      riskEngineInternals(riskEngine).metrics.killSwitchActive = true;
+
       // Reduce long exposure
-      const orderReq = {
+      const orderReq: OrderRequest = {
         product_id: 'BTC-USD',
         side: 'sell',
         type: 'market',
         size: '0.05',
         client_oid: 'exit-123',
-      } as any;
-      
-      const sim = (riskEngine as any).simulatePositionAfterOrder(positionTracker.getPosition('BTC-USD'), orderReq, 50000);
+      };
+
+      const sim = riskEngineInternals(riskEngine).simulatePositionAfterOrder(positionTracker.getPosition('BTC-USD'), orderReq, 50000);
       expect(sim.currentSide).toBe('long');
       expect(sim.isReduceOnly).toBe(true);
       
@@ -276,8 +279,8 @@ describe('RiskEngine', () => {
     
     test('should not trigger daily loss kill switch on profits', () => {
       // Directly invoke internal kill-switch checks (private at type-level only)
-      (riskEngine as any).metrics.dailyPnL = 1000; // +$1,000 day
-      (riskEngine as any).checkKillSwitches();
+      riskEngineInternals(riskEngine).metrics.dailyPnL = 1000; // +$1,000 day
+      riskEngineInternals(riskEngine).checkKillSwitches();
       
       expect(riskEngine.getMetrics().killSwitchActive).toBe(false);
     });
@@ -305,22 +308,22 @@ describe('RiskEngine', () => {
       const closeSpy = vi.spyOn(positionTracker, 'closeAllPositions').mockResolvedValue([]);
 
       // Force a loss beyond killSwitches.dailyLossLimit ($80)
-      (riskEngine as any).metrics.dailyPnL = -100;
-      (riskEngine as any).checkKillSwitches();
-      
+      riskEngineInternals(riskEngine).metrics.dailyPnL = -100;
+      riskEngineInternals(riskEngine).checkKillSwitches();
+
       expect(riskEngine.getMetrics().killSwitchActive).toBe(true);
       // Position flattening is now config-driven and not automatic
       expect(closeSpy).toHaveBeenCalledTimes(0);
-      
+
       // Idempotent: repeated checks shouldn't re-trigger
-      (riskEngine as any).checkKillSwitches();
+      riskEngineInternals(riskEngine).checkKillSwitches();
       expect(closeSpy).toHaveBeenCalledTimes(0);
     });
   });
   
   describe('Trade Outcome Tracking', () => {
     test('updates consecutiveLosses based on closed position realized P&L', async () => {
-      const make = (t: Partial<any>) => ({
+      const make = (t: Partial<Fill>): Fill => ({
         trade_id: t.trade_id ?? 1,
         product_id: 'BTC-USD',
         order_id: t.order_id ?? `order-${t.trade_id ?? 1}`,
@@ -337,23 +340,23 @@ describe('RiskEngine', () => {
       });
       
       // Loss #1: buy 1 @ 1000, sell 1 @ 850 => -150
-      await positionTracker.processFill(make({ trade_id: 1, side: 'buy', price: '1000' }) as any);
-      await positionTracker.processFill(make({ trade_id: 2, side: 'sell', price: '850' }) as any);
+      await positionTracker.processFill(make({ trade_id: 1, side: 'buy', price: '1000' }));
+      await positionTracker.processFill(make({ trade_id: 2, side: 'sell', price: '850' }));
       expect(riskEngine.getMetrics().consecutiveLosses).toBe(1);
       
       // Loss #2
-      await positionTracker.processFill(make({ trade_id: 3, side: 'buy', price: '1000' }) as any);
-      await positionTracker.processFill(make({ trade_id: 4, side: 'sell', price: '850' }) as any);
+      await positionTracker.processFill(make({ trade_id: 3, side: 'buy', price: '1000' }));
+      await positionTracker.processFill(make({ trade_id: 4, side: 'sell', price: '850' }));
       expect(riskEngine.getMetrics().consecutiveLosses).toBe(2);
       
       // Win resets: buy 1 @ 1000, sell 1 @ 1100 => +100
-      await positionTracker.processFill(make({ trade_id: 5, side: 'buy', price: '1000' }) as any);
-      await positionTracker.processFill(make({ trade_id: 6, side: 'sell', price: '1100' }) as any);
+      await positionTracker.processFill(make({ trade_id: 5, side: 'buy', price: '1000' }));
+      await positionTracker.processFill(make({ trade_id: 6, side: 'sell', price: '1100' }));
       expect(riskEngine.getMetrics().consecutiveLosses).toBe(0);
     });
     
     test('records per-symbol realized losses and blocks symbol when limit exceeded', async () => {
-      const make = (t: Partial<any>) => ({
+      const make = (t: Partial<Fill>): Fill => ({
         trade_id: t.trade_id ?? 1,
         product_id: 'BTC-USD',
         order_id: t.order_id ?? `order-${t.trade_id ?? 1}`,
@@ -371,10 +374,10 @@ describe('RiskEngine', () => {
       
       // BTC-USD per-symbol max daily loss is $200 (guardrails in this test).
       // Two -$150 trades should block the symbol.
-      await positionTracker.processFill(make({ trade_id: 1, side: 'buy', price: '1000' }) as any);
-      await positionTracker.processFill(make({ trade_id: 2, side: 'sell', price: '850' }) as any);
-      await positionTracker.processFill(make({ trade_id: 3, side: 'buy', price: '1000' }) as any);
-      await positionTracker.processFill(make({ trade_id: 4, side: 'sell', price: '850' }) as any);
+      await positionTracker.processFill(make({ trade_id: 1, side: 'buy', price: '1000' }));
+      await positionTracker.processFill(make({ trade_id: 2, side: 'sell', price: '850' }));
+      await positionTracker.processFill(make({ trade_id: 3, side: 'buy', price: '1000' }));
+      await positionTracker.processFill(make({ trade_id: 4, side: 'sell', price: '850' }));
       
       expect(riskEngine.isSymbolBlocked('BTC-USD')).toBe(true);
       
@@ -406,7 +409,7 @@ describe('RiskEngine', () => {
           perSymbolNotionalCapUsd: 250,
           minOrderSizeUsd: 25,
         },
-      }, mockLogger as any, positionTracker);
+      }, mockLogger, positionTracker);
       
       // Before any positions open, computeOrderSize should be quarter-risk + quarter exposure cap.
       const sized = softEngine.computeOrderSize('BTC-USD', 50000, 49000);
@@ -420,11 +423,11 @@ describe('RiskEngine', () => {
         type: 'market',
         size: '0.006',
         client_oid: 'soft-1',
-      } as any, 50000);
+      }, 50000);
       expect(check.passed).toBe(false);
       
       // Open and close two positions to consume the soft launch entry budget.
-      const mkFill = (t: Partial<any>) => ({
+      const mkFill = (t: Partial<Fill>): Fill => ({
         trade_id: t.trade_id ?? 1,
         product_id: 'BTC-USD',
         order_id: t.order_id ?? `order-${t.trade_id ?? 1}`,
@@ -440,10 +443,10 @@ describe('RiskEngine', () => {
         usd_volume: t.usd_volume ?? '0',
       });
       
-      await positionTracker.processFill(mkFill({ trade_id: 11, side: 'buy', price: '1000' }) as any);
-      await positionTracker.processFill(mkFill({ trade_id: 12, side: 'sell', price: '1100' }) as any);
-      await positionTracker.processFill(mkFill({ trade_id: 13, side: 'buy', price: '1000' }) as any);
-      await positionTracker.processFill(mkFill({ trade_id: 14, side: 'sell', price: '1100' }) as any);
+      await positionTracker.processFill(mkFill({ trade_id: 11, side: 'buy', price: '1000' }));
+      await positionTracker.processFill(mkFill({ trade_id: 12, side: 'sell', price: '1100' }));
+      await positionTracker.processFill(mkFill({ trade_id: 13, side: 'buy', price: '1000' }));
+      await positionTracker.processFill(mkFill({ trade_id: 14, side: 'sell', price: '1100' }));
       
       // Now soft launch should be inactive, sizing reverts to base capped by 2% safety margin → 0.098.
       const sizedAfter = softEngine.computeOrderSize('BTC-USD', 50000, 49000);

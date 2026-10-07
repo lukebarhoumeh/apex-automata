@@ -32,7 +32,7 @@ const mockLogger: Logger = {
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
-} as any;
+} as unknown as Logger;
 
 describe('Risk Math', () => {
   describe('Per-Trade Risk Validation', () => {
