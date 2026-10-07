@@ -232,7 +232,7 @@ describe('SupabaseWriter', () => {
     it('should track connected status', async () => {
       writer = createWriter();
 
-      let health = writer.getHealth();
+      const health = writer.getHealth();
       expect(health.connected).toBe(true);
 
       // Simulate failure

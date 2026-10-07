@@ -30,10 +30,11 @@ export function ValueDisplay({
       case 'percent':
         return formatPercent(value, decimals);
       case 'number':
-      default:
+      default: {
         if (value == null || isNaN(value)) return '--';
         const formatted = formatNumber(value, decimals);
         return showSign && value > 0 ? `+${formatted}` : formatted;
+      }
     }
   };
 

@@ -39,7 +39,9 @@ async function testCoinbaseWS() {
         if (msg.type === 'ticker') {
           receivedTicker = true;
         }
-      } catch {}
+      } catch {
+        // Ignore malformed frames
+      }
     });
 
     ws.on('error', (err) => {
@@ -56,7 +58,6 @@ async function main() {
   const supabaseResult = await testSupabase(env.SUPABASE_URL || '', env.SUPABASE_SERVICE_KEY || env.SUPABASE_ANON_KEY || '');
   const coinbaseResult = await testCoinbaseWS();
 
-  // eslint-disable-next-line no-console
   console.log(JSON.stringify({
     envPresence: {
       supabaseUrl: Boolean(env.SUPABASE_URL),
@@ -68,7 +69,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  // eslint-disable-next-line no-console
   console.error(JSON.stringify({ ok: false, error: String(err) }));
   process.exit(1);
 });

@@ -24,8 +24,8 @@ export type EventType =
   | 'Alert'
   | 'CandleUpdate';
 
-export interface TickerUpdate extends TickerPayload {}
-export interface CandleUpdate extends CandlePayload {}
+export type TickerUpdate = TickerPayload;
+export type CandleUpdate = CandlePayload;
 
 export interface RuntimeEvent<T = unknown> {
   type: EventType;

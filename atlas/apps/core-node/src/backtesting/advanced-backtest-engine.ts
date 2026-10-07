@@ -743,7 +743,7 @@ export class AdvancedBacktestEngine extends EventEmitter {
   
   private calculateMaxDrawdownDuration(): number {
     let maxDuration = 0;
-    let currentDuration = 0;
+    const currentDuration = 0;
     let peak = this.config.initialCapital;
     let drawdownStart: Date | null = null;
     

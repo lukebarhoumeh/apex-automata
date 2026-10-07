@@ -22,7 +22,6 @@ async function main() {
     .parse();
 
   // Always show help banner once for Sprint 0 acceptance
-  // eslint-disable-next-line no-console
   console.log('\nUsage: atlas --config ../../config/paper.local.yaml\n');
 
   const configPath = path.resolve(String(argv.config));
@@ -106,7 +105,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  // eslint-disable-next-line no-console
   console.error(err);
   process.exit(1);
 });

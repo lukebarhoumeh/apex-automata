@@ -123,7 +123,6 @@ export function parseCliArgs(argv: string[], now: Date = new Date()): CliArgs {
       continue;
     }
     if (arg === '--help' || arg === '-h') {
-      // eslint-disable-next-line no-console
       console.log(usage());
       process.exit(0);
     }
@@ -387,7 +386,6 @@ async function main(): Promise<void> {
   try {
     args = parseCliArgs(process.argv.slice(2));
   } catch (err) {
-    // eslint-disable-next-line no-console
     console.error(`error: ${err instanceof Error ? err.message : String(err)}\n\n${usage()}`);
     process.exit(2);
     return;
@@ -422,20 +420,16 @@ async function main(): Promise<void> {
 
   // Human-readable summary line on stderr (so stdout stays a clean JSON doc).
   const headline = `pass: ${summary.passed}/${summary.total} clean / fail: ${summary.failed} trades with issues`;
-  // eslint-disable-next-line no-console
   console.error(headline);
   for (const f of summary.failures.slice(0, 25)) {
     const reasons = f.violations.map((v) => v.reason).join('; ');
-    // eslint-disable-next-line no-console
     console.error(`  FAIL  ${f.trade.id}  ${f.trade.symbol}  ${f.trade.entry_time}  →  ${reasons}`);
   }
   if (summary.failures.length > 25) {
-    // eslint-disable-next-line no-console
     console.error(`  ... ${summary.failures.length - 25} more (see stdout JSON for full list)`);
   }
 
   // Machine-readable summary on stdout for piping/CI.
-  // eslint-disable-next-line no-console
   console.log(JSON.stringify(summary, null, 2));
 
   if (args.strict && summary.failed > 0) {
@@ -449,7 +443,6 @@ async function main(): Promise<void> {
 const invokedDirectly = process.argv[1] && process.argv[1].endsWith('audit-trades.ts');
 if (invokedDirectly) {
   main().catch((err) => {
-    // eslint-disable-next-line no-console
     console.error(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
     process.exit(2);
   });

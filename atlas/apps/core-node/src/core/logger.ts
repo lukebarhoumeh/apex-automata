@@ -34,7 +34,6 @@ export function createLogger(logFilePath?: string): Logger {
     } else if (level === 'error') {
       prefix = '\u001b[31mERROR\u001b[0m';
     }
-    // eslint-disable-next-line no-console
     console.log(`${prefix} ${line.t} ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`);
     if (stream) {
       stream.write(JSON.stringify(line) + '\n');

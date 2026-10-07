@@ -50,7 +50,7 @@ const Signals = () => {
   const updateLocal = (name: string, updates: Partial<StrategySignal>) => {
     setLocalConfig((prev) => ({
       ...prev,
-      [name]: { ...(prev[name] || strategySignals?.find((s) => s.name === name)!), ...updates },
+      [name]: { ...(prev[name] || (strategySignals?.find((s) => s.name === name) as StrategySignal)), ...updates },
     }));
     setHasChanges(true);
   };
