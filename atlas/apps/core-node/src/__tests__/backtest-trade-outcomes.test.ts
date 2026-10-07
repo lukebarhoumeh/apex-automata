@@ -42,7 +42,7 @@ function makeLogger() {
     debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
-  } as any;
+  };
 }
 
 /**

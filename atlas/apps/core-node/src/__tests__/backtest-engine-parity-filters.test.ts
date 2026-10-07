@@ -16,9 +16,10 @@ import { BacktestEngine, type BacktestConfig } from '../backtesting/backtest-eng
 import { buildBacktestConfig, buildFeeModel, resolveFeeTier } from '../backtesting/backtest-cli-config';
 import { loadGuardrails } from '../config/loadGuardrails';
 import type { Signal } from '../strategies/signal-processor';
+import { backtestEngineInternals } from './helpers/backtest-engine-test-access';
 
 function makeLogger() {
-  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as any;
+  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
 
 function cfg(overrides: Partial<BacktestConfig> = {}): BacktestConfig {
@@ -60,11 +61,11 @@ function signal(direction: 'buy' | 'sell', price: number, stop: number, tp: numb
 describe('engine parity — execution.minHoldBars (cooldown in bars)', () => {
   it('default 0: an opposite signal on the entry bar closes the position (pre-E4 behaviour)', () => {
     const engine = new BacktestEngine(cfg(), makeLogger());
-    const eng = engine as any;
+    const eng = backtestEngineInternals(engine);
     eng.initializeSignalProcessor();
     eng.barIndex = 10;
     eng.currentBarTime = new Date('2024-01-01T10:00:00Z');
-    eng.openPositionAt(signal('buy', 100, 98, 106), 100, eng.currentBarTime);
+    eng.openPositionAt(signal('buy', 100, 98, 106), 100, eng.currentBarTime!);
     expect(eng.positions.get('BTC-USD')?.entryBarIndex).toBe(10);
     eng.handleSignal(signal('sell', 101, 103, 96));
     expect(eng.positions.size).toBe(0);
@@ -74,17 +75,17 @@ describe('engine parity — execution.minHoldBars (cooldown in bars)', () => {
   it('minHoldBars=1: the same-bar opposite signal is ignored (exit_position_too_young), the next bar may exit', () => {
     const logger = makeLogger();
     const engine = new BacktestEngine(cfg({ execution: { minHoldBars: 1 } }), logger);
-    const eng = engine as any;
+    const eng = backtestEngineInternals(engine);
     eng.initializeSignalProcessor();
     eng.barIndex = 10;
     eng.currentBarTime = new Date('2024-01-01T10:00:00Z');
-    eng.openPositionAt(signal('buy', 100, 98, 106), 100, eng.currentBarTime);
+    eng.openPositionAt(signal('buy', 100, 98, 106), 100, eng.currentBarTime!);
 
     eng.handleSignal(signal('sell', 101, 103, 96)); // barsHeld = 0 < 1
     expect(eng.positions.size).toBe(1);
     expect(eng.exitsIgnoredMinHold).toBe(1);
-    const filtered = logger.info.mock.calls.find((c: any[]) => c[0] === 'signal:filtered' && c[1]?.extra?.reason === 'exit_position_too_young')
-      ?? logger.info.mock.calls.find((c: any[]) => JSON.stringify(c).includes('exit_position_too_young'));
+    const filtered = logger.info.mock.calls.find((c) => c[0] === 'signal:filtered' && c[1]?.extra?.reason === 'exit_position_too_young')
+      ?? logger.info.mock.calls.find((c) => JSON.stringify(c).includes('exit_position_too_young'));
     expect(filtered).toBeDefined();
 
     eng.barIndex = 11;
@@ -98,12 +99,12 @@ describe('engine parity — execution.minHoldBars (cooldown in bars)', () => {
 
   it('stops and take-profits bypass the min hold (same as live position monitor)', () => {
     const engine = new BacktestEngine(cfg({ execution: { minHoldBars: 5 } }), makeLogger());
-    const eng = engine as any;
+    const eng = backtestEngineInternals(engine);
     eng.initializeSignalProcessor();
     eng.barIndex = 3;
     eng.currentBarTime = new Date('2024-01-01T03:00:00Z');
-    eng.openPositionAt(signal('buy', 100, 98, 106), 100, eng.currentBarTime);
-    eng.checkExitConditions('BTC-USD', { time: Date.UTC(2024, 0, 1, 3), open: 100, high: 100.5, low: 97, close: 97.5, volume: 1 }, eng.currentBarTime);
+    eng.openPositionAt(signal('buy', 100, 98, 106), 100, eng.currentBarTime!);
+    eng.checkExitConditions('BTC-USD', { time: Date.UTC(2024, 0, 1, 3), open: 100, high: 100.5, low: 97, close: 97.5, volume: 1 }, eng.currentBarTime!);
     expect(eng.positions.size).toBe(0);
     expect(eng.closedTrades[0].exitReason).toBe('stop_loss');
     expect(eng.exitsIgnoredMinHold).toBe(0);
@@ -113,7 +114,7 @@ describe('engine parity — execution.minHoldBars (cooldown in bars)', () => {
 describe('engine parity — filters.atrVolatilityMin/Max (live atr_vol stage)', () => {
   it('rejects an entry whose ATR% is below the min or above the max; passes inside the band or without ATR', () => {
     const engine = new BacktestEngine(cfg({ filters: { atrVolatilityMin: 0.005, atrVolatilityMax: 0.05 } }), makeLogger());
-    const eng = engine as any;
+    const eng = backtestEngineInternals(engine);
     eng.initializeSignalProcessor();
     eng.currentBarTime = new Date('2024-01-01T00:00:00Z');
 
@@ -137,7 +138,7 @@ describe('engine parity — filters.atrVolatilityMin/Max (live atr_vol stage)', 
 
   it('no `filters` block ⇒ no filtering (pre-E4 behaviour)', () => {
     const engine = new BacktestEngine(cfg(), makeLogger());
-    const eng = engine as any;
+    const eng = backtestEngineInternals(engine);
     eng.initializeSignalProcessor();
     eng.currentBarTime = new Date('2024-01-01T00:00:00Z');
     eng.handleSignal(signal('buy', 100, 98, 106, 0.1));

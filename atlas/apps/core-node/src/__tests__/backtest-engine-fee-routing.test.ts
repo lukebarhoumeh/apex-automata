@@ -36,7 +36,7 @@ function makeLogger() {
     debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
-  } as any;
+  };
 }
 
 function buildSyntheticCandles(count: number, seed = 42): OHLCV[] {
@@ -160,7 +160,7 @@ describe('BacktestEngine — per-symbol fee routing (#11)', () => {
   it('throws if neither feeModel nor commission is configured', () => {
     const broken = feeRoutingConfig(['BTC-USD']);
     // Delete the feeModel so neither path is configured.
-    delete (broken as any).feeModel;
+    delete broken.feeModel;
     expect(() => new BacktestEngine(broken, makeLogger())).toThrowError(
       /feeModel.*commission|commission.*feeModel/i,
     );

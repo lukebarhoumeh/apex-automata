@@ -153,7 +153,7 @@ describe('Bug A — trend_follow emits ONCE per EMA crossover (no per-bar re-emi
     const signals = strategy.generateSignals(ctx);
     expect(signals).toHaveLength(1);
     expect(signals[0].direction).toBe('buy');
-    expect((signals[0].metadata as any).crossoverBarsAgo).toBe(0);
+    expect(signals[0].metadata.crossoverBarsAgo).toBe(0);
   });
 
   it('emits ZERO signals on each of bars N+1 through N+5 after the cross', () => {
@@ -341,7 +341,7 @@ describe('Bug B — momentum SELL only fires when RSI crosses UP through 70 (not
     const signals = strategy.generateSignals(ctx);
     const sells = signals.filter(s => s.direction === 'sell');
     expect(sells).toHaveLength(1);
-    expect((sells[0].metadata as any).rsiCrossedInto).toBe('overbought');
+    expect(sells[0].metadata.rsiCrossedInto).toBe('overbought');
   });
 });
 
@@ -368,6 +368,6 @@ describe('Bug B — momentum BUY only fires when RSI crosses DOWN through 30 (no
     const signals = strategy.generateSignals(ctx);
     const buys = signals.filter(s => s.direction === 'buy');
     expect(buys).toHaveLength(1);
-    expect((buys[0].metadata as any).rsiCrossedInto).toBe('oversold');
+    expect(buys[0].metadata.rsiCrossedInto).toBe('oversold');
   });
 });

@@ -52,9 +52,55 @@ afterEach(() => {
   }
 });
 
+/** A strategy param override block ({ stopAtr, takeProfitAtr, ... }). */
+interface OverrideParams {
+  stopAtr?: number;
+  takeProfitAtr?: number;
+  [key: string]: unknown;
+}
+
+/** A per_symbol / perps_symbols / hyperliquid_symbols entry. */
+interface SymbolBlock {
+  max_notional_usd?: number;
+  max_daily_loss_usd?: number;
+  disabled_strategies?: string[];
+  strategy_overrides?: Record<string, OverrideParams>;
+  [key: string]: unknown;
+}
+
+/**
+ * Structural view of the parsed canonical guardrails YAML covering exactly
+ * the paths the drift fixtures mutate. Keys a fixture deletes are optional;
+ * everything else falls through to the `unknown` index signatures.
+ */
+interface CanonicalDoc {
+  fees?: unknown;
+  disabled_strategies: string[];
+  filters: { atr_volatility_min: number; [key: string]: unknown };
+  strategy: { trade_cooldown_min: number; [key: string]: unknown };
+  momentum: { requireMacdConfirm: boolean; takeProfitAtr: number; [key: string]: unknown };
+  risk: { min_ev_threshold: number; [key: string]: unknown };
+  per_symbol: Record<string, SymbolBlock>;
+  perps_symbols: Record<string, SymbolBlock>;
+  hyperliquid_symbols: Record<string, SymbolBlock>;
+  regime_gates?: {
+    enabled: boolean;
+    paper_only: boolean;
+    rules: Array<{
+      strategy: string;
+      venues?: string[];
+      symbols?: string[];
+      block_regimes: string[];
+      [key: string]: unknown;
+    }>;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
 interface FixtureOptions {
   /** Mutate the parsed canonical YAML before it is written. */
-  mutateCanonical?: (doc: Record<string, any>) => void;
+  mutateCanonical?: (doc: CanonicalDoc) => void;
   /** Omit the canonical file entirely. */
   omitCanonical?: boolean;
   /** Content for the core-node stub; `null` omits the file. Defaults to the real stub. */
@@ -96,7 +142,13 @@ function codes(violations: DriftViolation[]): DriftViolationCode[] {
   return violations.map((v) => v.code);
 }
 
-function withStrategies(mutate: (strategies: Record<string, any>) => void): string {
+/** A strategies.json entry ({ enabled, ...smuggled params }). */
+interface StrategiesJsonEntry {
+  enabled?: boolean;
+  [key: string]: unknown;
+}
+
+function withStrategies(mutate: (strategies: Record<string, StrategiesJsonEntry>) => void): string {
   const doc = JSON.parse(realStrategiesJson);
   mutate(doc.strategies);
   return JSON.stringify(doc, null, 2);
@@ -318,7 +370,7 @@ describe('checkConfigDrift() fixtures', () => {
   });
 
   describe('desk pins', () => {
-    const pinCase = (name: string, mutate: (doc: Record<string, any>) => void, expectedKeys: string[], expectedCodes?: DriftViolationCode[]) =>
+    const pinCase = (name: string, mutate: (doc: CanonicalDoc) => void, expectedKeys: string[], expectedCodes?: DriftViolationCode[]) =>
       test(name, () => {
         const { violations } = checkConfigDrift(makeRepo({ mutateCanonical: mutate }));
         expect(violations.map((v) => v.key)).toEqual(expectedKeys);
@@ -360,15 +412,15 @@ describe('checkConfigDrift() fixtures', () => {
 
     pinCase(
       'spot per-symbol momentum takeProfitAtr override must stay 5.0',
-      (doc) => { doc.per_symbol['ETH-USD'].strategy_overrides.momentum.takeProfitAtr = 6.0; },
+      (doc) => { doc.per_symbol['ETH-USD'].strategy_overrides!.momentum.takeProfitAtr = 6.0; },
       ['per_symbol.ETH-USD.strategy_overrides.momentum.takeProfitAtr']
     );
 
     pinCase(
       'perps momentum takeProfitAtr overrides must stay 6.0',
       (doc) => {
-        doc.perps_symbols['ETH-PERP-INTX'].strategy_overrides.momentum.takeProfitAtr = 5.0;
-        delete doc.perps_symbols['BTC-PERP-INTX'].strategy_overrides.momentum.takeProfitAtr;
+        doc.perps_symbols['ETH-PERP-INTX'].strategy_overrides!.momentum.takeProfitAtr = 5.0;
+        delete doc.perps_symbols['BTC-PERP-INTX'].strategy_overrides!.momentum.takeProfitAtr;
       },
       [
         'perps_symbols.ETH-PERP-INTX.strategy_overrides.momentum.takeProfitAtr',
@@ -384,7 +436,7 @@ describe('checkConfigDrift() fixtures', () => {
 
     pinCase(
       'trend_follow 2.5 / 6.0 must be carried by every symbol block (spot)',
-      (doc) => { delete doc.per_symbol['BTC-USD'].strategy_overrides.trend_follow; },
+      (doc) => { delete doc.per_symbol['BTC-USD'].strategy_overrides!.trend_follow; },
       [
         'per_symbol.BTC-USD.strategy_overrides.trend_follow.stopAtr',
         'per_symbol.BTC-USD.strategy_overrides.trend_follow.takeProfitAtr',
@@ -394,8 +446,8 @@ describe('checkConfigDrift() fixtures', () => {
     pinCase(
       'trend_follow takeProfitAtr drift on a perp or HL symbol is caught',
       (doc) => {
-        doc.perps_symbols['BTC-PERP-INTX'].strategy_overrides.trend_follow.takeProfitAtr = 5.0;
-        doc.hyperliquid_symbols['ETH-USD'].strategy_overrides.trend_follow.stopAtr = 2.0;
+        doc.perps_symbols['BTC-PERP-INTX'].strategy_overrides!.trend_follow.takeProfitAtr = 5.0;
+        doc.hyperliquid_symbols['ETH-USD'].strategy_overrides!.trend_follow.stopAtr = 2.0;
       },
       [
         'perps_symbols.BTC-PERP-INTX.strategy_overrides.trend_follow.takeProfitAtr',
@@ -465,7 +517,7 @@ describe('checkConfigDrift() fixtures', () => {
       const { violations } = checkConfigDrift(
         makeRepo({
           mutateCanonical: (doc) => {
-            doc.regime_gates.enabled = false;
+            doc.regime_gates!.enabled = false;
           },
         })
       );
@@ -477,7 +529,7 @@ describe('checkConfigDrift() fixtures', () => {
       const { violations } = checkConfigDrift(
         makeRepo({
           mutateCanonical: (doc) => {
-            doc.regime_gates.rules[0].venues = ['PERP'];
+            doc.regime_gates!.rules[0].venues = ['PERP'];
           },
         })
       );
@@ -490,7 +542,7 @@ describe('checkConfigDrift() fixtures', () => {
       const { violations } = checkConfigDrift(
         makeRepo({
           mutateCanonical: (doc) => {
-            doc.regime_gates.rules[0].symbols = ['BTC-USD'];
+            doc.regime_gates!.rules[0].symbols = ['BTC-USD'];
           },
         })
       );
@@ -511,7 +563,7 @@ describe('checkConfigDrift() fixtures', () => {
       const { violations } = checkConfigDrift(
         makeRepo({
           mutateCanonical: (doc) => {
-            doc.regime_gates.rules[0].block_regimes = ['weak_trend', 'choppy'];
+            doc.regime_gates!.rules[0].block_regimes = ['weak_trend', 'choppy'];
           },
         })
       );
@@ -522,7 +574,7 @@ describe('checkConfigDrift() fixtures', () => {
       const { violations } = checkConfigDrift(
         makeRepo({
           mutateCanonical: (doc) => {
-            doc.regime_gates.rules[0].block_regimes = [];
+            doc.regime_gates!.rules[0].block_regimes = [];
           },
         })
       );
@@ -536,7 +588,7 @@ describe('checkConfigDrift() fixtures', () => {
       const { violations } = checkConfigDrift(
         makeRepo({
           mutateCanonical: (doc) => {
-            doc.regime_gates.rules[0].block_regimes = ['ranging'];
+            doc.regime_gates!.rules[0].block_regimes = ['ranging'];
           },
         })
       );
@@ -548,7 +600,7 @@ describe('checkConfigDrift() fixtures', () => {
       const { violations } = checkConfigDrift(
         makeRepo({
           mutateCanonical: (doc) => {
-            doc.regime_gates.rules = [];
+            doc.regime_gates!.rules = [];
           },
         })
       );
@@ -561,7 +613,7 @@ describe('checkConfigDrift() fixtures', () => {
       const { violations } = checkConfigDrift(
         makeRepo({
           mutateCanonical: (doc) => {
-            doc.regime_gates.rules[0].strategy = 'momentum';
+            doc.regime_gates!.rules[0].strategy = 'momentum';
           },
         })
       );
@@ -585,7 +637,7 @@ describe('checkConfigDrift() fixtures', () => {
       const { violations } = checkConfigDrift(
         makeRepo({
           mutateCanonical: (doc) => {
-            doc.regime_gates.paper_only = false;
+            doc.regime_gates!.paper_only = false;
           },
         })
       );

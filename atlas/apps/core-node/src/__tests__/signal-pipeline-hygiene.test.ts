@@ -257,11 +257,11 @@ describe('Audit fix #4 — per-stage signal:filtered telemetry', () => {
       });
     }
     // Each stage produced its own log line — five total in this test.
-    const calls = (mockLogger.info as any).mock.calls.filter(
-      (c: any[]) => c[0] === 'signal:filtered',
+    const calls = vi.mocked(mockLogger.info).mock.calls.filter(
+      (c) => c[0] === 'signal:filtered',
     );
     expect(calls.length).toBeGreaterThanOrEqual(5);
-    const seenStages = new Set(calls.map((c: any[]) => c[1].stage));
+    const seenStages = new Set(calls.map((c) => (c[1] as { stage: string }).stage));
     for (const stage of stages) expect(seenStages.has(stage)).toBe(true);
   });
 });
@@ -302,10 +302,10 @@ describe('Silent-funnel regression (2026-05-11) — new stages emit signal:filte
         direction: 'buy',
       });
     }
-    const calls = (mockLogger.info as any).mock.calls.filter(
-      (c: any[]) => c[0] === 'signal:filtered',
+    const calls = vi.mocked(mockLogger.info).mock.calls.filter(
+      (c) => c[0] === 'signal:filtered',
     );
-    const seen = new Set(calls.map((c: any[]) => c[1].stage));
+    const seen = new Set(calls.map((c) => (c[1] as { stage: string }).stage));
     for (const stage of NEW_STAGES) expect(seen.has(stage), `${stage} must emit signal:filtered`).toBe(true);
 
     // Counter labels are bounded — every stage should also be counted.
@@ -411,6 +411,13 @@ function makeQuietProcessor(overrides: Partial<SignalProcessorConfig> = {}): Sig
   return new SignalProcessor(config, mockLogger as unknown as Logger);
 }
 
+/**
+ * Typed view onto BaseStrategy's protected `getConfig` (read-only poke; the
+ * cast only unlocks the type-level `protected`, no runtime effect).
+ */
+type ConfigReader = { getConfig<T>(key: string, defaultValue: T, symbol?: string): T };
+const configReader = (strategy: object): ConfigReader => strategy as unknown as ConfigReader;
+
 describe('Audit fix #5 — momentum plugin defaults are the source of truth', () => {
   it('plugin uses configSchema defaults (30/70 industry-standard) when no overrides are passed', () => {
     // strategy-tuning (Bug B, 2026-05): defaults previously drifted to
@@ -419,16 +426,16 @@ describe('Audit fix #5 — momentum plugin defaults are the source of truth', ()
     // schema defaults and inline getConfig fallbacks.
     const m = new MomentumStrategy();
     // Read-only access via getConfig: BaseStrategy stores the merged config.
-    const oversold = (m as any).getConfig('rsiOversold', undefined as unknown as number);
-    const overbought = (m as any).getConfig('rsiOverbought', undefined as unknown as number);
+    const oversold = configReader(m).getConfig('rsiOversold', undefined as unknown as number);
+    const overbought = configReader(m).getConfig('rsiOverbought', undefined as unknown as number);
     expect(oversold).toBe(30);
     expect(overbought).toBe(70);
   });
 
   it('explicit YAML overrides win over plugin defaults', () => {
     const m = new MomentumStrategy({ rsiOversold: 25, rsiOverbought: 75 });
-    const oversold = (m as any).getConfig('rsiOversold', undefined as unknown as number);
-    const overbought = (m as any).getConfig('rsiOverbought', undefined as unknown as number);
+    const oversold = configReader(m).getConfig('rsiOversold', undefined as unknown as number);
+    const overbought = configReader(m).getConfig('rsiOverbought', undefined as unknown as number);
     expect(oversold).toBe(25);
     expect(overbought).toBe(75);
   });

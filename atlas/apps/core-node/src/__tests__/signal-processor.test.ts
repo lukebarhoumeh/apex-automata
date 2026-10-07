@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, vi } from 'vitest';
-import { SignalProcessor, SignalProcessorConfig } from '../strategies/signal-processor';
+import { SignalProcessor, SignalProcessorConfig, type Signal } from '../strategies/signal-processor';
 import { OHLCV } from '../indicators/technical';
 import type { MarketContext, StrategyPlugin } from '../strategies/plugins/types';
 import type { Logger } from '../core/logger';
@@ -125,7 +125,7 @@ describe('SignalProcessor', () => {
 
   describe('Donchian Breakout Strategy', () => {
     test('should generate buy signal on upper channel breakout', async () => {
-      const signals: any[] = [];
+      const signals: Signal[] = [];
       signalProcessor.on('signal:generated', (signal) => signals.push(signal));
 
       // Feed candles to build Donchian channel

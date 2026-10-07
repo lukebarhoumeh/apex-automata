@@ -24,9 +24,10 @@ import { computeRiskBasedSize } from '../trading/risk/position-sizing';
 import { isShortingAllowed, venueForSymbol } from '../trading/execution/venue-capabilities';
 import { OHLCV } from '../indicators/technical';
 import type { Signal } from '../strategies/signal-processor';
+import { backtestEngineInternals } from './helpers/backtest-engine-test-access';
 
 function makeLogger() {
-  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as any;
+  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
 
 function buildSyntheticCandles(count: number, seed = 1, barMs = 900_000): OHLCV[] {
@@ -223,7 +224,7 @@ describe('TASK_017 §2 — spot is long-only by venue capability', () => {
 
   it('handleSignal drops a spot SELL with no position and closes an open long on SELL', () => {
     const engine = new BacktestEngine(baseConfig({ evGate: { mode: 'off' } }), makeLogger());
-    const eng = engine as any;
+    const eng = backtestEngineInternals(engine);
     eng.initializeSignalProcessor();
     eng.currentBarTime = new Date('2024-01-01T00:00:00Z');
 
@@ -262,38 +263,46 @@ describe('TASK_017 §3 — EV gate in the backtest engine', () => {
     // Round trip at 120 bps taker = 2 · 0.012 · $1500 = $36 → EV = −$33.00.
     const signal = fakeSignal('buy', 3000, 2985, 3037.5);
 
-    const strict = new BacktestEngine(baseConfig({ commission: 0.012, evGate: { mode: 'enforce' } }), makeLogger());
-    (strict as any).initializeSignalProcessor();
-    const rejected = (strict as any).evaluateEntryEv(signal, 3000, 2985, 3037.5, 0.5);
+    const strict = backtestEngineInternals(
+      new BacktestEngine(baseConfig({ commission: 0.012, evGate: { mode: 'enforce' } }), makeLogger()),
+    );
+    strict.initializeSignalProcessor();
+    const rejected = strict.evaluateEntryEv(signal, 3000, 2985, 3037.5, 0.5);
     expect(rejected.allowed).toBe(false);
-    expect(rejected.record.ev).toBeCloseTo(-33, 6);
-    expect(rejected.record.p).toBeCloseTo(0.4, 9);
-    expect(rejected.record.feeUsd).toBeCloseTo(36, 6);
-    expect((strict as any).evGateStats.rejected).toBe(1);
-    expect((strict as any).evGateStats.rejectedByStrategy.momentum).toBe(1);
+    expect(rejected.record!.ev).toBeCloseTo(-33, 6);
+    expect(rejected.record!.p).toBeCloseTo(0.4, 9);
+    expect(rejected.record!.feeUsd).toBeCloseTo(36, 6);
+    expect(strict.evGateStats.rejected).toBe(1);
+    expect(strict.evGateStats.rejectedByStrategy.momentum).toBe(1);
 
-    const free = new BacktestEngine(baseConfig({ commission: 0, evGate: { mode: 'enforce' } }), makeLogger());
-    (free as any).initializeSignalProcessor();
-    const allowed = (free as any).evaluateEntryEv(signal, 3000, 2985, 3037.5, 0.5);
+    const free = backtestEngineInternals(
+      new BacktestEngine(baseConfig({ commission: 0, evGate: { mode: 'enforce' } }), makeLogger()),
+    );
+    free.initializeSignalProcessor();
+    const allowed = free.evaluateEntryEv(signal, 3000, 2985, 3037.5, 0.5);
     expect(allowed.allowed).toBe(true);
-    expect(allowed.record.ev).toBeCloseTo(3, 6);
-    expect(allowed.record.feeUsd).toBe(0);
+    expect(allowed.record!.ev).toBeCloseTo(3, 6);
+    expect(allowed.record!.feeUsd).toBe(0);
   });
 
   it('shadow mode allows the negative-EV entry but counts it; off mode does not evaluate', () => {
     const signal = fakeSignal('buy', 3000, 2985, 3037.5);
-    const shadow = new BacktestEngine(baseConfig({ commission: 0.012, evGate: { mode: 'shadow' } }), makeLogger());
-    (shadow as any).initializeSignalProcessor();
-    const res = (shadow as any).evaluateEntryEv(signal, 3000, 2985, 3037.5, 0.5);
+    const shadow = backtestEngineInternals(
+      new BacktestEngine(baseConfig({ commission: 0.012, evGate: { mode: 'shadow' } }), makeLogger()),
+    );
+    shadow.initializeSignalProcessor();
+    const res = shadow.evaluateEntryEv(signal, 3000, 2985, 3037.5, 0.5);
     expect(res.allowed).toBe(true);
-    expect(res.record.shadowWouldReject).toBe(true);
-    expect((shadow as any).evGateStats.shadowWouldReject).toBe(1);
-    expect((shadow as any).evGateStats.rejected).toBe(0);
+    expect(res.record!.shadowWouldReject).toBe(true);
+    expect(shadow.evGateStats.shadowWouldReject).toBe(1);
+    expect(shadow.evGateStats.rejected).toBe(0);
 
-    const off = new BacktestEngine(baseConfig({ commission: 0.012, evGate: { mode: 'off' } }), makeLogger());
-    (off as any).initializeSignalProcessor();
-    expect((off as any).evaluateEntryEv(signal, 3000, 2985, 3037.5, 0.5)).toEqual({ allowed: true });
-    expect((off as any).evGateStats.evaluated).toBe(0);
+    const off = backtestEngineInternals(
+      new BacktestEngine(baseConfig({ commission: 0.012, evGate: { mode: 'off' } }), makeLogger()),
+    );
+    off.initializeSignalProcessor();
+    expect(off.evaluateEntryEv(signal, 3000, 2985, 3037.5, 0.5)).toEqual({ allowed: true });
+    expect(off.evGateStats.evaluated).toBe(0);
   });
 
   it('end-to-end: enforce at 120 bps opens no more trades than at 0 bps and reports rejects', async () => {
@@ -315,7 +324,7 @@ describe('TASK_017 §3 — EV gate in the backtest engine', () => {
 describe('TASK_017 §4/§5 — equity-based sizing and hold time', () => {
   it('sizes the next trade from current cash equity after a loss', () => {
     const engine = new BacktestEngine(baseConfig({ commission: 0.001, evGate: { mode: 'off' } }), makeLogger());
-    const eng = engine as any;
+    const eng = backtestEngineInternals(engine);
     eng.initializeSignalProcessor();
 
     const t0 = new Date('2024-01-01T00:00:00Z');

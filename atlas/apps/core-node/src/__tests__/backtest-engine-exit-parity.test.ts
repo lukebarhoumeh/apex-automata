@@ -31,6 +31,7 @@ import { PositionMonitor, type PositionExitCondition } from '../trading/position
 import { PositionTracker, type Position } from '../trading/position-tracker';
 import type { Signal } from '../strategies/signal-processor';
 import type { OHLCV } from '../indicators/technical';
+import { backtestEngineInternals, type BacktestEngineTestAccess } from './helpers/backtest-engine-test-access';
 
 vi.mock('@supabase/supabase-js', () => ({
   createClient: () => ({
@@ -48,7 +49,7 @@ vi.mock('@supabase/supabase-js', () => ({
 }));
 
 function makeLogger() {
-  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as any;
+  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
 
 /**
@@ -109,11 +110,11 @@ function bar(time: number, open: number, high: number, low: number, close: numbe
 /** Engine with the signal processor initialised and a long opened at `entry` on bar 10. */
 function openLong(config: BacktestConfig, sig: Signal, entry = 1000) {
   const engine = new BacktestEngine(config, makeLogger());
-  const eng = engine as any;
+  const eng = backtestEngineInternals(engine);
   eng.initializeSignalProcessor();
   eng.barIndex = 10;
   eng.currentBarTime = new Date(t(10));
-  eng.openPositionAt(sig, entry, eng.currentBarTime);
+  eng.openPositionAt(sig, entry, eng.currentBarTime!);
   expect(eng.positions.size).toBe(1);
   return { engine, eng, position: eng.positions.get('BTC-USD') };
 }
@@ -312,9 +313,9 @@ describe('G1 — time stop (completed bars of the symbol, entry bar included)', 
 
 describe('G1/G3 — through the bar loop (processTimeSteps on fixture candles)', () => {
   /** Ten 15m bars; a buy is injected at bar 1's close so it fills at bar 2's open. */
-  async function runWith(config: BacktestConfig, candles: OHLCV[]): Promise<{ result: BacktestResult; eng: any }> {
+  async function runWith(config: BacktestConfig, candles: OHLCV[]): Promise<{ result: BacktestResult; eng: BacktestEngineTestAccess }> {
     const engine = new BacktestEngine(config, makeLogger());
-    const eng = engine as any;
+    const eng = backtestEngineInternals(engine);
     await engine.loadHistoricalData(async () => candles);
     eng.initializeSignalProcessor();
     const processor = engine.getSignalProcessor()!;
