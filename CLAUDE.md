@@ -33,6 +33,7 @@ pnpm exec vitest run <file>   # single file
 pnpm build            # rimraf dist && tsc (has pre-existing type errors; runtime uses tsx)
 pnpm exec tsx src/cli/backtest.ts --start-date <s> --end-date <e> --products BTC-USD --fixture-dir fixtures/bars/15m/<set>
                       # NEVER `pnpm backtest -- --flags` (yargs eats the flags). 12-month runs take minutes.
+pnpm cb:preflight     # Read-only Coinbase Advanced Trade account check (auth, permissions, balances, fee tier, specs)
 pnpm diagnose         # System diagnostics
 ```
 
