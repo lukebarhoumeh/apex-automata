@@ -54,6 +54,8 @@ export interface CoinbaseOrder {
   type: 'limit' | 'market' | 'stop';
   post_only?: boolean;
   created_at: string;
+  /** Completion timestamp (last fill time); empty string when the order is still open. */
+  done_at?: string;
   fill_fees: string;
   filled_size: string;
   executed_value: string;
@@ -139,8 +141,10 @@ export interface Candle {
 export type Granularity = 60 | 300 | 900 | 3600 | 21600 | 86400;
 
 export interface HistoricRatesParams {
-  start: string;
-  end: string;
+  /** Optional — the Coinbase candles endpoint returns the most recent window when omitted. */
+  start?: string;
+  /** Optional — the Coinbase candles endpoint returns the most recent window when omitted. */
+  end?: string;
   granularity: Granularity;
 }
 

@@ -427,9 +427,18 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
     this.ensureConnected();
     try {
       const hlSymbol = toHyperliquidSymbol(symbol);
-      const predicted: any[] = await this.sdk!.info.perpetuals.getPredictedFundings();
-      const entry = predicted.find((p: any) =>
-        p[0] === hlSymbol || p[0] === hlSymbol.replace('-PERP', '')
+      // The hyperliquid SDK declares `PredictedFundings` as a coin-keyed map, but
+      // the actual `/info { type: "predictedFundings" }` payload (which the SDK
+      // passes through) is an array of `[coin, venueData]` tuples — the shape this
+      // code has always consumed at runtime. Re-declare the wire shape locally and
+      // cast, since the SDK's .d.ts does not match its own runtime value.
+      type PredictedFundingTuple = [
+        coin: string,
+        venueData: { fundingRate?: string; predictedRate?: string } | null | undefined,
+      ];
+      const predicted = (await this.sdk!.info.perpetuals.getPredictedFundings()) as unknown as PredictedFundingTuple[];
+      const entry = predicted.find(
+        (p) => p[0] === hlSymbol || p[0] === hlSymbol.replace('-PERP', ''),
       );
 
       if (!entry) return null;
