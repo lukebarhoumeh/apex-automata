@@ -45,3 +45,6 @@ atlas/var/backtest_results/
 
 # Local backtest artifacts (stdout dumps, reports, session folders)
 atlas/var/backtest_results/
+
+# Local Cursor editor config (agents/rules/skills/mcp) - kept local only
+.cursor/
