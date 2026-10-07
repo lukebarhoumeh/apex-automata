@@ -349,7 +349,7 @@ export class RegimeFilter extends EventEmitter {
     );
 
     // Adjust signal strength if trading against weak regime
-    let adjustedSignal = { ...signal };
+    const adjustedSignal = { ...signal };
     if (compatibilityScore < 0.7) {
       // Require higher strength for lower compatibility
       const requiredStrength = signal.strength + this.config.counterRegimeStrengthBoost;

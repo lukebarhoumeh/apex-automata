@@ -21,12 +21,12 @@ import type {
 export type WebSocketEventType = CanonicalEventType;
 export type WebSocketEvent = RuntimeEventEnvelope;
 
-export interface CandleEvent extends CandlePayload {}
-export interface SignalEvent extends SignalPayload {}
-export interface OrderEvent extends OrderPayload {}
-export interface PositionEvent extends PositionPayload {}
-export interface StatusEvent extends StatusPayload {}
-export interface RegimeEvent extends RegimePayload {}
+export type CandleEvent = CandlePayload;
+export type SignalEvent = SignalPayload;
+export type OrderEvent = OrderPayload;
+export type PositionEvent = PositionPayload;
+export type StatusEvent = StatusPayload;
+export type RegimeEvent = RegimePayload;
 
 type EventCallback = (payload: unknown) => void;
 

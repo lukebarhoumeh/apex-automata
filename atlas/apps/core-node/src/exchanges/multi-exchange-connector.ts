@@ -214,13 +214,13 @@ export class MultiExchangeConnector extends EventEmitter {
     
     for (const [symbol, orderBook] of this.orderBooks) {
       // Find best bid and ask from different exchanges
-      let bestBidExchange = '';
-      let bestBidPrice = 0;
-      let bestBidSize = 0;
+      const bestBidExchange = '';
+      const bestBidPrice = 0;
+      const bestBidSize = 0;
       
-      let bestAskExchange = '';
-      let bestAskPrice = Infinity;
-      let bestAskSize = 0;
+      const bestAskExchange = '';
+      const bestAskPrice = Infinity;
+      const bestAskSize = 0;
       
       // Group by exchange to find best prices
       const exchangeBids = new Map<string, { price: number; size: number }>();

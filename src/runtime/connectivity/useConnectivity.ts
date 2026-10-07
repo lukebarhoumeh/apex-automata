@@ -58,13 +58,14 @@ export function getConnectivityDisplayInfo(connectivity: RuntimeConnectivity): {
         variant: 'success',
       };
       
-    case 'STALE':
+    case 'STALE': {
       const ageSeconds = Math.round((connectivity.ageMs || 0) / 1000);
       return {
         label: 'Stale',
         description: `No heartbeat for ${ageSeconds}s — showing last known data`,
         variant: 'warning',
       };
+    }
       
     case 'DISCONNECTED':
       return {
@@ -87,13 +88,14 @@ export function getConnectivityDisplayInfo(connectivity: RuntimeConnectivity): {
         variant: 'info',
       };
       
-    case 'ENGINE_HALTED':
+    case 'ENGINE_HALTED': {
       const reason = connectivity.reasonCode || 'unknown';
       return {
         label: 'Engine Halted',
         description: `Trading halted: ${formatHaltReason(reason)}`,
         variant: 'warning',
       };
+    }
       
     default:
       return {

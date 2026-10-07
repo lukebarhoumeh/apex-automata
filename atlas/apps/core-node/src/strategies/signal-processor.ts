@@ -1183,7 +1183,7 @@ export class SignalProcessor extends EventEmitter {
     }
 
     // Use the adjusted signal (has regime metadata)
-    let adjustedSignal = filterResult.adjustedSignal || signal;
+    const adjustedSignal = filterResult.adjustedSignal || signal;
     
     // Add position multiplier to metadata for downstream use
     adjustedSignal.metadata = {

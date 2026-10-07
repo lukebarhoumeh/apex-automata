@@ -416,15 +416,12 @@ async function checkRepoClient(checks: Check[], auth: Auth): Promise<void> {
 function render(checks: Check[]): void {
   const icon: Record<Verdict, string> = { PASS: '✅', WARN: '⚠️ ', FAIL: '❌', INFO: 'ℹ️ ' };
   const width = Math.max(...checks.map((c) => c.name.length));
-  // eslint-disable-next-line no-console
   console.log('\nCoinbase Advanced Trade — read-only live preflight\n');
   for (const c of checks) {
-    // eslint-disable-next-line no-console
     console.log(`${icon[c.verdict]} ${c.verdict.padEnd(4)}  ${c.name.padEnd(width)}  ${c.detail}`);
   }
   const fails = checks.filter((c) => c.verdict === 'FAIL').length;
   const warns = checks.filter((c) => c.verdict === 'WARN').length;
-  // eslint-disable-next-line no-console
   console.log(`\n${fails === 0 ? 'READY (no FAIL)' : `NOT READY — ${fails} FAIL`} · ${warns} WARN\n`);
 }
 
@@ -451,7 +448,6 @@ async function main(): Promise<void> {
   }
 
   if (args.json) {
-    // eslint-disable-next-line no-console
     console.log(JSON.stringify({ generatedAt: new Date().toISOString(), checks }, null, 2));
   } else {
     render(checks);
@@ -460,7 +456,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  // eslint-disable-next-line no-console
   console.error('preflight crashed:', err instanceof Error ? err.message : String(err));
   process.exit(2);
 });
