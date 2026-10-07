@@ -30,7 +30,7 @@ pnpm api              # Express API + WebSocket server
 pnpm check:config     # Must print "config-drift: OK" before any commit
 pnpm test             # vitest run — 101 files / 1701 tests, all pass (~40s)
 pnpm exec vitest run <file>   # single file
-pnpm build            # rimraf dist && tsc (has pre-existing type errors; runtime uses tsx)
+pnpm build            # rimraf dist && tsc (typecheck-clean since 2026-10-07; CI gates it; runtime uses tsx)
 pnpm exec tsx src/cli/backtest.ts --start-date <s> --end-date <e> --products BTC-USD --fixture-dir fixtures/bars/15m/<set>
                       # NEVER `pnpm backtest -- --flags` (yargs eats the flags). 12-month runs take minutes.
 pnpm cb:preflight     # Read-only Coinbase Advanced Trade account check (auth, permissions, balances, fee tier, specs)
