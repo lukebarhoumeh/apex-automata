@@ -24,9 +24,11 @@ import {
   ResilientHttpClient, 
   DEFAULT_COINBASE_HTTP_CONFIG 
 } from '../exchanges/coinbase/http/resilient-http';
-import { 
-  CoinbaseReconciler, 
-  DEFAULT_RECONCILER_CONFIG 
+import {
+  CoinbaseReconciler,
+  DEFAULT_RECONCILER_CONFIG,
+  type ReconcilerRestClient,
+  type ReconcilerOrderManager,
 } from '../exchanges/coinbase/reconciliation/reconciler';
 import { Logger } from '../core/logger';
 
@@ -36,7 +38,14 @@ const mockLogger: Logger = {
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
-} as any;
+};
+
+/**
+ * Typed window onto ResilientHttpClient's private circuit-breaker hooks
+ * (type-level unlock only; mirrors the helpers/*-test-access pattern).
+ */
+const clientInternals = (c: ResilientHttpClient) =>
+  c as unknown as { recordFailure(error: unknown): void; recordSuccess(): void };
 
 describe('CoinbaseApiError', () => {
   describe('Error Classification', () => {
@@ -265,7 +274,7 @@ describe('ResilientHttpClient', () => {
     it('should track consecutive failures', () => {
       // Record failures (simulated)
       for (let i = 0; i < 2; i++) {
-        (client as any).recordFailure(new Error('Test failure'));
+        clientInternals(client).recordFailure(new Error('Test failure'));
       }
 
       const state = client.getCircuitState();
@@ -276,7 +285,7 @@ describe('ResilientHttpClient', () => {
     it('should open circuit after threshold failures', () => {
       // Record enough failures to trip the circuit
       for (let i = 0; i < 3; i++) {
-        (client as any).recordFailure(new Error('Test failure'));
+        clientInternals(client).recordFailure(new Error('Test failure'));
       }
 
       expect(client.isCircuitOpen()).toBe(true);
@@ -285,13 +294,13 @@ describe('ResilientHttpClient', () => {
 
     it('should reset failures on success', () => {
       // Add some failures
-      (client as any).recordFailure(new Error('Test failure'));
-      (client as any).recordFailure(new Error('Test failure'));
+      clientInternals(client).recordFailure(new Error('Test failure'));
+      clientInternals(client).recordFailure(new Error('Test failure'));
       
       expect(client.getCircuitState().consecutiveFailures).toBe(2);
       
       // Record success
-      (client as any).recordSuccess();
+      clientInternals(client).recordSuccess();
       
       expect(client.getCircuitState().consecutiveFailures).toBe(0);
     });
@@ -299,7 +308,7 @@ describe('ResilientHttpClient', () => {
     it('should allow force close', () => {
       // Open circuit
       for (let i = 0; i < 3; i++) {
-        (client as any).recordFailure(new Error('Test failure'));
+        clientInternals(client).recordFailure(new Error('Test failure'));
       }
       
       expect(client.isCircuitOpen()).toBe(true);
@@ -327,8 +336,8 @@ describe('ResilientHttpClient', () => {
 
 describe('CoinbaseReconciler', () => {
   let reconciler: CoinbaseReconciler;
-  let mockRestClient: any;
-  let mockOrderManager: any;
+  let mockRestClient: { [K in keyof ReconcilerRestClient]: ReturnType<typeof vi.fn> };
+  let mockOrderManager: { [K in keyof ReconcilerOrderManager]: ReturnType<typeof vi.fn> };
 
   beforeEach(() => {
     vi.useFakeTimers();

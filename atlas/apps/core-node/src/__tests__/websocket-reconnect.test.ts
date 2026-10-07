@@ -4,15 +4,25 @@
  * Tests for infinite reconnection and health monitoring
  */
 
-import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach, type Mock } from 'vitest';
 import { CoinbaseWebSocket, WebSocketHealth } from '../exchanges/coinbase/websocket';
 import { CoinbaseConfig } from '../exchanges/coinbase/types';
 import { Logger } from '../core/logger';
 import WebSocket from 'ws';
 
-// Mock ws module
+// Mock ws module (vi.mock turns the default-export class into a mock constructor)
 vi.mock('ws');
-const MockWebSocket = WebSocket as any;
+const MockWebSocket = WebSocket as unknown as Mock;
+
+/** Structural stand-in for the `ws` socket instance the client drives. */
+interface MockWsInstance {
+  on: ReturnType<typeof vi.fn>;
+  send: ReturnType<typeof vi.fn>;
+  close: ReturnType<typeof vi.fn>;
+  ping: ReturnType<typeof vi.fn>;
+  readyState: number;
+  removeAllListeners: ReturnType<typeof vi.fn>;
+}
 
 // Mock logger
 const mockLogger: Logger = {
@@ -20,7 +30,7 @@ const mockLogger: Logger = {
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
-} as any;
+};
 
 // Mock config
 const mockConfig: CoinbaseConfig = {
@@ -34,7 +44,7 @@ const mockConfig: CoinbaseConfig = {
 
 describe('CoinbaseWebSocket - Infinite Reconnection', () => {
   let wsClient: CoinbaseWebSocket;
-  let mockWsInstance: any;
+  let mockWsInstance: MockWsInstance;
 
   beforeEach(() => {
     vi.useFakeTimers();

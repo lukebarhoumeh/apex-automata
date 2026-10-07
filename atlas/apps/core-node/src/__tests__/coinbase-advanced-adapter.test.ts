@@ -37,7 +37,9 @@ import {
   AdvancedTradeUserStream,
   USER_STREAM_STALE,
   WsLike,
+  type UserStreamOrderUpdate,
 } from '../exchanges/coinbase/advanced-trade-user-stream';
+import type { CoinbaseExchange } from '../exchanges/coinbase';
 import {
   CoinbaseAdvancedExecutionAdapter,
   FILL_ADJUSTMENT_SEEN,
@@ -138,6 +140,10 @@ interface RecordedCall {
   path: string;
   query: URLSearchParams;
   headers: Record<string, string>;
+  // JSON.parse of the recorded outbound request body, passed straight through
+  // to ad-hoc assertions on arbitrary Advanced Trade payload shapes — genuinely
+  // dynamic, so `unknown` would force dozens of per-field casts for zero safety.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   body: any;
   url: string;
 }
@@ -1434,8 +1440,8 @@ describe('AdvancedTradeUserStream', () => {
 
   it('normalises user channel orders and relays heartbeats', async () => {
     const stream = makeStream();
-    const orders: any[] = [];
-    stream.on('order', (u) => orders.push(u));
+    const orders: UserStreamOrderUpdate[] = [];
+    stream.on('order', (u: UserStreamOrderUpdate) => orders.push(u));
     await stream.start();
     sockets[0].open();
     sockets[0].message(
@@ -1541,7 +1547,8 @@ describe('AdvancedTradeUserStream', () => {
 
 describe('createAdapters — live fails closed without Advanced Trade', () => {
   const logger = createLogger();
-  const fakeExchange = {} as any;
+  // The live factory paths under test throw before ever touching the exchange.
+  const fakeExchange = {} as unknown as CoinbaseExchange;
 
   it('throws LIVE_REQUIRES_ADVANCED_TRADE for live + COINBASE_API_VERSION=exchange (and when unset)', () => {
     expect(() =>

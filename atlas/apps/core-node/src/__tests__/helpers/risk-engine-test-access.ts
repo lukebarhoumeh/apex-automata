@@ -14,6 +14,7 @@
 import type { OrderRequest } from '../../exchanges/coinbase';
 import type { RiskEngine, RiskMetrics } from '../../trading/risk-engine';
 import type { Position } from '../../trading/position-tracker';
+import type { RiskStateMachine } from '../../trading/risk-state';
 
 /** Result shape of RiskEngine's private `simulatePositionAfterOrder`. */
 export interface SimulatedPositionAfterOrder {
@@ -29,6 +30,8 @@ export interface SimulatedPositionAfterOrder {
 
 /** Structural window onto the RiskEngine internals the tests drive directly. */
 export interface RiskEngineTestAccess {
+  /** Private halt state machine; tests read halt status via its public getStatus(). */
+  riskStateMachine: Pick<RiskStateMachine, 'getStatus'>;
   killSwitchActive: boolean;
   metrics: RiskMetrics;
   dailyStartEquity: number;

@@ -290,10 +290,29 @@ afterEach(() => {
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-function makeRepo(mutate: (doc: Record<string, any>) => void): string {
+/**
+ * Structural view of the parsed canonical guardrails YAML covering exactly the
+ * paths these drift fixtures mutate (mirrors config-drift.test.ts's
+ * CanonicalDoc pattern); everything else falls through to `unknown`.
+ */
+interface CfmDriftDoc {
+  fees: {
+    coinbase: {
+      spot: { maker_bps: number; taker_bps: number; [key: string]: unknown };
+      cfm_nano: { maker_bps: number; taker_bps: number; exchange_fee_per_contract_usd: number; [key: string]: unknown };
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
+  cfm: { max_leverage: number; [key: string]: unknown };
+  cfm_symbols: Record<string, { disabled_strategies: string[]; spot_proxy: string; [key: string]: unknown }>;
+  [key: string]: unknown;
+}
+
+function makeRepo(mutate: (doc: CfmDriftDoc) => void): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-cfm-drift-'));
   tempDirs.push(root);
-  const doc = YAML.parse(realCanonicalYaml);
+  const doc = YAML.parse(realCanonicalYaml) as CfmDriftDoc;
   mutate(doc);
   for (const [rel, content] of [
     [CANONICAL_GUARDRAILS_REPO_PATH, YAML.stringify(doc)],
