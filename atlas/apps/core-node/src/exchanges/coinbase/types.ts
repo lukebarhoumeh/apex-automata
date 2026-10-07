@@ -18,6 +18,12 @@ export interface WebSocketMessage {
   product_id?: string;
   sequence?: number;
   time?: string;
+  // Coinbase WS payloads carry message-type-specific extra fields. The
+  // CLAUDE.md-frozen consumer (coinbase/websocket.ts) reads loosely-typed
+  // fields off this index signature AND casts WebSocketMessage to Ticker —
+  // an `unknown` index signature breaks both, and that file must compile
+  // unmodified, so this `any` is irreducible.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   [key: string]: any;
 }
 

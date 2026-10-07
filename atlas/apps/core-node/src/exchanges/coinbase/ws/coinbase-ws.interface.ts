@@ -53,15 +53,16 @@ export interface CoinbaseWsHealth {
  * Events emitted by the Coinbase WebSocket client
  */
 export interface CoinbaseWsEvents {
-  // Market data events
-  'market:ticker': (data: any) => void;
-  'market:level2': (data: any) => void;
-  'market:matches': (data: any) => void;
-  'market:candle': (data: any) => void;
-  
+  // Market data events (raw venue payloads — channel-specific shapes,
+  // narrowed by the consumer)
+  'market:ticker': (data: unknown) => void;
+  'market:level2': (data: unknown) => void;
+  'market:matches': (data: unknown) => void;
+  'market:candle': (data: unknown) => void;
+
   // User events (if authenticated)
-  'user:fill': (data: any) => void;
-  'user:order': (data: any) => void;
+  'user:fill': (data: unknown) => void;
+  'user:order': (data: unknown) => void;
   
   // Connection lifecycle events
   'ws:connected': () => void;

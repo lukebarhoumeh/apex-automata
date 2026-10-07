@@ -84,7 +84,9 @@ export interface ReconcilerRestClient {
  */
 export interface ReconcilerOrderManager {
   getActiveOrders(): Array<{ exchangeOrderId?: string; id: string; status: string }>;
-  getOrderByExchangeOrderId(exchangeOrderId: string): any | undefined;
+  // Reconciler only checks existence; the concrete order shape stays with the
+  // order manager (OrderManager returns ManagedOrder | undefined).
+  getOrderByExchangeOrderId(exchangeOrderId: string): object | undefined;
 }
 
 /**

@@ -25,6 +25,7 @@ import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
 import * as net from 'net';
 import * as tls from 'tls';
+import type { Agent as HttpsAgent } from 'https';
 
 /**
  * @deprecated Use CoinbaseWebSocket instead
@@ -55,8 +56,19 @@ export interface MarketDataUpdate {
   symbol: string;
   timestamp: number;
   sequence?: number;
-  data: any;
+  /** Raw venue payload — channel-specific shape, narrowed by the consumer */
+  data: unknown;
   latency?: number;
+}
+
+/** Parsed wire message — shape depends on the venue channel */
+interface ParsedWsMessage {
+  type?: string;
+  product_id?: string;
+  sequence?: number;
+  timestamp?: number;
+  latency?: number;
+  [key: string]: unknown;
 }
 
 /**
@@ -143,7 +155,7 @@ export class UltraFastWebSocket extends EventEmitter {
     this.activeConnection = null;
   }
   
-  public send(message: any): void {
+  public send(message: unknown): void {
     if (!this.activeConnection || this.activeConnection.readyState !== WebSocket.OPEN) {
       this.logger.warn('No active WebSocket connection');
       return;
@@ -220,9 +232,9 @@ export class UltraFastWebSocket extends EventEmitter {
           socket.setKeepAlive(true, this.config.keepAliveInitialDelay);
         }
         
-        // Additional TCP tuning
+        // Additional TCP tuning (non-standard socket extension, probed at runtime)
         if ('setKeepAliveInitialDelay' in socket) {
-          (socket as any).setKeepAliveInitialDelay(1000);
+          (socket as unknown as { setKeepAliveInitialDelay: (ms: number) => void }).setKeepAliveInitialDelay(1000);
         }
       });
       
@@ -245,7 +257,7 @@ export class UltraFastWebSocket extends EventEmitter {
     });
   }
   
-  private createOptimizedAgent(): any {
+  private createOptimizedAgent(): HttpsAgent {
     // Create custom HTTPS agent with optimized settings
     // eslint-disable-next-line @typescript-eslint/no-require-imports -- intentional lazy require: agent is built on demand inside this method, keeping module load fast
     const agent = new (require('https').Agent)({
@@ -271,10 +283,10 @@ export class UltraFastWebSocket extends EventEmitter {
       this.messageCount++;
       
       try {
-        let message: any;
-        
+        let message: ParsedWsMessage;
+
         if (this.config.useBinaryProtocol && this.binaryDecoder && Buffer.isBuffer(data)) {
-          message = this.binaryDecoder.decode(data as Buffer);
+          message = this.binaryDecoder.decode(data as Buffer) as ParsedWsMessage;
           this.bytesReceived += (data as Buffer).length;
         } else {
           const text = data.toString();
@@ -303,7 +315,7 @@ export class UltraFastWebSocket extends EventEmitter {
     });
   }
   
-  private processMessage(message: any, connectionId: number): void {
+  private processMessage(message: ParsedWsMessage, connectionId: number): void {
     // Fast path for market data
     if (message.type === 'ticker' || message.type === 'match' || message.type === 'l2update') {
       const marketData: MarketDataUpdate = {
@@ -352,7 +364,7 @@ export class UltraFastWebSocket extends EventEmitter {
     
     // Override send method to distribute load
     const originalSend = this.send.bind(this);
-    this.send = (message: any) => {
+    this.send = (message: unknown) => {
       if (this.connections.length > 1) {
         this.activeConnection = this.connections[currentIndex];
         currentIndex = (currentIndex + 1) % this.connections.length;
@@ -468,7 +480,7 @@ class BinaryProtocolDecoder {
   private static readonly MSG_ORDERBOOK = 0x03;
   private static readonly MSG_HEARTBEAT = 0x04;
   
-  encode(message: any): Buffer {
+  encode(message: unknown): Buffer {
     // Simple binary encoding (in production, use more sophisticated protocol)
     const json = JSON.stringify(message);
     const jsonBuffer = Buffer.from(json, 'utf8');
@@ -482,7 +494,7 @@ class BinaryProtocolDecoder {
     return buffer;
   }
   
-  decode(buffer: Buffer): any {
+  decode(buffer: Buffer): unknown {
     if (buffer.length < 5) {
       throw new Error('Invalid binary message: too short');
     }
@@ -500,8 +512,8 @@ class BinaryProtocolDecoder {
     return message;
   }
   
-  private getMessageType(message: any): number {
-    switch (message.type) {
+  private getMessageType(message: unknown): number {
+    switch ((message as { type?: string }).type) {
       case 'ticker': return BinaryProtocolDecoder.MSG_TICKER;
       case 'trade': return BinaryProtocolDecoder.MSG_TRADE;
       case 'orderbook': return BinaryProtocolDecoder.MSG_ORDERBOOK;
@@ -562,8 +574,8 @@ export class MultiExchangeWebSocketManager extends EventEmitter {
     return this.connections.get(name);
   }
   
-  public getAllStats(): Record<string, any> {
-    const stats: Record<string, any> = {};
+  public getAllStats(): Record<string, ReturnType<UltraFastWebSocket['getStats']>> {
+    const stats: Record<string, ReturnType<UltraFastWebSocket['getStats']>> = {};
     
     for (const [name, ws] of this.connections) {
       stats[name] = ws.getStats();

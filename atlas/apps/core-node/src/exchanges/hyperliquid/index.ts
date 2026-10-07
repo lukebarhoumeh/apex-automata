@@ -41,6 +41,17 @@ import {
   fromHyperliquidSymbol,
   fromHyperliquidStatus,
 } from './types.js';
+import type {
+  HlRawCandle,
+  HlRawBookLevel,
+  HlRawOrderResponse,
+  HlRawOrderStatus,
+  HlRawOrder,
+  HlRawClearinghouseState,
+  HlRawLeverage,
+  HlRawTrade,
+  HlRawMetaAsset,
+} from './types.js';
 
 export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter, IPerpsAdapter {
   readonly id = 'hyperliquid';
@@ -132,14 +143,15 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
   ): Promise<AdapterCandle[]> {
     this.ensureConnected();
     const hlSymbol = toHyperliquidSymbol(symbol);
-    const candles: any[] = await this.sdk!.info.getCandleSnapshot(
+    // SDK .d.ts and runtime payloads diverge — treat as loose wire data (HlRaw*).
+    const candles = (await this.sdk!.info.getCandleSnapshot(
       hlSymbol,
       granularity,
       start || Date.now() - 24 * 60 * 60 * 1000,
       end || Date.now(),
-    );
+    )) as unknown as HlRawCandle[];
 
-    return candles.map((c: any) => ({
+    return candles.map((c) => ({
       timestamp: typeof c.t === 'number' ? c.t : parseInt(c.t),
       open: typeof c.o === 'number' ? c.o : parseFloat(c.o),
       high: typeof c.h === 'number' ? c.h : parseFloat(c.h),
@@ -152,13 +164,14 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
   async getOrderBook(symbol: string, depth?: number): Promise<AdapterOrderBook> {
     this.ensureConnected();
     const hlSymbol = toHyperliquidSymbol(symbol);
-    const book: any = await this.sdk!.info.getL2Book(hlSymbol, false, depth || 5);
+    const book = (await this.sdk!.info.getL2Book(hlSymbol, false, depth || 5)) as unknown as
+      { levels?: HlRawBookLevel[][] } & HlRawBookLevel[][];
     const levels = book.levels || book;
 
     return {
       symbol,
-      bids: (levels[0] || []).map((l: any) => [String(l.px), String(l.sz)]),
-      asks: (levels[1] || []).map((l: any) => [String(l.px), String(l.sz)]),
+      bids: (levels[0] || []).map((l): [string, string] => [String(l.px), String(l.sz)]),
+      asks: (levels[1] || []).map((l): [string, string] => [String(l.px), String(l.sz)]),
       timestamp: Date.now(),
     };
   }
@@ -191,24 +204,25 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
       symbol: hlSymbol, side: order.side, type: order.type, size: order.size,
     });
 
-    let result: any;
+    // SDK .d.ts and runtime payloads diverge — treat acks as loose wire data.
+    let result: HlRawOrderResponse;
 
     if (order.type === 'market') {
       const mids = await this.sdk!.info.getAllMids();
       const mid = mids[hlSymbol] ?? mids[hlSymbol.replace('-PERP', '')];
       const midPrice = typeof mid === 'number' ? mid : parseFloat(String(mid));
       const slippage = 0.01;
-      result = await this.sdk!.custom.marketOpen(
+      result = (await this.sdk!.custom.marketOpen(
         hlSymbol,
         isBuy,
         parseFloat(order.size),
         midPrice,
         slippage,
         order.clientOrderId,
-      );
+      )) as unknown as HlRawOrderResponse;
     } else {
       const limitPx = order.price || '0';
-      result = await this.sdk!.exchange.placeOrder({
+      result = (await this.sdk!.exchange.placeOrder({
         coin: hlSymbol,
         is_buy: isBuy,
         sz: parseFloat(order.size),
@@ -216,10 +230,10 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
         order_type: { limit: { tif: 'Gtc' } },
         reduce_only: order.reduceOnly || false,
         cloid: order.clientOrderId,
-      });
+      })) as unknown as HlRawOrderResponse;
     }
 
-    const status = result?.response?.data?.statuses?.[0] || result?.statuses?.[0] || {};
+    const status: HlRawOrderStatus = result?.response?.data?.statuses?.[0] || result?.statuses?.[0] || {};
     const orderId = status.resting?.oid || status.filled?.oid || String(Date.now());
 
     return {
@@ -263,7 +277,8 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
 
   async getOrder(orderId: string): Promise<AdapterOrderResult> {
     this.ensureConnected();
-    const result: any = await this.sdk!.info.getOrderStatus(this.walletAddress, parseInt(orderId));
+    const result = (await this.sdk!.info.getOrderStatus(this.walletAddress, parseInt(orderId))) as unknown as
+      { order?: HlRawOrder } & HlRawOrder;
     const order = result?.order || result;
 
     return {
@@ -284,13 +299,13 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
 
   async getOpenOrders(symbol?: string): Promise<AdapterOrderResult[]> {
     this.ensureConnected();
-    const orders: any[] = await this.sdk!.info.getUserOpenOrders(this.walletAddress);
+    const orders = (await this.sdk!.info.getUserOpenOrders(this.walletAddress)) as unknown as HlRawOrder[];
 
     return orders
-      .filter((o: any) => !symbol || fromHyperliquidSymbol(o.coin) === symbol)
-      .map((o: any) => ({
+      .filter((o) => !symbol || fromHyperliquidSymbol(o.coin!) === symbol)
+      .map((o) => ({
         orderId: String(o.oid),
-        symbol: fromHyperliquidSymbol(o.coin),
+        symbol: fromHyperliquidSymbol(o.coin!),
         side: o.side === 'B' ? 'buy' as const : 'sell' as const,
         type: 'limit' as const,
         status: 'open' as const,
@@ -308,7 +323,7 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
 
   async getBalances(): Promise<AdapterBalance[]> {
     this.ensureConnected();
-    const state: any = await this.sdk!.info.perpetuals.getClearinghouseState(this.walletAddress);
+    const state = (await this.sdk!.info.perpetuals.getClearinghouseState(this.walletAddress)) as unknown as HlRawClearinghouseState;
     const mb = state.marginSummary || state.crossMarginSummary || {};
 
     return [{
@@ -321,23 +336,23 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
 
   async getPositions(): Promise<AdapterPosition[]> {
     this.ensureConnected();
-    const state: any = await this.sdk!.info.perpetuals.getClearinghouseState(this.walletAddress);
+    const state = (await this.sdk!.info.perpetuals.getClearinghouseState(this.walletAddress)) as unknown as HlRawClearinghouseState;
     const positions = state.assetPositions || [];
 
     return positions
-      .filter((p: any) => parseFloat(p.position?.szi || '0') !== 0)
-      .map((p: any) => {
-        const pos = p.position;
-        const szi = parseFloat(pos.szi);
+      .filter((p) => parseFloat(p.position?.szi || '0') !== 0)
+      .map((p) => {
+        const pos = p.position!;
+        const szi = parseFloat(pos.szi!);
         return {
-          symbol: fromHyperliquidSymbol(pos.coin),
+          symbol: fromHyperliquidSymbol(pos.coin!),
           side: szi > 0 ? 'buy' as const : 'sell' as const,
           size: String(Math.abs(szi)),
           entryPrice: String(pos.entryPx || '0'),
           markPrice: String(pos.positionValue ? Math.abs(parseFloat(pos.positionValue) / szi) : '0'),
           unrealizedPnl: String(pos.unrealizedPnl || '0'),
           liquidationPrice: pos.liquidationPx ? String(pos.liquidationPx) : undefined,
-          leverage: pos.leverage ? parseFloat(String(pos.leverage.value || pos.leverage)) : undefined,
+          leverage: pos.leverage ? parseFloat(String((pos.leverage as { value?: number | string }).value || pos.leverage)) : undefined,
           marginUsed: pos.marginUsed ? String(pos.marginUsed) : undefined,
         };
       });
@@ -348,11 +363,12 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
   async subscribeOrderBook(symbol: string): Promise<void> {
     this.ensureConnected();
     const hlSymbol = toHyperliquidSymbol(symbol);
-    await this.sdk!.subscriptions.subscribeToL2Book(hlSymbol, (data: any) => {
+    await this.sdk!.subscriptions.subscribeToL2Book(hlSymbol, (raw: unknown) => {
+      const data = raw as { levels?: HlRawBookLevel[][] };
       this.emit('orderbook:update', {
         symbol,
-        bids: (data.levels?.[0] || []).map((l: any) => [String(l.px), String(l.sz)]),
-        asks: (data.levels?.[1] || []).map((l: any) => [String(l.px), String(l.sz)]),
+        bids: (data.levels?.[0] || []).map((l): [string, string] => [String(l.px), String(l.sz)]),
+        asks: (data.levels?.[1] || []).map((l): [string, string] => [String(l.px), String(l.sz)]),
         timestamp: Date.now(),
       });
     });
@@ -360,7 +376,8 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
 
   async subscribeTicker(symbol: string): Promise<void> {
     this.ensureConnected();
-    await this.sdk!.subscriptions.subscribeToAllMids((mids: any) => {
+    await this.sdk!.subscriptions.subscribeToAllMids((raw: unknown) => {
+      const mids = raw as Record<string, string | number | undefined>;
       const hlSymbol = toHyperliquidSymbol(symbol);
       const baseSymbol = hlSymbol.replace('-PERP', '');
       const mid = mids[hlSymbol] ?? mids[baseSymbol];
@@ -380,8 +397,8 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
   async subscribeTrades(symbol: string): Promise<void> {
     this.ensureConnected();
     const hlSymbol = toHyperliquidSymbol(symbol);
-    await this.sdk!.subscriptions.subscribeToTrades(hlSymbol, (trades: any[]) => {
-      for (const t of trades) {
+    await this.sdk!.subscriptions.subscribeToTrades(hlSymbol, (raw: unknown) => {
+      for (const t of raw as HlRawTrade[]) {
         this.emit('trade:update', {
           symbol,
           price: String(t.px),
@@ -395,8 +412,8 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
 
   async subscribeUserOrders(): Promise<void> {
     this.ensureConnected();
-    await this.sdk!.subscriptions.subscribeToOrderUpdates(this.walletAddress, (orders: any[]) => {
-      for (const o of orders) {
+    await this.sdk!.subscriptions.subscribeToOrderUpdates(this.walletAddress, (raw: unknown) => {
+      for (const o of raw as HlRawOrder[]) {
         this.emit('order:update', {
           orderId: String(o.oid || o.order?.oid),
           symbol: fromHyperliquidSymbol(o.coin || o.order?.coin || ''),
@@ -475,15 +492,15 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
   async getLeverage(symbol: string): Promise<number | null> {
     this.ensureConnected();
     try {
-      const state: any = await this.sdk!.info.perpetuals.getClearinghouseState(this.walletAddress);
+      const state = (await this.sdk!.info.perpetuals.getClearinghouseState(this.walletAddress)) as unknown as HlRawClearinghouseState;
       const hlSymbol = toHyperliquidSymbol(symbol);
       const base = hlSymbol.replace('-PERP', '');
-      const pos = (state.assetPositions || []).find((p: any) =>
+      const pos = (state.assetPositions || []).find((p) =>
         p.position?.coin === base || p.position?.coin === hlSymbol
       );
       if (!pos?.position?.leverage) return null;
-      const lev = pos.position.leverage;
-      return typeof lev === 'number' ? lev : parseFloat(String(lev.value || lev));
+      const lev: HlRawLeverage = pos.position.leverage;
+      return typeof lev === 'number' ? lev : parseFloat(String((lev as { value?: number | string }).value || lev));
     } catch {
       return null;
     }
@@ -492,7 +509,7 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
   async getPortfolioSummary(): Promise<AdapterPortfolioSummary | null> {
     this.ensureConnected();
     try {
-      const state: any = await this.sdk!.info.perpetuals.getClearinghouseState(this.walletAddress);
+      const state = (await this.sdk!.info.perpetuals.getClearinghouseState(this.walletAddress)) as unknown as HlRawClearinghouseState;
       const ms = state.marginSummary || state.crossMarginSummary || {};
       return {
         totalCollateral: String(ms.accountValue || '0'),
@@ -526,7 +543,8 @@ export class HyperliquidAdapter extends EventEmitter implements IExchangeAdapter
   private async refreshMarketCache(): Promise<void> {
     if (!this.sdk) return;
     try {
-      const meta: any = await this.sdk.info.perpetuals.getMeta();
+      const meta = (await this.sdk.info.perpetuals.getMeta()) as unknown as
+        { universe?: HlRawMetaAsset[] } & HlRawMetaAsset[];
       const universe = meta?.universe || meta || [];
 
       this.marketCache.clear();

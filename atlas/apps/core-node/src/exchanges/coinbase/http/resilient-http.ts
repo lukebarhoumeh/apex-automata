@@ -130,7 +130,7 @@ export class ResilientHttpClient extends EventEmitter {
   private consecutiveFailures = 0;
   private consecutiveSuccesses = 0;
   private circuitOpenedAt: number | null = null;
-  private lastFailure: { error: any; timestamp: number } | null = null;
+  private lastFailure: { error: unknown; timestamp: number } | null = null;
 
   constructor(config: ResilientHttpConfig) {
     super();
@@ -151,7 +151,7 @@ export class ResilientHttpClient extends EventEmitter {
   /**
    * Make a GET request with resilience
    */
-  public async get<T = any>(
+  public async get<T = unknown>(
     route: string,
     config?: AxiosRequestConfig,
     options?: RequestOptions
@@ -162,9 +162,9 @@ export class ResilientHttpClient extends EventEmitter {
   /**
    * Make a POST request with resilience
    */
-  public async post<T = any>(
+  public async post<T = unknown>(
     route: string,
-    data?: any,
+    data?: unknown,
     config?: AxiosRequestConfig,
     options?: RequestOptions
   ): Promise<T> {
@@ -174,7 +174,7 @@ export class ResilientHttpClient extends EventEmitter {
   /**
    * Make a DELETE request with resilience
    */
-  public async delete<T = any>(
+  public async delete<T = unknown>(
     route: string,
     config?: AxiosRequestConfig,
     options?: RequestOptions
@@ -185,9 +185,9 @@ export class ResilientHttpClient extends EventEmitter {
   /**
    * Make a PUT request with resilience
    */
-  public async put<T = any>(
+  public async put<T = unknown>(
     route: string,
-    data?: any,
+    data?: unknown,
     config?: AxiosRequestConfig,
     options?: RequestOptions
   ): Promise<T> {
@@ -214,7 +214,7 @@ export class ResilientHttpClient extends EventEmitter {
     // Check circuit breaker
     this.checkCircuit(route, isReconciliation);
 
-    let lastError: any = null;
+    let lastError: CoinbaseApiError | CoinbaseNetworkError | null = null;
     let attempt = 0;
 
     while (attempt <= this.config.retryPolicy.maxRetries) {
@@ -259,7 +259,7 @@ export class ResilientHttpClient extends EventEmitter {
         } finally {
           clearTimeout(timeoutId);
         }
-      } catch (error: any) {
+      } catch (error) {
         attempt++;
         lastError = this.transformError(error, route, method, requestId);
 
@@ -272,7 +272,9 @@ export class ResilientHttpClient extends EventEmitter {
         requestsTotal.inc({
           route: this.normalizeRoute(route),
           method,
-          status: lastError.httpStatus || 'network_error',
+          // httpStatus only exists on CoinbaseApiError; undefined falls through
+          // to 'network_error' exactly as before (type-only cast).
+          status: (lastError as Partial<CoinbaseApiError>).httpStatus || 'network_error',
         });
 
         // Handle rate limit
@@ -403,7 +405,7 @@ export class ResilientHttpClient extends EventEmitter {
   /**
    * Record a failed request
    */
-  private recordFailure(error: any): void {
+  private recordFailure(error: unknown): void {
     this.consecutiveFailures++;
     this.consecutiveSuccesses = 0;
     this.lastFailure = { error, timestamp: Date.now() };
@@ -416,7 +418,7 @@ export class ResilientHttpClient extends EventEmitter {
         
         this.logger.error('Circuit breaker opened due to consecutive failures', {
           failures: this.consecutiveFailures,
-          lastError: error.toJSON?.() ?? String(error),
+          lastError: (error as { toJSON?: () => unknown }).toJSON?.() ?? String(error),
         });
         
         this.emit('circuit:opened', { failures: this.consecutiveFailures, error });
@@ -449,30 +451,37 @@ export class ResilientHttpClient extends EventEmitter {
    * Transform axios error into our error types
    */
   private transformError(
-    error: any,
+    error: unknown,
     route: string,
     method: string,
     requestId: string
   ): CoinbaseApiError | CoinbaseNetworkError {
+    // Axios/network errors arrive untyped; probe the fields we classify on.
+    const err = error as {
+      name?: string;
+      code?: string;
+      response?: { status: number; data?: unknown; headers?: Record<string, string> };
+    };
+
     // Aborted request (timeout)
-    if (error.name === 'AbortError' || error.code === 'ECONNABORTED') {
+    if (err.name === 'AbortError' || err.code === 'ECONNABORTED') {
       return new CoinbaseNetworkError({
         kind: 'timeout',
         message: `Request timed out after ${this.config.timeoutMs}ms`,
-        originalError: error,
-        code: error.code,
+        originalError: error as Error,
+        code: err.code,
         route,
         method,
       });
     }
 
     // Response error (4xx, 5xx)
-    if (error.response) {
+    if (err.response) {
       return CoinbaseApiError.fromResponse(
         {
-          status: error.response.status,
-          data: error.response.data,
-          headers: error.response.headers,
+          status: err.response.status,
+          data: err.response.data,
+          headers: err.response.headers,
         },
         route,
         method
@@ -516,7 +525,7 @@ export class ResilientHttpClient extends EventEmitter {
     consecutiveFailures: number;
     consecutiveSuccesses: number;
     openedAt: number | null;
-    lastFailure: { error: any; timestamp: number } | null;
+    lastFailure: { error: unknown; timestamp: number } | null;
   } {
     return {
       state: this.circuitState,
