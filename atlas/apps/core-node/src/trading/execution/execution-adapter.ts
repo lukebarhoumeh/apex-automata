@@ -72,8 +72,8 @@ export interface PlaceOrderRequest {
   postOnly?: boolean;
   /** Time in force */
   timeInForce?: 'GTC' | 'IOC' | 'FOK' | 'GTT';
-  /** Custom metadata */
-  metadata?: Record<string, any>;
+  /** Custom metadata (adapter-specific keys, e.g. `protection` / `quoteSize` on Advanced Trade) */
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -84,7 +84,7 @@ export interface OrderAcceptedEvent {
   clientOrderId: string;
   exchangeOrderId?: string;
   ts: number;
-  raw?: any;
+  raw?: unknown;
 }
 
 /**
@@ -96,7 +96,7 @@ export interface OrderRejectedEvent {
   reason: string;
   code?: string;
   ts: number;
-  raw?: any;
+  raw?: unknown;
 }
 
 /**
@@ -107,7 +107,7 @@ export interface OrderCanceledEvent {
   clientOrderId: string;
   exchangeOrderId?: string;
   ts: number;
-  raw?: any;
+  raw?: unknown;
 }
 
 /**
@@ -124,7 +124,7 @@ export interface FillEvent {
   feeCurrency: string;
   liquidity: 'maker' | 'taker';
   ts: number;
-  raw?: any;
+  raw?: unknown;
 }
 
 /**
@@ -201,7 +201,7 @@ export interface IExecutionAdapter extends EventEmitter {
   /**
    * Get fills since cursor (for reconciliation)
    */
-  getFillsSince(cursor: any): Promise<FillRecord[]>;
+  getFillsSince(cursor: unknown): Promise<FillRecord[]>;
 
   /**
    * Register event callback

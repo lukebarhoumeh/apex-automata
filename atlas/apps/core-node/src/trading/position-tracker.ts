@@ -72,7 +72,29 @@ export interface Position {
   trades: Trade[];
   maxSize: number;
   maxDrawdown: number;
-  metadata?: Record<string, any>;
+  metadata?: PositionMetadata;
+}
+
+/**
+ * Free-form metadata carried on a position. The keys the runtime actually
+ * reads are typed; anything else rides along untyped (`unknown`).
+ */
+export interface PositionMetadata {
+  /** Entry reason/tag stamped by the router (read as `reasonCode` by TradeAnalytics). */
+  entryTag?: string;
+  entryOrderId?: string;
+  exitOrderId?: string;
+  /** Signal strength of the entry signal (meta-filter learning). */
+  signalStrength?: number;
+  /** Market regime stamped on the entry signal (exit attribution, kill-ladder L4). */
+  regime?: string;
+  metaQualityScore?: number;
+  /** Set when the position was hydrated from Supabase on boot (PR #74/#82). */
+  hydratedFromSupabase?: boolean;
+  /** Entry price the position was hydrated with (see position-entry-vwap.ts). */
+  hydratedEntryPrice?: number;
+  maxFavorableExcursion?: number;
+  [key: string]: unknown;
 }
 
 export interface Trade {

@@ -8,6 +8,16 @@
 import { EventEmitter } from 'events';
 import { Logger } from '../../core/logger';
 import { FillEvent } from '../execution/execution-adapter';
+import type { Account } from '../../exchanges/coinbase/types';
+
+/**
+ * Minimal structural surface of the exchange client the live provider uses.
+ * The adapter factory passes the hardened Advanced Trade REST client, which
+ * exposes the legacy paginated `getAccounts()` shape (`Account[]`).
+ */
+export interface IAccountsClient {
+  getAccounts(): Promise<Account[]>;
+}
 
 /**
  * Balance for a single currency
@@ -284,7 +294,7 @@ export class PaperAccountProvider extends EventEmitter implements IAccountProvid
   private getSymbolFromFill(fill: FillEvent): string | null {
     // Fill events from paper adapter have symbol in clientOrderId metadata
     // For now, we'll extract from a standard pattern or require it
-    return (fill.raw as any)?.symbol || null;
+    return (fill.raw as { symbol?: string } | undefined)?.symbol || null;
   }
 
   /**
@@ -308,8 +318,8 @@ export class PaperAccountProvider extends EventEmitter implements IAccountProvid
  * Live Account Provider Configuration
  */
 export interface LiveAccountConfig {
-  /** Exchange instance */
-  exchange: any; // CoinbaseExchange
+  /** Exchange client (anything exposing the legacy `getAccounts()` shape) */
+  exchange: IAccountsClient;
   /** Logger */
   logger: Logger;
   /** Refresh interval in ms (default: 30000) */
@@ -323,7 +333,7 @@ export interface LiveAccountConfig {
  */
 export class LiveAccountProvider extends EventEmitter implements IAccountProvider {
   private logger: Logger;
-  private exchange: any;
+  private exchange: IAccountsClient;
   private refreshIntervalMs: number;
   private cachedSnapshot: AccountSnapshot | null = null;
   private refreshTimer: NodeJS.Timeout | null = null;
@@ -405,7 +415,7 @@ export class LiveAccountProvider extends EventEmitter implements IAccountProvide
     try {
       const accounts = await this.exchange.getAccounts();
       
-      const balances: CurrencyBalance[] = accounts.map((acc: any) => ({
+      const balances: CurrencyBalance[] = accounts.map((acc) => ({
         currency: acc.currency,
         available: parseFloat(acc.available),
         hold: parseFloat(acc.hold || '0'),
@@ -442,8 +452,8 @@ export class LiveAccountProvider extends EventEmitter implements IAccountProvide
       };
 
       this.emit('snapshot', this.cachedSnapshot);
-    } catch (error: any) {
-      this.logger.error('Failed to refresh account data', { error: error.message });
+    } catch (error) {
+      this.logger.error('Failed to refresh account data', { error: (error as Error).message });
       throw error;
     }
   }

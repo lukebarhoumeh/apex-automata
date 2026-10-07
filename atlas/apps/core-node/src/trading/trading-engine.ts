@@ -2,7 +2,10 @@ import { EventEmitter } from 'events';
 import { Logger } from '../core/logger';
 import { AppConfig } from '../core/types';
 import { CoinbaseExchange, CoinbaseConfig, Ticker, OrderBook, Fill, OrderRequest } from '../exchanges/coinbase';
-import { OrderManager, OrderManagerConfig, ManagedOrder } from './order-manager';
+import type { CoinbaseWsHealth } from '../exchanges/coinbase/ws/coinbase-ws.interface';
+import type { Signal } from '../strategies/signal-processor';
+import type { TradeOutcome } from '../strategies/meta-filter';
+import { OrderManager, OrderManagerConfig, ManagedOrder, OrderMetadata, TWAPOrder } from './order-manager';
 import { PositionTracker, PositionTrackerConfig, Position } from './position-tracker';
 import { RiskEngine, RiskEngineConfig, RiskMetrics } from './risk-engine';
 import type { LadderTransition } from './risk/paper-kill-ladder';
@@ -104,8 +107,20 @@ export interface TradingEngineEvents {
   'order:created': (order: ManagedOrder) => void;
   'order:filled': (order: ManagedOrder, fill: Fill) => void;
   'position:update': (position: Position) => void;
-  'risk:alert': (alert: any) => void;
-  'signal:generated': (signal: any) => void;
+  'risk:alert': (alert: EngineRiskAlert) => void;
+  'signal:generated': (signal: Signal) => void;
+}
+
+/**
+ * Payload emitted on `risk:alert`. Heterogeneous by design: fee-tier changes,
+ * kill-switch latches, kill-ladder rungs and forwarded risk-engine alerts all
+ * ride this channel (the API layer broadcasts it as a RiskEvent verbatim).
+ */
+export interface EngineRiskAlert {
+  type?: string;
+  severity?: string;
+  message?: string;
+  [key: string]: unknown;
 }
 
 /**
@@ -117,6 +132,15 @@ export interface TradingEngineEvents {
  * - halted: Engine is running but trading halted due to kill switch
  */
 export type EngineState = 'stopped' | 'starting' | 'running' | 'stopping' | 'halted';
+
+/**
+ * The slice of SignalProcessor the engine talks back to (meta-filter
+ * learning on position close). Structural on purpose: the API layer wires
+ * the real SignalProcessor in via `setSignalProcessor`, tests wire stubs.
+ */
+export interface IEngineSignalSink {
+  recordTradeOutcome(outcome: TradeOutcome): void;
+}
 
 /**
  * Why `createOrder()` last returned `null` without throwing. Lets the signal
@@ -161,7 +185,7 @@ export class TradingEngine extends EventEmitter {
   private riskEngine: RiskEngine | null = null;
   private positionMonitor: PositionMonitor | null = null;
   private tradeAnalytics: TradeAnalytics | null = null;
-  private signalProcessor: any = null;
+  private signalProcessor: IEngineSignalSink | null = null;
   private secretManager: SecretManager;
   private paperSimulator: PaperTradingSimulator | null = null;
   private isRunning = false;
@@ -253,7 +277,7 @@ export class TradingEngine extends EventEmitter {
     return this.config;
   }
 
-  public setSignalProcessor(sp: any): void {
+  public setSignalProcessor(sp: IEngineSignalSink): void {
     this.signalProcessor = sp;
   }
 
@@ -754,7 +778,7 @@ export class TradingEngine extends EventEmitter {
     lastStartReason: string;
     lastStopReason: string;
     activeSymbols: string[];
-    wsHealth: any;
+    wsHealth: CoinbaseWsHealth | null | undefined;
   } {
     return {
       engineState: this.engineState,
@@ -765,7 +789,10 @@ export class TradingEngine extends EventEmitter {
       lastStartReason: this.lastStartReason,
       lastStopReason: this.lastStopReason,
       activeSymbols: this.activeSymbols,
-      wsHealth: this.exchange ? (this.exchange as any).ws?.getHealth?.() : null,
+      // `ws` is private on CoinbaseExchange (frozen file) — structural peek only.
+      wsHealth: this.exchange
+        ? (this.exchange as unknown as { ws?: { getHealth?: () => CoinbaseWsHealth } }).ws?.getHealth?.()
+        : null,
     };
   }
 
@@ -1844,7 +1871,7 @@ export class TradingEngine extends EventEmitter {
     request: Omit<OrderRequest, 'client_oid'>,
     context?: {
       strategy?: string;
-      metadata?: Record<string, any>;
+      metadata?: OrderMetadata;
     }
   ): Promise<ManagedOrder | null> {
     if (!this.isRunning) {
@@ -1909,9 +1936,9 @@ export class TradingEngine extends EventEmitter {
           await this.orderManager.trackPaperOrder(managedOrder);
 
           const paperOrder = await this.paperSimulator.placeOrder({
-            ...(request as any),
+            ...request,
             client_oid: clientOrderId,
-          } as OrderRequest);
+          });
           
           // Best-effort state sync from simulator response (fills/events may have already updated the order)
           managedOrder.exchangeOrderId = paperOrder.id;
@@ -2026,7 +2053,7 @@ export class TradingEngine extends EventEmitter {
       duration: number;
       numSlices?: number;
     }
-  ): Promise<any> {
+  ): Promise<TWAPOrder | null> {
     if (!this.isRunning) {
       throw new Error('Trading engine not running');
     }

@@ -377,7 +377,7 @@ export class PaperExecutionAdapter extends EventEmitter implements IExecutionAda
   /**
    * Get fills since cursor
    */
-  public async getFillsSince(cursor: any): Promise<FillRecord[]> {
+  public async getFillsSince(cursor: unknown): Promise<FillRecord[]> {
     const fills: FillRecord[] = [];
     const cursorTs = typeof cursor === 'number' ? cursor : 0;
 

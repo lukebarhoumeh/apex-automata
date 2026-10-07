@@ -245,7 +245,8 @@ export class RiskStateMachine extends EventEmitter {
     if (this.currentState.state === 'HALTED') {
       // Already halted - log but don't re-emit
       this.logger.debug('Already halted, ignoring duplicate halt', {
-        existingReason: (this.currentState as any).reasonCode,
+        // Narrowed by the HALTED check above (discriminated union).
+        existingReason: this.currentState.reasonCode,
         newReason: reasonCode,
       });
       return;
@@ -325,7 +326,8 @@ export class RiskStateMachine extends EventEmitter {
     const previousState = this.currentState;
     const now = Date.now();
 
-    const reasonCode = (previousState as any).reasonCode;
+    // Only the HALTED variant carries a reasonCode (RUNNING/PAUSED resolved to undefined before too).
+    const reasonCode = previousState.state === 'HALTED' ? previousState.reasonCode : undefined;
 
     this.currentState = { state: 'RUNNING' };
     this.lastStateChange = now;

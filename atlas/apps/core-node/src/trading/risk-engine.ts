@@ -1912,7 +1912,7 @@ export class RiskEngine extends EventEmitter {
     reasonCode: RiskHaltReasonCode,
     reasonText: string,
     daily: boolean,
-    context?: Record<string, any>
+    context?: HaltContext
   ): void {
     if (this.riskStateMachine.isHalted()) {
       return; // Already halted

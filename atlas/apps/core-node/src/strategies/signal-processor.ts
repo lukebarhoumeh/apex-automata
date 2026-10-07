@@ -251,7 +251,7 @@ export class SignalProcessor extends EventEmitter {
     });
 
     // Forward meta filter events
-    this.metaFilter.on('signal:blocked', (signal: Signal, score: number, rules: any[]) => {
+    this.metaFilter.on('signal:blocked', (signal: Signal, score: number, rules: MetaFilterResult['rulesEvaluated']) => {
       this.emit('signal:meta_filtered', signal, { qualityScore: score, rulesEvaluated: rules } as MetaFilterResult, 'Meta filter blocked');
     });
 
@@ -1415,7 +1415,7 @@ export class SignalProcessor extends EventEmitter {
       
       // bars.time is BIGINT epoch-seconds (migration 20260308_phase2a). The
       // OHLCV.time field used by indicators/strategies is millis, so convert.
-      return data.map((row: any) => ({
+      return data.map((row: { time: number | string; open: string; high: string; low: string; close: string; volume: string }) => ({
         time: Number(row.time) * 1000,
         open: parseFloat(row.open),
         high: parseFloat(row.high),
