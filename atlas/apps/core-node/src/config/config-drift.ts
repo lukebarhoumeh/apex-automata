@@ -108,7 +108,6 @@ export const SCALAR_PINS: readonly ScalarPin[] = [
   { key: 'fees.coinbase.cfm_nano.maker_bps', expected: 9.5 },
   { key: 'fees.coinbase.cfm_nano.taker_bps', expected: 10 },
   { key: 'fees.coinbase.cfm_nano.exchange_fee_per_contract_usd', expected: 0.1 },
-  { key: 'fees.coinbase.cfm_nano.cfm_clearing_fee_per_contract_usd', expected: 0.05 },
   // CFM venue policy — Charter ≤2×, true post-only, never chased.
   { key: 'cfm.max_leverage', expected: 2 },
   { key: 'cfm.execution.order_type', expected: 'post_only' },

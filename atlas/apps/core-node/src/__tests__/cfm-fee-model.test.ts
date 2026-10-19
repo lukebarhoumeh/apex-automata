@@ -191,7 +191,6 @@ describe('canonical guardrails.yaml — CFM bucket + paper symbols load', () => 
       maker_bps: 9.5,
       taker_bps: 10,
       exchange_fee_per_contract_usd: 0.1,
-      cfm_clearing_fee_per_contract_usd: 0.05,
     });
     const fm = FeeModel.fromGuardrails(guardrails);
     expect(fm.getFeeBps('coinbase', 'cfm', 'maker')).toBe(9.5);
@@ -232,7 +231,7 @@ describe('canonical guardrails.yaml — CFM bucket + paper symbols load', () => 
     const etp = guardrails.cfm_symbols?.['ETP-20DEC30-CDE'];
     expect(etp).toBeDefined();
     expect(etp!.contract_size).toBe(0.1);
-    expect(etp!.price_increment_usd).toBe(0.25);
+    expect(etp!.price_increment_usd).toBe(0.50);
     expect(etp!.spot_proxy).toBe('ETH-USD');
     expect(Object.keys(guardrails.per_symbol ?? {})).toContain(etp!.spot_proxy);
     expect(etp!.disabled_strategies).toEqual(expect.arrayContaining(['momentum', 'vwap_mr', 'breakout']));

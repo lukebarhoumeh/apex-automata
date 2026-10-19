@@ -94,7 +94,6 @@ const FeeSideSchema = z.object({
 // `PAPER-FeeModel-SPOT-25-40` paper).
 const CostPlusFeeSchema = FeeSideSchema.extend({
   exchange_fee_per_contract_usd: z.number().nonnegative(),
-  cfm_clearing_fee_per_contract_usd: z.number().nonnegative().optional(),
 });
 
 const FeesSchema = z.object({

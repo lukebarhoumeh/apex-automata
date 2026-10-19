@@ -45,10 +45,6 @@ fees:
       maker_bps: 9.5      # 0.095%  — CLI `coinbase fees product_type==FUTURE` maker_fee_rate 0.00095
       taker_bps: 10       # 0.10%   — taker_fee_rate 0.001
       exchange_fee_per_contract_usd: 0.10   # CDE Non-Professional Electronic floor, per side per contract
-      # ESTIMATE — clearing fee is not yet confirmed in the public fee schedule.
-      # Source: CME Group NQF/BFF clearing fee analogy ($0.05/side/ct for micro
-      # futures). Treat as upper bound until Coinbase publishes CDE clearing.
-      cfm_clearing_fee_per_contract_usd: 0.05
   hyperliquid:
     perps:
       maker_bps: -1.5     # rebate (negative = paid to maker)
@@ -386,8 +382,8 @@ cfm_symbols:
         takeProfitAtr: 6.0
       donchian_daily_s3: {}
   ETP-20DEC30-CDE:
-    contract_size: 0.1           # ETH per contract (CDE ETP spec PDF, https://www.coinbase.com/derivatives/resources/nano-ether-futures)
-    price_increment_usd: 0.25    # $0.25 per ETH = $0.025 per nano contract (CDE ETP spec PDF)
+    contract_size: 0.1           # ETH per contract (CDE ETP spec, CFTC 2025-33 filing)
+    price_increment_usd: 0.50    # $0.50 per ETH = $0.05 per nano contract (CDE ETP Perp Style spec PDF)
     spot_proxy: ETH-USD
     max_notional_usd: 2000
     max_daily_loss_usd: 100
@@ -453,22 +449,23 @@ filters:
   atr_volatility_min: 0.005
   atr_volatility_max: 0.05
   # Per-timeframe ATR volatility bounds. The 15m bounds above are the global
-  # default; these override them for specific bar durations. Longer timeframes
-  # see structurally higher ATR% (cumulative price range widens with sqrt(t)):
-  #   4H ATR% ≈ 15m ATR% × sqrt(16) ≈ 4× → lower bound 0.002 allows the
-  #   0.2–0.5% ATR% range typical of BTC/ETH 4H bars (2024-09 – 2025-09
-  #   fixture data); 15m's 0.5% floor would reject >90% of 4H bars.
-  #   1D ATR% ≈ 15m ATR% × sqrt(96) ≈ 10× → lower bound 0.001 covers the
-  #   0.1–0.3% ATR% range typical of daily bars in low-vol regimes.
-  # Upper bounds are relaxed proportionally to avoid rejecting moves that are
-  # within normal range for the longer timeframe.
+  # default; these override them for specific bar durations.
+  #
+  # Derived from real fixture data (BTC-USD + ETH-USD):
+  #   4H (fixtures/bars/4h/{tune,holdout}, ~13k bars 2023-03 to 2026-03):
+  #     p5=0.79–0.88%  p10=0.85–1.45%  p50=1.2–2.1%  p90=1.9–3.1%  p95=2.4–3.6%
+  #     Floor 0.8% blocks 5.9% of holdout bars (dead-market filter).
+  #     Ceiling 4% is above p95 for both assets.
+  #   1D (fixtures/bars/1d/{tune,root}, ~7k bars 2017-01 to 2025-03):
+  #     p5=2.3–3.3%  p10=2.5–3.9%  p50=3.4–6.3%  p90=4.7–10.4%  p95=5.1–13.2%
+  #     Floor 2.5% blocks ~5% of bars; ceiling 15% above p95 for both.
   atr_volatility_by_timeframe:
     240:   # 4H bars
-      atr_volatility_min: 0.002
-      atr_volatility_max: 0.12
+      atr_volatility_min: 0.008
+      atr_volatility_max: 0.04
     1440:  # 1D bars
-      atr_volatility_min: 0.001
-      atr_volatility_max: 0.20
+      atr_volatility_min: 0.025
+      atr_volatility_max: 0.15
   funding_bias_enabled: true
   # Time-of-day filter is OFF by default. The previous default
   # (time_filter_enabled: true with allowed_hours_utc: [0, 23]) was a no-op

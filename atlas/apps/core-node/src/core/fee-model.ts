@@ -46,11 +46,6 @@ interface FeeBucket {
    * Absent / 0 for pure-percentage books.
    */
   exchange_fee_per_contract_usd?: number;
-  /**
-   * Clearing fee in USD per contract per side (CFM/CDE only). ESTIMATE —
-   * not yet confirmed in the public schedule. Absent / 0 when not applicable.
-   */
-  cfm_clearing_fee_per_contract_usd?: number;
 }
 
 /**
@@ -88,16 +83,12 @@ export interface FillFeeBreakdown {
   commissionUsd: string;
   /** Exchange floor: contracts × per-contract fee (decimal string, USD; "0" for non cost-plus books). */
   exchangeFeeUsd: string;
-  /** Clearing fee: contracts × clearing fee (decimal string, USD; "0" when not applicable). ESTIMATE. */
-  clearingFeeUsd: string;
-  /** commissionUsd + exchangeFeeUsd + clearingFeeUsd (decimal string, USD). */
+  /** commissionUsd + exchangeFeeUsd (decimal string, USD). */
   totalUsd: string;
   /** Rate actually applied to the notional (decimal, not bps). */
   rate: number;
   /** Per-contract floor actually applied (USD). */
   perContractUsd: number;
-  /** Per-contract clearing fee actually applied (USD). ESTIMATE. */
-  clearingPerContractUsd: number;
 }
 
 /** USD precision used when rendering fee breakdowns (1e-8, matches NUMERIC(20,8)). */
@@ -146,9 +137,6 @@ export class FeeModel {
       taker_bps: override.takerBps,
       ...(current.exchange_fee_per_contract_usd !== undefined
         ? { exchange_fee_per_contract_usd: current.exchange_fee_per_contract_usd }
-        : {}),
-      ...(current.cfm_clearing_fee_per_contract_usd !== undefined
-        ? { cfm_clearing_fee_per_contract_usd: current.cfm_clearing_fee_per_contract_usd }
         : {}),
     };
     const fees = structuredClone(this.fees) as FeesConfig;
@@ -226,23 +214,6 @@ export class FeeModel {
   }
 
   /**
-   * Per-contract clearing fee (USD, per side) for a cost-plus book. ESTIMATE.
-   * Returns 0 for buckets without a clearing fee. Throws on unknown combinations.
-   */
-  getClearingFeePerContractUsd(exchange: Exchange | string, market: Market): number {
-    const bucket = this.resolveBucket(exchange, market);
-    return bucket.cfm_clearing_fee_per_contract_usd ?? 0;
-  }
-
-  /**
-   * Total per-contract fees (exchange + clearing) in USD per side.
-   * Returns 0 for pure-percentage books. Convenience for round-trip fee math.
-   */
-  getTotalPerContractFeeUsd(exchange: Exchange | string, market: Market): number {
-    return this.getExchangeFeePerContractUsd(exchange, market) + this.getClearingFeePerContractUsd(exchange, market);
-  }
-
-  /**
    * All-in fee for one fill, computed with exact decimal arithmetic:
    *
    *   commission   = notionalUsd × rate(side)
@@ -261,15 +232,13 @@ export class FeeModel {
   computeFillFeeUsd(inputs: FillFeeInputs): FillFeeBreakdown {
     const rate = this.getFeeRate(inputs.exchange, inputs.market, inputs.side);
     const perContractUsd = this.getExchangeFeePerContractUsd(inputs.exchange, inputs.market);
-    const clearingPerContractUsd = this.getClearingFeePerContractUsd(inputs.exchange, inputs.market);
 
     const commissionUsd = roundUsd(decimalMul(toDecimalString(inputs.notionalUsd), rate));
     const contracts = inputs.contracts !== undefined ? toDecimalString(inputs.contracts) : '0';
     const exchangeFeeUsd = perContractUsd > 0 ? roundUsd(decimalMul(contracts, perContractUsd)) : '0';
-    const clearingFeeUsd = clearingPerContractUsd > 0 ? roundUsd(decimalMul(contracts, clearingPerContractUsd)) : '0';
-    const totalUsd = roundUsd(decimalAdd(decimalAdd(commissionUsd, exchangeFeeUsd), clearingFeeUsd));
+    const totalUsd = roundUsd(decimalAdd(commissionUsd, exchangeFeeUsd));
 
-    return { commissionUsd, exchangeFeeUsd, clearingFeeUsd, totalUsd, rate, perContractUsd, clearingPerContractUsd };
+    return { commissionUsd, exchangeFeeUsd, totalUsd, rate, perContractUsd };
   }
 
   /**
