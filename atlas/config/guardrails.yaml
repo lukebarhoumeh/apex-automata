@@ -659,6 +659,39 @@ ui:
     - telegram
     - email
 
+# ---------------------------------------------------------------------------
+# Agentic / Claude advisory layer — ADVISORY ONLY, NEVER in the order path.
+# Claude may only (a) emit advisory signals that REDUCE position size or PAUSE
+# new entries (never increase), (b) write reports, (c) propose text/PR drafts.
+# Feature-flagged OFF by default. API key read from ANTHROPIC_API_KEY at runtime.
+# ---------------------------------------------------------------------------
+agentic:
+  enabled: false
+  # Monthly cost cap in USD. When cumulative spend (tracked in agentic_calls)
+  # reaches this, all agentic components auto-disable for the calendar month.
+  monthly_cost_cap_usd: 190
+  # Model IDs — pinned to specific versions for cost predictability.
+  models:
+    news_filter: claude-haiku-5-5
+    regime_advisor: claude-opus-5-5
+    daily_review: claude-opus-5-5
+    research: claude-opus-5-5
+    pr_reviewer: claude-opus-5-5
+  # Per-component enable flags (all default false when agentic.enabled is false).
+  components:
+    news_filter: false
+    regime_advisor: false
+    daily_review: false
+    research: false
+    pr_reviewer: false
+  # Regime advisor: runs hourly, outputs structured JSON with size_multiplier<=1.
+  regime_advisor_interval_min: 60
+  # Daily risk review: submitted as a Batch API request (50% cost).
+  daily_review_hour_utc: 5
+  # Nightly research window (UTC hours).
+  research_start_hour_utc: 6
+  research_max_sweeps: 10
+
 go_live_criteria:
   paper_parity_max_diff_bps: 20
   min_profitable_days: 3
