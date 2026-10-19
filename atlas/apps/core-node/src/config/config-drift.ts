@@ -108,6 +108,7 @@ export const SCALAR_PINS: readonly ScalarPin[] = [
   { key: 'fees.coinbase.cfm_nano.maker_bps', expected: 9.5 },
   { key: 'fees.coinbase.cfm_nano.taker_bps', expected: 10 },
   { key: 'fees.coinbase.cfm_nano.exchange_fee_per_contract_usd', expected: 0.1 },
+  { key: 'fees.coinbase.cfm_nano.cfm_clearing_fee_per_contract_usd', expected: 0.05 },
   // CFM venue policy — Charter ≤2×, true post-only, never chased.
   { key: 'cfm.max_leverage', expected: 2 },
   { key: 'cfm.execution.order_type', expected: 'post_only' },
@@ -473,31 +474,34 @@ function checkPins(guardrails: GuardrailConfig, out: DriftViolation[]): void {
 }
 
 /**
- * CFM paper symbols (card SH-QMAKER-CFM-PAPER-v0, infra only — NOT strategy GO):
+ * CFM paper symbols — Phase 1 active venue (promoted from infra-only):
  *
- *   1. every built-in strategy must be in the symbol's `disabled_strategies`
- *      until the card's strategy lands under its own GO, so wiring the venue
- *      never lets an existing strategy trade `*-CDE` by accident;
+ *   1. momentum, vwap_mr, breakout must remain disabled on every `*-CDE` symbol
+ *      (no research pass); trend_follow and donchian_daily_s3 are now ALLOWED
+ *      (Phase 1 GO, 2026-10-19);
  *   2. `spot_proxy` must name a `per_symbol` spot product — that is the only
  *      paper quote path (desk seal (a)); a dangling proxy means no ticks.
  */
+
+/** Strategies that must remain disabled on CFM symbols (no research pass). */
+const CFM_MUST_DISABLE: readonly string[] = ['momentum', 'vwap_mr', 'breakout'];
+
 function checkCfmSymbols(guardrails: GuardrailConfig, out: DriftViolation[]): void {
   const file = CANONICAL_GUARDRAILS_REPO_PATH;
   const cfmSymbols = guardrails.cfm_symbols ?? {};
   const spotSymbols = new Set(Object.keys(guardrails.per_symbol ?? {}));
-  const builtin = getBuiltinStrategyIds();
 
   for (const [symbol, cfg] of Object.entries(cfmSymbols)) {
     const disabled = new Set(cfg.disabled_strategies ?? []);
-    for (const id of builtin) {
+    for (const id of CFM_MUST_DISABLE) {
       if (!disabled.has(id)) {
         out.push({
           code: 'cfm_symbol_strategy_enabled',
           file,
           key: `cfm_symbols.${symbol}.disabled_strategies`,
           message:
-            `Built-in strategy "${id}" is not disabled on CFM paper symbol ${symbol}. ` +
-            'CFM wiring is infra only (NOT strategy GO); every built-in strategy must be listed until a card strategy is authorised.',
+            `Strategy "${id}" is not disabled on CFM paper symbol ${symbol}. ` +
+            'momentum, vwap_mr, and breakout must be listed in disabled_strategies (no research pass).',
         });
       }
     }

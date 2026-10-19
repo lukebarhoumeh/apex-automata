@@ -199,12 +199,10 @@ describe('guardrails.yaml — disabled_strategies state (F4 follow-up §8)', () 
     expect(buildPerSymbolDisabledStrategies(guardrails)).toEqual({
       'ETH-PERP-INTX': ['momentum'],
       'BTC-PERP-INTX': ['momentum'],
-      // Card SH-QMAKER-CFM-PAPER-v0 (2026-09-21): the CFM venue is wired for
-      // paper infra only; all built-in strategies stay disabled on it until a
-      // card strategy is authorised (pinned by `pnpm check:config`).
-      // donchian_daily_s3 (PAPER-S3-DONCHIAN-v0, 2026-09-28) joins the list as
-      // a built-in the moment it is registered — HOLD, not a GO.
-      'BIP-20DEC30-CDE': ['trend_follow', 'momentum', 'vwap_mr', 'breakout', 'donchian_daily_s3'],
+      // Phase 1 (2026-10-19): trend_follow and donchian_daily_s3 are ENABLED
+      // on CFM symbols. Only momentum/vwap_mr/breakout stay disabled.
+      'BIP-20DEC30-CDE': ['momentum', 'vwap_mr', 'breakout'],
+      'ETP-20DEC30-CDE': ['momentum', 'vwap_mr', 'breakout'],
     });
   });
 });

@@ -504,13 +504,11 @@ describe('donchian_daily_s3 — registry integration and desk pins', () => {
     expect(registry.getAll().map((p) => p.id)).toEqual(['trend_follow']);
   });
 
-  it('is pinned OFF: guardrails, LIST_PINS, cfm_symbols and the strategies.json mirror all carry it; config-drift is clean', () => {
+  it('is pinned OFF globally: guardrails, LIST_PINS, and the strategies.json mirror all carry it; config-drift is clean', () => {
     expect(guardrails.disabled_strategies).toContain('donchian_daily_s3');
     const pin = LIST_PINS.find((p) => p.key === 'disabled_strategies');
     expect(pin?.mustInclude).toContain('donchian_daily_s3');
-    for (const [, cfg] of Object.entries(guardrails.cfm_symbols ?? {})) {
-      expect(cfg.disabled_strategies).toContain('donchian_daily_s3');
-    }
+    // Phase 1: donchian_daily_s3 is ENABLED on CFM symbols but stays globally disabled
     const mirror = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, STRATEGIES_JSON_REPO_PATH), 'utf8'));
     expect(mirror.strategies.donchian_daily_s3).toEqual({ enabled: false });
     expect(checkConfigDrift(REPO_ROOT).violations).toEqual([]);
@@ -548,19 +546,18 @@ describe('backtest harness hook — --include-disabled (config + engine level)',
     expect(r.disabledStrategies).toEqual(expect.arrayContaining(['vwap_mr', 'breakout', 'momentum']));
     expect(r.forceEnabled).toEqual(['donchian_daily_s3']);
     expect(r.notDisabled).toEqual([]);
-    for (const ids of Object.values(r.perSymbolDisabledStrategies)) {
-      expect(ids).not.toContain('donchian_daily_s3');
-    }
-    // cfm symbol keeps the other four.
+    // Phase 1: donchian_daily_s3 is NOT in cfm per-symbol disabled lists, so no lift needed there
+    // CFM symbol keeps the three still-disabled strategies.
     expect(r.perSymbolDisabledStrategies['BIP-20DEC30-CDE']).toEqual(
-      expect.arrayContaining(['trend_follow', 'momentum', 'vwap_mr', 'breakout']),
+      expect.arrayContaining(['momentum', 'vwap_mr', 'breakout']),
     );
     // Guardrails object untouched.
     expect(guardrails.disabled_strategies).toEqual(before);
-    expect(guardrails.cfm_symbols?.['BIP-20DEC30-CDE']?.disabled_strategies).toContain('donchian_daily_s3');
 
     const noop = stripDisabledForRun(guardrails, ['trend_follow']);
-    expect(noop.forceEnabled).toEqual(['trend_follow']); // lifted from the cfm per-symbol list only
+    // Phase 1: trend_follow is not disabled globally or on CFM, so --include-disabled is a no-op
+    expect(noop.forceEnabled).toEqual([]);
+    expect(noop.notDisabled).toEqual(['trend_follow']);
     expect(noop.disabledStrategies).toEqual(before);
     const unknown = stripDisabledForRun(guardrails, ['not_a_strategy']);
     expect(unknown.forceEnabled).toEqual([]);
@@ -574,7 +571,7 @@ describe('backtest harness hook — --include-disabled (config + engine level)',
     expect(cfg.signals.donchianDailyS3?.enabled).toBe(true);
     expect(cfg.disabledStrategies).toContain('donchian_daily_s3');
     expect(cfg.forceEnabledStrategies).toBeUndefined();
-    expect(cfg.perSymbolDisabledStrategies?.['BIP-20DEC30-CDE']).toContain('donchian_daily_s3');
+    // Phase 1: donchian_daily_s3 is NOT in cfm per-symbol disabled lists
     // Other selectors leave donchian's toggle off.
     expect(buildBacktestConfig({ ...base, strategy: 'trend_follow' }, guardrails).signals.donchianDailyS3?.enabled).toBe(false);
     expect(buildBacktestConfig({ ...base, strategy: 'all' }, guardrails).signals.donchianDailyS3?.enabled).toBe(true);
