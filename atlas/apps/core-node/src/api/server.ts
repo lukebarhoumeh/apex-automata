@@ -23,6 +23,7 @@ import {
   ATR_VOL_STAGE,
   describeAtrVolatilityReject,
   evaluateAtrVolatilityFilter,
+  resolveAtrBounds,
 } from '../strategies/atr-volatility-filter';
 import { buildStrategyPolicy } from '../strategies/strategy-policy';
 import { resolvePersistedEntryPrice } from '../trading/position-entry-vwap';
@@ -87,6 +88,8 @@ import { loadGuardrails, resolveLiveConfig, resolveCfmConfig, resolvePaperSessio
 import { PaperHardStopFireRunner, PaperHardStopScheduler, type PaperHardStopFireContext } from '../runtime/paper-hard-stop';
 import type { ExecutionMode } from '../runtime/session-context';
 import { FeeModel } from '../core/fee-model';
+import { isCfmSymbol } from '../core/symbol-utils';
+import { computeCfmPositionSize } from '../trading/cfm/cfm-position-sizer';
 import { CfmGuard, CfmFlattenRequiredEvent, CfmLeverageSnapshot } from '../trading/cfm/cfm-guard';
 import { OrderOpsThrottle } from '../trading/execution/order-ops-throttle';
 import { resolveEntryExecution } from '../trading/execution/execution-policy';
@@ -2691,8 +2694,12 @@ app.post('/api/engine/start', async (req, res) => {
         // applies to trend_follow entries too; the backtest mirror uses the
         // same helper. A signal with no usable ATR still passes (unchanged),
         // but the skip is logged instead of silent.
-        const atrMin = guardrails.filters.atr_volatility_min;
-        const atrMax = guardrails.filters.atr_volatility_max;
+        // Phase 1 (2026-10-19): per-timeframe ATR bounds. CFM symbols use the
+        // bar timeframe from cfm_bar_timeframes to resolve the correct bounds.
+        const cfmBarTf = isCfmSymbol(signal.symbol) && guardrails.cfm_bar_timeframes
+          ? guardrails.cfm_bar_timeframes[signal.strategy]
+          : undefined;
+        const { atrMin, atrMax } = resolveAtrBounds(guardrails.filters, cfmBarTf);
         const atrVerdict = evaluateAtrVolatilityFilter({
           metadata: signal.metadata,
           price: entryPrice,
@@ -2787,14 +2794,44 @@ app.post('/api/engine/start', async (req, res) => {
           return routeRejected(routedExchange, 'kill_ladder', ladderEntry.reasonCode);
         }
 
-        // Use perps risk_per_trade for perpetual symbols, spot risk for others
+        // Use perps risk_per_trade for perpetual symbols, spot risk for others.
+        // Phase 1: CFM symbols use stop-distance sizing that caps one stop-out
+        // at min(max_daily_loss_usd, L1 daily-R budget in USD).
+        const isCfm = isCfmSymbol(signal.symbol);
         const isPerpsSymbol = signal.symbol.includes('-PERP-');
-        const effectiveRiskPerTrade = isPerpsSymbol && guardrails.perps
-          ? guardrails.perps.risk_per_trade
-          : guardrails.account.risk_per_trade;
-        const rawSize = isPerpsSymbol && guardrails.perps
-          ? tradingEngine!.computeOrderSize(signal.symbol, entryPrice, stopPrice, effectiveRiskPerTrade)
-          : tradingEngine!.computeOrderSize(signal.symbol, entryPrice, stopPrice);
+        let rawSize: number;
+        let effectiveRiskPerTrade: number;
+        if (isCfm && guardrails.cfm_symbols?.[signal.symbol]) {
+          const cfmCfg = guardrails.cfm_symbols[signal.symbol];
+          effectiveRiskPerTrade = guardrails.account.risk_per_trade;
+          const equity = tradingEngine!.getRiskEngineInstance()?.getAccountEquity() ?? guardrails.account.equity_usd;
+          const l1Cfg = guardrails.paper_kill_ladder?.l1_size_down;
+          const l1DailyR = l1Cfg?.daily_r ?? -1;
+          const l1BudgetUsd = equity * effectiveRiskPerTrade * Math.abs(l1DailyR);
+          const cfmSizing = computeCfmPositionSize({
+            entryPrice,
+            stopPrice,
+            contractSize: cfmCfg.contract_size,
+            maxDailyLossUsd: cfmCfg.max_daily_loss_usd,
+            maxNotionalUsd: cfmCfg.max_notional_usd,
+            l1DailyRBudgetUsd: l1BudgetUsd,
+          });
+          rawSize = cfmSizing.size;
+          logger.debug('CFM stop-distance sizing', {
+            symbol: signal.symbol,
+            size: rawSize,
+            contracts: cfmSizing.contracts,
+            cappedBy: cfmSizing.cappedBy,
+            stopDistancePct: cfmSizing.stopDistancePct,
+            maxLossUsd: cfmSizing.maxLossUsd,
+          });
+        } else if (isPerpsSymbol && guardrails.perps) {
+          effectiveRiskPerTrade = guardrails.perps.risk_per_trade;
+          rawSize = tradingEngine!.computeOrderSize(signal.symbol, entryPrice, stopPrice, effectiveRiskPerTrade);
+        } else {
+          effectiveRiskPerTrade = guardrails.account.risk_per_trade;
+          rawSize = tradingEngine!.computeOrderSize(signal.symbol, entryPrice, stopPrice);
+        }
         if (!Number.isFinite(rawSize) || rawSize <= 0) {
           logger.warn('Guardrail sizing returned zero/invalid size, skipping signal', {
             signalId: signal.id,
@@ -2920,6 +2957,16 @@ app.post('/api/engine/start', async (req, res) => {
         // rate backed by closed trades is evidence; otherwise the gate's
         // documented default-allow path applies.
         const strategyPerf = signalProcessor!.getStrategyPerformance(signal.strategy);
+        // Phase 1 (2026-10-19): CFM cost-plus per-contract fees flow into the
+        // EV gate so the round-trip cost bar includes the exchange floor.
+        const cfmPerContractFee = isCfmSymbol(signal.symbol) && feeModel?.isCostPlus('coinbase', 'cfm')
+          ? (() => {
+              const cfmCfg = guardrails.cfm_symbols?.[signal.symbol];
+              if (!cfmCfg) return 0;
+              const contracts = Math.abs(computedSize / cfmCfg.contract_size);
+              return 2 * feeModel.getExchangeFeePerContractUsd('coinbase', 'cfm') * contracts;
+            })()
+          : 0;
         const evGate = tradingEngine!.getRiskEngineInstance()?.evaluateSignalEv({
           symbol: signal.symbol,
           strategy: signal.strategy,
@@ -2932,6 +2979,7 @@ app.post('/api/engine/start', async (req, res) => {
           sampleSize: strategyPerf?.totalTrades ?? 0,
           // Paper keeps the legacy taker-both-sides assumption bit-for-bit.
           entryLiquidity: mode === 'live' && orderType === 'limit' && postOnly ? 'maker' : 'taker',
+          perContractFeeUsd: cfmPerContractFee,
         });
         if (evGate && !evGate.allowed) {
           logger.warn('Signal rejected by EV gate', {

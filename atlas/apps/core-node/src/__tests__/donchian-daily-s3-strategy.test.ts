@@ -555,9 +555,10 @@ describe('backtest harness hook — --include-disabled (config + engine level)',
     expect(guardrails.disabled_strategies).toEqual(before);
 
     const noop = stripDisabledForRun(guardrails, ['trend_follow']);
-    // Phase 1: trend_follow is not disabled globally or on CFM, so --include-disabled is a no-op
-    expect(noop.forceEnabled).toEqual([]);
-    expect(noop.notDisabled).toEqual(['trend_follow']);
+    // trend_follow is disabled on ETP-20DEC30-CDE (Phase 1: ETP fully disabled),
+    // so --include-disabled lifts it from that per-symbol list.
+    expect(noop.forceEnabled).toEqual(['trend_follow']);
+    expect(noop.notDisabled).toEqual([]);
     expect(noop.disabledStrategies).toEqual(before);
     const unknown = stripDisabledForRun(guardrails, ['not_a_strategy']);
     expect(unknown.forceEnabled).toEqual([]);

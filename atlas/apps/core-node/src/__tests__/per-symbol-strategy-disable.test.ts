@@ -199,10 +199,9 @@ describe('guardrails.yaml — disabled_strategies state (F4 follow-up §8)', () 
     expect(buildPerSymbolDisabledStrategies(guardrails)).toEqual({
       'ETH-PERP-INTX': ['momentum'],
       'BTC-PERP-INTX': ['momentum'],
-      // Phase 1 (2026-10-19): trend_follow and donchian_daily_s3 are ENABLED
-      // on CFM symbols. Only momentum/vwap_mr/breakout stay disabled.
+      // Phase 1: BIP has trend_follow + donchian_daily_s3 ENABLED; ETP fully disabled
       'BIP-20DEC30-CDE': ['momentum', 'vwap_mr', 'breakout'],
-      'ETP-20DEC30-CDE': ['momentum', 'vwap_mr', 'breakout'],
+      'ETP-20DEC30-CDE': ['trend_follow', 'momentum', 'vwap_mr', 'breakout', 'donchian_daily_s3'],
     });
   });
 });

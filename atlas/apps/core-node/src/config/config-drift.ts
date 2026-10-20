@@ -473,26 +473,26 @@ function checkPins(guardrails: GuardrailConfig, out: DriftViolation[]): void {
 }
 
 /**
- * CFM paper symbols — Phase 1 active venue (promoted from infra-only):
+ * CFM paper symbols — Phase 1 active venue:
  *
- *   1. momentum, vwap_mr, breakout must remain disabled on every `*-CDE` symbol
- *      (no research pass); trend_follow and donchian_daily_s3 are now ALLOWED
- *      (Phase 1 GO, 2026-10-19);
- *   2. `spot_proxy` must name a `per_symbol` spot product — that is the only
- *      paper quote path (desk seal (a)); a dangling proxy means no ticks.
+ *   1. Only strategies in the ALLOWLIST may be enabled on `*-CDE` symbols.
+ *      Any other built-in strategy not in the symbol's `disabled_strategies`
+ *      is a violation (fails closed — new builtins must be explicitly allowed).
+ *   2. `spot_proxy` must name a `per_symbol` spot product.
  */
 
-/** Strategies that must remain disabled on CFM symbols (no research pass). */
-const CFM_MUST_DISABLE: readonly string[] = ['momentum', 'vwap_mr', 'breakout'];
+export const CFM_ALLOWED_STRATEGIES: readonly string[] = ['trend_follow', 'donchian_daily_s3'];
 
 function checkCfmSymbols(guardrails: GuardrailConfig, out: DriftViolation[]): void {
   const file = CANONICAL_GUARDRAILS_REPO_PATH;
   const cfmSymbols = guardrails.cfm_symbols ?? {};
   const spotSymbols = new Set(Object.keys(guardrails.per_symbol ?? {}));
+  const builtin = getBuiltinStrategyIds();
 
   for (const [symbol, cfg] of Object.entries(cfmSymbols)) {
     const disabled = new Set(cfg.disabled_strategies ?? []);
-    for (const id of CFM_MUST_DISABLE) {
+    for (const id of builtin) {
+      if (CFM_ALLOWED_STRATEGIES.includes(id)) continue;
       if (!disabled.has(id)) {
         out.push({
           code: 'cfm_symbol_strategy_enabled',
@@ -500,7 +500,7 @@ function checkCfmSymbols(guardrails: GuardrailConfig, out: DriftViolation[]): vo
           key: `cfm_symbols.${symbol}.disabled_strategies`,
           message:
             `Strategy "${id}" is not disabled on CFM paper symbol ${symbol}. ` +
-            'momentum, vwap_mr, and breakout must be listed in disabled_strategies (no research pass).',
+            `Only [${CFM_ALLOWED_STRATEGIES.join(', ')}] are allowed on CFM; all others must be in disabled_strategies.`,
         });
       }
     }

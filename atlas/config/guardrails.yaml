@@ -387,7 +387,10 @@ cfm_symbols:
     spot_proxy: ETH-USD
     max_notional_usd: 2000
     max_daily_loss_usd: 100
-    disabled_strategies: [momentum, vwap_mr, breakout]
+    # Phase 1: ETP kept DISABLED pending Risk Master sign-off. Spec verified:
+    # hours=Fri 6pm–Fri 5pm ET (1h break), tick=$0.50/ETH, size=0.1 ETH/ct.
+    # Sources: coinbase.com/futures/etp-20dec30-cde, CFTC 2025-33, CDE Product Ref 10/20/2025.
+    disabled_strategies: [trend_follow, momentum, vwap_mr, breakout, donchian_daily_s3]
     strategy_overrides:
       trend_follow:
         emaFast: 12

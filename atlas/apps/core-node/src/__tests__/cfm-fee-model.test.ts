@@ -226,7 +226,7 @@ describe('canonical guardrails.yaml — CFM bucket + paper symbols load', () => 
     expect(bip!.disabled_strategies).not.toContain('donchian_daily_s3');
   });
 
-  test('ETP-20DEC30-CDE is wired with ETH contract spec and spot proxy', () => {
+  test('ETP-20DEC30-CDE is wired with ETH contract spec but ALL strategies disabled (Phase 1)', () => {
     const guardrails = loadGuardrails();
     const etp = guardrails.cfm_symbols?.['ETP-20DEC30-CDE'];
     expect(etp).toBeDefined();
@@ -234,8 +234,9 @@ describe('canonical guardrails.yaml — CFM bucket + paper symbols load', () => 
     expect(etp!.price_increment_usd).toBe(0.50);
     expect(etp!.spot_proxy).toBe('ETH-USD');
     expect(Object.keys(guardrails.per_symbol ?? {})).toContain(etp!.spot_proxy);
-    expect(etp!.disabled_strategies).toEqual(expect.arrayContaining(['momentum', 'vwap_mr', 'breakout']));
-    expect(etp!.disabled_strategies).not.toContain('trend_follow');
+    expect(etp!.disabled_strategies).toContain('trend_follow');
+    expect(etp!.disabled_strategies).toContain('donchian_daily_s3');
+    expect(etp!.disabled_strategies).toContain('momentum');
   });
 
   test('resolveCfmConfig falls back to Charter defaults when the block is absent', () => {
