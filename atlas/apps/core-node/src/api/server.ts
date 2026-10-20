@@ -2817,6 +2817,39 @@ app.post('/api/engine/start', async (req, res) => {
             l1DailyRBudgetUsd: l1BudgetUsd,
           });
           rawSize = cfmSizing.size;
+          if (rawSize <= 0) {
+            logger.info('CFM sizer: zero size — stop distance exceeds risk cap for even 1 contract', {
+              reasonCode: 'cfm_size_zero_risk_cap',
+              signalId: signal.id,
+              symbol: signal.symbol,
+              strategy: signal.strategy,
+              direction: signal.direction,
+              cappedBy: cfmSizing.cappedBy,
+              stopDistancePct: cfmSizing.stopDistancePct,
+              maxLossUsd: cfmSizing.maxLossUsd,
+              contractSize: cfmCfg.contract_size,
+              entryPrice,
+              stopPrice,
+            });
+            recordSignalFiltered(logger, {
+              stage: 'sizing',
+              reason: 'cfm_size_zero_risk_cap',
+              symbol: signal.symbol,
+              strategy: signal.strategy,
+              signalId: signal.id,
+              direction: signal.direction,
+              strength: signal.strength,
+              context: {
+                cappedBy: cfmSizing.cappedBy,
+                stopDistancePct: cfmSizing.stopDistancePct,
+                maxLossUsd: cfmSizing.maxLossUsd,
+                contractSize: cfmCfg.contract_size,
+                entryPrice,
+                stopPrice,
+              },
+            });
+            return routeRejected(routedExchange, 'sizing', 'cfm_size_zero_risk_cap');
+          }
           logger.debug('CFM stop-distance sizing', {
             symbol: signal.symbol,
             size: rawSize,
