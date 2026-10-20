@@ -473,14 +473,16 @@ function checkPins(guardrails: GuardrailConfig, out: DriftViolation[]): void {
 }
 
 /**
- * CFM paper symbols (card SH-QMAKER-CFM-PAPER-v0, infra only — NOT strategy GO):
+ * CFM paper symbols — Phase 1 active venue:
  *
- *   1. every built-in strategy must be in the symbol's `disabled_strategies`
- *      until the card's strategy lands under its own GO, so wiring the venue
- *      never lets an existing strategy trade `*-CDE` by accident;
- *   2. `spot_proxy` must name a `per_symbol` spot product — that is the only
- *      paper quote path (desk seal (a)); a dangling proxy means no ticks.
+ *   1. Only strategies in the ALLOWLIST may be enabled on `*-CDE` symbols.
+ *      Any other built-in strategy not in the symbol's `disabled_strategies`
+ *      is a violation (fails closed — new builtins must be explicitly allowed).
+ *   2. `spot_proxy` must name a `per_symbol` spot product.
  */
+
+export const CFM_ALLOWED_STRATEGIES: readonly string[] = ['trend_follow', 'donchian_daily_s3'];
+
 function checkCfmSymbols(guardrails: GuardrailConfig, out: DriftViolation[]): void {
   const file = CANONICAL_GUARDRAILS_REPO_PATH;
   const cfmSymbols = guardrails.cfm_symbols ?? {};
@@ -490,14 +492,15 @@ function checkCfmSymbols(guardrails: GuardrailConfig, out: DriftViolation[]): vo
   for (const [symbol, cfg] of Object.entries(cfmSymbols)) {
     const disabled = new Set(cfg.disabled_strategies ?? []);
     for (const id of builtin) {
+      if (CFM_ALLOWED_STRATEGIES.includes(id)) continue;
       if (!disabled.has(id)) {
         out.push({
           code: 'cfm_symbol_strategy_enabled',
           file,
           key: `cfm_symbols.${symbol}.disabled_strategies`,
           message:
-            `Built-in strategy "${id}" is not disabled on CFM paper symbol ${symbol}. ` +
-            'CFM wiring is infra only (NOT strategy GO); every built-in strategy must be listed until a card strategy is authorised.',
+            `Strategy "${id}" is not disabled on CFM paper symbol ${symbol}. ` +
+            `Only [${CFM_ALLOWED_STRATEGIES.join(', ')}] are allowed on CFM; all others must be in disabled_strategies.`,
         });
       }
     }

@@ -322,14 +322,16 @@ perps_symbols:
         takeProfitAtr: 6.0
 
 # ---------------------------------------------------------------------------
-# CFM / CDE nano futures — PAPER harness prerequisites for card
-# SH-QMAKER-CFM-PAPER-v0 (Tier-A Eng infra, TM DESK SoT 2026-09-21).
+# CFM / CDE nano futures — PRIMARY PAPER VENUE (Phase 1, 2026-10-19).
+# Promoted from infra-only (card SH-QMAKER-CFM-PAPER-v0) to active paper
+# venue. trend_follow (4H) and donchian_daily_s3 (1D) are enabled on *-CDE
+# symbols. Live `*-CDE` execution is NOT wired: api/server.ts drops
+# cfm_symbols when the engine starts in live mode. CONFIRM_LIVE stays NO.
 #
-# INFRA ONLY. NOT a strategy GO, NOT research-pass, NOT CONFIRM_LIVE. Live
-# `*-CDE` execution is not wired: api/server.ts drops cfm_symbols when the
-# engine starts in live mode. API surface for any future live path is
-# Advanced Trade CDP JWT on api.coinbase.com + /cfm/* only — NOT INTX/drb,
-# NOT CDE Command Center HMAC.
+# Contract specs source: CDE nano Bitcoin Perp-Style Futures spec
+# (https://www.coinbase.com/derivatives/resources/nano-bitcoin-futures) and
+# CDE nano Ether Futures spec
+# (https://www.coinbase.com/derivatives/resources/nano-ether-futures).
 #
 # Venue facts carried in code (trading/cfm/cde-hours.ts): CDE crypto weekly
 # break Friday 17:00–18:00 America/New_York; no resting logic across the gap.
@@ -357,16 +359,15 @@ cfm:
 # the venue boundary (lot rounding + the $/contract exchange floor).
 #
 # Quote path (paper): spot proxy — ticks + candles from `spot_proxy` are
-# mirrored onto the *-CDE symbol (desk seal (a)). `BIP-20DEC30-CDE` GET is
-# still domain-fail on the research box (HTTP 400, 2026-09-21); UI is SoT for
-# nano perps until fixed. No live quote path is implied here.
+# mirrored onto the *-CDE symbol (desk seal (a)).
 #
-# ALL built-in strategies are disabled on the CFM symbol: the wiring exists,
-# no signal routes to it until the card's strategy lands under its own GO.
-# Enforced by `pnpm check:config` (config-drift.ts LIST_PINS).
-#
-# ETP-20DEC30-CDE (0.1 ETH/contract) is deliberately NOT listed: its hours
-# and tick are still UNVERIFIED on the ETP spec (CDE API memo 2026-09-11).
+# Phase 1 (2026-10-19): trend_follow and donchian_daily_s3 are ENABLED on CFM
+# symbols (other strategies remain disabled). trend_follow runs on 4H bars,
+# donchian_daily_s3 on 1D bars. Paper fills charge the full cost-plus fee model.
+# Bar timeframes for CFM strategies:
+cfm_bar_timeframes:
+  trend_follow: 240       # 4H bars (minutes)
+  donchian_daily_s3: 1440 # 1D bars (minutes)
 cfm_symbols:
   BIP-20DEC30-CDE:
     contract_size: 0.01          # BTC per contract (CDE BIP spec PDF)
@@ -374,7 +375,29 @@ cfm_symbols:
     spot_proxy: BTC-USD
     max_notional_usd: 2000
     max_daily_loss_usd: 100
+    disabled_strategies: [momentum, vwap_mr, breakout]
+    strategy_overrides:
+      trend_follow:
+        stopAtr: 2.5
+        takeProfitAtr: 6.0
+      donchian_daily_s3: {}
+  ETP-20DEC30-CDE:
+    contract_size: 0.1           # ETH per contract (CDE ETP spec, CFTC 2025-33 filing)
+    price_increment_usd: 0.50    # $0.50 per ETH = $0.05 per nano contract (CDE ETP Perp Style spec PDF)
+    spot_proxy: ETH-USD
+    max_notional_usd: 2000
+    max_daily_loss_usd: 100
+    # Phase 1: ETP kept DISABLED pending Risk Master sign-off. Spec verified:
+    # hours=Fri 6pm–Fri 5pm ET (1h break), tick=$0.50/ETH, size=0.1 ETH/ct.
+    # Sources: coinbase.com/futures/etp-20dec30-cde, CFTC 2025-33, CDE Product Ref 10/20/2025.
     disabled_strategies: [trend_follow, momentum, vwap_mr, breakout, donchian_daily_s3]
+    strategy_overrides:
+      trend_follow:
+        emaFast: 12
+        emaSlow: 15
+        stopAtr: 2.5
+        takeProfitAtr: 6.0
+      donchian_daily_s3: {}
 
 execution:
   order_type: marketable_limit
@@ -428,6 +451,24 @@ filters:
   # 0.0005 let sub-fee-floor chop through. Enforced by `pnpm check:config` (config-drift.ts).
   atr_volatility_min: 0.005
   atr_volatility_max: 0.05
+  # Per-timeframe ATR volatility bounds. The 15m bounds above are the global
+  # default; these override them for specific bar durations.
+  #
+  # Derived from real fixture data (BTC-USD + ETH-USD):
+  #   4H (fixtures/bars/4h/{tune,holdout}, ~13k bars 2023-03 to 2026-03):
+  #     p5=0.79–0.88%  p10=0.85–1.45%  p50=1.2–2.1%  p90=1.9–3.1%  p95=2.4–3.6%
+  #     Floor 0.8% blocks 5.9% of holdout bars (dead-market filter).
+  #     Ceiling 4% is above p95 for both assets.
+  #   1D (fixtures/bars/1d/{tune,root}, ~7k bars 2017-01 to 2025-03):
+  #     p5=2.3–3.3%  p10=2.5–3.9%  p50=3.4–6.3%  p90=4.7–10.4%  p95=5.1–13.2%
+  #     Floor 2.5% blocks ~5% of bars; ceiling 15% above p95 for both.
+  atr_volatility_by_timeframe:
+    240:   # 4H bars
+      atr_volatility_min: 0.008
+      atr_volatility_max: 0.04
+    1440:  # 1D bars
+      atr_volatility_min: 0.025
+      atr_volatility_max: 0.15
   funding_bias_enabled: true
   # Time-of-day filter is OFF by default. The previous default
   # (time_filter_enabled: true with allowed_hours_utc: [0, 23]) was a no-op

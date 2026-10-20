@@ -55,11 +55,14 @@ describe('resolveEntryExecution', () => {
 });
 
 describe('cfm_symbols.disabled_strategies → per-symbol disable map (NOT strategy GO)', () => {
-  it('every built-in strategy is disabled on the CFM paper symbol in the canonical guardrails', () => {
+  it('non-Phase-1 strategies are disabled on the CFM paper symbol in the canonical guardrails', () => {
     const map = buildPerSymbolDisabledStrategies(loadGuardrails());
-    for (const strategy of ['trend_follow', 'momentum', 'vwap_mr', 'breakout']) {
+    for (const strategy of ['momentum', 'vwap_mr', 'breakout']) {
       expect(isSymbolStrategyDisabled(map, BIP, strategy)).toBe(true);
     }
+    // Phase 1: trend_follow and donchian_daily_s3 are ENABLED on CFM
+    expect(isSymbolStrategyDisabled(map, BIP, 'trend_follow')).toBe(false);
+    expect(isSymbolStrategyDisabled(map, BIP, 'donchian_daily_s3')).toBe(false);
     // spot is untouched by the CFM block
     expect(isSymbolStrategyDisabled(map, 'BTC-USD', 'trend_follow')).toBe(false);
   });

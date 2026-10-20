@@ -213,7 +213,7 @@ describe('canonical guardrails.yaml — CFM bucket + paper symbols load', () => 
     expect(cfm.hours_gap.flatten_lead_min).toBe(10);
   });
 
-  test('BIP-20DEC30-CDE paper symbol carries the CDE spec, a spot proxy, and disables every strategy', () => {
+  test('BIP-20DEC30-CDE paper symbol carries the CDE spec, a spot proxy, and disables non-Phase-1 strategies', () => {
     const guardrails = loadGuardrails();
     const bip = guardrails.cfm_symbols?.[BIP];
     expect(bip).toBeDefined();
@@ -221,9 +221,22 @@ describe('canonical guardrails.yaml — CFM bucket + paper symbols load', () => 
     expect(bip!.price_increment_usd).toBe(5);
     expect(bip!.spot_proxy).toBe('BTC-USD');
     expect(Object.keys(guardrails.per_symbol ?? {})).toContain(bip!.spot_proxy);
-    expect(bip!.disabled_strategies).toEqual(expect.arrayContaining(['trend_follow', 'momentum', 'vwap_mr', 'breakout']));
-    // ETP is deliberately not wired (hours / tick UNVERIFIED on the ETP spec).
-    expect(guardrails.cfm_symbols?.['ETP-20DEC30-CDE']).toBeUndefined();
+    expect(bip!.disabled_strategies).toEqual(expect.arrayContaining(['momentum', 'vwap_mr', 'breakout']));
+    expect(bip!.disabled_strategies).not.toContain('trend_follow');
+    expect(bip!.disabled_strategies).not.toContain('donchian_daily_s3');
+  });
+
+  test('ETP-20DEC30-CDE is wired with ETH contract spec but ALL strategies disabled (Phase 1)', () => {
+    const guardrails = loadGuardrails();
+    const etp = guardrails.cfm_symbols?.['ETP-20DEC30-CDE'];
+    expect(etp).toBeDefined();
+    expect(etp!.contract_size).toBe(0.1);
+    expect(etp!.price_increment_usd).toBe(0.50);
+    expect(etp!.spot_proxy).toBe('ETH-USD');
+    expect(Object.keys(guardrails.per_symbol ?? {})).toContain(etp!.spot_proxy);
+    expect(etp!.disabled_strategies).toContain('trend_follow');
+    expect(etp!.disabled_strategies).toContain('donchian_daily_s3');
+    expect(etp!.disabled_strategies).toContain('momentum');
   });
 
   test('resolveCfmConfig falls back to Charter defaults when the block is absent', () => {
@@ -366,13 +379,13 @@ describe('config drift — CFM pins', () => {
     expect(codesFor(root)).toContainEqual({ code: 'pin_mismatch', key: 'cfm.max_leverage' });
   });
 
-  test('enabling any built-in strategy on the CFM paper symbol is a violation (infra only, NOT strategy GO)', () => {
+  test('enabling a non-Phase-1 strategy on the CFM paper symbol is a violation', () => {
     const root = makeRepo((doc) => {
-      doc.cfm_symbols[BIP].disabled_strategies = ['momentum', 'vwap_mr', 'breakout']; // trend_follow re-enabled
+      doc.cfm_symbols[BIP].disabled_strategies = ['vwap_mr', 'breakout']; // momentum re-enabled
     });
     const codes = codesFor(root);
     expect(codes).toContainEqual({ code: 'cfm_symbol_strategy_enabled', key: `cfm_symbols.${BIP}.disabled_strategies` });
-    expect(checkConfigDrift(root).violations.find((v) => v.code === 'cfm_symbol_strategy_enabled')?.message).toMatch(/trend_follow/);
+    expect(checkConfigDrift(root).violations.find((v) => v.code === 'cfm_symbol_strategy_enabled')?.message).toMatch(/momentum/);
   });
 
   test('a spot_proxy that is not a subscribed per_symbol product is a violation (no quote path)', () => {

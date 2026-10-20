@@ -535,6 +535,7 @@ export const GuardrailsSchema = z.object({
   // leads); `cfm_symbols` carries contract specs + limits per `*-CDE` product.
   cfm: CfmConfigSchema,
   cfm_symbols: CfmSymbolsSchema,
+  cfm_bar_timeframes: z.record(z.string(), z.number().int().positive()).optional(),
   execution: z.object({
     order_type: z.string(),
     price_offset_ticks: z.number().int().nonnegative(),
@@ -553,6 +554,13 @@ export const GuardrailsSchema = z.object({
   filters: z.object({
     atr_volatility_min: z.number().nonnegative(),
     atr_volatility_max: z.number().nonnegative(),
+    atr_volatility_by_timeframe: z.record(
+      z.string(),
+      z.object({
+        atr_volatility_min: z.number().nonnegative(),
+        atr_volatility_max: z.number().nonnegative(),
+      }),
+    ).optional(),
     funding_bias_enabled: z.boolean(),
     time_filter_enabled: z.boolean(),
     allowed_hours_utc: z.array(z.number().int().min(0).max(23)).nonempty()

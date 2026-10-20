@@ -116,6 +116,13 @@ export interface EvGateInputs {
   geometryHaircut?: number;
   /** 'enforce' (default) rejects; 'shadow' allows + logs EV_GATE_SHADOW_ALLOW. */
   mode?: EvGateMode;
+  /**
+   * Per-contract fees (exchange + clearing, both legs) in USD. When set, these
+   * are ADDED to the percentage-based fee for CFM/CDE symbols. The EV formula
+   * becomes: fees = (entryFeeRate + exitFeeRate) * notional + perContractFeeUsd.
+   * Compute as: 2 * contracts * (exchange_fee + clearing_fee).
+   */
+  perContractFeeUsd?: number;
 }
 
 /**
@@ -310,7 +317,11 @@ export function evaluateEvGate(
   }
 
   const notional = size * entryPrice;
-  const feeUsd = (entryFeeRate + exitFeeRate) * notional;
+  const percentageFeeUsd = (entryFeeRate + exitFeeRate) * notional;
+  const perContractFeeUsd = typeof inputs.perContractFeeUsd === 'number' && Number.isFinite(inputs.perContractFeeUsd)
+    ? inputs.perContractFeeUsd
+    : 0;
+  const feeUsd = percentageFeeUsd + perContractFeeUsd;
 
   // Win-rate estimate.
   const prior = inputs.winRatePrior;

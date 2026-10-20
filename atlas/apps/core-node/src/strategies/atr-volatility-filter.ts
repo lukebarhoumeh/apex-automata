@@ -70,6 +70,41 @@ export const ATR_BELOW_MIN = 'atr_below_min' as const;
 /** Reason slug when ATR% is over `atr_volatility_max`. */
 export const ATR_ABOVE_MAX = 'atr_above_max' as const;
 
+/**
+ * Per-timeframe ATR volatility bounds entry as stored in
+ * `guardrails.filters.atr_volatility_by_timeframe`.
+ */
+export interface AtrTimeframeBounds {
+  atr_volatility_min: number;
+  atr_volatility_max: number;
+}
+
+/**
+ * Resolve ATR volatility bounds for a given bar timeframe (minutes).
+ *
+ * Checks `guardrails.filters.atr_volatility_by_timeframe[barMinutes]` first;
+ * falls back to the global `atr_volatility_min` / `atr_volatility_max`.
+ * Longer timeframes structurally show higher ATR% (price range widens with
+ * sqrt(bars)), so the per-timeframe overrides prevent the 15m floor from
+ * rejecting valid 4H/1D signals.
+ */
+export function resolveAtrBounds(
+  filters: {
+    atr_volatility_min: number;
+    atr_volatility_max: number;
+    atr_volatility_by_timeframe?: Record<string, AtrTimeframeBounds>;
+  },
+  barMinutes?: number,
+): { atrMin: number; atrMax: number } {
+  if (barMinutes && filters.atr_volatility_by_timeframe) {
+    const override = filters.atr_volatility_by_timeframe[String(barMinutes)];
+    if (override) {
+      return { atrMin: override.atr_volatility_min, atrMax: override.atr_volatility_max };
+    }
+  }
+  return { atrMin: filters.atr_volatility_min, atrMax: filters.atr_volatility_max };
+}
+
 export type AtrVolatilityVerdict =
   /** ATR% inside `[atrMin, atrMax]` — entry may proceed. */
   | { outcome: 'pass'; atrPct: number; atr: number; atrSource: SignalAtrSource }
