@@ -1,7 +1,6 @@
 -- Phase 1 (2026-10-19): market_context_bars — per-closed-bar context snapshot
 -- for CFM paper venue. The engine writes one row per closed bar with basis,
 -- funding, and price context for post-trade analysis.
--- DO NOT APPLY — ships as a migration file only (no DDL applied to Supabase).
 
 create table if not exists public.market_context_bars (
   id              bigint generated always as identity primary key,
