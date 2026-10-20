@@ -410,6 +410,59 @@ export function resolvePaperSessionHardStopConfig(guardrails: {
   return guardrails.paper_session_hard_stop ?? (PaperSessionHardStopSchema.parse({}) as PaperSessionHardStopConfig);
 }
 
+// ---------------------------------------------------------------------------
+// Agentic / Claude advisory layer (2026-10-19). ADVISORY ONLY.
+//
+// Claude is NEVER in the order path. It may only:
+//   (a) emit advisory signals that REDUCE position size or PAUSE new entries
+//       (never increase size/risk, never place/cancel orders);
+//   (b) write reports to Supabase;
+//   (c) propose changes as text/PR drafts.
+//
+// Feature-flagged OFF by default (`enabled: false`). API key read from
+// `process.env.ANTHROPIC_API_KEY` at runtime — never logged or committed.
+// Per-call token accounting persisted to `agentic_calls` (Supabase), with a
+// monthly cost cap that auto-disables all components when hit.
+// ---------------------------------------------------------------------------
+
+const ANTHROPIC_MODEL_PATTERN = /^claude-[a-z0-9.-]+$/;
+
+const AgenticModelsSchema = z.object({
+  news_filter: z.string().regex(ANTHROPIC_MODEL_PATTERN).default('claude-haiku-5-5'),
+  regime_advisor: z.string().regex(ANTHROPIC_MODEL_PATTERN).default('claude-opus-5-5'),
+  daily_review: z.string().regex(ANTHROPIC_MODEL_PATTERN).default('claude-opus-5-5'),
+  research: z.string().regex(ANTHROPIC_MODEL_PATTERN).default('claude-opus-5-5'),
+  pr_reviewer: z.string().regex(ANTHROPIC_MODEL_PATTERN).default('claude-opus-5-5'),
+});
+
+const AgenticComponentsSchema = z.object({
+  news_filter: z.boolean().default(false),
+  regime_advisor: z.boolean().default(false),
+  daily_review: z.boolean().default(false),
+  research: z.boolean().default(false),
+  pr_reviewer: z.boolean().default(false),
+});
+
+const AgenticConfigSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    monthly_cost_cap_usd: z.number().positive().default(190),
+    models: AgenticModelsSchema.default({}),
+    components: AgenticComponentsSchema.default({}),
+    regime_advisor_interval_min: z.number().int().positive().default(60),
+    daily_review_hour_utc: z.number().int().min(0).max(23).default(5),
+    research_start_hour_utc: z.number().int().min(0).max(23).default(6),
+    research_max_sweeps: z.number().int().positive().default(10),
+  })
+  .optional();
+
+export type AgenticConfig = NonNullable<z.infer<typeof AgenticConfigSchema>>;
+
+/** Effective agentic config: the parsed block or its defaults when absent. */
+export function resolveAgenticConfig(guardrails: { agentic?: AgenticConfig }): AgenticConfig {
+  return guardrails.agentic ?? (AgenticConfigSchema.parse({}) as AgenticConfig);
+}
+
 export const GuardrailsSchema = z.object({
   disabled_strategies: z.array(z.string()).optional().default([]),
   momentum: MomentumConfigSchema.optional(),
@@ -519,6 +572,10 @@ export const GuardrailsSchema = z.object({
   // Handoff P5 (2026-09-29) — engine-side 22:30 CT self-stop backstop for
   // PAPER sessions. Optional; absent = disabled. See `resolvePaperSessionHardStopConfig()`.
   paper_session_hard_stop: PaperSessionHardStopSchema,
+  // Agentic / Claude advisory layer (2026-10-19). ADVISORY ONLY — Claude is
+  // never in the order path. It may only reduce size / pause entries. Feature
+  // flagged OFF by default (`enabled: false`). See `resolveAgenticConfig()`.
+  agentic: AgenticConfigSchema,
   compliance: z.object({
     tax_method: z.string(),
     export_frequency_days: z.number().int().positive(),
